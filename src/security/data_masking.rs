@@ -347,12 +347,21 @@ mod tests {
     #[test]
     fn detect_credit_card_with_luhn() {
         let masker = DataMasker::new(true);
-        // Valid Luhn test number
-        let text = "Card: 4532 0151 2345 6789";
+        // Valid Luhn test number (Visa test card)
+        let text = "Card: 4111 1111 1111 1111";
         let matches = masker.detect(text);
-        // Note: this may or may not match depending on Luhn validation
-        // The test verifies the detection pipeline works
-        let _ = matches;
+        assert!(
+            matches.iter().any(|m| m.category == PiiCategory::CreditCard),
+            "Should detect valid Luhn credit card number"
+        );
+
+        // Invalid Luhn number should NOT be detected as credit card
+        let text2 = "Number: 1234 5678 9012 3456";
+        let matches2 = masker.detect(text2);
+        assert!(
+            !matches2.iter().any(|m| m.category == PiiCategory::CreditCard),
+            "Should not detect invalid Luhn number as credit card"
+        );
     }
 
     #[test]

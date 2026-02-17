@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use axum::{
     extract::State,
     http::StatusCode,
+    response::Json,
     routing::{get, post},
     Router,
 };
@@ -22,9 +23,6 @@ const KAKAO_CHANNEL_API: &str = "https://kapi.kakao.com/v1/api/talk/channels/mes
 
 /// Alimtalk API base URL (Kakao notification templates).
 const KAKAO_ALIMTALK_API: &str = "https://kapi.kakao.com/v2/api/talk/memo/default/send";
-
-/// OAuth2 token endpoint for refreshing access tokens.
-const KAKAO_TOKEN_URL: &str = "https://kauth.kakao.com/oauth/token";
 
 /// KakaoTalk channel — connects via webhook HTTP receiver for incoming messages,
 /// sends replies through Kakao REST API with support for rich message types.
@@ -147,7 +145,6 @@ impl KakaoTalkChannel {
             .client
             .post(KAKAO_CHANNEL_API)
             .header("Authorization", format!("KakaoAK {token}"))
-            .header("Content-Type", "application/x-www-form-urlencoded")
             .form(&[
                 ("receiver_uuids", serde_json::json!([user_id]).to_string()),
                 ("template_object", template.to_string()),
@@ -206,38 +203,50 @@ impl KakaoTalkChannel {
         Ok(())
     }
 
-    /// Split a long message into KakaoTalk-sized chunks (1000 chars max).
+    /// Split a long message into KakaoTalk-sized chunks (1000 characters max).
+    /// Uses character count (not byte length) since KakaoTalk counts characters,
+    /// and Korean characters are 3 bytes in UTF-8 but count as 1 character.
     fn split_message(text: &str) -> Vec<String> {
-        if text.len() <= KAKAO_MAX_TEXT_LEN {
+        if text.chars().count() <= KAKAO_MAX_TEXT_LEN {
             return vec![text.to_string()];
         }
 
         let mut chunks = Vec::new();
         let mut current = String::new();
+        let mut current_char_count = 0usize;
 
         for line in text.lines() {
-            if current.len() + line.len() + 1 > KAKAO_MAX_TEXT_LEN {
+            let line_char_count = line.chars().count();
+            let needed = if current.is_empty() {
+                line_char_count
+            } else {
+                current_char_count + 1 + line_char_count // +1 for newline
+            };
+
+            if needed > KAKAO_MAX_TEXT_LEN {
                 if !current.is_empty() {
                     chunks.push(current.clone());
                     current.clear();
+                    current_char_count = 0;
                 }
                 // Handle single lines that exceed the limit
-                if line.len() > KAKAO_MAX_TEXT_LEN {
-                    let mut remaining = line;
-                    while !remaining.is_empty() {
-                        let boundary = find_char_boundary(remaining, KAKAO_MAX_TEXT_LEN);
-                        let (chunk, rest) = remaining.split_at(boundary);
-                        chunks.push(chunk.to_string());
-                        remaining = rest;
+                if line_char_count > KAKAO_MAX_TEXT_LEN {
+                    let mut chars = line.chars().peekable();
+                    while chars.peek().is_some() {
+                        let chunk: String = chars.by_ref().take(KAKAO_MAX_TEXT_LEN).collect();
+                        chunks.push(chunk);
                     }
                 } else {
                     current.push_str(line);
+                    current_char_count = line_char_count;
                 }
             } else {
                 if !current.is_empty() {
                     current.push('\n');
+                    current_char_count += 1;
                 }
                 current.push_str(line);
+                current_char_count += line_char_count;
             }
         }
 
@@ -367,19 +376,6 @@ pub enum RemoteCommand {
     Shell(String),
 }
 
-/// Find a safe character boundary for UTF-8 string splitting.
-fn find_char_boundary(s: &str, max_bytes: usize) -> usize {
-    if max_bytes >= s.len() {
-        return s.len();
-    }
-    // Walk backwards to find a valid char boundary
-    let mut boundary = max_bytes;
-    while boundary > 0 && !s.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
-
 /// Get the current epoch time in seconds.
 fn current_epoch_secs() -> u64 {
     std::time::SystemTime::now()
@@ -401,35 +397,64 @@ fn verify_webhook_signature(secret: &str, body: &[u8], signature: &str) -> bool 
     mac.update(body);
 
     // Kakao sends base64-encoded HMAC
-    let Ok(expected_bytes) = base64_decode(signature) else {
+    use base64::Engine;
+    let Ok(expected_bytes) = base64::engine::general_purpose::STANDARD.decode(signature) else {
         return false;
     };
 
     mac.verify_slice(&expected_bytes).is_ok()
 }
 
-/// Decode base64 (standard encoding).
-fn base64_decode(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(input)
+/// Build a Kakao Chatbot Skill JSON response with a simple text message.
+fn kakao_skill_response(text: &str) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "version": "2.0",
+        "template": {
+            "outputs": [
+                {
+                    "simpleText": {
+                        "text": text
+                    }
+                }
+            ]
+        }
+    }))
 }
 
 /// Webhook handler: POST /kakao/webhook
-async fn handle_webhook(State(state): State<WebhookState>, body: axum::body::Bytes) -> StatusCode {
-    // Signature verification (if configured)
-    // Note: In production, extract the X-Kakao-Signature header
-    // For now we parse the body directly
+/// Returns Kakao Chatbot Skill JSON response format for Skill API requests,
+/// and plain StatusCode for direct callback format.
+async fn handle_webhook(
+    State(state): State<WebhookState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Verify webhook signature if secret is configured
+    if let Some(ref secret) = state.webhook_secret {
+        let signature = headers
+            .get("X-Kakao-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !verify_webhook_signature(secret, &body, signature) {
+            tracing::warn!("KakaoTalk: webhook signature verification failed");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("KakaoTalk: invalid webhook payload: {e}");
-            return StatusCode::BAD_REQUEST;
+            return StatusCode::BAD_REQUEST.into_response();
         }
     };
 
     // Extract user event type
     let user_request = payload.get("userRequest");
-    // Kakao Chatbot Skill format
+    // Kakao Chatbot Skill format — must return JSON response
     if let Some(user_req) = user_request {
         let user_id = user_req
             .get("user")
@@ -440,7 +465,7 @@ async fn handle_webhook(State(state): State<WebhookState>, body: axum::body::Byt
         // Check user allowlist
         if !state.allowed_users.iter().any(|u| u == "*" || u == user_id) {
             tracing::warn!("KakaoTalk: ignoring message from unauthorized user: {user_id}");
-            return StatusCode::FORBIDDEN;
+            return kakao_skill_response("접근이 허용되지 않은 사용자입니다.").into_response();
         }
 
         let utterance = user_req
@@ -450,7 +475,35 @@ async fn handle_webhook(State(state): State<WebhookState>, body: axum::body::Byt
             .trim();
 
         if utterance.is_empty() {
-            return StatusCode::OK;
+            return kakao_skill_response("메시지를 입력해주세요.").into_response();
+        }
+
+        // Check for remote commands (e.g., /status, /help, /memory)
+        if let Some(cmd) = KakaoTalkChannel::parse_remote_command(utterance) {
+            let cmd_content = format!("[remote_command] {}", match &cmd {
+                RemoteCommand::Status => "/status".to_string(),
+                RemoteCommand::Help => "/help".to_string(),
+                RemoteCommand::CronList => "/cron".to_string(),
+                RemoteCommand::MemoryQuery(q) => format!("/memory {q}"),
+                RemoteCommand::MemoryStore(v) => format!("/remember {v}"),
+                RemoteCommand::MemoryForget(k) => format!("/forget {k}"),
+                RemoteCommand::Shell(c) => format!("/shell {c}"),
+            });
+
+            let channel_msg = ChannelMessage {
+                id: Uuid::new_v4().to_string(),
+                sender: user_id.to_string(),
+                reply_target: user_id.to_string(),
+                content: cmd_content,
+                channel: "kakao".to_string(),
+                timestamp: current_epoch_secs(),
+            };
+
+            if state.tx.send(channel_msg).await.is_err() {
+                tracing::warn!("KakaoTalk: message channel closed");
+                return kakao_skill_response("시스템 오류가 발생했습니다. 잠시 후 다시 시도해주세요.").into_response();
+            }
+            return kakao_skill_response("명령을 처리 중입니다...").into_response();
         }
 
         // Extract bot_user_key for replies
@@ -484,13 +537,13 @@ async fn handle_webhook(State(state): State<WebhookState>, body: axum::body::Byt
 
         if state.tx.send(channel_msg).await.is_err() {
             tracing::warn!("KakaoTalk: message channel closed");
-            return StatusCode::INTERNAL_SERVER_ERROR;
+            return kakao_skill_response("시스템 오류가 발생했습니다.").into_response();
         }
 
-        return StatusCode::OK;
+        return kakao_skill_response("요청을 처리 중입니다. 잠시만 기다려주세요...").into_response();
     }
 
-    // Also handle direct message callback format
+    // Also handle direct message callback format (plain StatusCode response)
     if let Some(content) = payload.get("content") {
         let user_id = payload
             .get("user_id")
@@ -498,12 +551,12 @@ async fn handle_webhook(State(state): State<WebhookState>, body: axum::body::Byt
             .unwrap_or("unknown");
 
         if !state.allowed_users.iter().any(|u| u == "*" || u == user_id) {
-            return StatusCode::FORBIDDEN;
+            return StatusCode::FORBIDDEN.into_response();
         }
 
         let text = content.as_str().unwrap_or("").trim();
         if text.is_empty() {
-            return StatusCode::OK;
+            return StatusCode::OK.into_response();
         }
 
         let channel_msg = ChannelMessage {
@@ -516,13 +569,13 @@ async fn handle_webhook(State(state): State<WebhookState>, body: axum::body::Byt
         };
 
         if state.tx.send(channel_msg).await.is_err() {
-            return StatusCode::INTERNAL_SERVER_ERROR;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
 
-        return StatusCode::OK;
+        return StatusCode::OK.into_response();
     }
 
-    StatusCode::OK
+    StatusCode::OK.into_response()
 }
 
 /// Health check endpoint: GET /kakao/health
@@ -636,7 +689,7 @@ mod tests {
         let chunks = KakaoTalkChannel::split_message(&text);
         assert!(chunks.len() >= 3);
         for chunk in &chunks {
-            assert!(chunk.len() <= KAKAO_MAX_TEXT_LEN);
+            assert!(chunk.chars().count() <= KAKAO_MAX_TEXT_LEN);
         }
         let rejoined: String = chunks.join("");
         assert_eq!(rejoined, text);
@@ -651,7 +704,7 @@ mod tests {
         let chunks = KakaoTalkChannel::split_message(&text);
         assert!(chunks.len() > 1);
         for chunk in &chunks {
-            assert!(chunk.len() <= KAKAO_MAX_TEXT_LEN);
+            assert!(chunk.chars().count() <= KAKAO_MAX_TEXT_LEN);
         }
     }
 
@@ -660,37 +713,22 @@ mod tests {
         let text = "a".repeat(KAKAO_MAX_TEXT_LEN);
         let chunks = KakaoTalkChannel::split_message(&text);
         assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chars().count(), KAKAO_MAX_TEXT_LEN);
     }
 
     #[test]
     fn test_split_message_utf8_safe() {
         // Korean text (3 bytes per char in UTF-8)
-        let korean = "가".repeat(500);
+        // 1500 Korean chars should split into 2 chunks by character count
+        let korean = "가".repeat(1500);
         let chunks = KakaoTalkChannel::split_message(&korean);
+        assert_eq!(chunks.len(), 2);
         for chunk in &chunks {
-            assert!(chunk.len() <= KAKAO_MAX_TEXT_LEN);
-            // Must not panic on char boundary
-            assert!(chunk.is_char_boundary(chunk.len()));
+            assert!(chunk.chars().count() <= KAKAO_MAX_TEXT_LEN);
         }
-    }
-
-    #[test]
-    fn test_find_char_boundary_ascii() {
-        let s = "hello world";
-        assert_eq!(find_char_boundary(s, 5), 5);
-    }
-
-    #[test]
-    fn test_find_char_boundary_utf8() {
-        let s = "가나다라"; // Each char is 3 bytes
-        assert_eq!(find_char_boundary(s, 4), 3); // Rounds down to char boundary
-        assert_eq!(find_char_boundary(s, 6), 6); // Exactly on boundary
-    }
-
-    #[test]
-    fn test_find_char_boundary_beyond_len() {
-        let s = "abc";
-        assert_eq!(find_char_boundary(s, 100), 3);
+        // Total characters should be preserved
+        let total_chars: usize = chunks.iter().map(|c| c.chars().count()).sum();
+        assert_eq!(total_chars, 1500);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use chrono::Datelike;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Default daily spending limit in USD (0 = no limit).
 const DEFAULT_DAILY_LIMIT_USD: f64 = 0.0;
@@ -60,7 +60,8 @@ pub struct ProviderUsage {
 
 /// Cost tracker with SQLite persistence and spending limits.
 pub struct CostTracker {
-    db_path: PathBuf,
+    /// Persistent SQLite connection (avoids per-operation open overhead).
+    conn: Option<Connection>,
     daily_limit_usd: f64,
     monthly_limit_usd: f64,
     enabled: bool,
@@ -69,9 +70,8 @@ pub struct CostTracker {
 impl CostTracker {
     /// Create a new cost tracker for the given workspace.
     pub fn new(workspace_dir: &Path, enabled: bool) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("billing.db");
-
-        if enabled {
+        let conn = if enabled {
+            let db_path = workspace_dir.join("billing.db");
             let conn = Connection::open(&db_path)?;
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS cost_ledger (
@@ -88,10 +88,13 @@ impl CostTracker {
                 CREATE INDEX IF NOT EXISTS idx_cost_timestamp ON cost_ledger(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_cost_provider ON cost_ledger(provider);",
             )?;
-        }
+            Some(conn)
+        } else {
+            None
+        };
 
         Ok(Self {
-            db_path,
+            conn,
             daily_limit_usd: DEFAULT_DAILY_LIMIT_USD,
             monthly_limit_usd: DEFAULT_MONTHLY_LIMIT_USD,
             enabled,
@@ -110,11 +113,10 @@ impl CostTracker {
 
     /// Record a cost entry in the ledger.
     pub fn record(&self, entry: &CostEntry) -> anyhow::Result<()> {
-        if !self.enabled {
+        let Some(ref conn) = self.conn else {
             return Ok(());
-        }
+        };
 
-        let conn = Connection::open(&self.db_path)?;
         conn.execute(
             "INSERT INTO cost_ledger (provider, model, input_tokens, output_tokens, cost_usd, channel, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -134,13 +136,15 @@ impl CostTracker {
 
     /// Check if daily spending limit has been exceeded.
     pub fn check_daily_limit(&self) -> anyhow::Result<bool> {
-        if !self.enabled || self.daily_limit_usd <= 0.0 {
+        if self.daily_limit_usd <= 0.0 {
             return Ok(false);
         }
 
-        let today_start = today_start_epoch();
-        let conn = Connection::open(&self.db_path)?;
+        let Some(ref conn) = self.conn else {
+            return Ok(false);
+        };
 
+        let today_start = today_start_epoch();
         let total: f64 = conn.query_row(
             "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger WHERE timestamp >= ?1",
             params![today_start],
@@ -152,13 +156,15 @@ impl CostTracker {
 
     /// Check if monthly spending limit has been exceeded.
     pub fn check_monthly_limit(&self) -> anyhow::Result<bool> {
-        if !self.enabled || self.monthly_limit_usd <= 0.0 {
+        if self.monthly_limit_usd <= 0.0 {
             return Ok(false);
         }
 
-        let month_start = month_start_epoch();
-        let conn = Connection::open(&self.db_path)?;
+        let Some(ref conn) = self.conn else {
+            return Ok(false);
+        };
 
+        let month_start = month_start_epoch();
         let total: f64 = conn.query_row(
             "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger WHERE timestamp >= ?1",
             params![month_start],
@@ -170,13 +176,11 @@ impl CostTracker {
 
     /// Get today's total spending.
     pub fn today_total(&self) -> anyhow::Result<f64> {
-        if !self.enabled {
+        let Some(ref conn) = self.conn else {
             return Ok(0.0);
-        }
+        };
 
         let today_start = today_start_epoch();
-        let conn = Connection::open(&self.db_path)?;
-
         let total: f64 = conn.query_row(
             "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger WHERE timestamp >= ?1",
             params![today_start],
@@ -188,13 +192,11 @@ impl CostTracker {
 
     /// Get this month's total spending.
     pub fn month_total(&self) -> anyhow::Result<f64> {
-        if !self.enabled {
+        let Some(ref conn) = self.conn else {
             return Ok(0.0);
-        }
+        };
 
         let month_start = month_start_epoch();
-        let conn = Connection::open(&self.db_path)?;
-
         let total: f64 = conn.query_row(
             "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger WHERE timestamp >= ?1",
             params![month_start],
@@ -206,7 +208,7 @@ impl CostTracker {
 
     /// Get a usage summary for a given time range.
     pub fn summary(&self, from_timestamp: i64, to_timestamp: i64) -> anyhow::Result<UsageSummary> {
-        if !self.enabled {
+        let Some(ref conn) = self.conn else {
             return Ok(UsageSummary {
                 total_cost_usd: 0.0,
                 total_input_tokens: 0,
@@ -214,9 +216,7 @@ impl CostTracker {
                 request_count: 0,
                 by_provider: Vec::new(),
             });
-        }
-
-        let conn = Connection::open(&self.db_path)?;
+        };
 
         // Overall totals
         let (total_cost, total_input, total_output, count): (f64, i64, i64, i64) = conn.query_row(

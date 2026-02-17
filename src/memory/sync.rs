@@ -131,14 +131,119 @@ pub struct SyncEngine {
     device_id: DeviceId,
     /// Current version vector.
     version: VersionVector,
-    /// Delta journal (in-memory, persisted to SQLite).
+    /// Delta journal (in-memory cache, persisted to SQLite on write).
     journal: Vec<DeltaEntry>,
     /// Encryption key for sync payloads (32 bytes).
     encryption_key: [u8; 32],
-    /// Path to the sync state database.
+    /// Path to the sync state SQLite database.
     db_path: PathBuf,
     /// Whether sync is enabled.
     enabled: bool,
+}
+
+impl SyncEngine {
+    /// Initialize the SQLite journal database, creating the table if needed.
+    fn init_db(db_path: &Path) -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open(db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sync_journal (
+                id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                version_json TEXT NOT NULL,
+                operation_json TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sync_version (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_journal_timestamp ON sync_journal(timestamp);",
+        )?;
+        Ok(())
+    }
+
+    /// Persist the current journal and version vector to SQLite.
+    pub fn save(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let conn = rusqlite::Connection::open(&self.db_path)?;
+
+        // Save version vector
+        let version_json = serde_json::to_string(&self.version)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_version (key, value_json) VALUES ('current', ?1)",
+            rusqlite::params![version_json],
+        )?;
+
+        // Upsert journal entries
+        let mut stmt = conn.prepare(
+            "INSERT OR IGNORE INTO sync_journal (id, device_id, version_json, operation_json, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for entry in &self.journal {
+            let version_json = serde_json::to_string(&entry.version)?;
+            let operation_json = serde_json::to_string(&entry.operation)?;
+            stmt.execute(rusqlite::params![
+                entry.id,
+                entry.device_id,
+                version_json,
+                operation_json,
+                entry.timestamp as i64,
+            ])?;
+        }
+
+        Ok(())
+    }
+
+    /// Load journal and version vector from SQLite.
+    pub fn load(&mut self) -> anyhow::Result<()> {
+        if !self.enabled || !self.db_path.exists() {
+            return Ok(());
+        }
+        let conn = rusqlite::Connection::open(&self.db_path)?;
+
+        // Load version vector
+        let version_result: Result<String, _> = conn.query_row(
+            "SELECT value_json FROM sync_version WHERE key = 'current'",
+            [],
+            |row| row.get(0),
+        );
+        if let Ok(version_json) = version_result {
+            self.version = serde_json::from_str(&version_json)?;
+        }
+
+        // Load journal entries
+        let mut stmt = conn.prepare(
+            "SELECT id, device_id, version_json, operation_json, timestamp FROM sync_journal ORDER BY timestamp ASC",
+        )?;
+        let entries = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let device_id: String = row.get(1)?;
+            let version_json: String = row.get(2)?;
+            let operation_json: String = row.get(3)?;
+            let timestamp: i64 = row.get(4)?;
+            Ok((id, device_id, version_json, operation_json, timestamp))
+        })?;
+
+        self.journal.clear();
+        for entry in entries {
+            let (id, device_id, version_json, operation_json, timestamp) = entry?;
+            let version: VersionVector = serde_json::from_str(&version_json)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let operation: DeltaOperation = serde_json::from_str(&operation_json)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            self.journal.push(DeltaEntry {
+                id,
+                device_id,
+                version,
+                operation,
+                timestamp: timestamp as u64,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 impl SyncEngine {
@@ -174,14 +279,23 @@ impl SyncEngine {
             key
         };
 
-        Ok(Self {
+        if enabled {
+            Self::init_db(&db_path)?;
+        }
+
+        let mut engine = Self {
             device_id,
             version: VersionVector::default(),
             journal: Vec::new(),
             encryption_key,
             db_path,
             enabled,
-        })
+        };
+
+        // Load persisted state from SQLite
+        engine.load()?;
+
+        Ok(engine)
     }
 
     /// Get this device's ID.
@@ -215,6 +329,11 @@ impl SyncEngine {
         };
 
         self.journal.push(entry);
+
+        // Persist to SQLite (best-effort; log errors but don't fail)
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist sync journal: {e}");
+        }
     }
 
     /// Record a memory forget operation in the delta journal.
@@ -236,6 +355,11 @@ impl SyncEngine {
         };
 
         self.journal.push(entry);
+
+        // Persist to SQLite (best-effort)
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist sync journal: {e}");
+        }
     }
 
     /// Get deltas that the remote device hasn't seen yet.
@@ -250,7 +374,7 @@ impl SyncEngine {
     }
 
     /// Apply incoming deltas from a remote device.
-    /// Returns the number of operations applied.
+    /// Returns the list of operations applied.
     pub fn apply_deltas(&mut self, deltas: Vec<DeltaEntry>) -> Vec<DeltaOperation> {
         let mut applied = Vec::new();
 
@@ -263,6 +387,12 @@ impl SyncEngine {
                 self.version.merge(&delta.version);
                 applied.push(delta.operation.clone());
                 self.journal.push(delta);
+            }
+        }
+
+        if !applied.is_empty() {
+            if let Err(e) = self.save() {
+                tracing::warn!("Failed to persist sync journal after apply: {e}");
             }
         }
 
@@ -319,7 +449,19 @@ impl SyncEngine {
     /// Prune old journal entries beyond the retention period.
     pub fn prune_journal(&mut self) {
         let cutoff = current_epoch_secs().saturating_sub(JOURNAL_RETENTION_SECS);
+        let before = self.journal.len();
         self.journal.retain(|entry| entry.timestamp >= cutoff);
+
+        // Persist pruned state if entries were removed
+        if self.journal.len() < before {
+            // Delete pruned entries from SQLite too
+            if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+                let _ = conn.execute(
+                    "DELETE FROM sync_journal WHERE timestamp < ?1",
+                    rusqlite::params![cutoff as i64],
+                );
+            }
+        }
     }
 
     /// Get the current version vector.
@@ -509,6 +651,40 @@ mod tests {
         let id2 = engine2.device_id().0.clone();
 
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn journal_persists_across_instances() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create engine and record some entries
+        {
+            let mut engine = SyncEngine::new(tmp.path(), true).unwrap();
+            engine.record_store("persistent_key", "persistent_value", "general");
+            engine.record_forget("old_key");
+            assert_eq!(engine.journal_len(), 2);
+        }
+
+        // Create new engine from same directory — should load persisted journal
+        {
+            let engine = SyncEngine::new(tmp.path(), true).unwrap();
+            assert_eq!(engine.journal_len(), 2);
+
+            // Verify the operations were preserved
+            let ops: Vec<_> = engine
+                .journal
+                .iter()
+                .map(|e| &e.operation)
+                .collect();
+            assert!(matches!(
+                ops[0],
+                DeltaOperation::Store { key, .. } if key == "persistent_key"
+            ));
+            assert!(matches!(
+                ops[1],
+                DeltaOperation::Forget { key } if key == "old_key"
+            ));
+        }
     }
 
     #[test]
