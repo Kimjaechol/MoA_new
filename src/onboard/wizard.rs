@@ -2430,6 +2430,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         lark: None,
         dingtalk: None,
         qq: None,
+        kakao: None,
     };
 
     loop {

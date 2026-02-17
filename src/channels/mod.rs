@@ -4,6 +4,7 @@ pub mod discord;
 pub mod email_channel;
 pub mod imessage;
 pub mod irc;
+pub mod kakao;
 pub mod lark;
 pub mod matrix;
 pub mod qq;
@@ -19,6 +20,7 @@ pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
+pub use kakao::KakaoTalkChannel;
 pub use lark::LarkChannel;
 pub use matrix::MatrixChannel;
 pub use qq::QQChannel;
@@ -730,6 +732,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("Lark", config.channels_config.lark.is_some()),
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
                 ("QQ", config.channels_config.qq.is_some()),
+                ("KakaoTalk", config.channels_config.kakao.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -901,6 +904,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 qq.allowed_users.clone(),
             )),
         ));
+    }
+
+    if let Some(ref kakao) = config.channels_config.kakao {
+        channels.push(("KakaoTalk", Arc::new(KakaoTalkChannel::from_config(kakao))));
     }
 
     if channels.is_empty() {
@@ -1188,6 +1195,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             qq.app_secret.clone(),
             qq.allowed_users.clone(),
         )));
+    }
+
+    if let Some(ref kakao) = config.channels_config.kakao {
+        channels.push(Arc::new(KakaoTalkChannel::from_config(kakao)));
     }
 
     if channels.is_empty() {

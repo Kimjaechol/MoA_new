@@ -1302,6 +1302,7 @@ pub struct ChannelsConfig {
     pub lark: Option<LarkConfig>,
     pub dingtalk: Option<DingTalkConfig>,
     pub qq: Option<QQConfig>,
+    pub kakao: Option<KakaoTalkConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -1321,6 +1322,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            kakao: None,
         }
     }
 }
@@ -1662,6 +1664,28 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+/// KakaoTalk channel configuration for Korean messaging integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KakaoTalkConfig {
+    /// REST API key from Kakao Developers console
+    pub rest_api_key: String,
+    /// Admin key for server-side API calls (Alimtalk, push messages)
+    pub admin_key: String,
+    /// Webhook secret for verifying incoming payloads (optional)
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// Allowed Kakao user IDs. Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// HTTP port for the webhook receiver server (default: 8787)
+    #[serde(default = "default_kakao_port")]
+    pub port: u16,
+}
+
+fn default_kakao_port() -> u16 {
+    8787
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -2208,6 +2232,7 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                kakao: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -2623,6 +2648,7 @@ tool_dispatcher = "xml"
             lark: None,
             dingtalk: None,
             qq: None,
+            kakao: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -2785,6 +2811,7 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            kakao: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

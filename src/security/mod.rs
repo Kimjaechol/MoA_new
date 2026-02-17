@@ -1,14 +1,18 @@
 pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod data_masking;
 pub mod detect;
+pub mod device_binding;
 pub mod docker;
+pub mod encryption;
 #[cfg(target_os = "linux")]
 pub mod firejail;
 #[cfg(feature = "sandbox-landlock")]
 pub mod landlock;
 pub mod pairing;
 pub mod policy;
+pub mod remote_wipe;
 pub mod secrets;
 pub mod traits;
 
