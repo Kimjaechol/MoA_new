@@ -1,0 +1,37 @@
+# ZeroClaw Railway Deployment Configuration
+#
+# This file configures how Railway builds and deploys the ZeroClaw gateway.
+# Place this at the project root or reference it from the Railway dashboard.
+#
+# Docs: https://docs.railway.com/reference/config-as-code
+
+[build]
+# Use the Railway-specific Dockerfile for multi-stage Rust builds.
+# The path is relative to the repository root.
+dockerfilePath = "deploy/railway/Dockerfile"
+
+[deploy]
+# Health check: Railway pings this endpoint to verify the service is alive.
+# The ZeroClaw gateway exposes GET /health for liveness probes.
+healthcheckPath = "/health"
+
+# Timeout (seconds) before Railway marks a health check as failed.
+healthcheckTimeout = 10
+
+# Number of replicas to run. Start with 1 for cost efficiency;
+# increase for high-availability if needed.
+numReplicas = 1
+
+# Restart policy: always restart on failure to maintain uptime.
+restartPolicyType = "ON_FAILURE"
+
+# Maximum consecutive restart attempts before Railway stops trying.
+restartPolicyMaxRetries = 5
+
+# Grace period (seconds) for the process to start before health checks begin.
+# Rust binaries start fast, but allow headroom for config loading and provider init.
+startCommand = "zeroclaw gateway --host 0.0.0.0 --port $PORT"
+
+[env]
+# Railway injects PORT automatically. Map it to 3000 as a default fallback.
+PORT = "3000"
