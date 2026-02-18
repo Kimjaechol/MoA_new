@@ -83,6 +83,6 @@ EXPOSE 3000
 USER zeroclaw
 
 # Start the ZeroClaw gateway server.
-# --host and --port flags match the ENV defaults but can be overridden
-# via Railway environment variable injection.
-CMD ["zeroclaw", "gateway", "--host", "0.0.0.0", "--port", "3000"]
+# Shell form is required so $PORT is expanded at runtime.
+# Railway injects PORT; falls back to ZEROCLAW_PORT (3000) if unset.
+CMD zeroclaw gateway --host 0.0.0.0 --port ${PORT:-3000}

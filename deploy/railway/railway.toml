@@ -28,10 +28,6 @@ restartPolicyType = "ON_FAILURE"
 # Maximum consecutive restart attempts before Railway stops trying.
 restartPolicyMaxRetries = 5
 
-# Grace period (seconds) for the process to start before health checks begin.
-# Rust binaries start fast, but allow headroom for config loading and provider init.
-startCommand = "zeroclaw gateway --host 0.0.0.0 --port $PORT"
-
 [env]
 # Railway injects PORT automatically. Map it to 3000 as a default fallback.
 PORT = "3000"
