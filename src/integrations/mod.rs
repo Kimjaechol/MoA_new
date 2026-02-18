@@ -1,4 +1,5 @@
 pub mod registry;
+pub mod supabase;
 
 use crate::config::Config;
 use anyhow::Result;
