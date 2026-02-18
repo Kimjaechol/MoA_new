@@ -72,6 +72,8 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
+    /// SLM gatekeeper for local intent classification + simple response.
+    gatekeeper: Option<Arc<tokio::sync::Mutex<crate::gatekeeper::GatekeeperRouter>>>,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -197,6 +199,28 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
+
+    // ── SLM gatekeeper: try local handling first ──
+    if let Some(ref gatekeeper) = ctx.gatekeeper {
+        let gk = gatekeeper.lock().await;
+        let result = gk.process_message(&msg.content).await;
+        if let Some(local_response) = result.local_response {
+            println!(
+                "  🧠 SLM reply ({}ms): {}",
+                started_at.elapsed().as_millis(),
+                truncate_with_ellipsis(&local_response, 80)
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                if let Err(e) = channel
+                    .send(&SendMessage::new(&local_response, &msg.reply_target))
+                    .await
+                {
+                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                }
+            }
+            return;
+        }
+    }
 
     let mut history = vec![
         ChatMessage::system(ctx.system_prompt.as_str()),
@@ -1262,6 +1286,25 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
+    // ── SLM Gatekeeper for channels ────────────────────────
+    let gatekeeper = if config.gatekeeper.enabled {
+        let mut router = crate::gatekeeper::GatekeeperRouter::from_config(&config.gatekeeper);
+        let healthy = router.check_slm_health().await;
+        if healthy {
+            tracing::info!(
+                model = config.gatekeeper.model,
+                "SLM gatekeeper active for channels"
+            );
+        } else {
+            tracing::warn!(
+                "SLM gatekeeper enabled but Ollama not reachable for channels — will fall back to cloud"
+            );
+        }
+        Some(Arc::new(tokio::sync::Mutex::new(router)))
+    } else {
+        None
+    };
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -1272,6 +1315,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
+        gatekeeper,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1458,6 +1502,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            gatekeeper: None,
         });
 
         process_channel_message(
@@ -1553,6 +1598,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            gatekeeper: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);

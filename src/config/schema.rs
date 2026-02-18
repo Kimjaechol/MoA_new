@@ -92,6 +92,10 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// SLM gatekeeper configuration (local intent classification + simple response).
+    #[serde(default)]
+    pub gatekeeper: GatekeeperConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -1182,6 +1186,33 @@ impl Default for HeartbeatConfig {
     }
 }
 
+// ── Gatekeeper (SLM local routing) ──────────────────────────────
+
+/// Configuration for the SLM gatekeeper that classifies user intent locally
+/// and handles simple tasks without cloud LLM calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatekeeperConfig {
+    /// Enable the SLM gatekeeper for local intent classification.
+    pub enabled: bool,
+    /// Ollama API endpoint (e.g. "http://127.0.0.1:11434/v1").
+    pub ollama_url: String,
+    /// SLM model name to use for local inference (e.g. "qwen3:0.6b").
+    pub model: String,
+    /// Timeout in seconds for SLM inference requests.
+    pub timeout_secs: u64,
+}
+
+impl Default for GatekeeperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ollama_url: "http://127.0.0.1:11434/v1".to_string(),
+            model: "qwen3:0.6b".to_string(),
+            timeout_secs: 10,
+        }
+    }
+}
+
 // ── Cron ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1713,6 +1744,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            gatekeeper: GatekeeperConfig::default(),
         }
     }
 }
@@ -2234,6 +2266,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            gatekeeper: GatekeeperConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2343,6 +2376,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            gatekeeper: GatekeeperConfig::default(),
         };
 
         config.save().unwrap();

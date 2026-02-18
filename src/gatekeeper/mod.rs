@@ -15,5 +15,6 @@
 pub mod router;
 
 pub use router::{
-    CloudDelegation, GatekeeperRouter, RoutingDecision, SlmTask, TaskCategory, OfflineQueue,
+    CloudDelegation, GatekeeperResult, GatekeeperRouter, OfflineQueue, RoutingDecision,
+    RoutingTarget, SlmTask, TaskCategory,
 };

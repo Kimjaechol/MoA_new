@@ -237,10 +237,53 @@ const PRIVACY_PATTERNS: &[&str] = &[
 
 // ── Gatekeeper router ────────────────────────────────────────────
 
+/// Result of a gatekeeper routing + optional local response.
+#[derive(Debug, Clone)]
+pub struct GatekeeperResult {
+    /// The routing decision.
+    pub decision: RoutingDecision,
+    /// If the gatekeeper handled the message locally, the SLM response.
+    /// `None` means the message should be forwarded to the cloud LLM.
+    pub local_response: Option<String>,
+}
+
+/// Ollama chat request (native API format, not OpenAI-compatible).
+#[derive(Debug, Serialize)]
+struct OllamaChatRequest {
+    model: String,
+    messages: Vec<OllamaMessage>,
+    stream: bool,
+    options: OllamaOptions,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaOptions {
+    temperature: f64,
+}
+
+/// Ollama chat response.
+#[derive(Debug, Deserialize)]
+struct OllamaChatResponse {
+    message: OllamaResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaResponseMessage {
+    #[serde(default)]
+    content: String,
+}
+
 /// The local SLM gatekeeper router.
 ///
 /// Classifies user messages using fast keyword-based heuristics first,
 /// then optionally consults the local SLM via Ollama for ambiguous cases.
+/// For simple/greeting messages, generates a response locally without cloud calls.
 pub struct GatekeeperRouter {
     /// Ollama API endpoint.
     ollama_url: String,
@@ -248,6 +291,8 @@ pub struct GatekeeperRouter {
     model: String,
     /// Whether the SLM backend is available.
     slm_available: bool,
+    /// HTTP client for Ollama requests.
+    client: reqwest::Client,
     /// Offline task queue.
     queue: OfflineQueue,
 }
@@ -255,10 +300,31 @@ pub struct GatekeeperRouter {
 impl GatekeeperRouter {
     /// Create a new gatekeeper router.
     pub fn new(ollama_url: Option<&str>, model: Option<&str>) -> Self {
+        let timeout_secs = 10;
         Self {
             ollama_url: ollama_url.unwrap_or(DEFAULT_OLLAMA_URL).to_string(),
             model: model.unwrap_or(DEFAULT_SLM_MODEL).to_string(),
             slm_available: false,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            queue: OfflineQueue::new(100),
+        }
+    }
+
+    /// Create from a `GatekeeperConfig`.
+    pub fn from_config(config: &crate::config::GatekeeperConfig) -> Self {
+        Self {
+            ollama_url: config.ollama_url.clone(),
+            model: config.model.clone(),
+            slm_available: false,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(config.timeout_secs))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             queue: OfflineQueue::new(100),
         }
     }
@@ -278,16 +344,16 @@ impl GatekeeperRouter {
         &self.ollama_url
     }
 
+    /// Whether the SLM backend was last known to be available.
+    pub fn is_slm_available(&self) -> bool {
+        self.slm_available
+    }
+
     /// Check if the local SLM is reachable via Ollama.
     pub async fn check_slm_health(&mut self) -> bool {
-        let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-
         // Ollama health check: GET /api/tags
         let url = self.ollama_url.replace("/v1", "/api/tags");
-        match client.get(&url).send().await {
+        match self.client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 self.slm_available = true;
                 true
@@ -295,6 +361,82 @@ impl GatekeeperRouter {
             _ => {
                 self.slm_available = false;
                 false
+            }
+        }
+    }
+
+    /// Generate a response using the local SLM via Ollama.
+    ///
+    /// Returns `Ok(response)` if the SLM generated a response, or `Err` on failure.
+    /// On failure, callers should fall back to the cloud LLM.
+    async fn respond_locally(&self, message: &str) -> anyhow::Result<String> {
+        let url = self.ollama_url.replace("/v1", "/api/chat");
+        let body = OllamaChatRequest {
+            model: self.model.clone(),
+            messages: vec![
+                OllamaMessage {
+                    role: "system".to_string(),
+                    content: "You are a helpful AI assistant. Respond concisely in the same language as the user. Keep responses under 3 sentences for simple queries.".to_string(),
+                },
+                OllamaMessage {
+                    role: "user".to_string(),
+                    content: message.to_string(),
+                },
+            ],
+            stream: false,
+            options: OllamaOptions { temperature: 0.7 },
+        };
+
+        let resp = self.client.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Ollama returned status {}", resp.status());
+        }
+
+        let chat_resp: OllamaChatResponse = resp.json().await?;
+        let content = chat_resp.message.content.trim().to_string();
+        if content.is_empty() {
+            anyhow::bail!("Ollama returned empty response");
+        }
+        Ok(content)
+    }
+
+    /// Process a user message end-to-end through the gatekeeper.
+    ///
+    /// 1. Classifies the message using keyword heuristics.
+    /// 2. If routed to `Local` and SLM is available, generates a response locally.
+    /// 3. Returns `GatekeeperResult` with routing decision and optional local response.
+    ///
+    /// If `local_response` is `None`, the caller should forward to the cloud LLM.
+    pub async fn process_message(&self, message: &str) -> GatekeeperResult {
+        let decision = self.classify(message);
+
+        // Only attempt local response for Local-routed messages when SLM is available.
+        if decision.target != RoutingTarget::Local || !self.slm_available {
+            return GatekeeperResult {
+                decision,
+                local_response: None,
+            };
+        }
+
+        // Attempt SLM response for simple/greeting messages.
+        match self.respond_locally(message).await {
+            Ok(response) => {
+                tracing::info!(
+                    category = ?decision.category,
+                    confidence = decision.confidence,
+                    "Gatekeeper handled locally via SLM"
+                );
+                GatekeeperResult {
+                    decision,
+                    local_response: Some(response),
+                }
+            }
+            Err(e) => {
+                tracing::warn!("SLM local response failed, falling back to cloud: {e}");
+                GatekeeperResult {
+                    decision,
+                    local_response: None,
+                }
             }
         }
     }
