@@ -1,4 +1,8 @@
-use crate::channels::{Channel, DiscordChannel, SendMessage, SlackChannel, TelegramChannel};
+use crate::channels::{
+    Channel, DingTalkChannel, DiscordChannel, EmailChannel, IMessageChannel, IrcChannel,
+    KakaoTalkChannel, LarkChannel, MatrixChannel, QQChannel, SendMessage, SignalChannel,
+    SlackChannel, TelegramChannel, WhatsAppChannel,
+};
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
@@ -231,8 +235,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .telegram
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let channel = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone());
-            channel.send(&SendMessage::new(output, target)).await?;
+            let ch = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone());
+            ch.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
             let dc = config
@@ -240,14 +244,14 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .discord
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
-            let channel = DiscordChannel::new(
+            let ch = DiscordChannel::new(
                 dc.bot_token.clone(),
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            ch.send(&SendMessage::new(output, target)).await?;
         }
         "slack" => {
             let sl = config
@@ -255,12 +259,144 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .slack
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
-            let channel = SlackChannel::new(
+            let ch = SlackChannel::new(
                 sl.bot_token.clone(),
                 sl.channel_id.clone(),
                 sl.allowed_users.clone(),
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "kakao" | "kakaotalk" => {
+            let kk = config
+                .channels_config
+                .kakao
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("kakao channel not configured"))?;
+            let ch = KakaoTalkChannel::new(
+                kk.rest_api_key.clone(),
+                kk.admin_key.clone(),
+                kk.webhook_secret.clone(),
+                kk.allowed_users.clone(),
+                kk.port,
+            );
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "matrix" => {
+            let mx = config
+                .channels_config
+                .matrix
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
+            let ch = MatrixChannel::new(
+                mx.homeserver.clone(),
+                mx.access_token.clone(),
+                mx.room_id.clone(),
+                mx.allowed_users.clone(),
+            );
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "signal" => {
+            let sg = config
+                .channels_config
+                .signal
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("signal channel not configured"))?;
+            let ch = SignalChannel::new(
+                sg.http_url.clone(),
+                sg.account.clone(),
+                sg.group_id.clone(),
+                sg.allowed_from.clone(),
+                sg.ignore_attachments,
+                sg.ignore_stories,
+            );
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "whatsapp" => {
+            let wa = config
+                .channels_config
+                .whatsapp
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
+            let ch = WhatsAppChannel::new(
+                wa.access_token.clone(),
+                wa.phone_number_id.clone(),
+                wa.verify_token.clone(),
+                wa.allowed_numbers.clone(),
+            );
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "email" => {
+            let em = config
+                .channels_config
+                .email
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("email channel not configured"))?;
+            let ch = EmailChannel::new(em.clone());
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "lark" | "feishu" => {
+            let lk = config
+                .channels_config
+                .lark
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+            let ch = LarkChannel::from_config(lk);
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "dingtalk" => {
+            let dt = config
+                .channels_config
+                .dingtalk
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("dingtalk channel not configured"))?;
+            let ch = DingTalkChannel::new(
+                dt.client_id.clone(),
+                dt.client_secret.clone(),
+                dt.allowed_users.clone(),
+            );
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "qq" => {
+            let qq = config
+                .channels_config
+                .qq
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
+            let ch = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                qq.allowed_users.clone(),
+            );
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "irc" => {
+            let ir = config
+                .channels_config
+                .irc
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("irc channel not configured"))?;
+            let ch = IrcChannel::new(crate::channels::irc::IrcChannelConfig {
+                server: ir.server.clone(),
+                port: ir.port,
+                nickname: ir.nickname.clone(),
+                username: ir.username.clone(),
+                channels: ir.channels.clone(),
+                allowed_users: ir.allowed_users.clone(),
+                server_password: ir.server_password.clone(),
+                nickserv_password: ir.nickserv_password.clone(),
+                sasl_password: ir.sasl_password.clone(),
+                verify_tls: ir.verify_tls.unwrap_or(true),
+            });
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "imessage" => {
+            let im = config
+                .channels_config
+                .imessage
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("imessage channel not configured"))?;
+            let ch = IMessageChannel::new(im.allowed_contacts.clone());
+            ch.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

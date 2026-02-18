@@ -35,6 +35,7 @@ impl SystemPromptBuilder {
                 Box::new(IdentitySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
+                Box::new(SchedulingSection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
@@ -65,6 +66,7 @@ impl SystemPromptBuilder {
 pub struct IdentitySection;
 pub struct ToolsSection;
 pub struct SafetySection;
+pub struct SchedulingSection;
 pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
@@ -140,6 +142,73 @@ impl PromptSection for SafetySection {
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
+    }
+}
+
+impl PromptSection for SchedulingSection {
+    fn name(&self) -> &str {
+        "scheduling"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let has_cron = ctx.tools.iter().any(|t| t.name() == "cron_add");
+        if !has_cron {
+            return Ok(String::new());
+        }
+
+        let has_browser = ctx.tools.iter().any(|t| t.name() == "browser");
+
+        let mut out = String::from(
+            "## Periodic Monitoring & Scheduling\n\n\
+             When the user requests periodic, recurring, or scheduled monitoring \
+             (e.g. \"check this website every day\", \"notify me when X changes\", \
+             \"monitor Y every hour\"), use the `cron_add` tool to create a scheduled agent job.\n\n\
+             ### How to create a monitoring job\n\n\
+             Use `cron_add` with `job_type: \"agent\"` and a descriptive `prompt` that tells \
+             the scheduled agent exactly what to check and how to report results.\n\n\
+             Required parameters:\n\
+             - `schedule`: `{\"kind\":\"cron\",\"expr\":\"0 9 * * *\"}` (cron), \
+             `{\"kind\":\"every\",\"every_ms\":3600000}` (interval), or \
+             `{\"kind\":\"at\",\"at\":\"2025-01-01T09:00:00Z\"}` (one-shot)\n\
+             - `job_type`: `\"agent\"`\n\
+             - `prompt`: Clear instructions for the agent job\n\n\
+             Optional parameters:\n\
+             - `name`: Human-readable job name\n\
+             - `delivery`: To send results to a channel, use:\n\
+             ```json\n\
+             {\"mode\":\"announce\",\"channel\":\"telegram\",\"to\":\"<chat_id>\"}\n\
+             ```\n\
+             Supported delivery channels: telegram, discord, slack, kakao, matrix, signal, \
+             whatsapp, email, lark, dingtalk, qq, irc\n\
+             - `session_target`: `\"isolated\"` (default, separate context) or `\"main\"`\n\
+             - `model`: Override model for the job\n",
+        );
+
+        if has_browser {
+            out.push_str(
+                "\n### Browser access\n\n\
+                 Scheduled agent jobs have full access to the `browser` tool for web scraping \
+                 and monitoring. Include browser instructions in the job prompt when the task \
+                 requires visiting websites.\n",
+            );
+        }
+
+        out.push_str(
+            "\n### Example\n\n\
+             User: \"Check the Supreme Court website daily for new case rulings and notify me on Telegram.\"\n\n\
+             Response: Use `cron_add` with:\n\
+             ```json\n\
+             {\n\
+               \"name\": \"court_ruling_monitor\",\n\
+               \"schedule\": {\"kind\": \"cron\", \"expr\": \"0 9 * * *\"},\n\
+               \"job_type\": \"agent\",\n\
+               \"prompt\": \"Use the browser tool to visit the Supreme Court website. Check for new case rulings published today. Summarize any new rulings found.\",\n\
+               \"delivery\": {\"mode\": \"announce\", \"channel\": \"telegram\", \"to\": \"<chat_id>\"}\n\
+             }\n\
+             ```\n",
+        );
+
+        Ok(out)
     }
 }
 
