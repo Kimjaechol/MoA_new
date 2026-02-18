@@ -74,32 +74,122 @@
 
 ### 로컬 개발 도구 설치
 
+아래에서 자신의 운영체제에 맞는 탭을 따라하세요.
+
+#### Windows에서 설치 (초보자 가이드)
+
+윈도우 노트북에서 앱을 빌드하려면 아래 순서대로 설치하세요.
+모든 설치 프로그램은 "다음 → 다음 → 완료" 방식으로 진행하면 됩니다.
+
+**1단계: Git 설치 (코드 다운로드용)**
+
+1. https://git-scm.com/download/win 접속
+2. **"Click here to download"** 클릭하여 설치 파일 다운로드
+3. 설치 프로그램 실행 → 모든 옵션 기본값 그대로 → **Install** 클릭
+4. 설치 완료 후 시작 메뉴에서 **"Git Bash"** 또는 **"PowerShell"** 을 열어 확인:
+   ```
+   git --version
+   ```
+   `git version 2.xx.x` 같은 결과가 나오면 성공
+
+**2단계: Visual Studio Build Tools 설치 (C++ 컴파일러)**
+
+Rust와 Tauri 앱을 빌드하려면 C++ 컴파일러가 필요합니다.
+
+1. https://visualstudio.microsoft.com/ko/visual-cpp-build-tools/ 접속
+2. **"Build Tools 다운로드"** 클릭
+3. 설치 프로그램 실행
+4. 워크로드 선택 화면에서 **"C++를 사용한 데스크톱 개발"** 체크
+5. **설치** 클릭 (약 2~5GB 다운로드, 시간이 걸릴 수 있습니다)
+6. 설치 완료 후 **PC 재시작**
+
+**3단계: Rust 설치 (백엔드 빌드용)**
+
+1. https://rustup.rs 접속
+2. **"RUSTUP-INIT.EXE (64-BIT)"** 클릭하여 다운로드
+3. 다운로드된 `rustup-init.exe` 실행
+4. 검은 터미널 창이 뜨면 **1** 을 입력하고 Enter (기본 설치 선택)
+5. 설치가 끝나면 터미널 창을 닫고, **새 PowerShell 창**을 열어서 확인:
+   ```
+   rustc --version
+   ```
+   `rustc 1.xx.x` 같은 결과가 나오면 성공
+
+**4단계: Node.js 설치 (프론트엔드 빌드용)**
+
+1. https://nodejs.org 접속
+2. **LTS** (왼쪽 초록색 버튼) 클릭하여 다운로드
+3. 설치 프로그램 실행 → 모든 옵션 기본값 그대로 → **Install** 클릭
+4. 새 PowerShell 창을 열어서 확인:
+   ```
+   node --version
+   npm --version
+   ```
+   각각 버전 번호가 나오면 성공
+
+**5단계: 저장소 복제 (코드 다운로드)**
+
+PowerShell을 열고 아래 명령어 실행:
+```powershell
+# 원하는 폴더로 이동 (예: 바탕화면)
+cd ~/Desktop
+
+# 코드 다운로드
+git clone https://github.com/Kimjaechol/MoA_new.git
+
+# 다운로드된 폴더로 이동
+cd MoA_new
+```
+
+**6단계 (선택): 배포용 CLI 도구 설치**
+
+앱 빌드만 할 거라면 이 단계는 건너뛰어도 됩니다.
+서버 배포(Railway, Vercel)까지 하려면 설치하세요.
+
+```powershell
+npm install -g @railway/cli
+npm install -g vercel
+```
+
+AWS CLI (R2 업로드용)는 https://aws.amazon.com/cli/ 에서 별도 다운로드합니다.
+
+#### macOS에서 설치
+
 ```bash
-# 1. Rust 설치 (백엔드 빌드)
+# 1. Xcode 커맨드라인 도구 설치 (C++ 컴파일러 포함)
+xcode-select --install
+
+# 2. Rust 설치
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 
-# 2. Node.js 18+ 설치 (프론트엔드 빌드)
-# macOS: brew install node
-# Ubuntu: sudo apt install nodejs npm
-# Windows: https://nodejs.org 에서 다운로드
+# 3. Node.js 설치 (Homebrew 사용)
+brew install node
 
-# 3. Railway CLI 설치
+# 4. 배포 CLI 도구 (선택)
 npm install -g @railway/cli
-
-# 4. Vercel CLI 설치
 npm install -g vercel
+```
 
-# 5. AWS CLI 설치 (R2 업로드용)
-# macOS: brew install awscli
-# Ubuntu: sudo apt install awscli
-# Windows: https://aws.amazon.com/cli/ 에서 다운로드
+#### Linux (Ubuntu/Debian)에서 설치
 
-# 6. Tauri 앱 빌드 도구 (선택)
-# macOS: xcode-select --install
-# Ubuntu: sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-# Windows: Visual Studio Build Tools 설치 (C++ workload)
-cargo install tauri-cli
+```bash
+# 1. 시스템 패키지 설치 (C++ 컴파일러 + Tauri 의존성)
+sudo apt update
+sudo apt install -y build-essential curl wget file \
+  libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+  libayatana-appindicator3-dev librsvg2-dev
+
+# 2. Rust 설치
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
+# 3. Node.js 18+ 설치
+sudo apt install -y nodejs npm
+
+# 4. 배포 CLI 도구 (선택)
+npm install -g @railway/cli
+npm install -g vercel
 ```
 
 ---
@@ -366,6 +456,41 @@ bash deploy/r2/upload.sh
 
 ### 7.1 데스크탑 앱 (Windows, macOS, Linux)
 
+#### Windows에서 빌드하기
+
+사전 준비: [2. 사전 준비물](#2-사전-준비물)의 Windows 설치 가이드를 모두 완료한 상태여야 합니다.
+(Git, Visual Studio Build Tools, Rust, Node.js 설치 완료)
+
+**PowerShell**을 열고 아래 명령어를 **한 줄씩** 실행하세요:
+
+```powershell
+# 1. 프로젝트 폴더로 이동 (코드를 다운로드한 위치)
+cd ~/Desktop/MoA_new
+
+# 2. Tauri 앱 폴더로 이동
+cd clients/tauri
+
+# 3. 프론트엔드 패키지 설치 (처음 한 번만)
+npm install
+
+# 4-A. 개발 모드로 실행 (테스트용, 코드 수정하면 바로 반영됨)
+npm run tauri dev
+
+# 4-B. 또는, 배포용 설치파일(.msi) 만들기
+npm run tauri build
+```
+
+> **참고**: 첫 빌드에서는 Rust 패키지를 다운로드하고 컴파일하므로 시간이 오래 걸립니다.
+> 두 번째 빌드부터는 훨씬 빠릅니다.
+
+빌드가 완료되면 설치 파일이 아래 경로에 생성됩니다:
+```
+clients/tauri/src-tauri/target/release/bundle/msi/MoA_*.msi
+```
+이 `.msi` 파일을 더블클릭하면 MoA 앱이 내 PC에 설치됩니다.
+
+#### macOS / Linux에서 빌드하기
+
 ```bash
 # Tauri 앱 디렉토리로 이동
 cd clients/tauri
@@ -470,6 +595,12 @@ Railway 환경변수에 추가:
 ZEROCLAW_REQUIRE_PAIRING=false
 ```
 > ⚠️ 보안 위험: 누구나 API에 접근 가능해집니다
+
+### Q: Windows에서 빌드가 안돼요
+- **"MSVC not found"** 오류 → Visual Studio Build Tools에서 **"C++를 사용한 데스크톱 개발"** 워크로드가 설치되어 있는지 확인하세요.
+- **"rustc not found"** 오류 → PowerShell 창을 닫고 새로 열어보세요. 그래도 안 되면 `rustup-init.exe`를 다시 실행하세요.
+- **"npm not found"** 오류 → Node.js 설치 후 PowerShell 창을 새로 열어야 합니다.
+- 빌드 중 멈춘 것처럼 보일 때 → Rust 첫 빌드는 오래 걸립니다. 인내심을 갖고 기다려주세요.
 
 ### Q: AI API 키는 어디서 얻나요?
 - **OpenRouter** (추천, 다양한 모델): https://openrouter.ai/keys
