@@ -1,285 +1,519 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import Link from "next/link";
-import Header from "@/components/Header";
+import { useState, useEffect } from "react";
 import Footer from "@/components/Footer";
 
-const R2_BASE =
-  process.env.NEXT_PUBLIC_R2_BASE_URL || "https://downloads.moa.example.com";
+type Platform = "windows" | "macos" | "linux" | "android" | "ios" | "unknown";
 
-interface Platform {
-  id: string;
-  name: string;
-  icon: string;
-  arch: string;
-  files: { label: string; path: string; size: string }[];
-  instructions: string[];
+function detectPlatform(): Platform {
+  if (typeof window === "undefined") return "unknown";
+  const ua = navigator.userAgent.toLowerCase();
+  if (ua.includes("win")) return "windows";
+  if (ua.includes("mac")) return "macos";
+  if (ua.includes("linux") && !ua.includes("android")) return "linux";
+  if (ua.includes("android")) return "android";
+  if (ua.includes("iphone") || ua.includes("ipad") || ua.includes("ipod"))
+    return "ios";
+  return "unknown";
 }
 
-const platforms: Platform[] = [
+const R2_BASE =
+  process.env.NEXT_PUBLIC_R2_BASE_URL || "https://downloads.moa-agent.com";
+
+interface DownloadItem {
+  platform: Platform;
+  icon: string;
+  name: string;
+  nameKo: string;
+  variants: {
+    label: string;
+    filename: string;
+    url: string;
+    badge?: string;
+  }[];
+  requirements: string[];
+  requirementsKo: string[];
+  instructions: string[];
+  instructionsKo: string[];
+}
+
+const downloads: DownloadItem[] = [
   {
-    id: "windows",
+    platform: "windows",
+    icon: "\uD83E\uDE9F",
     name: "Windows",
-    icon: "🪟",
-    arch: "x64 (64-bit)",
-    files: [
+    nameKo: "\uC708\uB3C4\uC6B0",
+    variants: [
       {
-        label: "MSI Installer",
-        path: "/releases/latest/MoA-windows-x64.msi",
-        size: "~25 MB",
+        label: "Windows x64 Installer (.msi)",
+        filename: "MoA-x64-setup.msi",
+        url: `${R2_BASE}/releases/latest/MoA-x64-setup.msi`,
+        badge: "Recommended",
       },
       {
-        label: "EXE Installer",
-        path: "/releases/latest/MoA-windows-x64-setup.exe",
-        size: "~25 MB",
+        label: "Windows x64 Portable (.exe)",
+        filename: "MoA-x64-portable.exe",
+        url: `${R2_BASE}/releases/latest/MoA-x64-portable.exe`,
       },
     ],
+    requirements: [
+      "Windows 10 or later (64-bit)",
+      "4GB RAM minimum",
+      "200MB disk space",
+      "WebView2 Runtime (included in Windows 10/11)",
+    ],
+    requirementsKo: [
+      "Windows 10 \uC774\uC0C1 (64\uBE44\uD2B8)",
+      "\uCD5C\uC18C 4GB RAM",
+      "200MB \uB514\uC2A4\uD06C \uACF5\uAC04",
+      "WebView2 \uB7F0\uD0C0\uC784 (Windows 10/11 \uD3EC\uD568)",
+    ],
     instructions: [
-      "MSI 또는 EXE 파일을 다운로드합니다.",
-      "다운로드한 파일을 실행합니다.",
-      "설치 마법사의 안내를 따릅니다.",
-      "설치 완료 후 시작 메뉴에서 MoA를 찾아 실행합니다.",
+      "Download the .msi installer",
+      "Double-click the downloaded file",
+      "Follow the installation wizard",
+      "Launch MoA from Start Menu",
+    ],
+    instructionsKo: [
+      ".msi \uC124\uCE58 \uD30C\uC77C \uB2E4\uC6B4\uB85C\uB4DC",
+      "\uB2E4\uC6B4\uB85C\uB4DC\uB41C \uD30C\uC77C \uB354\uBE14 \uD074\uB9AD",
+      "\uC124\uCE58 \uB9C8\uBC95\uC0AC \uC548\uB0B4 \uB530\uB77C \uC124\uCE58",
+      "\uC2DC\uC791 \uBA54\uB274\uC5D0\uC11C MoA \uC2E4\uD589",
     ],
   },
   {
-    id: "macos",
+    platform: "macos",
+    icon: "\uD83C\uDF4E",
     name: "macOS",
-    icon: "🍎",
-    arch: "Universal (Intel + Apple Silicon)",
-    files: [
+    nameKo: "\uB9E5OS",
+    variants: [
       {
-        label: "DMG (Universal)",
-        path: "/releases/latest/MoA-macos-universal.dmg",
-        size: "~30 MB",
+        label: "macOS Universal (.dmg)",
+        filename: "MoA-universal.dmg",
+        url: `${R2_BASE}/releases/latest/MoA-universal.dmg`,
+        badge: "Intel + Apple Silicon",
+      },
+      {
+        label: "macOS Apple Silicon (.dmg)",
+        filename: "MoA-aarch64.dmg",
+        url: `${R2_BASE}/releases/latest/MoA-aarch64.dmg`,
+      },
+      {
+        label: "macOS Intel (.dmg)",
+        filename: "MoA-x64.dmg",
+        url: `${R2_BASE}/releases/latest/MoA-x64.dmg`,
       },
     ],
+    requirements: [
+      "macOS 11 (Big Sur) or later",
+      "Apple Silicon (M1/M2/M3) or Intel",
+      "4GB RAM minimum",
+      "200MB disk space",
+    ],
+    requirementsKo: [
+      "macOS 11 (Big Sur) \uC774\uC0C1",
+      "Apple Silicon (M1/M2/M3) \uB610\uB294 Intel",
+      "\uCD5C\uC18C 4GB RAM",
+      "200MB \uB514\uC2A4\uD06C \uACF5\uAC04",
+    ],
     instructions: [
-      "DMG 파일을 다운로드합니다.",
-      "DMG를 열고 MoA 아이콘을 Applications 폴더로 드래그합니다.",
-      "처음 실행시 '개발자를 확인할 수 없습니다' 메시지가 뜨면:",
-      "시스템 설정 → 개인정보 보호 및 보안 → '확인 없이 열기' 클릭",
+      "Download the .dmg file",
+      "Open the .dmg file",
+      "Drag MoA to Applications folder",
+      "Open MoA from Applications or Launchpad",
+      "If blocked: System Settings > Privacy & Security > Allow",
+    ],
+    instructionsKo: [
+      ".dmg \uD30C\uC77C \uB2E4\uC6B4\uB85C\uB4DC",
+      ".dmg \uD30C\uC77C \uC5F4\uAE30",
+      "MoA\uB97C \uC751\uC6A9 \uD504\uB85C\uADF8\uB7A8 \uD3F4\uB354\uB85C \uB4DC\uB798\uADF8",
+      "\uC751\uC6A9 \uD504\uB85C\uADF8\uB7A8 \uB610\uB294 Launchpad\uC5D0\uC11C MoA \uC2E4\uD589",
+      "\uCC28\uB2E8 \uC2DC: \uC2DC\uC2A4\uD15C \uC124\uC815 > \uAC1C\uC778\uC815\uBCF4 \uBCF4\uD638 > \uD5C8\uC6A9",
     ],
   },
   {
-    id: "linux",
+    platform: "linux",
+    icon: "\uD83D\uDC27",
     name: "Linux",
-    icon: "🐧",
-    arch: "x86_64",
-    files: [
+    nameKo: "\uB9AC\uB205\uC2A4",
+    variants: [
       {
-        label: "AppImage",
-        path: "/releases/latest/MoA-linux-x86_64.AppImage",
-        size: "~30 MB",
+        label: "Linux x64 AppImage",
+        filename: "MoA-x64.AppImage",
+        url: `${R2_BASE}/releases/latest/MoA-x64.AppImage`,
+        badge: "Universal",
       },
       {
-        label: "DEB (Ubuntu/Debian)",
-        path: "/releases/latest/moa_amd64.deb",
-        size: "~20 MB",
+        label: "Linux x64 Debian (.deb)",
+        filename: "MoA-x64.deb",
+        url: `${R2_BASE}/releases/latest/MoA-x64.deb`,
+      },
+      {
+        label: "Linux x64 RPM (.rpm)",
+        filename: "MoA-x64.rpm",
+        url: `${R2_BASE}/releases/latest/MoA-x64.rpm`,
       },
     ],
+    requirements: [
+      "Ubuntu 20.04+ / Fedora 36+ / Arch Linux or equivalent",
+      "x86_64 architecture",
+      "4GB RAM minimum",
+      "200MB disk space",
+      "WebKitGTK 4.1+",
+    ],
+    requirementsKo: [
+      "Ubuntu 20.04+ / Fedora 36+ / Arch Linux \uB610\uB294 \uD638\uD658 \uBC30\uD3EC\uD310",
+      "x86_64 \uC544\uD0A4\uD14D\uCC98",
+      "\uCD5C\uC18C 4GB RAM",
+      "200MB \uB514\uC2A4\uD06C \uACF5\uAC04",
+      "WebKitGTK 4.1+",
+    ],
     instructions: [
-      "AppImage: 다운로드 후 chmod +x MoA*.AppImage && ./MoA*.AppImage",
-      "DEB: sudo dpkg -i moa_amd64.deb",
-      "AppImage는 설치 없이 바로 실행 가능합니다.",
+      "AppImage: chmod +x MoA-x64.AppImage && ./MoA-x64.AppImage",
+      "Debian/Ubuntu: sudo dpkg -i MoA-x64.deb",
+      "Fedora/RHEL: sudo rpm -i MoA-x64.rpm",
+    ],
+    instructionsKo: [
+      "AppImage: chmod +x MoA-x64.AppImage && ./MoA-x64.AppImage",
+      "Debian/Ubuntu: sudo dpkg -i MoA-x64.deb",
+      "Fedora/RHEL: sudo rpm -i MoA-x64.rpm",
     ],
   },
   {
-    id: "android",
+    platform: "android",
+    icon: "\uD83E\uDD16",
     name: "Android",
-    icon: "🤖",
-    arch: "ARM64 / x86_64",
-    files: [
+    nameKo: "\uC548\uB4DC\uB85C\uC774\uB4DC",
+    variants: [
       {
-        label: "APK Direct Download",
-        path: "/releases/latest/MoA-android.apk",
-        size: "~20 MB",
+        label: "Android APK (Direct Download)",
+        filename: "MoA-arm64.apk",
+        url: `${R2_BASE}/releases/latest/MoA-arm64.apk`,
+        badge: "APK",
+      },
+      {
+        label: "Google Play Store",
+        filename: "",
+        url: "#",
+        badge: "Coming Soon",
       },
     ],
+    requirements: [
+      "Android 8.0 (Oreo) or later",
+      "ARM64 architecture",
+      "2GB RAM minimum",
+      "100MB storage",
+    ],
+    requirementsKo: [
+      "Android 8.0 (Oreo) \uC774\uC0C1",
+      "ARM64 \uC544\uD0A4\uD14D\uCC98",
+      "\uCD5C\uC18C 2GB RAM",
+      "100MB \uC800\uC7A5 \uACF5\uAC04",
+    ],
     instructions: [
-      "APK 파일을 다운로드합니다.",
-      "설정 → 보안 → 알 수 없는 출처 허용을 활성화합니다.",
-      "다운로드한 APK를 탭하여 설치합니다.",
-      "Google Play 출시 예정",
+      "Download the .apk file",
+      "Enable 'Install from Unknown Sources' in Settings",
+      "Open the .apk file to install",
+      "Launch MoA from app drawer",
+    ],
+    instructionsKo: [
+      ".apk \uD30C\uC77C \uB2E4\uC6B4\uB85C\uB4DC",
+      "\uC124\uC815\uC5D0\uC11C '\uCD9C\uCC98\uB97C \uC54C \uC218 \uC5C6\uB294 \uC571 \uC124\uCE58' \uD5C8\uC6A9",
+      ".apk \uD30C\uC77C\uC744 \uC5F4\uC5B4 \uC124\uCE58",
+      "\uC571 \uC11C\uB78D\uC5D0\uC11C MoA \uC2E4\uD589",
     ],
   },
   {
-    id: "ios",
+    platform: "ios",
+    icon: "\uD83D\uDCF1",
     name: "iOS",
-    icon: "📱",
-    arch: "ARM64",
-    files: [],
+    nameKo: "iOS",
+    variants: [
+      {
+        label: "App Store",
+        filename: "",
+        url: "#",
+        badge: "Coming Soon",
+      },
+      {
+        label: "TestFlight Beta",
+        filename: "",
+        url: "#",
+        badge: "Beta",
+      },
+    ],
+    requirements: [
+      "iOS 16.0 or later",
+      "iPhone 8 or later",
+      "100MB storage",
+    ],
+    requirementsKo: [
+      "iOS 16.0 \uC774\uC0C1",
+      "iPhone 8 \uC774\uC0C1",
+      "100MB \uC800\uC7A5 \uACF5\uAC04",
+    ],
     instructions: [
-      "App Store에서 'MoA AI' 검색 (출시 예정)",
-      "TestFlight 베타 참여: 아래 링크 클릭",
+      "Open App Store on your device",
+      "Search for 'MoA - Master of AI'",
+      "Tap 'Get' to download and install",
+      "Open MoA from home screen",
+    ],
+    instructionsKo: [
+      "\uAE30\uAE30\uC5D0\uC11C App Store \uC5F4\uAE30",
+      "'MoA - Master of AI' \uAC80\uC0C9",
+      "'\uBC1B\uAE30' \uD0ED\uD558\uC5EC \uB2E4\uC6B4\uB85C\uB4DC \uBC0F \uC124\uCE58",
+      "\uD648 \uD654\uBA74\uC5D0\uC11C MoA \uC2E4\uD589",
     ],
   },
 ];
 
-function detectPlatform(): string {
-  if (typeof navigator === "undefined") return "windows";
-  const ua = navigator.userAgent.toLowerCase();
-  if (ua.includes("android")) return "android";
-  if (ua.includes("iphone") || ua.includes("ipad")) return "ios";
-  if (ua.includes("mac")) return "macos";
-  if (ua.includes("linux")) return "linux";
-  return "windows";
-}
-
 export default function DownloadPage() {
-  const [currentPlatform, setCurrentPlatform] = useState("windows");
-  const [selected, setSelected] = useState<string | null>(null);
+  const [currentPlatform, setCurrentPlatform] = useState<Platform>("unknown");
+  const [expandedPlatform, setExpandedPlatform] = useState<Platform | null>(
+    null,
+  );
 
   useEffect(() => {
     const detected = detectPlatform();
     setCurrentPlatform(detected);
-    setSelected(detected);
+    setExpandedPlatform(detected !== "unknown" ? detected : null);
   }, []);
 
-  const activePlatform = platforms.find((p) => p.id === selected) || platforms[0];
+  const togglePlatform = (platform: Platform) => {
+    setExpandedPlatform(expandedPlatform === platform ? null : platform);
+  };
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white">
-      <Header />
+    <>
+      <div className="pt-32 pb-20">
+        <div className="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8">
+          {/* Header */}
+          <div className="text-center mb-16">
+            <h1 className="text-3xl font-bold text-dark-50 sm:text-4xl lg:text-5xl">
+              {"\uB2E4\uC6B4\uB85C\uB4DC"}
+              <span className="text-dark-500 ml-3 text-xl font-normal sm:text-2xl">
+                Download
+              </span>
+            </h1>
+            <p className="mt-4 text-dark-400 max-w-xl mx-auto">
+              {"\uBAA8\uB4E0 \uD50C\uB7AB\uD3FC\uC5D0\uC11C MoA\uB97C \uC0AC\uC6A9\uD558\uC138\uC694. \uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C\uB3C4 \uBC14\uB85C \uC0AC\uC6A9 \uAC00\uB2A5\uD569\uB2C8\uB2E4."}
+            </p>
+            <p className="mt-1 text-sm text-dark-500">
+              Use MoA on every platform. Also available directly in your browser.
+            </p>
 
-      <section className="pt-28 pb-12 px-4">
-        <div className="max-w-4xl mx-auto text-center">
-          <h1 className="text-4xl font-bold mb-3">앱 다운로드</h1>
-          <p className="text-gray-400 text-lg mb-2">
-            모든 기기에서 MoA를 사용하세요
-          </p>
-          <p className="text-gray-500 text-sm">
-            Download MoA for your platform
-          </p>
-        </div>
-      </section>
-
-      {/* Platform selector */}
-      <section className="px-4 pb-16">
-        <div className="max-w-4xl mx-auto">
-          <div className="flex flex-wrap justify-center gap-3 mb-10">
-            {platforms.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => setSelected(p.id)}
-                className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium transition-all ${
-                  selected === p.id
-                    ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20"
-                    : "bg-gray-900 border border-gray-800 text-gray-400 hover:text-white hover:border-gray-600"
-                } ${
-                  p.id === currentPlatform && selected !== p.id
-                    ? "ring-1 ring-indigo-500/30"
-                    : ""
-                }`}
-              >
-                <span>{p.icon}</span>
-                {p.name}
-                {p.id === currentPlatform && (
-                  <span className="text-[10px] opacity-60">(현재 OS)</span>
-                )}
-              </button>
-            ))}
-          </div>
-
-          {/* Download card */}
-          <div className="bg-gray-900/50 border border-gray-800 rounded-2xl p-8">
-            <div className="flex items-center gap-4 mb-6">
-              <span className="text-4xl">{activePlatform.icon}</span>
-              <div>
-                <h2 className="text-xl font-semibold">
-                  {activePlatform.name}
-                </h2>
-                <p className="text-sm text-gray-500">{activePlatform.arch}</p>
-              </div>
-            </div>
-
-            {activePlatform.files.length > 0 ? (
-              <div className="space-y-3 mb-8">
-                {activePlatform.files.map((file, i) => (
-                  <a
-                    key={i}
-                    href={`${R2_BASE}${file.path}`}
-                    className="flex items-center justify-between p-4 bg-gray-800/50 border border-gray-700 rounded-xl hover:border-indigo-500/40 transition-colors group"
-                    download
-                  >
-                    <div className="flex items-center gap-3">
-                      <span className="text-indigo-400 text-lg">⬇</span>
-                      <div>
-                        <p className="font-medium text-sm group-hover:text-indigo-400 transition-colors">
-                          {file.label}
-                        </p>
-                        <p className="text-xs text-gray-500">{file.size}</p>
-                      </div>
-                    </div>
-                    <span className="text-xs px-3 py-1.5 bg-indigo-600 rounded-lg font-medium">
-                      다운로드
-                    </span>
-                  </a>
-                ))}
-              </div>
-            ) : (
-              <div className="p-6 bg-gray-800/30 rounded-xl text-center mb-8">
-                <p className="text-gray-400 text-sm">곧 출시 예정입니다</p>
-                <p className="text-gray-500 text-xs mt-1">Coming soon</p>
+            {currentPlatform !== "unknown" && (
+              <div className="mt-6 inline-flex items-center gap-2 rounded-full border border-accent-500/20 bg-accent-500/5 px-4 py-1.5">
+                <div className="h-1.5 w-1.5 rounded-full bg-accent-400" />
+                <span className="text-xs font-medium text-accent-300">
+                  {"\uAC10\uC9C0\uB41C OS: "}
+                  {downloads.find((d) => d.platform === currentPlatform)?.name ||
+                    "Unknown"}
+                </span>
               </div>
             )}
-
-            {/* Installation instructions */}
-            <div>
-              <h3 className="text-sm font-semibold text-gray-300 mb-3">
-                설치 방법
-              </h3>
-              <ol className="space-y-2">
-                {activePlatform.instructions.map((step, i) => (
-                  <li
-                    key={i}
-                    className="flex gap-3 text-sm text-gray-400"
-                  >
-                    <span className="text-indigo-400 font-mono text-xs mt-0.5 shrink-0">
-                      {i + 1}.
-                    </span>
-                    {step}
-                  </li>
-                ))}
-              </ol>
-            </div>
           </div>
 
-          {/* System Requirements */}
-          <div className="mt-10 p-6 bg-gray-900/30 border border-gray-800 rounded-2xl">
-            <h3 className="text-sm font-semibold mb-4">
-              시스템 요구사항
-            </h3>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm text-gray-400">
-              <div>
-                <p className="text-gray-300 font-medium mb-1">데스크탑</p>
-                <ul className="space-y-1 text-xs">
-                  <li>Windows 10+ / macOS 11+ / Ubuntu 20.04+</li>
-                  <li>RAM 4GB 이상</li>
-                  <li>저장공간 100MB</li>
-                </ul>
-              </div>
-              <div>
-                <p className="text-gray-300 font-medium mb-1">모바일</p>
-                <ul className="space-y-1 text-xs">
-                  <li>Android 8.0+ / iOS 15+</li>
-                  <li>RAM 2GB 이상</li>
-                  <li>저장공간 50MB</li>
-                </ul>
-              </div>
-              <div>
-                <p className="text-gray-300 font-medium mb-1">네트워크</p>
-                <ul className="space-y-1 text-xs">
-                  <li>인터넷 연결 필수</li>
-                  <li>HTTPS 지원</li>
-                </ul>
-              </div>
+          {/* Download cards */}
+          <div className="space-y-4">
+            {downloads.map((item) => {
+              const isExpanded = expandedPlatform === item.platform;
+              const isCurrent = currentPlatform === item.platform;
+
+              return (
+                <div
+                  key={item.platform}
+                  className={`rounded-2xl border transition-all duration-300 ${
+                    isCurrent
+                      ? "border-primary-500/30 bg-primary-500/5"
+                      : "border-dark-800/50 bg-dark-900/50"
+                  }`}
+                >
+                  {/* Card header */}
+                  <button
+                    onClick={() => togglePlatform(item.platform)}
+                    className="flex w-full items-center justify-between px-6 py-5 text-left"
+                  >
+                    <div className="flex items-center gap-4">
+                      <span className="text-3xl">{item.icon}</span>
+                      <div>
+                        <h2 className="text-lg font-semibold text-dark-50 flex items-center gap-2">
+                          {item.nameKo}{" "}
+                          <span className="text-dark-500 text-sm font-normal">
+                            {item.name}
+                          </span>
+                          {isCurrent && (
+                            <span className="rounded-full bg-primary-500/20 px-2 py-0.5 text-[10px] font-medium text-primary-400">
+                              {"\uD604\uC7AC OS"} Current
+                            </span>
+                          )}
+                        </h2>
+                        <p className="text-xs text-dark-500 mt-0.5">
+                          {item.variants.length}{" "}
+                          {item.variants.length === 1
+                            ? "download option"
+                            : "download options"}{" "}
+                          available
+                        </p>
+                      </div>
+                    </div>
+                    <svg
+                      className={`h-5 w-5 text-dark-400 transition-transform duration-200 ${
+                        isExpanded ? "rotate-180" : ""
+                      }`}
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      strokeWidth={2}
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M19.5 8.25l-7.5 7.5-7.5-7.5"
+                      />
+                    </svg>
+                  </button>
+
+                  {/* Expanded content */}
+                  {isExpanded && (
+                    <div className="border-t border-dark-800/50 px-6 py-6 space-y-6 animate-fade-in">
+                      {/* Download buttons */}
+                      <div>
+                        <h3 className="text-sm font-semibold text-dark-200 mb-3">
+                          {"\uB2E4\uC6B4\uB85C\uB4DC"} Downloads
+                        </h3>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          {item.variants.map((variant) => {
+                            const isDisabled = variant.url === "#";
+                            return (
+                              <a
+                                key={variant.label}
+                                href={isDisabled ? undefined : variant.url}
+                                className={`flex items-center justify-between rounded-xl border px-4 py-3 transition-all ${
+                                  isDisabled
+                                    ? "border-dark-800 bg-dark-900/50 cursor-not-allowed opacity-60"
+                                    : "border-dark-700 bg-dark-800/50 hover:border-primary-500/30 hover:bg-primary-500/5"
+                                }`}
+                                {...(isDisabled
+                                  ? {}
+                                  : { download: variant.filename })}
+                                onClick={
+                                  isDisabled
+                                    ? (e: React.MouseEvent) =>
+                                        e.preventDefault()
+                                    : undefined
+                                }
+                              >
+                                <div>
+                                  <div className="text-sm font-medium text-dark-200">
+                                    {variant.label}
+                                  </div>
+                                  {variant.filename && (
+                                    <div className="text-[10px] text-dark-500 font-mono mt-0.5">
+                                      {variant.filename}
+                                    </div>
+                                  )}
+                                </div>
+                                {variant.badge && (
+                                  <span
+                                    className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                                      variant.badge === "Coming Soon"
+                                        ? "bg-dark-700 text-dark-400"
+                                        : variant.badge === "Recommended"
+                                          ? "bg-primary-500/20 text-primary-400"
+                                          : "bg-accent-500/20 text-accent-400"
+                                    }`}
+                                  >
+                                    {variant.badge}
+                                  </span>
+                                )}
+                              </a>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div className="grid gap-6 sm:grid-cols-2">
+                        {/* System requirements */}
+                        <div>
+                          <h3 className="text-sm font-semibold text-dark-200 mb-3">
+                            {"\uC2DC\uC2A4\uD15C \uC694\uAD6C \uC0AC\uD56D"} System Requirements
+                          </h3>
+                          <ul className="space-y-1.5">
+                            {item.requirementsKo.map((req, i) => (
+                              <li
+                                key={i}
+                                className="flex items-start gap-2 text-xs"
+                              >
+                                <span className="text-dark-600 mt-0.5">
+                                  &bull;
+                                </span>
+                                <span className="text-dark-400">{req}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+
+                        {/* Installation */}
+                        <div>
+                          <h3 className="text-sm font-semibold text-dark-200 mb-3">
+                            {"\uC124\uCE58 \uBC29\uBC95"} Installation
+                          </h3>
+                          <ol className="space-y-1.5">
+                            {item.instructionsKo.map((step, i) => (
+                              <li
+                                key={i}
+                                className="flex items-start gap-2 text-xs"
+                              >
+                                <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-dark-800 text-[10px] text-dark-400 font-mono">
+                                  {i + 1}
+                                </span>
+                                <span className="text-dark-400">{step}</span>
+                              </li>
+                            ))}
+                          </ol>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Web version CTA */}
+          <div className="mt-12 text-center">
+            <div className="glass-card inline-block rounded-2xl px-8 py-6">
+              <h3 className="text-lg font-semibold text-dark-50">
+                {"\uC124\uCE58 \uC5C6\uC774 \uC0AC\uC6A9\uD558\uAE30"}{" "}
+                <span className="text-dark-500 text-sm font-normal">
+                  Use without installation
+                </span>
+              </h3>
+              <p className="mt-2 text-sm text-dark-400">
+                {"\uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C \uBC14\uB85C MoA\uB97C \uC0AC\uC6A9\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4."}
+              </p>
+              <a href="/chat" className="btn-accent mt-4 inline-flex px-6 py-2.5">
+                {"\uC6F9\uC5D0\uC11C \uCC44\uD305 \uC2DC\uC791"} Start Web Chat
+                <svg
+                  className="ml-2 h-4 w-4"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  strokeWidth={2}
+                  stroke="currentColor"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3"
+                  />
+                </svg>
+              </a>
             </div>
           </div>
         </div>
-      </section>
-
+      </div>
       <Footer />
-    </div>
+    </>
   );
 }
