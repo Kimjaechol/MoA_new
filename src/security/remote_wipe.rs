@@ -350,7 +350,7 @@ mod tests {
     fn wipe_sync_state_deletes_sync_files() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".device_id"), "device_123").unwrap();
-        std::fs::write(tmp.path().join(".sync_key"), &[0u8; 32]).unwrap();
+        std::fs::write(tmp.path().join(".sync_key"), [0u8; 32]).unwrap();
         std::fs::write(tmp.path().join(".device_binding"), "binding_data").unwrap();
 
         let wiper = RemoteWipe::new(tmp.path(), true);
