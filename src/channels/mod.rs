@@ -74,6 +74,8 @@ struct ChannelRuntimeContext {
     auto_save_memory: bool,
     /// SLM gatekeeper for local intent classification + simple response.
     gatekeeper: Option<Arc<tokio::sync::Mutex<crate::gatekeeper::GatekeeperRouter>>>,
+    /// Telemetry store for recording user activity.
+    telemetry: Option<Arc<crate::telemetry::TelemetryStore>>,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -199,6 +201,27 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
+
+    // ── Telemetry: record user activity ──
+    if let Some(ref telemetry) = ctx.telemetry {
+        let event = crate::telemetry::TelemetryEvent {
+            id: 0,
+            user_id: msg.sender.clone(),
+            country: String::new(),
+            ip_address: String::new(),
+            channel: msg.channel.clone(),
+            action: "message".into(),
+            target_url: String::new(),
+            details: crate::util::truncate_with_ellipsis(&msg.content, 200),
+            tool_name: String::new(),
+            alert_level: crate::telemetry::AlertLevel::None,
+            alert_reason: String::new(),
+            timestamp: chrono::Utc::now(),
+        };
+        if let Err(e) = telemetry.record(event) {
+            tracing::debug!("Telemetry record failed: {e}");
+        }
+    }
 
     // ── SLM gatekeeper: try local handling first ──
     if let Some(ref gatekeeper) = ctx.gatekeeper {
@@ -1305,6 +1328,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None
     };
 
+    // ── Telemetry ──────────────────────────────────────────
+    let telemetry = if config.telemetry.enabled {
+        match crate::telemetry::TelemetryStore::new(
+            &config.workspace_dir,
+            config.telemetry.clone(),
+        ) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize channel telemetry: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -1316,6 +1355,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         temperature,
         auto_save_memory: config.memory.auto_save,
         gatekeeper,
+        telemetry,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1503,6 +1543,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             gatekeeper: None,
+            telemetry: None,
         });
 
         process_channel_message(
@@ -1599,6 +1640,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             gatekeeper: None,
+            telemetry: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
