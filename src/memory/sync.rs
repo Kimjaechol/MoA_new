@@ -238,7 +238,7 @@ impl SyncEngine {
                 device_id,
                 version,
                 operation,
-                timestamp: timestamp as u64,
+                timestamp: u64::try_from(timestamp).unwrap_or(0),
             });
         }
 
@@ -275,7 +275,7 @@ impl SyncEngine {
         } else {
             let mut key = [0u8; 32];
             OsRng.fill_bytes(&mut key);
-            std::fs::write(&key_path, &key)?;
+            std::fs::write(&key_path, key)?;
             key
         };
 

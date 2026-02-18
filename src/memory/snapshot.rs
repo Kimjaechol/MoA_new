@@ -62,19 +62,22 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let mut output = String::with_capacity(rows.len() * 200);
     output.push_str(SNAPSHOT_HEADER);
 
+    use std::fmt::Write;
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    output.push_str(&format!("**Last exported:** {now}\n\n"));
-    output.push_str(&format!(
+    let _ = write!(output, "**Last exported:** {now}\n\n");
+    let _ = write!(
+        output,
         "**Total core memories:** {}\n\n---\n\n",
         rows.len()
-    ));
+    );
 
     for (key, content, _category, created_at, updated_at) in &rows {
-        output.push_str(&format!("### 🔑 `{key}`\n\n"));
-        output.push_str(&format!("{content}\n\n"));
-        output.push_str(&format!(
+        let _ = write!(output, "### 🔑 `{key}`\n\n");
+        let _ = write!(output, "{content}\n\n");
+        let _ = write!(
+            output,
             "*Created: {created_at} | Updated: {updated_at}*\n\n---\n\n"
-        ));
+        );
     }
 
     let snapshot_path = snapshot_path(workspace_dir);

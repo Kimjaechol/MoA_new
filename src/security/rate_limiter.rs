@@ -165,9 +165,9 @@ impl RateLimiter {
             };
 
             let message = match new_strike {
-                StrikeLevel::Strike2 => Some(format!(
-                    "Strike 2: Rate limit cooldown escalated to 1 hour. Final warning."
-                )),
+                StrikeLevel::Strike2 => Some(
+                    "Strike 2: Rate limit cooldown escalated to 1 hour. Final warning.".into(),
+                ),
                 StrikeLevel::Banned => Some(
                     "Strike 3: Permanently banned. Contact admin to restore access.".into(),
                 ),
@@ -202,7 +202,7 @@ impl RateLimiter {
             .retain(|&ts| ts >= window_start);
 
         // Check rate limit
-        if state.request_timestamps.len() as u32 >= self.limit {
+        if u32::try_from(state.request_timestamps.len()).unwrap_or(u32::MAX) >= self.limit {
             // Rate limit exceeded — issue first strike or escalate
             state.strike = match state.strike {
                 StrikeLevel::None => {
@@ -233,7 +233,7 @@ impl RateLimiter {
                     "Strike 3: Permanently banned. Contact admin to restore access."
                         .into(),
                 ),
-                _ => None,
+                StrikeLevel::None => None,
             };
 
             return RateLimitResult {
@@ -247,7 +247,7 @@ impl RateLimiter {
 
         // Request allowed — record timestamp
         state.request_timestamps.push(now);
-        let remaining = self.limit - state.request_timestamps.len() as u32;
+        let remaining = self.limit - u32::try_from(state.request_timestamps.len()).unwrap_or(u32::MAX);
 
         RateLimitResult {
             allowed: true,

@@ -306,7 +306,8 @@ fn is_valid_luhn(digits: &str) -> bool {
         double = !double;
     }
 
-    sum % 10 == 0
+    #[allow(clippy::manual_is_multiple_of)]
+    { sum % 10 == 0 }
 }
 
 /// Validate that a string is a valid IPv4 address.

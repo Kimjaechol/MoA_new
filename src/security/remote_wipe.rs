@@ -177,7 +177,7 @@ impl RemoteWipe {
         // Wipe memory directory markdown files
         let memory_dir = self.workspace_dir.join("memory");
         if memory_dir.exists() {
-            deleted += self.wipe_directory(&memory_dir, &mut errors);
+            deleted += Self::wipe_directory(&memory_dir, &mut errors);
         }
 
         (deleted, errors)
@@ -228,7 +228,7 @@ impl RemoteWipe {
     }
 
     /// Recursively wipe a directory and its contents.
-    fn wipe_directory(&self, dir: &Path, errors: &mut Vec<String>) -> usize {
+    fn wipe_directory(dir: &Path, errors: &mut Vec<String>) -> usize {
         let mut deleted = 0;
 
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -240,7 +240,7 @@ impl RemoteWipe {
                         Err(e) => errors.push(format!("Failed to wipe {}: {e}", path.display())),
                     }
                 } else if path.is_dir() {
-                    deleted += self.wipe_directory(&path, errors);
+                    deleted += Self::wipe_directory(&path, errors);
                 }
             }
         }
@@ -260,7 +260,7 @@ fn secure_delete(path: &Path) -> anyhow::Result<()> {
 
     // Overwrite with zeros
     let metadata = std::fs::metadata(path)?;
-    let size = metadata.len() as usize;
+    let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
     if size > 0 {
         let zeros = vec![0u8; size.min(1024 * 1024)]; // Cap at 1MB per write
         let mut remaining = size;

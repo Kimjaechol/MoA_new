@@ -73,6 +73,7 @@ pub struct ThreatMatch {
 
 /// Result of a full threat analysis.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ThreatAnalysis {
     /// Whether the request should proceed.
     pub proceed: bool,
@@ -314,8 +315,7 @@ impl ThreatDetector {
         let (proceed, blocked, awaiting_consent) = match max_level {
             Some(ThreatLevel::Critical) => (false, true, false),
             Some(ThreatLevel::High) => (false, false, true),
-            Some(ThreatLevel::Medium) => (true, false, false),
-            Some(ThreatLevel::Low) | None => (true, false, false),
+            Some(ThreatLevel::Medium | ThreatLevel::Low) | None => (true, false, false),
         };
 
         // Also block if risk score is very high

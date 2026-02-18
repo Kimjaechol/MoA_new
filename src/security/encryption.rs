@@ -45,7 +45,7 @@ impl AesEncryptor {
     pub fn generate_key_file(path: &Path) -> anyhow::Result<Self> {
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);
-        std::fs::write(path, &key)?;
+        std::fs::write(path, key)?;
         Ok(Self { key })
     }
 

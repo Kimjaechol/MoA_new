@@ -405,7 +405,7 @@ mod tests {
         let path = PathBuf::from("/tmp/vault/daily/backup-1708123456-abcd1234.enc");
         assert_eq!(
             EncryptedVault::extract_timestamp_from_filename(&path),
-            1708123456
+            1_708_123_456
         );
     }
 
@@ -414,7 +414,7 @@ mod tests {
         let path = PathBuf::from("/tmp/vault/daily/backup-1708123456.enc");
         assert_eq!(
             EncryptedVault::extract_timestamp_from_filename(&path),
-            1708123456
+            1_708_123_456
         );
     }
 
