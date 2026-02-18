@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent;
 pub mod approval;
+pub mod billing;
 pub mod channels;
 pub mod config;
 pub mod cost;
@@ -47,6 +48,7 @@ pub mod cron;
 pub mod daemon;
 pub mod doctor;
 pub mod gateway;
+pub mod gatekeeper;
 pub mod hardware;
 pub mod health;
 pub mod heartbeat;
@@ -66,6 +68,7 @@ pub mod skills;
 pub mod tools;
 pub mod tunnel;
 pub mod util;
+pub mod voice;
 
 pub use config::Config;
 

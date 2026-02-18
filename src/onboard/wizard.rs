@@ -132,6 +132,7 @@ pub fn run_wizard() -> Result<Config> {
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
+        gatekeeper: crate::config::GatekeeperConfig::default(),
     };
 
     println!(
@@ -348,6 +349,7 @@ pub fn run_quick_setup(
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
+        gatekeeper: crate::config::GatekeeperConfig::default(),
     };
 
     config.save()?;
@@ -2430,6 +2432,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         lark: None,
         dingtalk: None,
         qq: None,
+        kakao: None,
     };
 
     loop {

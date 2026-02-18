@@ -1,0 +1,131 @@
+const STORAGE_KEY_TOKEN = "moa_token";
+const STORAGE_KEY_SERVER = "moa_server_url";
+
+export interface PairResponse {
+  paired: boolean;
+  token: string;
+}
+
+export interface ChatResponse {
+  response: string;
+  model: string;
+}
+
+export interface HealthResponse {
+  status: string;
+}
+
+export class MoAClient {
+  private serverUrl: string;
+  private token: string | null;
+
+  constructor() {
+    this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || "http://localhost:3000";
+    this.token = localStorage.getItem(STORAGE_KEY_TOKEN);
+  }
+
+  getServerUrl(): string {
+    return this.serverUrl;
+  }
+
+  setServerUrl(url: string): void {
+    this.serverUrl = url.replace(/\/+$/, "");
+    localStorage.setItem(STORAGE_KEY_SERVER, this.serverUrl);
+  }
+
+  getToken(): string | null {
+    return this.token;
+  }
+
+  isConnected(): boolean {
+    return this.token !== null && this.token.length > 0;
+  }
+
+  getMaskedToken(): string {
+    if (!this.token) return "";
+    if (this.token.length <= 8) return "****";
+    return this.token.substring(0, 4) + "..." + this.token.substring(this.token.length - 4);
+  }
+
+  disconnect(): void {
+    this.token = null;
+    localStorage.removeItem(STORAGE_KEY_TOKEN);
+  }
+
+  async pair(code: string): Promise<PairResponse> {
+    const res = await fetch(`${this.serverUrl}/pair`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Pairing-Code": code,
+      },
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "Unknown error");
+      throw new Error(`Pairing failed (${res.status}): ${text}`);
+    }
+
+    const data: PairResponse = await res.json();
+
+    if (data.paired && data.token) {
+      this.token = data.token;
+      localStorage.setItem(STORAGE_KEY_TOKEN, data.token);
+    }
+
+    return data;
+  }
+
+  async chat(message: string): Promise<ChatResponse> {
+    if (!this.token) {
+      throw new Error("Not authenticated. Please pair with the server first.");
+    }
+
+    const res = await fetch(`${this.serverUrl}/webhook`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ message }),
+    });
+
+    if (!res.ok) {
+      if (res.status === 401) {
+        this.disconnect();
+        throw new Error("Authentication expired. Please re-pair with the server.");
+      }
+      const text = await res.text().catch(() => "Unknown error");
+      throw new Error(`Chat request failed (${res.status}): ${text}`);
+    }
+
+    return await res.json();
+  }
+
+  async healthCheck(): Promise<HealthResponse> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    try {
+      const res = await fetch(`${this.serverUrl}/health`, {
+        method: "GET",
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        throw new Error(`Health check failed (${res.status})`);
+      }
+
+      return await res.json();
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw new Error("Health check timed out");
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+export const apiClient = new MoAClient();

@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -189,6 +190,8 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// SLM gatekeeper for local intent classification + simple response.
+    pub gatekeeper: Option<Arc<tokio::sync::Mutex<crate::gatekeeper::GatekeeperRouter>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -295,6 +298,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         })
         .map(Arc::from);
 
+    // ── SLM Gatekeeper ────────────────────────────────────
+    let gatekeeper = if config.gatekeeper.enabled {
+        let mut router = crate::gatekeeper::GatekeeperRouter::from_config(&config.gatekeeper);
+        let healthy = router.check_slm_health().await;
+        if healthy {
+            tracing::info!(
+                model = config.gatekeeper.model,
+                "SLM gatekeeper active — local routing enabled"
+            );
+        } else {
+            tracing::warn!(
+                "SLM gatekeeper enabled but Ollama not reachable — will fall back to cloud"
+            );
+        }
+        Some(Arc::new(tokio::sync::Mutex::new(router)))
+    } else {
+        None
+    };
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -366,7 +388,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        gatekeeper,
     };
+
+    // ── CORS — allow web/Tauri clients to connect from any origin ──
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("x-webhook-secret"),
+            header::HeaderName::from_static("x-pairing-code"),
+            header::HeaderName::from_static("x-idempotency-key"),
+        ])
+        .max_age(Duration::from_secs(3600));
 
     // Build router with middleware
     let app = Router::new()
@@ -376,6 +416,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .with_state(state)
+        .layer(cors)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -541,6 +582,28 @@ async fn handle_webhook(
             .mem
             .store(&key, message, MemoryCategory::Conversation, None)
             .await;
+    }
+
+    // ── SLM gatekeeper: try local handling first ──
+    if let Some(ref gatekeeper) = state.gatekeeper {
+        let gk: tokio::sync::MutexGuard<'_, crate::gatekeeper::GatekeeperRouter> =
+            gatekeeper.lock().await;
+        let result = gk.process_message(message).await;
+        if let Some(local_response) = result.local_response {
+            let body = serde_json::json!({
+                "response": local_response,
+                "model": gk.model(),
+                "routed": "local",
+                "category": format!("{:?}", result.decision.category),
+            });
+            return (StatusCode::OK, Json(body));
+        }
+        // Fall through to cloud LLM if gatekeeper didn't handle it.
+        tracing::debug!(
+            category = ?result.decision.category,
+            reason = result.decision.reason,
+            "Gatekeeper routed to cloud"
+        );
     }
 
     match state
@@ -1008,6 +1071,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            gatekeeper: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1056,6 +1120,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            gatekeeper: None,
         };
 
         let headers = HeaderMap::new();
@@ -1113,6 +1178,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            gatekeeper: None,
         };
 
         let response = handle_webhook(
@@ -1147,6 +1213,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            gatekeeper: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1184,6 +1251,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            gatekeeper: None,
         };
 
         let mut headers = HeaderMap::new();

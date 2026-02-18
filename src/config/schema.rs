@@ -92,6 +92,10 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// SLM gatekeeper configuration (local intent classification + simple response).
+    #[serde(default)]
+    pub gatekeeper: GatekeeperConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -124,18 +128,13 @@ fn default_max_depth() -> u32 {
 // ── Hardware Config (wizard-driven) ─────────────────────────────
 
 /// Hardware transport mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HardwareTransport {
+    #[default]
     None,
     Native,
     Serial,
     Probe,
-}
-
-impl Default for HardwareTransport {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl std::fmt::Display for HardwareTransport {
@@ -407,7 +406,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeripheralsConfig {
     /// Enable peripheral support (boards become agent tools)
     #[serde(default)]
@@ -444,15 +443,6 @@ fn default_peripheral_baud() -> u32 {
     115_200
 }
 
-impl Default for PeripheralsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            boards: Vec::new(),
-            datasheet_dir: None,
-        }
-    }
-}
 
 impl Default for PeripheralBoardConfig {
     fn default() -> Self {
@@ -710,6 +700,7 @@ fn default_http_timeout_secs() -> u64 {
 // ── Memory ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
     /// "sqlite" | "lucid" | "markdown" | "none" (`none` = explicit no-op memory)
     pub backend: String,
@@ -1195,6 +1186,33 @@ impl Default for HeartbeatConfig {
     }
 }
 
+// ── Gatekeeper (SLM local routing) ──────────────────────────────
+
+/// Configuration for the SLM gatekeeper that classifies user intent locally
+/// and handles simple tasks without cloud LLM calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatekeeperConfig {
+    /// Enable the SLM gatekeeper for local intent classification.
+    pub enabled: bool,
+    /// Ollama API endpoint (e.g. "http://127.0.0.1:11434/v1").
+    pub ollama_url: String,
+    /// SLM model name to use for local inference (e.g. "qwen3:0.6b").
+    pub model: String,
+    /// Timeout in seconds for SLM inference requests.
+    pub timeout_secs: u64,
+}
+
+impl Default for GatekeeperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ollama_url: "http://127.0.0.1:11434/v1".to_string(),
+            model: "qwen3:0.6b".to_string(),
+            timeout_secs: 10,
+        }
+    }
+}
+
 // ── Cron ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1302,6 +1320,7 @@ pub struct ChannelsConfig {
     pub lark: Option<LarkConfig>,
     pub dingtalk: Option<DingTalkConfig>,
     pub qq: Option<QQConfig>,
+    pub kakao: Option<KakaoTalkConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -1321,6 +1340,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            kakao: None,
         }
     }
 }
@@ -1664,6 +1684,28 @@ pub struct QQConfig {
     pub allowed_users: Vec<String>,
 }
 
+/// KakaoTalk channel configuration for Korean messaging integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KakaoTalkConfig {
+    /// REST API key from Kakao Developers console
+    pub rest_api_key: String,
+    /// Admin key for server-side API calls (Alimtalk, push messages)
+    pub admin_key: String,
+    /// Webhook secret for verifying incoming payloads (optional)
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// Allowed Kakao user IDs. Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// HTTP port for the webhook receiver server (default: 8787)
+    #[serde(default = "default_kakao_port")]
+    pub port: u16,
+}
+
+fn default_kakao_port() -> u16 {
+    8787
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -1702,6 +1744,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            gatekeeper: GatekeeperConfig::default(),
         }
     }
 }
@@ -2208,6 +2251,7 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                kakao: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -2222,6 +2266,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            gatekeeper: GatekeeperConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2331,6 +2376,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            gatekeeper: GatekeeperConfig::default(),
         };
 
         config.save().unwrap();
@@ -2623,6 +2669,7 @@ tool_dispatcher = "xml"
             lark: None,
             dingtalk: None,
             qq: None,
+            kakao: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -2785,6 +2832,7 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            kakao: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

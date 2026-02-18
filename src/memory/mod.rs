@@ -8,6 +8,7 @@ pub mod none;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
+pub mod sync;
 pub mod traits;
 pub mod vector;
 

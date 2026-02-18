@@ -47,6 +47,7 @@ mod config;
 mod cron;
 mod daemon;
 mod doctor;
+mod gatekeeper;
 mod gateway;
 mod hardware;
 mod health;
