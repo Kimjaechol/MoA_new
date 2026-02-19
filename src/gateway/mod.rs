@@ -199,6 +199,10 @@ pub struct AppState {
     pub telemetry: Option<Arc<crate::telemetry::TelemetryStore>>,
     /// Admin token hash for telemetry API authentication.
     pub telemetry_admin_token_hash: Option<Arc<str>>,
+    /// Multi-user auth store (when auth.enabled = true).
+    pub auth_store: Option<Arc<crate::auth::AuthStore>>,
+    /// Whether new user registration is allowed.
+    pub auth_allow_registration: bool,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -318,6 +322,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
+    // ── Auth store (multi-user) ─────────────────────────────
+    let auth_store = if config.auth.enabled {
+        let auth_db = config.workspace_dir.join("auth.db");
+        match crate::auth::AuthStore::new(&auth_db, Some(config.auth.session_ttl_secs)) {
+            Ok(store) => {
+                tracing::info!("Multi-user auth store initialized");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize auth store: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let auth_allow_registration = config.auth.allow_registration;
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -362,6 +384,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
     println!("  GET  /health    — health check");
+    if config.auth.enabled {
+        println!("  POST /api/auth/register            — create new user account");
+        println!("  POST /api/auth/login               — authenticate and get session token");
+        println!("  POST /api/auth/logout              — revoke current session");
+        println!("  GET  /api/auth/me                  — current user info");
+        println!("  GET  /api/auth/devices             — list user devices");
+        println!("  POST /api/auth/devices             — register a device");
+        println!("  DELETE /api/auth/devices/:id       — remove a device");
+    }
     if config.telemetry.enabled {
         println!("  POST /api/telemetry/events        — ingest telemetry events");
         println!("  GET  /api/admin/telemetry/events   — query events (admin)");
@@ -421,6 +452,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         agent,
         telemetry,
         telemetry_admin_token_hash,
+        auth_store,
+        auth_allow_registration,
     };
 
     // ── CORS — allow web/Tauri clients to connect from any origin ──
@@ -447,6 +480,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/api/auth/register", post(handle_auth_register))
+        .route("/api/auth/login", post(handle_auth_login))
+        .route("/api/auth/logout", post(handle_auth_logout))
+        .route("/api/auth/me", get(handle_auth_me))
+        .route("/api/auth/devices", get(handle_auth_devices_list))
+        .route("/api/auth/devices", post(handle_auth_device_register))
+        .route("/api/auth/devices/:device_id", axum::routing::delete(handle_auth_device_remove))
         .route("/api/telemetry/events", post(handle_telemetry_ingest))
         .route("/api/admin/telemetry/events", get(handle_admin_telemetry_events))
         .route("/api/admin/telemetry/summary", get(handle_admin_telemetry_summary))
@@ -930,6 +970,355 @@ fn authenticate_admin(state: &AppState, headers: &HeaderMap) -> bool {
     crate::security::pairing::constant_time_eq(&provided_hash, expected_hash.as_ref())
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTH HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Concrete return type for auth handlers (avoids `impl IntoResponse` inference issues).
+type AuthResponse = (StatusCode, Json<serde_json::Value>);
+
+/// Request body for user registration.
+#[derive(GatewayDeserialize)]
+struct AuthRegisterBody {
+    username: String,
+    password: String,
+}
+
+/// Request body for login.
+#[derive(GatewayDeserialize)]
+struct AuthLoginBody {
+    username: String,
+    password: String,
+    device_id: Option<String>,
+    device_name: Option<String>,
+}
+
+/// Request body for device registration.
+#[derive(GatewayDeserialize)]
+struct AuthDeviceRegisterBody {
+    device_id: String,
+    device_name: String,
+    platform: Option<String>,
+}
+
+/// Extract bearer token from Authorization header.
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Validate a session token and return the session. Returns error response if invalid.
+fn require_auth_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<crate::auth::Session, (StatusCode, Json<serde_json::Value>)> {
+    let auth_store = state.auth_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Auth not enabled"})),
+        )
+    })?;
+
+    let token = extract_bearer_token(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Missing Authorization header"})),
+        )
+    })?;
+
+    auth_store.validate_session(token).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid or expired session token"})),
+        )
+    })
+}
+
+/// POST /api/auth/register — create a new user account.
+async fn handle_auth_register(
+    State(state): State<AppState>,
+    body: Result<Json<AuthRegisterBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Auth not enabled"})),
+            );
+        }
+    };
+
+    if !state.auth_allow_registration {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Registration is disabled"})),
+        );
+    }
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    match auth_store.register(&body.username, &body.password) {
+        Ok(user_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "status": "registered",
+                "user_id": user_id,
+            })),
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("already taken") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(serde_json::json!({"error": msg})))
+        }
+    }
+}
+
+/// POST /api/auth/login — authenticate and get a session token.
+async fn handle_auth_login(
+    State(state): State<AppState>,
+    body: Result<Json<AuthLoginBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Auth not enabled"})),
+            );
+        }
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    let user = match auth_store.authenticate(&body.username, &body.password) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid username or password"})),
+            );
+        }
+    };
+
+    match auth_store.create_session(
+        &user.id,
+        body.device_id.as_deref(),
+        body.device_name.as_deref(),
+    ) {
+        Ok(token) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "authenticated",
+                "token": token,
+                "user_id": user.id,
+                "username": user.username,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Session creation failed: {e}")})),
+        ),
+    }
+}
+
+/// POST /api/auth/logout — revoke current session.
+async fn handle_auth_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Auth not enabled"})),
+            );
+        }
+    };
+
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Missing Authorization header"})),
+            );
+        }
+    };
+
+    match auth_store.revoke_session(token) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "logged_out"})),
+        ),
+        Ok(false) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid session"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Logout failed: {e}")})),
+        ),
+    }
+}
+
+/// GET /api/auth/me — get current user info from session token.
+async fn handle_auth_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    match auth_store.get_user(&session.user_id) {
+        Ok(Some(user)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "user_id": user.id,
+                "username": user.username,
+                "device_id": session.device_id,
+                "device_name": session.device_name,
+            })),
+        ),
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "User not found"})),
+        ),
+    }
+}
+
+/// GET /api/auth/devices — list devices for authenticated user.
+async fn handle_auth_devices_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    match auth_store.list_devices(&session.user_id) {
+        Ok(devices) => {
+            let list: Vec<_> = devices
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "device_id": d.device_id,
+                        "device_name": d.device_name,
+                        "last_seen": d.last_seen,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({"devices": list})))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to list devices: {e}")})),
+        ),
+    }
+}
+
+/// POST /api/auth/devices — register a device for authenticated user.
+async fn handle_auth_device_register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<AuthDeviceRegisterBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    match auth_store.register_device(
+        &session.user_id,
+        &body.device_id,
+        &body.device_name,
+        body.platform.as_deref(),
+    ) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "status": "device_registered",
+                "device_id": body.device_id,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Device registration failed: {e}")})),
+        ),
+    }
+}
+
+/// DELETE /api/auth/devices/:device_id — remove a device.
+async fn handle_auth_device_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    match auth_store.remove_device(&session.user_id, &device_id) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "device_removed"})),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Device not found"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Device removal failed: {e}")})),
+        ),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TELEMETRY HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
 /// POST /api/telemetry/events — ingest telemetry events from app clients.
 /// Requires bearer token auth (pairing or admin token).
 async fn handle_telemetry_ingest(
@@ -1356,6 +1745,8 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
         };
 
         let mut headers = HeaderMap::new();
@@ -1408,6 +1799,8 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
         };
 
         let headers = HeaderMap::new();
@@ -1469,6 +1862,8 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
         };
 
         let response = handle_webhook(
@@ -1507,6 +1902,8 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
         };
 
         let mut headers = HeaderMap::new();
@@ -1548,6 +1945,8 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
         };
 
         let mut headers = HeaderMap::new();

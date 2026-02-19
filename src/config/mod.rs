@@ -2,7 +2,7 @@ pub mod schema;
 
 #[allow(unused_imports)]
 pub use schema::{
-    AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
+    AgentConfig, AuditConfig, AuthConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     ChannelsConfig, ComposioConfig, Config, CostConfig, CronConfig, DelegateAgentConfig,
     DiscordConfig, DockerRuntimeConfig, GatekeeperConfig, GatewayConfig, HardwareConfig,
     HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,

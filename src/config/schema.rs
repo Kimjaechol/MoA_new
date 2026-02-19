@@ -100,6 +100,10 @@ pub struct Config {
     /// Admin telemetry configuration (usage analytics and suspicious activity alerts).
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    /// Multi-user authentication configuration.
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -1340,6 +1344,53 @@ impl Default for TelemetryConfig {
     }
 }
 
+// ── Auth ────────────────────────────────────────────────────────
+
+/// Multi-user authentication configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Enable multi-user authentication (default: false).
+    /// When disabled, the gateway uses single-owner pairing mode.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Allow new user registration (default: true when auth is enabled).
+    #[serde(default = "default_true")]
+    pub allow_registration: bool,
+
+    /// Session token TTL in seconds (default: 30 days).
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+
+    /// Maximum devices per user (default: 10).
+    #[serde(default = "default_max_devices_per_user")]
+    pub max_devices_per_user: u32,
+
+    /// Maximum registered users (0 = unlimited, default: 0).
+    #[serde(default)]
+    pub max_users: u64,
+}
+
+fn default_session_ttl_secs() -> u64 {
+    30 * 24 * 3600 // 30 days
+}
+
+fn default_max_devices_per_user() -> u32 {
+    10
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_registration: true,
+            session_ttl_secs: default_session_ttl_secs(),
+            max_devices_per_user: default_max_devices_per_user(),
+            max_users: 0,
+        }
+    }
+}
+
 // ── Tunnel ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1850,6 +1901,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -2385,6 +2437,7 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
+            auth: AuthConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2496,6 +2549,7 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
+            auth: AuthConfig::default(),
         };
 
         config.save().unwrap();
