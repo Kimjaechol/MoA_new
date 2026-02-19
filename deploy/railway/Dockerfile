@@ -65,7 +65,8 @@ WORKDIR /app
 # allow_public_bind is required because Railway routes external traffic
 # through its reverse proxy to 0.0.0.0 inside the container.
 RUN mkdir -p /app/.zeroclaw /app/workspace \
-    && printf '[gateway]\nallow_public_bind = true\n' > /app/.zeroclaw/config.toml \
+    && printf 'default_temperature = 0.7\n\n[gateway]\nallow_public_bind = true\n' > /app/.zeroclaw/config.toml \
+    && chmod 600 /app/.zeroclaw/config.toml \
     && chown -R zeroclaw:zeroclaw /app
 
 # Copy the compiled binary from the builder stage.
