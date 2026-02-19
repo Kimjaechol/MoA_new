@@ -7,14 +7,12 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+use crate::agent::agent::Agent;
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
-use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
-use crate::security::SecurityPolicy;
-use crate::tools;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use axum::{
@@ -37,8 +35,8 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Request timeout (120s) — allows agentic tool execution while preventing abuse
+pub const REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
@@ -192,6 +190,10 @@ pub struct AppState {
     pub whatsapp_app_secret: Option<Arc<str>>,
     /// SLM gatekeeper for local intent classification + simple response.
     pub gatekeeper: Option<Arc<tokio::sync::Mutex<crate::gatekeeper::GatekeeperRouter>>>,
+    /// Agent with tools for agentic webhook handling.
+    /// When `Some`, `/webhook` uses `agent.turn()` (tools enabled).
+    /// When `None`, falls back to `provider.simple_chat()` (no tools).
+    pub agent: Option<Arc<tokio::sync::Mutex<Agent>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -228,36 +230,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    ));
+    // Note: runtime, security, tools, and composio are created internally
+    // by Agent::from_config() — no need to create them here.
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -361,7 +335,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  GET  /health    — health check");
     if let Some(code) = pairing.pairing_code() {
         println!();
-        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
+        println!("  🔐 PAIRING REQUIRED — use this code:");
         println!("     ┌──────────────┐");
         println!("     │  {code}  │");
         println!("     └──────────────┘");
@@ -374,6 +348,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  Press Ctrl+C to stop.\n");
 
     crate::health::mark_component_ok("gateway");
+
+    // ── Agent with tools ─────────────────────────────────────
+    let agent = match Agent::from_config(&config) {
+        Ok(a) => {
+            tracing::info!("Gateway agent initialized with tools");
+            Some(Arc::new(tokio::sync::Mutex::new(a)))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create gateway agent: {e} — falling back to simple chat");
+            None
+        }
+    };
 
     // Build shared state
     let state = AppState {
@@ -389,6 +375,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
         gatekeeper,
+        agent,
     };
 
     // ── CORS — allow web/Tauri clients to connect from any origin ──
@@ -606,6 +593,26 @@ async fn handle_webhook(
         );
     }
 
+    // ── Agentic handling: use Agent with tools when available ──
+    if let Some(ref agent) = state.agent {
+        let mut agent = agent.lock().await;
+        match agent.turn(message).await {
+            Ok(response) => {
+                let body = serde_json::json!({"response": response, "model": state.model});
+                return (StatusCode::OK, Json(body));
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Webhook agent error: {}",
+                    providers::sanitize_api_error(&e.to_string())
+                );
+                let err = serde_json::json!({"error": "LLM request failed"});
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+            }
+        }
+    }
+
+    // Fallback: simple chat without tools
     match state
         .provider
         .simple_chat(message, &state.model, state.temperature)
@@ -809,8 +816,8 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_is_120_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 120);
     }
 
     #[test]
@@ -1072,6 +1079,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1121,6 +1129,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
         };
 
         let headers = HeaderMap::new();
@@ -1179,6 +1188,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
         };
 
         let response = handle_webhook(
@@ -1214,6 +1224,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1252,6 +1263,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
         };
 
         let mut headers = HeaderMap::new();

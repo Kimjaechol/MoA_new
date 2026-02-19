@@ -1,9 +1,12 @@
-// Gateway pairing mode — first-connect authentication.
+// Gateway pairing mode — session-based authentication.
 //
-// On startup the gateway generates a one-time pairing code printed to the
-// terminal. The first client must present this code via `X-Pairing-Code`
-// header on a `POST /pair` request. The server responds with a bearer token
-// that must be sent on all subsequent requests via `Authorization: Bearer <token>`.
+// On startup the gateway generates a pairing code printed to the terminal.
+// Clients present this code via `X-Pairing-Code` header on a `POST /pair`
+// request. The server responds with a bearer token that must be sent on all
+// subsequent requests via `Authorization: Bearer <token>`.
+//
+// The pairing code remains valid for the entire gateway session, allowing
+// multiple clients (web, app, etc.) to pair with the same code.
 //
 // Already-paired tokens are persisted in config so restarts don't require
 // re-pairing.
@@ -27,7 +30,7 @@ const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
 pub struct PairingGuard {
     /// Whether pairing is required at all.
     require_pairing: bool,
-    /// One-time pairing code (generated on startup, consumed on first pair).
+    /// Session pairing code (generated on startup, valid for the session lifetime).
     pairing_code: Mutex<Option<String>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
     paired_tokens: Mutex<HashSet<String>>,
@@ -38,8 +41,8 @@ pub struct PairingGuard {
 impl PairingGuard {
     /// Create a new pairing guard.
     ///
-    /// If `require_pairing` is true and no tokens exist yet, a fresh
-    /// pairing code is generated and returned via `pairing_code()`.
+    /// If `require_pairing` is true, a pairing code is always generated
+    /// so that new clients can pair at any time during the session.
     ///
     /// Existing tokens are accepted in both forms:
     /// - Plaintext (`zc_...`): hashed on load for backward compatibility
@@ -55,7 +58,7 @@ impl PairingGuard {
                 }
             })
             .collect();
-        let code = if require_pairing && tokens.is_empty() {
+        let code = if require_pairing {
             Some(generate_code())
         } else {
             None
@@ -68,7 +71,7 @@ impl PairingGuard {
         }
     }
 
-    /// The one-time pairing code (only set when no tokens exist yet).
+    /// The session pairing code (set when pairing is required).
     pub fn pairing_code(&self) -> Option<String> {
         self.pairing_code.lock().clone()
     }
@@ -80,6 +83,9 @@ impl PairingGuard {
 
     /// Attempt to pair with the given code. Returns a bearer token on success.
     /// Returns `Err(lockout_seconds)` if locked out due to brute force.
+    ///
+    /// The pairing code is NOT consumed — multiple clients can pair with the
+    /// same code during a single gateway session.
     pub fn try_pair(&self, code: &str) -> Result<Option<String>, u64> {
         // Check brute force lockout
         {
@@ -95,7 +101,7 @@ impl PairingGuard {
         }
 
         {
-            let mut pairing_code = self.pairing_code.lock();
+            let pairing_code = self.pairing_code.lock();
             if let Some(ref expected) = *pairing_code {
                 if constant_time_eq(code.trim(), expected.trim()) {
                     // Reset failed attempts on success
@@ -107,8 +113,7 @@ impl PairingGuard {
                     let mut tokens = self.paired_tokens.lock();
                     tokens.insert(hash_token(&token));
 
-                    // Consume the pairing code so it cannot be reused
-                    *pairing_code = None;
+                    // Code remains valid — other clients can pair during this session
 
                     return Ok(Some(token));
                 }
@@ -243,9 +248,12 @@ mod tests {
     }
 
     #[test]
-    fn new_guard_no_code_when_tokens_exist() {
+    fn new_guard_generates_code_even_when_tokens_exist() {
         let guard = PairingGuard::new(true, &["zc_existing".into()]);
-        assert!(guard.pairing_code().is_none());
+        assert!(
+            guard.pairing_code().is_some(),
+            "Code should always be generated when pairing is required"
+        );
         assert!(guard.is_paired());
     }
 
@@ -328,6 +336,30 @@ mod tests {
         let token = guard.try_pair(&code).unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
         assert!(!guard.is_authenticated("wrong"));
+    }
+
+    #[test]
+    fn multiple_clients_can_pair_with_same_code() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+
+        // First client pairs
+        let token1 = guard.try_pair(&code).unwrap().unwrap();
+        assert!(guard.is_authenticated(&token1));
+
+        // Second client pairs with same code
+        let token2 = guard.try_pair(&code).unwrap().unwrap();
+        assert!(guard.is_authenticated(&token2));
+
+        // Both tokens are valid
+        assert!(guard.is_authenticated(&token1));
+        assert!(guard.is_authenticated(&token2));
+
+        // Tokens are distinct
+        assert_ne!(token1, token2);
+
+        // Code is still available
+        assert!(guard.pairing_code().is_some());
     }
 
     // ── Token hashing ────────────────────────────────────────
