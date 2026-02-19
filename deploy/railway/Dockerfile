@@ -61,8 +61,11 @@ RUN groupadd --system zeroclaw \
 
 WORKDIR /app
 
-# Create workspace and config directories.
+# Create workspace and config directories with gateway config.
+# allow_public_bind is required because Railway routes external traffic
+# through its reverse proxy to 0.0.0.0 inside the container.
 RUN mkdir -p /app/.zeroclaw /app/workspace \
+    && printf '[gateway]\nallow_public_bind = true\n' > /app/.zeroclaw/config.toml \
     && chown -R zeroclaw:zeroclaw /app
 
 # Copy the compiled binary from the builder stage.
