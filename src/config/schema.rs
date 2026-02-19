@@ -96,6 +96,10 @@ pub struct Config {
     /// SLM gatekeeper configuration (local intent classification + simple response).
     #[serde(default)]
     pub gatekeeper: GatekeeperConfig,
+
+    /// Admin telemetry configuration (usage analytics and suspicious activity alerts).
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -1249,6 +1253,93 @@ impl Default for CronConfig {
     }
 }
 
+// ── Telemetry (Admin Usage Analytics) ───────────────────────────
+
+/// Configuration for server-side usage telemetry and admin monitoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    /// Enable telemetry collection (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Admin secret token for querying telemetry data (required when enabled).
+    #[serde(default)]
+    pub admin_token: Option<String>,
+    /// Maximum telemetry events retained in the database.
+    #[serde(default = "default_telemetry_max_events")]
+    pub max_events: u64,
+    /// Retention period in days (events older than this are pruned).
+    #[serde(default = "default_telemetry_retention_days")]
+    pub retention_days: u32,
+    /// Enable alert system for suspicious activities (crypto, gambling, etc.).
+    #[serde(default = "default_true")]
+    pub alerts_enabled: bool,
+    /// Delivery channel for admin alerts (e.g. "telegram", "discord", "slack").
+    #[serde(default)]
+    pub alert_channel: Option<String>,
+    /// Delivery target for admin alerts (e.g. chat_id or channel_id).
+    #[serde(default)]
+    pub alert_to: Option<String>,
+    /// Suspicious domain patterns to flag (default: crypto/gambling/darkweb patterns).
+    #[serde(default = "default_suspicious_patterns")]
+    pub suspicious_patterns: Vec<String>,
+}
+
+fn default_telemetry_max_events() -> u64 {
+    1_000_000
+}
+
+fn default_telemetry_retention_days() -> u32 {
+    365
+}
+
+fn default_suspicious_patterns() -> Vec<String> {
+    vec![
+        // Cryptocurrency exchanges and services
+        "binance.com".into(),
+        "coinbase.com".into(),
+        "kraken.com".into(),
+        "bybit.com".into(),
+        "okx.com".into(),
+        "upbit.com".into(),
+        "bithumb.com".into(),
+        "kucoin.com".into(),
+        "gate.io".into(),
+        "huobi.com".into(),
+        "crypto.com".into(),
+        "mexc.com".into(),
+        // Gambling / betting
+        "bet365.com".into(),
+        "pokerstars.com".into(),
+        "888casino.com".into(),
+        "betfair.com".into(),
+        "williamhill.com".into(),
+        "draftkings.com".into(),
+        "fanduel.com".into(),
+        // Generic suspicious keywords in domains
+        "casino".into(),
+        "gambling".into(),
+        "betting".into(),
+        "poker".into(),
+        "darkweb".into(),
+        "torrent".into(),
+    ]
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            admin_token: None,
+            max_events: default_telemetry_max_events(),
+            retention_days: default_telemetry_retention_days(),
+            alerts_enabled: true,
+            alert_channel: None,
+            alert_to: None,
+            suspicious_patterns: default_suspicious_patterns(),
+        }
+    }
+}
+
 // ── Tunnel ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1758,6 +1849,7 @@ impl Default for Config {
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
+            telemetry: TelemetryConfig::default(),
         }
     }
 }
@@ -2292,6 +2384,7 @@ default_temperature = 0.7
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
+            telemetry: TelemetryConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2402,6 +2495,7 @@ tool_dispatcher = "xml"
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
+            telemetry: TelemetryConfig::default(),
         };
 
         config.save().unwrap();

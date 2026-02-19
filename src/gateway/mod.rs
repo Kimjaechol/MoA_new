@@ -195,6 +195,10 @@ pub struct AppState {
     /// When `Some`, `/webhook` uses `agent.turn()` (tools enabled).
     /// When `None`, falls back to `provider.simple_chat()` (no tools).
     pub agent: Option<Arc<tokio::sync::Mutex<Agent>>>,
+    /// Admin telemetry store for usage analytics.
+    pub telemetry: Option<Arc<crate::telemetry::TelemetryStore>>,
+    /// Admin token hash for telemetry API authentication.
+    pub telemetry_admin_token_hash: Option<Arc<str>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -292,6 +296,28 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
+    // ── Telemetry ─────────────────────────────────────────
+    let (telemetry, telemetry_admin_token_hash) = if config.telemetry.enabled {
+        match crate::telemetry::TelemetryStore::new(&config.workspace_dir, config.telemetry.clone())
+        {
+            Ok(store) => {
+                tracing::info!("Telemetry store initialized");
+                let hash = config.telemetry.admin_token.as_deref().map(|token| {
+                    use sha2::{Digest, Sha256};
+                    let h = format!("{:x}", Sha256::digest(token.as_bytes()));
+                    Arc::from(h.as_str())
+                });
+                (Some(Arc::new(store)), hash)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize telemetry store: {e}");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -336,6 +362,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
     println!("  GET  /health    — health check");
+    if config.telemetry.enabled {
+        println!("  POST /api/telemetry/events        — ingest telemetry events");
+        println!("  GET  /api/admin/telemetry/events   — query events (admin)");
+        println!("  GET  /api/admin/telemetry/summary  — usage summary (admin)");
+        println!("  GET  /api/admin/telemetry/alerts   — suspicious alerts (admin)");
+    }
     if let Some(code) = pairing.pairing_code() {
         println!();
         if pairing.requires_credentials() {
@@ -387,6 +419,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp_app_secret,
         gatekeeper,
         agent,
+        telemetry,
+        telemetry_admin_token_hash,
     };
 
     // ── CORS — allow web/Tauri clients to connect from any origin ──
@@ -413,6 +447,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/api/telemetry/events", post(handle_telemetry_ingest))
+        .route("/api/admin/telemetry/events", get(handle_admin_telemetry_events))
+        .route("/api/admin/telemetry/summary", get(handle_admin_telemetry_summary))
+        .route("/api/admin/telemetry/alerts", get(handle_admin_telemetry_alerts))
         .with_state(state)
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
@@ -605,6 +643,32 @@ async fn handle_webhook(
     }
 
     let message = &webhook_body.message;
+
+    // ── Telemetry: record webhook interaction ──
+    if let Some(ref store) = state.telemetry {
+        let event = crate::telemetry::TelemetryEvent {
+            id: 0,
+            user_id: client_key.clone(),
+            country: String::new(),
+            ip_address: headers
+                .get("x-forwarded-for")
+                .or_else(|| headers.get("x-real-ip"))
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string(),
+            channel: "webhook".into(),
+            action: "message".into(),
+            target_url: String::new(),
+            details: crate::util::truncate_with_ellipsis(message, 200),
+            tool_name: String::new(),
+            alert_level: crate::telemetry::AlertLevel::None,
+            alert_reason: String::new(),
+            timestamp: chrono::Utc::now(),
+        };
+        if let Err(e) = store.record(event) {
+            tracing::debug!("Telemetry record failed: {e}");
+        }
+    }
 
     if state.auto_save {
         let key = webhook_memory_key();
@@ -838,6 +902,173 @@ async fn handle_whatsapp_message(
 
     // Acknowledge the webhook
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TELEMETRY HANDLERS (admin-only)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Authenticate admin requests by checking the `Authorization: Bearer <token>` header
+/// against the SHA-256-hashed admin token stored in state.
+fn authenticate_admin(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(ref expected_hash) = state.telemetry_admin_token_hash else {
+        return false;
+    };
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .strip_prefix("Bearer ")
+        .unwrap_or("");
+
+    if token.is_empty() {
+        return false;
+    }
+
+    use sha2::{Digest, Sha256};
+    let provided_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    crate::security::pairing::constant_time_eq(&provided_hash, expected_hash.as_ref())
+}
+
+/// POST /api/telemetry/events — ingest telemetry events from app clients.
+/// Requires bearer token auth (pairing or admin token).
+async fn handle_telemetry_ingest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(event): Json<crate::telemetry::TelemetryEvent>,
+) -> impl IntoResponse {
+    let Some(ref store) = state.telemetry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "telemetry not enabled"})),
+        );
+    };
+
+    // Accept events from paired clients or admin
+    let is_paired = {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        state.pairing.is_authenticated(token)
+    };
+    let is_admin = authenticate_admin(&state, &headers);
+
+    if !is_paired && !is_admin {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        );
+    }
+
+    // Enrich event with IP-derived country if not already set
+    let mut enriched = event;
+    if enriched.ip_address.is_empty() {
+        enriched.ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+    }
+
+    match store.record(enriched) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "recorded"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to record: {e}")})),
+        ),
+    }
+}
+
+/// GET /api/admin/telemetry/events — query telemetry events (admin only).
+/// Query params: user_id, country, channel, action, alert_level, since, until, search, limit, offset
+async fn handle_admin_telemetry_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<crate::telemetry::TelemetryQuery>,
+) -> impl IntoResponse {
+    if !authenticate_admin(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "admin authentication required"})),
+        );
+    }
+
+    let Some(ref store) = state.telemetry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "telemetry not enabled"})),
+        );
+    };
+
+    match store.query(&query) {
+        Ok(events) => (StatusCode::OK, Json(serde_json::json!({"events": events}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("query failed: {e}")})),
+        ),
+    }
+}
+
+/// GET /api/admin/telemetry/summary — dashboard summary (admin only).
+async fn handle_admin_telemetry_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !authenticate_admin(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "admin authentication required"})),
+        );
+    }
+
+    let Some(ref store) = state.telemetry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "telemetry not enabled"})),
+        );
+    };
+
+    match store.summary() {
+        Ok(summary) => (StatusCode::OK, Json(serde_json::json!(summary))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("summary failed: {e}")})),
+        ),
+    }
+}
+
+/// GET /api/admin/telemetry/alerts — recent suspicious activity alerts (admin only).
+async fn handle_admin_telemetry_alerts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !authenticate_admin(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "admin authentication required"})),
+        );
+    }
+
+    let Some(ref store) = state.telemetry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "telemetry not enabled"})),
+        );
+    };
+
+    match store.pending_alerts() {
+        Ok(alerts) => (StatusCode::OK, Json(serde_json::json!({"alerts": alerts}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("alerts query failed: {e}")})),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1123,6 +1354,8 @@ mod tests {
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
+            telemetry: None,
+            telemetry_admin_token_hash: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1173,6 +1406,8 @@ mod tests {
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
+            telemetry: None,
+            telemetry_admin_token_hash: None,
         };
 
         let headers = HeaderMap::new();
@@ -1232,6 +1467,8 @@ mod tests {
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
+            telemetry: None,
+            telemetry_admin_token_hash: None,
         };
 
         let response = handle_webhook(
@@ -1268,6 +1505,8 @@ mod tests {
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
+            telemetry: None,
+            telemetry_admin_token_hash: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1307,6 +1546,8 @@ mod tests {
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
+            telemetry: None,
+            telemetry_admin_token_hash: None,
         };
 
         let mut headers = HeaderMap::new();
