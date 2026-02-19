@@ -10,7 +10,6 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "title": "MoA - Master of AI",
     "windows": [
       {
         "label": "main",

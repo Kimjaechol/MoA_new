@@ -61,8 +61,12 @@ RUN groupadd --system zeroclaw \
 
 WORKDIR /app
 
-# Create workspace and config directories.
+# Create workspace and config directories with gateway config.
+# allow_public_bind is required because Railway routes external traffic
+# through its reverse proxy to 0.0.0.0 inside the container.
 RUN mkdir -p /app/.zeroclaw /app/workspace \
+    && printf 'default_temperature = 0.7\n\n[gateway]\nallow_public_bind = true\n' > /app/.zeroclaw/config.toml \
+    && chmod 600 /app/.zeroclaw/config.toml \
     && chown -R zeroclaw:zeroclaw /app
 
 # Copy the compiled binary from the builder stage.
@@ -83,6 +87,6 @@ EXPOSE 3000
 USER zeroclaw
 
 # Start the ZeroClaw gateway server.
-# --host and --port flags match the ENV defaults but can be overridden
-# via Railway environment variable injection.
-CMD ["zeroclaw", "gateway", "--host", "0.0.0.0", "--port", "3000"]
+# Shell form is required so $PORT is expanded at runtime.
+# Railway injects PORT; falls back to ZEROCLAW_PORT (3000) if unset.
+CMD zeroclaw gateway --host 0.0.0.0 --port ${PORT:-3000}
