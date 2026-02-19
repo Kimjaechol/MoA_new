@@ -197,7 +197,7 @@ impl TelegramChannel {
     pub fn new(bot_token: String, allowed_users: Vec<String>) -> Self {
         let normalized_allowed = Self::normalize_allowed_users(allowed_users);
         let pairing = if normalized_allowed.is_empty() {
-            let guard = PairingGuard::new(true, &[]);
+            let guard = PairingGuard::new(true, &[], None, None);
             if let Some(code) = guard.pairing_code() {
                 println!("  🔐 Telegram pairing required. One-time bind code: {code}");
                 println!("     Send `{TELEGRAM_BIND_COMMAND} <code>` from your Telegram account.");
@@ -365,7 +365,12 @@ impl TelegramChannel {
 
         if let Some(code) = Self::extract_bind_code(text) {
             if let Some(pairing) = self.pairing.as_ref() {
-                match pairing.try_pair(code) {
+                let pair_req = crate::security::pairing::PairRequest {
+                    code,
+                    username: None,
+                    password: None,
+                };
+                match pairing.try_pair(&pair_req) {
                     Ok(Some(_token)) => {
                         let bind_identity = normalized_user_id.clone().or_else(|| {
                             if normalized_username.is_empty() || normalized_username == "unknown" {

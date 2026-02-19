@@ -25,6 +25,8 @@ type TranslationKey =
   | "error_occurred"
   | "retry"
   | "server_url"
+  | "username"
+  | "password"
   | "pairing_code"
   | "pair"
   | "pairing"
@@ -62,6 +64,8 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     error_occurred: "An error occurred",
     retry: "Retry",
     server_url: "Server URL",
+    username: "Username",
+    password: "Password",
     pairing_code: "Pairing Code",
     pair: "Pair",
     pairing: "Pairing...",
@@ -98,6 +102,8 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     error_occurred: "\uC624\uB958\uAC00 \uBC1C\uC0DD\uD588\uC2B5\uB2C8\uB2E4",
     retry: "\uC7AC\uC2DC\uB3C4",
     server_url: "\uC11C\uBC84 URL",
+    username: "\uC544\uC774\uB514",
+    password: "\uBE44\uBC00\uBC88\uD638",
     pairing_code: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC",
     pair: "\uD398\uC5B4\uB9C1",
     pairing: "\uD398\uC5B4\uB9C1 \uC911...",

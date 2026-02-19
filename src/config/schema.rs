@@ -490,6 +490,17 @@ pub struct GatewayConfig {
     /// TTL for webhook idempotency keys.
     #[serde(default = "default_idempotency_ttl_secs")]
     pub idempotency_ttl_secs: u64,
+
+    /// Owner username for pairing authentication (optional).
+    /// When set together with `owner_password`, clients must provide
+    /// matching credentials during the pairing handshake.
+    #[serde(default)]
+    pub owner_username: Option<String>,
+
+    /// Owner password for pairing authentication (optional).
+    /// Stored as plaintext in config/env; hashed on load.
+    #[serde(default)]
+    pub owner_password: Option<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -527,6 +538,8 @@ impl Default for GatewayConfig {
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
+            owner_username: None,
+            owner_password: None,
         }
     }
 }
@@ -2054,6 +2067,18 @@ impl Config {
             }
         }
 
+        // Owner credentials: ZEROCLAW_OWNER_USERNAME, ZEROCLAW_OWNER_PASSWORD
+        if let Ok(username) = std::env::var("ZEROCLAW_OWNER_USERNAME") {
+            if !username.is_empty() {
+                self.gateway.owner_username = Some(username);
+            }
+        }
+        if let Ok(password) = std::env::var("ZEROCLAW_OWNER_PASSWORD") {
+            if !password.is_empty() {
+                self.gateway.owner_password = Some(password);
+            }
+        }
+
         // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
         if let Ok(val) = std::env::var("ZEROCLAW_ALLOW_PUBLIC_BIND") {
             self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
@@ -2999,6 +3024,8 @@ channel_id = "C123"
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
             idempotency_ttl_secs: 600,
+            owner_username: None,
+            owner_password: None,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

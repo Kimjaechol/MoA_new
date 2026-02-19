@@ -7,14 +7,13 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+use crate::agent::agent::Agent;
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
+use serde::Deserialize as GatewayDeserialize;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
-use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
-use crate::security::SecurityPolicy;
-use crate::tools;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use axum::{
@@ -37,8 +36,8 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Request timeout (120s) — allows agentic tool execution while preventing abuse
+pub const REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
@@ -192,6 +191,10 @@ pub struct AppState {
     pub whatsapp_app_secret: Option<Arc<str>>,
     /// SLM gatekeeper for local intent classification + simple response.
     pub gatekeeper: Option<Arc<tokio::sync::Mutex<crate::gatekeeper::GatekeeperRouter>>>,
+    /// Agent with tools for agentic webhook handling.
+    /// When `Some`, `/webhook` uses `agent.turn()` (tools enabled).
+    /// When `None`, falls back to `provider.simple_chat()` (no tools).
+    pub agent: Option<Arc<tokio::sync::Mutex<Agent>>>,
     /// Admin telemetry store for usage analytics.
     pub telemetry: Option<Arc<crate::telemetry::TelemetryStore>>,
     /// Admin token hash for telemetry API authentication.
@@ -232,36 +235,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    ));
+    // Note: runtime, security, tools, and composio are created internally
+    // by Agent::from_config() — no need to create them here.
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -347,6 +322,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
+        config.gateway.owner_username.as_deref(),
+        config.gateway.owner_password.as_deref(),
     ));
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
@@ -393,11 +370,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     if let Some(code) = pairing.pairing_code() {
         println!();
-        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
+        if pairing.requires_credentials() {
+            println!("  🔐 PAIRING REQUIRED — credentials + code:");
+        } else {
+            println!("  🔐 PAIRING REQUIRED — use this code:");
+        }
         println!("     ┌──────────────┐");
         println!("     │  {code}  │");
         println!("     └──────────────┘");
-        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
+        if pairing.requires_credentials() {
+            println!("     Send: POST /pair with X-Pairing-Code header + {{username, password}} body");
+        } else {
+            println!("     Send: POST /pair with header X-Pairing-Code: {code}");
+        }
     } else if pairing.require_pairing() {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
     } else {
@@ -406,6 +391,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  Press Ctrl+C to stop.\n");
 
     crate::health::mark_component_ok("gateway");
+
+    // ── Agent with tools ─────────────────────────────────────
+    let agent = match Agent::from_config(&config) {
+        Ok(a) => {
+            tracing::info!("Gateway agent initialized with tools");
+            Some(Arc::new(tokio::sync::Mutex::new(a)))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create gateway agent: {e} — falling back to simple chat");
+            None
+        }
+    };
 
     // Build shared state
     let state = AppState {
@@ -421,6 +418,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
         gatekeeper,
+        agent,
         telemetry,
         telemetry_admin_token_hash,
     };
@@ -481,8 +479,25 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     Json(body)
 }
 
-/// POST /pair — exchange one-time code for bearer token
-async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// Optional JSON body for pairing with credentials.
+#[derive(Debug, Default, GatewayDeserialize)]
+struct PairBody {
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// POST /pair — exchange pairing code (+ optional credentials) for bearer token.
+///
+/// The pairing code is read from the `X-Pairing-Code` header.
+/// If owner credentials are configured on the server, `username` and `password`
+/// must also be provided in the JSON request body.
+async fn handle_pair(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<PairBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
     let client_key = client_key_from_headers(&headers);
     if !state.rate_limiter.allow_pair(&client_key) {
         tracing::warn!("/pair rate limit exceeded for key: {client_key}");
@@ -498,19 +513,34 @@ async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    match state.pairing.try_pair(code) {
+    let pair_body = body.map(|Json(b)| b).unwrap_or_default();
+    let username = pair_body.username;
+    let password = pair_body.password;
+
+    let request = crate::security::pairing::PairRequest {
+        code,
+        username: username.as_deref(),
+        password: password.as_deref(),
+    };
+
+    match state.pairing.try_pair(&request) {
         Ok(Some(token)) => {
-            tracing::info!("🔐 New client paired successfully");
+            tracing::info!("🔐 New device paired successfully");
             let body = serde_json::json!({
                 "paired": true,
                 "token": token,
-                "message": "Save this token — use it as Authorization: Bearer <token>"
+                "message": "Device paired. Save this token — use it as Authorization: Bearer <token>"
             });
             (StatusCode::OK, Json(body))
         }
         Ok(None) => {
-            tracing::warn!("🔐 Pairing attempt with invalid code");
-            let err = serde_json::json!({"error": "Invalid pairing code"});
+            let msg = if state.pairing.requires_credentials() {
+                "Invalid credentials or pairing code"
+            } else {
+                "Invalid pairing code"
+            };
+            tracing::warn!("🔐 Pairing attempt failed");
+            let err = serde_json::json!({"error": msg});
             (StatusCode::FORBIDDEN, Json(err))
         }
         Err(lockout_secs) => {
@@ -670,6 +700,26 @@ async fn handle_webhook(
         );
     }
 
+    // ── Agentic handling: use Agent with tools when available ──
+    if let Some(ref agent) = state.agent {
+        let mut agent = agent.lock().await;
+        match agent.turn(message).await {
+            Ok(response) => {
+                let body = serde_json::json!({"response": response, "model": state.model});
+                return (StatusCode::OK, Json(body));
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Webhook agent error: {}",
+                    providers::sanitize_api_error(&e.to_string())
+                );
+                let err = serde_json::json!({"error": "LLM request failed"});
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+            }
+        }
+    }
+
+    // Fallback: simple chat without tools
     match state
         .provider
         .simple_chat(message, &state.model, state.temperature)
@@ -1040,8 +1090,8 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_is_120_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 120);
     }
 
     #[test]
@@ -1297,12 +1347,13 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
         };
@@ -1348,12 +1399,13 @@ mod tests {
             mem: memory,
             auto_save: true,
             webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
         };
@@ -1408,12 +1460,13 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
         };
@@ -1445,12 +1498,13 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
         };
@@ -1485,12 +1539,13 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
+            agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
         };
