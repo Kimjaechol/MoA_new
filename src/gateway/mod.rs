@@ -203,6 +203,10 @@ pub struct AppState {
     pub auth_store: Option<Arc<crate::auth::AuthStore>>,
     /// Whether new user registration is allowed.
     pub auth_allow_registration: bool,
+    /// Temporary relay for sync Layer 1 (TTL-based in-memory storage).
+    pub sync_relay: Option<Arc<crate::sync::SyncRelay>>,
+    /// Broadcast channel for sync WebSocket messages.
+    pub sync_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -340,6 +344,33 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     };
     let auth_allow_registration = config.auth.allow_registration;
 
+    // ── Sync relay + broadcast ───────────────────────────────
+    let (sync_relay, sync_broadcast) = if config.sync.enabled {
+        let relay = Arc::new(crate::sync::SyncRelay::with_ttl(config.sync.relay_ttl_secs));
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(256);
+        tracing::info!(
+            ttl = config.sync.relay_ttl_secs,
+            "Sync relay + broadcast channel initialized"
+        );
+
+        // Periodic relay sweep (every 60 seconds)
+        let relay_for_sweep = Arc::clone(&relay);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let removed = relay_for_sweep.sweep_expired();
+                if removed > 0 {
+                    tracing::debug!(removed, "Swept expired relay entries");
+                }
+            }
+        });
+
+        (Some(relay), Some(tx))
+    } else {
+        (None, None)
+    };
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -384,6 +415,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
     println!("  GET  /health    — health check");
+    if config.sync.enabled {
+        println!("  WS   /sync      — WebSocket sync broadcast channel");
+        println!("  POST /api/sync/relay  — upload encrypted data to relay");
+        println!("  GET  /api/sync/relay  — pickup pending relay entries");
+    }
     if config.auth.enabled {
         println!("  POST /api/auth/register            — create new user account");
         println!("  POST /api/auth/login               — authenticate and get session token");
@@ -454,6 +490,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         telemetry_admin_token_hash,
         auth_store,
         auth_allow_registration,
+        sync_relay,
+        sync_broadcast,
     };
 
     // ── CORS — allow web/Tauri clients to connect from any origin ──
@@ -487,6 +525,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/auth/devices", get(handle_auth_devices_list))
         .route("/api/auth/devices", post(handle_auth_device_register))
         .route("/api/auth/devices/:device_id", axum::routing::delete(handle_auth_device_remove))
+        .route("/sync", get(handle_sync_ws))
+        .route("/api/sync/relay", post(handle_sync_relay_upload))
+        .route("/api/sync/relay", get(handle_sync_relay_pickup))
         .route("/api/telemetry/events", post(handle_telemetry_ingest))
         .route("/api/admin/telemetry/events", get(handle_admin_telemetry_events))
         .route("/api/admin/telemetry/summary", get(handle_admin_telemetry_summary))
@@ -1316,6 +1357,217 @@ async fn handle_auth_device_remove(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// SYNC HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Request body for relay upload.
+#[derive(GatewayDeserialize)]
+struct SyncRelayUploadBody {
+    encrypted_payload: String,
+    nonce: String,
+}
+
+/// Query params for relay pickup.
+#[derive(GatewayDeserialize)]
+struct SyncRelayPickupQuery {
+    device_id: Option<String>,
+}
+
+/// GET /sync — WebSocket upgrade for sync broadcast channel.
+///
+/// Once connected, clients receive all broadcast messages from peers.
+/// Clients can also send messages that get broadcast to all other
+/// connected WebSocket clients. The server does NOT store any messages.
+async fn handle_sync_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: axum::extract::WebSocketUpgrade,
+) -> impl IntoResponse {
+    // Authenticate via session token (query param or header)
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err((status, json)) => {
+            return (status, json.0.to_string()).into_response();
+        }
+    };
+
+    let broadcast_tx = match state.sync_broadcast.as_ref() {
+        Some(tx) => tx.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Sync not enabled",
+            )
+                .into_response();
+        }
+    };
+
+    let device_id = session.device_id.clone().unwrap_or_default();
+    let user_id = session.user_id.clone();
+
+    ws.on_upgrade(move |socket| {
+        handle_sync_ws_connection(socket, broadcast_tx, device_id, user_id)
+    })
+}
+
+/// Handle a single WebSocket sync connection.
+async fn handle_sync_ws_connection(
+    socket: axum::extract::ws::WebSocket,
+    broadcast_tx: tokio::sync::broadcast::Sender<String>,
+    device_id: String,
+    _user_id: String,
+) {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let mut broadcast_rx = broadcast_tx.subscribe();
+
+    // Spawn task to forward broadcast messages to this client
+    let device_id_clone = device_id.clone();
+    let send_task = tokio::spawn(async move {
+        while let Ok(msg) = broadcast_rx.recv().await {
+            // Don't echo messages back to the sender
+            if msg.starts_with(&format!("{{\"from_device_id\":\"{device_id_clone}\""))
+                || msg.contains(&format!("\"from_device_id\":\"{device_id_clone}\""))
+            {
+                continue;
+            }
+            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Receive messages from this client and broadcast to all peers
+    while let Some(Ok(msg)) = ws_receiver.next().await {
+        match msg {
+            Message::Text(text) => {
+                let _ = broadcast_tx.send(text.to_string());
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    send_task.abort();
+    tracing::debug!(device_id, "Sync WebSocket disconnected");
+}
+
+/// POST /api/sync/relay — upload encrypted data to the temporary relay.
+async fn handle_sync_relay_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<SyncRelayUploadBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let relay = match state.sync_relay.as_ref() {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Sync not enabled"})),
+            );
+        }
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    let entry_id = uuid::Uuid::new_v4().to_string();
+    let device_id = session.device_id.clone().unwrap_or_default();
+
+    let entry = crate::sync::relay::RelayEntry {
+        id: entry_id.clone(),
+        sender_device_id: device_id.clone(),
+        user_id: session.user_id.clone(),
+        encrypted_payload: body.encrypted_payload,
+        nonce: body.nonce,
+        created_at_epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    relay.store(entry);
+
+    // Notify connected peers via broadcast
+    if let Some(ref tx) = state.sync_broadcast {
+        let notify = serde_json::json!({
+            "type": "relay_notify",
+            "from_device_id": device_id,
+            "relay_ids": [entry_id],
+        });
+        let _ = tx.send(notify.to_string());
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "status": "stored",
+            "relay_id": entry_id,
+        })),
+    )
+}
+
+/// GET /api/sync/relay — pick up pending relay entries.
+async fn handle_sync_relay_pickup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Query<SyncRelayPickupQuery>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let relay = match state.sync_relay.as_ref() {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Sync not enabled"})),
+            );
+        }
+    };
+
+    let exclude_device = query.device_id.as_deref().or(session.device_id.as_deref());
+    let entries = relay.pickup(&session.user_id, exclude_device);
+
+    let list: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "sender_device_id": e.sender_device_id,
+                "encrypted_payload": e.encrypted_payload,
+                "nonce": e.nonce,
+                "created_at_epoch": e.created_at_epoch,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "entries": list,
+            "count": list.len(),
+        })),
+    )
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // TELEMETRY HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -1747,6 +1999,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1801,6 +2055,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let headers = HeaderMap::new();
@@ -1864,6 +2120,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let response = handle_webhook(
@@ -1904,6 +2162,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1947,6 +2207,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let mut headers = HeaderMap::new();

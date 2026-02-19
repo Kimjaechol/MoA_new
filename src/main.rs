@@ -66,6 +66,7 @@ mod security;
 mod service;
 mod skillforge;
 mod skills;
+mod sync;
 mod telemetry;
 mod tools;
 mod tunnel;

@@ -104,6 +104,10 @@ pub struct Config {
     /// Multi-user authentication configuration.
     #[serde(default)]
     pub auth: AuthConfig,
+
+    /// Multi-device synchronization configuration.
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -1391,6 +1395,51 @@ impl Default for AuthConfig {
     }
 }
 
+// ── Sync ────────────────────────────────────────────────────────
+
+/// Multi-device synchronization configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncConfig {
+    /// Enable cross-device memory synchronization (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// TTL for temporary relay entries in seconds (default: 300 = 5 minutes).
+    #[serde(default = "default_relay_ttl_secs")]
+    pub relay_ttl_secs: u64,
+
+    /// Delta journal retention period in days (default: 30).
+    #[serde(default = "default_journal_retention_days")]
+    pub journal_retention_days: u32,
+
+    /// Maximum deltas per sync_response batch (default: 50).
+    #[serde(default = "default_sync_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_relay_ttl_secs() -> u64 {
+    300
+}
+
+fn default_journal_retention_days() -> u32 {
+    30
+}
+
+fn default_sync_batch_size() -> usize {
+    50
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            relay_ttl_secs: default_relay_ttl_secs(),
+            journal_retention_days: default_journal_retention_days(),
+            batch_size: default_sync_batch_size(),
+        }
+    }
+}
+
 // ── Tunnel ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1902,6 +1951,7 @@ impl Default for Config {
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -2438,6 +2488,7 @@ default_temperature = 0.7
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
+            sync: SyncConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2550,6 +2601,7 @@ tool_dispatcher = "xml"
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
+            sync: SyncConfig::default(),
         };
 
         config.save().unwrap();
