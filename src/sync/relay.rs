@@ -72,13 +72,14 @@ impl SyncRelay {
     pub fn store(&self, entry: RelayEntry) -> String {
         let id = entry.id.clone();
         let user_id = entry.user_id.clone();
-        let expires_at = Instant::now() + self.ttl;
+        let now = Instant::now();
+        let expires_at = now + self.ttl;
 
         let mut slots = self.slots.lock();
         let user_slots = slots.entry(user_id).or_default();
 
         // Evict expired entries first
-        user_slots.retain(|slot| slot.expires_at > Instant::now());
+        user_slots.retain(|slot| slot.expires_at > now);
 
         // Enforce per-device limit
         let sender = &entry.sender_device_id;
@@ -243,8 +244,8 @@ mod tests {
             ));
         }
 
-        // Should be capped at MAX_ENTRIES_PER_DEVICE
-        assert!(relay.entry_count() <= MAX_ENTRIES_PER_DEVICE + 1);
+        // Should be capped at exactly MAX_ENTRIES_PER_DEVICE
+        assert_eq!(relay.entry_count(), MAX_ENTRIES_PER_DEVICE);
     }
 
     #[test]

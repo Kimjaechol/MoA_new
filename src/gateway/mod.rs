@@ -203,6 +203,10 @@ pub struct AppState {
     pub auth_store: Option<Arc<crate::auth::AuthStore>>,
     /// Whether new user registration is allowed.
     pub auth_allow_registration: bool,
+    /// Maximum registered users (0 = unlimited).
+    pub auth_max_users: u64,
+    /// Maximum devices per user.
+    pub auth_max_devices_per_user: u32,
     /// Temporary relay for sync Layer 1 (TTL-based in-memory storage).
     pub sync_relay: Option<Arc<crate::sync::SyncRelay>>,
     /// Broadcast channel for sync WebSocket messages.
@@ -343,6 +347,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
     let auth_allow_registration = config.auth.allow_registration;
+    let auth_max_users = config.auth.max_users;
+    let auth_max_devices_per_user = config.auth.max_devices_per_user;
 
     // ── Sync relay + broadcast ───────────────────────────────
     let (sync_relay, sync_broadcast) = if config.sync.enabled {
@@ -490,6 +496,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         telemetry_admin_token_hash,
         auth_store,
         auth_allow_registration,
+        auth_max_users,
+        auth_max_devices_per_user,
         sync_relay,
         sync_broadcast,
     };
@@ -500,6 +508,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
+            axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
         .allow_headers([
@@ -524,7 +533,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/auth/me", get(handle_auth_me))
         .route("/api/auth/devices", get(handle_auth_devices_list))
         .route("/api/auth/devices", post(handle_auth_device_register))
-        .route("/api/auth/devices/:device_id", axum::routing::delete(handle_auth_device_remove))
+        .route("/api/auth/devices/{device_id}", axum::routing::delete(handle_auth_device_remove))
         .route("/sync", get(handle_sync_ws))
         .route("/api/sync/relay", post(handle_sync_relay_upload))
         .route("/api/sync/relay", get(handle_sync_relay_pickup))
@@ -1099,6 +1108,18 @@ async fn handle_auth_register(
         );
     }
 
+    // Enforce max_users limit (0 = unlimited)
+    if state.auth_max_users > 0 {
+        if let Ok(count) = auth_store.user_count() {
+            if count >= state.auth_max_users {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "Maximum user limit reached"})),
+                );
+            }
+        }
+    }
+
     let body = match body {
         Ok(Json(b)) => b,
         Err(e) => {
@@ -1308,6 +1329,21 @@ async fn handle_auth_device_register(
     };
 
     let auth_store = state.auth_store.as_ref().unwrap();
+
+    // Enforce max_devices_per_user limit
+    if let Ok(devices) = auth_store.list_devices(&session.user_id) {
+        // Only enforce if this is a new device (not an update of an existing one)
+        let is_existing = devices.iter().any(|d| d.device_id == body.device_id);
+        if !is_existing && devices.len() >= state.auth_max_devices_per_user as usize {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": format!("Maximum devices per user ({}) reached", state.auth_max_devices_per_user),
+                })),
+            );
+        }
+    }
+
     match auth_store.register_device(
         &session.user_id,
         &body.device_id,
@@ -1427,10 +1463,13 @@ async fn handle_sync_ws_connection(
     let device_id_clone = device_id.clone();
     let send_task = tokio::spawn(async move {
         while let Ok(msg) = broadcast_rx.recv().await {
-            // Don't echo messages back to the sender
-            if msg.starts_with(&format!("{{\"from_device_id\":\"{device_id_clone}\""))
-                || msg.contains(&format!("\"from_device_id\":\"{device_id_clone}\""))
-            {
+            // Don't echo messages back to the sender.
+            // Parse JSON to reliably check from_device_id regardless of field order.
+            let is_own_message = serde_json::from_str::<serde_json::Value>(&msg)
+                .ok()
+                .and_then(|v| v.get("from_device_id")?.as_str().map(String::from))
+                .is_some_and(|id| id == device_id_clone);
+            if is_own_message {
                 continue;
             }
             if ws_sender.send(Message::Text(msg.into())).await.is_err() {
@@ -1999,6 +2038,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
         };
@@ -2055,6 +2096,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
         };
@@ -2120,6 +2163,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
         };
@@ -2162,6 +2207,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
         };
@@ -2207,6 +2254,8 @@ mod tests {
             telemetry_admin_token_hash: None,
             auth_store: None,
             auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
         };

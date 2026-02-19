@@ -15,5 +15,4 @@
 pub mod protocol;
 pub mod relay;
 
-pub use protocol::{BroadcastMessage, FullSyncManifest, OrderBuffer};
 pub use relay::SyncRelay;
