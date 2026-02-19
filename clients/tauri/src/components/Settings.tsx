@@ -142,7 +142,7 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                     type="url"
                     value={serverUrl}
                     onChange={(e) => handleServerUrlChange(e.target.value)}
-                    placeholder="http://localhost:3000"
+                    placeholder="https://moanew-production.up.railway.app"
                   />
                   <button
                     className="settings-btn settings-btn-secondary"

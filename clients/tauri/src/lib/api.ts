@@ -20,7 +20,7 @@ export class MoAClient {
   private token: string | null;
 
   constructor() {
-    this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || "http://localhost:3000";
+    this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || "https://moanew-production.up.railway.app";
     this.token = localStorage.getItem(STORAGE_KEY_TOKEN);
   }
 
