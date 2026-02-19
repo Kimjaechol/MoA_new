@@ -12,6 +12,8 @@ interface SettingsProps {
 export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }: SettingsProps) {
   const [serverUrl, setServerUrl] = useState(apiClient.getServerUrl());
   const [pairingCode, setPairingCode] = useState("");
+  const [pairUsername, setPairUsername] = useState("");
+  const [pairPassword, setPairPassword] = useState("");
   const [isPairing, setIsPairing] = useState(false);
   const [isHealthChecking, setIsHealthChecking] = useState(false);
   const [isConnected, setIsConnected] = useState(apiClient.isConnected());
@@ -40,12 +42,18 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
     setMessage(null);
 
     try {
-      const result = await apiClient.pair(pairingCode.trim());
+      const result = await apiClient.pair(
+        pairingCode.trim(),
+        pairUsername.trim() || undefined,
+        pairPassword || undefined,
+      );
       if (result.paired) {
         setIsConnected(true);
         onConnectionChange(true);
         setMessage({ type: "success", text: t("pair_success", locale) });
         setPairingCode("");
+        setPairUsername("");
+        setPairPassword("");
       } else {
         setMessage({ type: "error", text: t("pair_failed", locale) });
       }
@@ -58,7 +66,7 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
       setIsPairing(false);
       clearMessage();
     }
-  }, [pairingCode, locale, onConnectionChange, clearMessage]);
+  }, [pairingCode, pairUsername, pairPassword, locale, onConnectionChange, clearMessage]);
 
   const handleDisconnect = useCallback(() => {
     apiClient.disconnect();
@@ -155,28 +163,52 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
               </div>
 
               {!isConnected && (
-                <div className="settings-field">
-                  <label className="settings-label">{t("pairing_code", locale)}</label>
-                  <div className="settings-input-row">
+                <>
+                  <div className="settings-field">
+                    <label className="settings-label">{t("username", locale)}</label>
                     <input
                       className="settings-input"
                       type="text"
-                      value={pairingCode}
-                      onChange={(e) => setPairingCode(e.target.value)}
-                      placeholder="Enter pairing code"
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") handlePair();
-                      }}
+                      value={pairUsername}
+                      onChange={(e) => setPairUsername(e.target.value)}
+                      placeholder="Enter username"
+                      autoComplete="username"
                     />
-                    <button
-                      className="settings-btn settings-btn-primary"
-                      onClick={handlePair}
-                      disabled={isPairing || !pairingCode.trim()}
-                    >
-                      {isPairing ? t("pairing", locale) : t("pair", locale)}
-                    </button>
                   </div>
-                </div>
+                  <div className="settings-field">
+                    <label className="settings-label">{t("password", locale)}</label>
+                    <input
+                      className="settings-input"
+                      type="password"
+                      value={pairPassword}
+                      onChange={(e) => setPairPassword(e.target.value)}
+                      placeholder="Enter password"
+                      autoComplete="current-password"
+                    />
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-label">{t("pairing_code", locale)}</label>
+                    <div className="settings-input-row">
+                      <input
+                        className="settings-input"
+                        type="text"
+                        value={pairingCode}
+                        onChange={(e) => setPairingCode(e.target.value)}
+                        placeholder="Enter pairing code"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") handlePair();
+                        }}
+                      />
+                      <button
+                        className="settings-btn settings-btn-primary"
+                        onClick={handlePair}
+                        disabled={isPairing || !pairingCode.trim()}
+                      >
+                        {isPairing ? t("pairing", locale) : t("pair", locale)}
+                      </button>
+                    </div>
+                  </div>
+                </>
               )}
 
               {message && (

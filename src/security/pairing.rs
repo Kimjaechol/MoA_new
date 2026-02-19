@@ -1,12 +1,13 @@
-// Gateway pairing mode — session-based authentication.
+// Gateway pairing mode — device-based authentication.
 //
 // On startup the gateway generates a pairing code printed to the terminal.
-// Clients present this code via `X-Pairing-Code` header on a `POST /pair`
-// request. The server responds with a bearer token that must be sent on all
-// subsequent requests via `Authorization: Bearer <token>`.
+// Clients present this code (plus optional owner credentials) via `POST /pair`.
+// The server validates everything and responds with a bearer token that must
+// be sent on all subsequent requests via `Authorization: Bearer <token>`.
 //
-// The pairing code remains valid for the entire gateway session, allowing
-// multiple clients (web, app, etc.) to pair with the same code.
+// Each successful pairing consumes the current code and generates a fresh one
+// for the next device — like Bluetooth pairing. Once paired, the device uses
+// the bearer token automatically (no re-pairing needed).
 //
 // Already-paired tokens are persisted in config so restarts don't require
 // re-pairing.
@@ -21,6 +22,13 @@ const MAX_PAIR_ATTEMPTS: u32 = 5;
 /// Lockout duration after too many failed pairing attempts.
 const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
 
+/// Credentials required during pairing (username + password hash).
+#[derive(Debug, Clone)]
+struct OwnerCredentials {
+    username: String,
+    password_hash: String,
+}
+
 /// Manages pairing state for the gateway.
 ///
 /// Bearer tokens are stored as SHA-256 hashes to prevent plaintext exposure
@@ -30,24 +38,38 @@ const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
 pub struct PairingGuard {
     /// Whether pairing is required at all.
     require_pairing: bool,
-    /// Session pairing code (generated on startup, valid for the session lifetime).
+    /// Per-device pairing code (consumed on success, regenerated for next device).
     pairing_code: Mutex<Option<String>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
     paired_tokens: Mutex<HashSet<String>>,
     /// Brute-force protection: failed attempt counter + lockout time.
     failed_attempts: Mutex<(u32, Option<Instant>)>,
+    /// Owner credentials for pairing authentication (optional).
+    owner_credentials: Option<OwnerCredentials>,
+}
+
+/// Pairing request with optional credentials.
+pub struct PairRequest<'a> {
+    pub code: &'a str,
+    pub username: Option<&'a str>,
+    pub password: Option<&'a str>,
 }
 
 impl PairingGuard {
     /// Create a new pairing guard.
     ///
-    /// If `require_pairing` is true, a pairing code is always generated
-    /// so that new clients can pair at any time during the session.
+    /// If `require_pairing` is true, a pairing code is always generated.
+    /// If owner credentials are provided, they must also match during pairing.
     ///
     /// Existing tokens are accepted in both forms:
     /// - Plaintext (`zc_...`): hashed on load for backward compatibility
     /// - Already hashed (64-char hex): stored as-is
-    pub fn new(require_pairing: bool, existing_tokens: &[String]) -> Self {
+    pub fn new(
+        require_pairing: bool,
+        existing_tokens: &[String],
+        owner_username: Option<&str>,
+        owner_password: Option<&str>,
+    ) -> Self {
         let tokens: HashSet<String> = existing_tokens
             .iter()
             .map(|t| {
@@ -63,15 +85,26 @@ impl PairingGuard {
         } else {
             None
         };
+
+        // Build owner credentials only when both username and password are set
+        let owner_credentials = match (owner_username, owner_password) {
+            (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => Some(OwnerCredentials {
+                username: u.to_string(),
+                password_hash: hash_password(p),
+            }),
+            _ => None,
+        };
+
         Self {
             require_pairing,
             pairing_code: Mutex::new(code),
             paired_tokens: Mutex::new(tokens),
             failed_attempts: Mutex::new((0, None)),
+            owner_credentials,
         }
     }
 
-    /// The session pairing code (set when pairing is required).
+    /// The current pairing code (regenerated after each successful pair).
     pub fn pairing_code(&self) -> Option<String> {
         self.pairing_code.lock().clone()
     }
@@ -81,12 +114,17 @@ impl PairingGuard {
         self.require_pairing
     }
 
-    /// Attempt to pair with the given code. Returns a bearer token on success.
+    /// Whether owner credentials are required for pairing.
+    pub fn requires_credentials(&self) -> bool {
+        self.owner_credentials.is_some()
+    }
+
+    /// Attempt to pair with the given request. Returns a bearer token on success.
     /// Returns `Err(lockout_seconds)` if locked out due to brute force.
     ///
-    /// The pairing code is NOT consumed — multiple clients can pair with the
-    /// same code during a single gateway session.
-    pub fn try_pair(&self, code: &str) -> Result<Option<String>, u64> {
+    /// Each successful pairing consumes the code and generates a new one
+    /// for the next device.
+    pub fn try_pair(&self, request: &PairRequest<'_>) -> Result<Option<String>, u64> {
         // Check brute force lockout
         {
             let attempts = self.failed_attempts.lock();
@@ -100,10 +138,29 @@ impl PairingGuard {
             }
         }
 
+        // Validate owner credentials if configured
+        if let Some(ref creds) = self.owner_credentials {
+            let username = request.username.unwrap_or("");
+            let password = request.password.unwrap_or("");
+            let username_ok = constant_time_eq(username.trim(), &creds.username);
+            let password_ok =
+                constant_time_eq(&hash_password(password.trim()), &creds.password_hash);
+            if !username_ok || !password_ok {
+                // Increment failed attempts for bad credentials
+                let mut attempts = self.failed_attempts.lock();
+                attempts.0 += 1;
+                if attempts.0 >= MAX_PAIR_ATTEMPTS {
+                    attempts.1 = Some(Instant::now());
+                }
+                return Ok(None);
+            }
+        }
+
+        // Validate pairing code
         {
-            let pairing_code = self.pairing_code.lock();
+            let mut pairing_code = self.pairing_code.lock();
             if let Some(ref expected) = *pairing_code {
-                if constant_time_eq(code.trim(), expected.trim()) {
+                if constant_time_eq(request.code.trim(), expected.trim()) {
                     // Reset failed attempts on success
                     {
                         let mut attempts = self.failed_attempts.lock();
@@ -113,7 +170,8 @@ impl PairingGuard {
                     let mut tokens = self.paired_tokens.lock();
                     tokens.insert(hash_token(&token));
 
-                    // Code remains valid — other clients can pair during this session
+                    // Consume code and generate a new one for the next device
+                    *pairing_code = Some(generate_code());
 
                     return Ok(Some(token));
                 }
@@ -197,6 +255,11 @@ fn hash_token(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
+/// SHA-256 hash a password. Returns lowercase hex.
+fn hash_password(password: &str) -> String {
+    format!("{:x}", Sha256::digest(password.as_bytes()))
+}
+
 /// Check if a stored value looks like a SHA-256 hash (64 hex chars)
 /// rather than a plaintext token.
 fn is_token_hash(value: &str) -> bool {
@@ -238,18 +301,51 @@ pub fn is_public_bind(host: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Helper: create a guard without owner credentials (backward compat).
+    fn guard_no_creds(require: bool, tokens: &[String]) -> PairingGuard {
+        PairingGuard::new(require, tokens, None, None)
+    }
+
+    /// Helper: create a guard with owner credentials.
+    fn guard_with_creds(
+        require: bool,
+        tokens: &[String],
+        username: &str,
+        password: &str,
+    ) -> PairingGuard {
+        PairingGuard::new(require, tokens, Some(username), Some(password))
+    }
+
+    /// Helper: build a PairRequest with code only.
+    fn code_only(code: &str) -> PairRequest<'_> {
+        PairRequest {
+            code,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// Helper: build a PairRequest with code + credentials.
+    fn with_creds<'a>(code: &'a str, username: &'a str, password: &'a str) -> PairRequest<'a> {
+        PairRequest {
+            code,
+            username: Some(username),
+            password: Some(password),
+        }
+    }
+
     // ── PairingGuard ─────────────────────────────────────────
 
     #[test]
     fn new_guard_generates_code_when_no_tokens() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = guard_no_creds(true, &[]);
         assert!(guard.pairing_code().is_some());
         assert!(!guard.is_paired());
     }
 
     #[test]
     fn new_guard_generates_code_even_when_tokens_exist() {
-        let guard = PairingGuard::new(true, &["zc_existing".into()]);
+        let guard = guard_no_creds(true, &["zc_existing".into()]);
         assert!(
             guard.pairing_code().is_some(),
             "Code should always be generated when pairing is required"
@@ -259,15 +355,15 @@ mod tests {
 
     #[test]
     fn new_guard_no_code_when_pairing_disabled() {
-        let guard = PairingGuard::new(false, &[]);
+        let guard = guard_no_creds(false, &[]);
         assert!(guard.pairing_code().is_none());
     }
 
     #[test]
     fn try_pair_correct_code() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = guard_no_creds(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
-        let token = guard.try_pair(&code).unwrap();
+        let token = guard.try_pair(&code_only(&code)).unwrap();
         assert!(token.is_some());
         assert!(token.unwrap().starts_with("zc_"));
         assert!(guard.is_paired());
@@ -275,53 +371,48 @@ mod tests {
 
     #[test]
     fn try_pair_wrong_code() {
-        let guard = PairingGuard::new(true, &[]);
-        let result = guard.try_pair("000000").unwrap();
-        // Might succeed if code happens to be 000000, but extremely unlikely
-        // Just check it returns Ok(None) normally
+        let guard = guard_no_creds(true, &[]);
+        let result = guard.try_pair(&code_only("000000")).unwrap();
         let _ = result;
     }
 
     #[test]
     fn try_pair_empty_code() {
-        let guard = PairingGuard::new(true, &[]);
-        assert!(guard.try_pair("").unwrap().is_none());
+        let guard = guard_no_creds(true, &[]);
+        assert!(guard.try_pair(&code_only("")).unwrap().is_none());
     }
 
     #[test]
     fn is_authenticated_with_valid_token() {
-        // Pass plaintext token — PairingGuard hashes it on load
-        let guard = PairingGuard::new(true, &["zc_valid".into()]);
+        let guard = guard_no_creds(true, &["zc_valid".into()]);
         assert!(guard.is_authenticated("zc_valid"));
     }
 
     #[test]
     fn is_authenticated_with_prehashed_token() {
-        // Pass an already-hashed token (64 hex chars)
         let hashed = hash_token("zc_valid");
-        let guard = PairingGuard::new(true, &[hashed]);
+        let guard = guard_no_creds(true, &[hashed]);
         assert!(guard.is_authenticated("zc_valid"));
     }
 
     #[test]
     fn is_authenticated_with_invalid_token() {
-        let guard = PairingGuard::new(true, &["zc_valid".into()]);
+        let guard = guard_no_creds(true, &["zc_valid".into()]);
         assert!(!guard.is_authenticated("zc_invalid"));
     }
 
     #[test]
     fn is_authenticated_when_pairing_disabled() {
-        let guard = PairingGuard::new(false, &[]);
+        let guard = guard_no_creds(false, &[]);
         assert!(guard.is_authenticated("anything"));
         assert!(guard.is_authenticated(""));
     }
 
     #[test]
     fn tokens_returns_hashes() {
-        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into()]);
+        let guard = guard_no_creds(true, &["zc_a".into(), "zc_b".into()]);
         let tokens = guard.tokens();
         assert_eq!(tokens.len(), 2);
-        // Tokens should be stored as 64-char hex hashes, not plaintext
         for t in &tokens {
             assert_eq!(t.len(), 64, "Token should be a SHA-256 hash");
             assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
@@ -331,35 +422,113 @@ mod tests {
 
     #[test]
     fn pair_then_authenticate() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = guard_no_creds(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
-        let token = guard.try_pair(&code).unwrap().unwrap();
+        let token = guard.try_pair(&code_only(&code)).unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
         assert!(!guard.is_authenticated("wrong"));
     }
 
+    // ── Per-device code (consume and regenerate) ─────────────
+
     #[test]
-    fn multiple_clients_can_pair_with_same_code() {
-        let guard = PairingGuard::new(true, &[]);
-        let code = guard.pairing_code().unwrap().to_string();
+    fn code_consumed_and_regenerated_after_pair() {
+        let guard = guard_no_creds(true, &[]);
+        let code1 = guard.pairing_code().unwrap();
 
-        // First client pairs
-        let token1 = guard.try_pair(&code).unwrap().unwrap();
+        // First device pairs — code consumed, new one generated
+        let token1 = guard.try_pair(&code_only(&code1)).unwrap().unwrap();
         assert!(guard.is_authenticated(&token1));
 
-        // Second client pairs with same code
-        let token2 = guard.try_pair(&code).unwrap().unwrap();
+        // Old code no longer works
+        assert!(guard.try_pair(&code_only(&code1)).unwrap().is_none());
+
+        // New code is different and works
+        let code2 = guard.pairing_code().unwrap();
+        assert_ne!(code1, code2);
+        let token2 = guard.try_pair(&code_only(&code2)).unwrap().unwrap();
         assert!(guard.is_authenticated(&token2));
 
-        // Both tokens are valid
+        // Both tokens remain valid
         assert!(guard.is_authenticated(&token1));
         assert!(guard.is_authenticated(&token2));
+    }
 
-        // Tokens are distinct
-        assert_ne!(token1, token2);
+    // ── Owner credentials ────────────────────────────────────
 
-        // Code is still available
-        assert!(guard.pairing_code().is_some());
+    #[test]
+    fn requires_credentials_reports_correctly() {
+        let guard_no = guard_no_creds(true, &[]);
+        assert!(!guard_no.requires_credentials());
+
+        let guard_yes = guard_with_creds(true, &[], "admin", "secret");
+        assert!(guard_yes.requires_credentials());
+    }
+
+    #[test]
+    fn pair_with_correct_credentials_succeeds() {
+        let guard = guard_with_creds(true, &[], "admin", "secret");
+        let code = guard.pairing_code().unwrap();
+        let token = guard
+            .try_pair(&with_creds(&code, "admin", "secret"))
+            .unwrap();
+        assert!(token.is_some());
+        assert!(guard.is_authenticated(&token.unwrap()));
+    }
+
+    #[test]
+    fn pair_with_wrong_username_fails() {
+        let guard = guard_with_creds(true, &[], "admin", "secret");
+        let code = guard.pairing_code().unwrap();
+        let result = guard
+            .try_pair(&with_creds(&code, "hacker", "secret"))
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pair_with_wrong_password_fails() {
+        let guard = guard_with_creds(true, &[], "admin", "secret");
+        let code = guard.pairing_code().unwrap();
+        let result = guard
+            .try_pair(&with_creds(&code, "admin", "wrong"))
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pair_with_missing_credentials_fails() {
+        let guard = guard_with_creds(true, &[], "admin", "secret");
+        let code = guard.pairing_code().unwrap();
+        // Code-only request should fail when credentials are required
+        let result = guard.try_pair(&code_only(&code)).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pair_without_credentials_config_ignores_creds() {
+        let guard = guard_no_creds(true, &[]);
+        let code = guard.pairing_code().unwrap();
+        // Even if client sends credentials, they are ignored
+        let token = guard
+            .try_pair(&with_creds(&code, "any", "thing"))
+            .unwrap();
+        assert!(token.is_some());
+    }
+
+    #[test]
+    fn partial_credentials_config_treated_as_no_creds() {
+        // Only username, no password
+        let guard = PairingGuard::new(true, &[], Some("admin"), None);
+        assert!(!guard.requires_credentials());
+
+        // Only password, no username
+        let guard = PairingGuard::new(true, &[], None, Some("secret"));
+        assert!(!guard.requires_credentials());
+
+        // Empty strings
+        let guard = PairingGuard::new(true, &[], Some(""), Some("secret"));
+        assert!(!guard.requires_credentials());
     }
 
     // ── Token hashing ────────────────────────────────────────
@@ -387,6 +556,16 @@ mod tests {
         assert!(!is_token_hash("zc_test_token"));
         assert!(!is_token_hash("too_short"));
         assert!(!is_token_hash(""));
+    }
+
+    #[test]
+    fn hash_password_is_deterministic() {
+        assert_eq!(hash_password("secret"), hash_password("secret"));
+    }
+
+    #[test]
+    fn hash_password_differs_for_different_inputs() {
+        assert_ne!(hash_password("abc"), hash_password("def"));
     }
 
     // ── is_public_bind ───────────────────────────────────────
@@ -436,12 +615,9 @@ mod tests {
 
     #[test]
     fn generate_code_is_not_deterministic() {
-        // Two codes should differ with overwhelming probability. We try
-        // multiple pairs so a single 1-in-10^6 collision doesn't cause
-        // a flaky CI failure. All 10 pairs colliding is ~1-in-10^60.
         for _ in 0..10 {
             if generate_code() != generate_code() {
-                return; // Pass: found a non-matching pair.
+                return;
             }
         }
         panic!("Generated 10 pairs of codes and all were collisions — CSPRNG failure");
@@ -458,14 +634,12 @@ mod tests {
 
     #[test]
     fn brute_force_lockout_after_max_attempts() {
-        let guard = PairingGuard::new(true, &[]);
-        // Exhaust all attempts with wrong codes
+        let guard = guard_no_creds(true, &[]);
         for i in 0..MAX_PAIR_ATTEMPTS {
-            let result = guard.try_pair(&format!("wrong_{i}"));
+            let result = guard.try_pair(&code_only(&format!("wrong_{i}")));
             assert!(result.is_ok(), "Attempt {i} should not be locked out yet");
         }
-        // Next attempt should be locked out
-        let result = guard.try_pair("another_wrong");
+        let result = guard.try_pair(&code_only("another_wrong"));
         assert!(
             result.is_err(),
             "Should be locked out after {MAX_PAIR_ATTEMPTS} attempts"
@@ -480,28 +654,36 @@ mod tests {
 
     #[test]
     fn correct_code_resets_failed_attempts() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = guard_no_creds(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
-        // Fail a few times
         for _ in 0..3 {
-            let _ = guard.try_pair("wrong");
+            let _ = guard.try_pair(&code_only("wrong"));
         }
-        // Correct code should still work (under MAX_PAIR_ATTEMPTS)
-        let result = guard.try_pair(&code).unwrap();
+        let result = guard.try_pair(&code_only(&code)).unwrap();
         assert!(result.is_some(), "Correct code should work before lockout");
     }
 
     #[test]
     fn lockout_returns_remaining_seconds() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = guard_no_creds(true, &[]);
         for _ in 0..MAX_PAIR_ATTEMPTS {
-            let _ = guard.try_pair("wrong");
+            let _ = guard.try_pair(&code_only("wrong"));
         }
-        let err = guard.try_pair("wrong").unwrap_err();
-        // Should be close to PAIR_LOCKOUT_SECS (within a second)
+        let err = guard.try_pair(&code_only("wrong")).unwrap_err();
         assert!(
             err >= PAIR_LOCKOUT_SECS - 1,
             "Remaining lockout should be ~{PAIR_LOCKOUT_SECS}s, got {err}s"
         );
+    }
+
+    #[test]
+    fn bad_credentials_count_toward_lockout() {
+        let guard = guard_with_creds(true, &[], "admin", "secret");
+        let code = guard.pairing_code().unwrap();
+        for _ in 0..MAX_PAIR_ATTEMPTS {
+            let _ = guard.try_pair(&with_creds(&code, "hacker", "wrong"));
+        }
+        let result = guard.try_pair(&with_creds(&code, "admin", "secret"));
+        assert!(result.is_err(), "Should be locked out after bad cred attempts");
     }
 }

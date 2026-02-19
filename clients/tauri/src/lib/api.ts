@@ -52,13 +52,24 @@ export class MoAClient {
     localStorage.removeItem(STORAGE_KEY_TOKEN);
   }
 
-  async pair(code: string): Promise<PairResponse> {
+  async pair(
+    code: string,
+    username?: string,
+    password?: string,
+  ): Promise<PairResponse> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-Pairing-Code": code,
+    };
+
+    const body: Record<string, string> = {};
+    if (username) body.username = username;
+    if (password) body.password = password;
+
     const res = await fetch(`${this.serverUrl}/pair`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Pairing-Code": code,
-      },
+      headers,
+      body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined,
     });
 
     if (!res.ok) {

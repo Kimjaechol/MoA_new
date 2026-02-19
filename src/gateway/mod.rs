@@ -10,6 +10,7 @@
 use crate::agent::agent::Agent;
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
+use serde::Deserialize as GatewayDeserialize;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
@@ -295,6 +296,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
+        config.gateway.owner_username.as_deref(),
+        config.gateway.owner_password.as_deref(),
     ));
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
@@ -335,11 +338,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  GET  /health    — health check");
     if let Some(code) = pairing.pairing_code() {
         println!();
-        println!("  🔐 PAIRING REQUIRED — use this code:");
+        if pairing.requires_credentials() {
+            println!("  🔐 PAIRING REQUIRED — credentials + code:");
+        } else {
+            println!("  🔐 PAIRING REQUIRED — use this code:");
+        }
         println!("     ┌──────────────┐");
         println!("     │  {code}  │");
         println!("     └──────────────┘");
-        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
+        if pairing.requires_credentials() {
+            println!("     Send: POST /pair with X-Pairing-Code header + {{username, password}} body");
+        } else {
+            println!("     Send: POST /pair with header X-Pairing-Code: {code}");
+        }
     } else if pairing.require_pairing() {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
     } else {
@@ -430,8 +441,25 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     Json(body)
 }
 
-/// POST /pair — exchange one-time code for bearer token
-async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// Optional JSON body for pairing with credentials.
+#[derive(Debug, Default, GatewayDeserialize)]
+struct PairBody {
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// POST /pair — exchange pairing code (+ optional credentials) for bearer token.
+///
+/// The pairing code is read from the `X-Pairing-Code` header.
+/// If owner credentials are configured on the server, `username` and `password`
+/// must also be provided in the JSON request body.
+async fn handle_pair(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<PairBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
     let client_key = client_key_from_headers(&headers);
     if !state.rate_limiter.allow_pair(&client_key) {
         tracing::warn!("/pair rate limit exceeded for key: {client_key}");
@@ -447,19 +475,34 @@ async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    match state.pairing.try_pair(code) {
+    let pair_body = body.map(|Json(b)| b).unwrap_or_default();
+    let username = pair_body.username;
+    let password = pair_body.password;
+
+    let request = crate::security::pairing::PairRequest {
+        code,
+        username: username.as_deref(),
+        password: password.as_deref(),
+    };
+
+    match state.pairing.try_pair(&request) {
         Ok(Some(token)) => {
-            tracing::info!("🔐 New client paired successfully");
+            tracing::info!("🔐 New device paired successfully");
             let body = serde_json::json!({
                 "paired": true,
                 "token": token,
-                "message": "Save this token — use it as Authorization: Bearer <token>"
+                "message": "Device paired. Save this token — use it as Authorization: Bearer <token>"
             });
             (StatusCode::OK, Json(body))
         }
         Ok(None) => {
-            tracing::warn!("🔐 Pairing attempt with invalid code");
-            let err = serde_json::json!({"error": "Invalid pairing code"});
+            let msg = if state.pairing.requires_credentials() {
+                "Invalid credentials or pairing code"
+            } else {
+                "Invalid pairing code"
+            };
+            tracing::warn!("🔐 Pairing attempt failed");
+            let err = serde_json::json!({"error": msg});
             (StatusCode::FORBIDDEN, Json(err))
         }
         Err(lockout_secs) => {
@@ -1073,7 +1116,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
@@ -1123,7 +1166,7 @@ mod tests {
             mem: memory,
             auto_save: true,
             webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
@@ -1182,7 +1225,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
@@ -1218,7 +1261,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
@@ -1257,7 +1300,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,

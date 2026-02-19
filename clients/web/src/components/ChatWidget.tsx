@@ -25,6 +25,8 @@ export default function ChatWidget({
   const [showSettings, setShowSettings] = useState(false);
   const [serverUrl, setServerUrl] = useState("");
   const [pairingCode, setPairingCode] = useState("");
+  const [pairUsername, setPairUsername] = useState("");
+  const [pairPassword, setPairPassword] = useState("");
   const [isPairing, setIsPairing] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -50,11 +52,17 @@ export default function ChatWidget({
 
     try {
       clientRef.current.setServerUrl(serverUrl);
-      const result = await clientRef.current.pair(pairingCode.trim());
+      const result = await clientRef.current.pair(
+        pairingCode.trim(),
+        pairUsername.trim() || undefined,
+        pairPassword || undefined,
+      );
       if (result.paired) {
         setIsConnected(true);
         setShowSettings(false);
         setPairingCode("");
+        setPairUsername("");
+        setPairPassword("");
         setError(null);
       }
     } catch (err) {
@@ -62,7 +70,7 @@ export default function ChatWidget({
     } finally {
       setIsPairing(false);
     }
-  }, [pairingCode, serverUrl]);
+  }, [pairingCode, pairUsername, pairPassword, serverUrl]);
 
   const handleDisconnect = useCallback(() => {
     clientRef.current?.disconnect();
@@ -171,6 +179,32 @@ export default function ChatWidget({
                 value={serverUrl}
                 onChange={(e) => setServerUrl(e.target.value)}
                 placeholder="https://your-server.railway.app"
+                className="w-full rounded-lg border border-dark-700 bg-dark-800/50 px-4 py-2.5 text-sm text-dark-100 placeholder-dark-500 outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 transition-all"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-dark-300 mb-1.5">
+                {"\uC544\uC774\uB514"} Username
+              </label>
+              <input
+                type="text"
+                value={pairUsername}
+                onChange={(e) => setPairUsername(e.target.value)}
+                placeholder="Enter username"
+                autoComplete="username"
+                className="w-full rounded-lg border border-dark-700 bg-dark-800/50 px-4 py-2.5 text-sm text-dark-100 placeholder-dark-500 outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 transition-all"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-dark-300 mb-1.5">
+                {"\uBE44\uBC00\uBC88\uD638"} Password
+              </label>
+              <input
+                type="password"
+                value={pairPassword}
+                onChange={(e) => setPairPassword(e.target.value)}
+                placeholder="Enter password"
+                autoComplete="current-password"
                 className="w-full rounded-lg border border-dark-700 bg-dark-800/50 px-4 py-2.5 text-sm text-dark-100 placeholder-dark-500 outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 transition-all"
               />
             </div>
