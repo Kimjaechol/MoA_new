@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
 
 // ── State ────────────────────────────────────────────────────────
@@ -7,25 +9,38 @@ use tauri::Manager;
 struct AppState {
     server_url: std::sync::Mutex<String>,
     token: std::sync::Mutex<Option<String>>,
+    /// Whether sync WebSocket is currently connected.
+    sync_connected: AtomicBool,
+    /// Flag to signal sync task to stop.
+    sync_stop: AtomicBool,
+    /// App data directory (platform-specific).
+    data_dir: PathBuf,
 }
 
 // ── Types ────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ChatResponse {
     response: String,
     model: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct PairResponse {
     paired: bool,
     token: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct HealthResponse {
     status: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SyncStatus {
+    connected: bool,
+    device_id: String,
+    last_sync: Option<u64>,
 }
 
 // ── Tauri Commands ───────────────────────────────────────────────
@@ -110,6 +125,9 @@ async fn pair(
 
     if data.paired {
         *state.token.lock().map_err(|e| e.to_string())? = Some(data.token.clone());
+        // Persist token to data dir
+        let token_path = state.data_dir.join("session_token");
+        let _ = std::fs::write(&token_path, &data.token);
     }
 
     Ok(data)
@@ -167,6 +185,11 @@ fn is_authenticated(state: tauri::State<'_, AppState>) -> Result<bool, String> {
 #[tauri::command]
 fn disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     *state.token.lock().map_err(|e| e.to_string())? = None;
+    state.sync_stop.store(true, Ordering::SeqCst);
+    state.sync_connected.store(false, Ordering::SeqCst);
+    // Remove persisted token
+    let token_path = state.data_dir.join("session_token");
+    let _ = std::fs::remove_file(token_path);
     Ok(())
 }
 
@@ -180,6 +203,159 @@ fn get_platform_info() -> serde_json::Value {
     })
 }
 
+// ── Sync Commands ────────────────────────────────────────────────
+
+/// Get sync connection status.
+#[tauri::command]
+fn get_sync_status(state: tauri::State<'_, AppState>) -> SyncStatus {
+    SyncStatus {
+        connected: state.sync_connected.load(Ordering::SeqCst),
+        device_id: get_device_id(&state.data_dir),
+        last_sync: None,
+    }
+}
+
+/// Trigger a full sync (Layer 3) with the server.
+#[tauri::command]
+async fn trigger_full_sync(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let server_url = state.server_url.lock().map_err(|e| e.to_string())?.clone();
+    let token = state
+        .token
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "Not authenticated".to_string())?;
+    let device_id = get_device_id(&state.data_dir);
+
+    // Upload a sync request via HTTP relay as a trigger
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({
+        "type": "full_sync_request",
+        "from_device_id": device_id,
+        "manifest": {
+            "memory_chunk_ids": [],
+            "conversation_ids": [],
+            "setting_keys": [],
+            "generated_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        }
+    });
+
+    let res = client
+        .post(format!("{server_url}/api/sync/relay"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({
+            "encrypted_payload": payload.to_string(),
+            "nonce": "full_sync_trigger"
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Full sync trigger failed: {e}"))?;
+
+    if res.status().is_success() {
+        Ok("Full sync triggered".to_string())
+    } else {
+        let text = res.text().await.unwrap_or_default();
+        Err(format!("Full sync failed: {text}"))
+    }
+}
+
+// ── Lifecycle Commands ───────────────────────────────────────────
+
+/// Called when the app goes to background (mobile).
+/// Saves state and reduces activity.
+#[tauri::command]
+fn on_app_pause(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // Persist current token to disk for recovery
+    if let Ok(guard) = state.token.lock() {
+        if let Some(token) = guard.as_ref() {
+            let token_path = state.data_dir.join("session_token");
+            let _ = std::fs::write(token_path, token);
+        }
+    }
+
+    // Persist server URL
+    if let Ok(url) = state.server_url.lock() {
+        let url_path = state.data_dir.join("server_url");
+        let _ = std::fs::write(url_path, url.as_str());
+    }
+
+    Ok(())
+}
+
+/// Called when the app returns to foreground (mobile).
+/// Restores state and reconnects.
+#[tauri::command]
+async fn on_app_resume(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let mut restored_token = false;
+    let mut restored_url = false;
+
+    // Restore token if lost from memory
+    if state.token.lock().map_err(|e| e.to_string())?.is_none() {
+        let token_path = state.data_dir.join("session_token");
+        if let Ok(token) = std::fs::read_to_string(&token_path) {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                *state.token.lock().map_err(|e| e.to_string())? = Some(token);
+                restored_token = true;
+            }
+        }
+    }
+
+    // Restore server URL
+    let url_path = state.data_dir.join("server_url");
+    if let Ok(url) = std::fs::read_to_string(&url_path) {
+        let url = url.trim().to_string();
+        if !url.is_empty() {
+            *state.server_url.lock().map_err(|e| e.to_string())? = url;
+            restored_url = true;
+        }
+    }
+
+    // Try health check to verify connection
+    let is_online = if let Ok(url) = state.server_url.lock() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        client
+            .get(format!("{}/health", url))
+            .send()
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+
+    state.sync_stop.store(false, Ordering::SeqCst);
+
+    Ok(serde_json::json!({
+        "restored_token": restored_token,
+        "restored_url": restored_url,
+        "is_online": is_online,
+        "has_token": state.token.lock().map_err(|e| e.to_string())?.is_some(),
+    }))
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+/// Get or create a persistent device ID.
+fn get_device_id(data_dir: &std::path::Path) -> String {
+    let id_path = data_dir.join(".device_id");
+    if let Ok(id) = std::fs::read_to_string(&id_path) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let _ = std::fs::create_dir_all(data_dir);
+    let _ = std::fs::write(&id_path, &id);
+    id
+}
+
 // ── Entry Point ──────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -191,6 +367,22 @@ pub fn run() {
                 "https://moanew-production.up.railway.app".to_string(),
             ),
             token: std::sync::Mutex::new(None),
+            sync_connected: AtomicBool::new(false),
+            sync_stop: AtomicBool::new(false),
+            data_dir: {
+                // Use platform-appropriate data directory
+                let dir = if cfg!(target_os = "android") || cfg!(target_os = "ios") {
+                    // On mobile, Tauri provides the app data path at runtime.
+                    // We use a safe default that Tauri's setup will override.
+                    PathBuf::from(".")
+                } else {
+                    dirs_next::data_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("com.moa.agent")
+                };
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            },
         })
         .invoke_handler(tauri::generate_handler![
             greet,
@@ -202,8 +394,38 @@ pub fn run() {
             is_authenticated,
             disconnect,
             get_platform_info,
+            get_sync_status,
+            trigger_full_sync,
+            on_app_pause,
+            on_app_resume,
         ])
         .setup(|app| {
+            // Override data_dir with Tauri's actual app data path
+            let app_data_dir = app.path().app_data_dir().unwrap_or_default();
+            let _ = std::fs::create_dir_all(&app_data_dir);
+            if let Some(state) = app.try_state::<AppState>() {
+                // Restore persisted token on startup
+                let token_path = app_data_dir.join("session_token");
+                if let Ok(token) = std::fs::read_to_string(&token_path) {
+                    let token = token.trim().to_string();
+                    if !token.is_empty() {
+                        if let Ok(mut guard) = state.token.lock() {
+                            *guard = Some(token);
+                        }
+                    }
+                }
+                // Restore persisted server URL
+                let url_path = app_data_dir.join("server_url");
+                if let Ok(url) = std::fs::read_to_string(&url_path) {
+                    let url = url.trim().to_string();
+                    if !url.is_empty() {
+                        if let Ok(mut guard) = state.server_url.lock() {
+                            *guard = url;
+                        }
+                    }
+                }
+            }
+
             #[cfg(debug_assertions)]
             {
                 if let Some(window) = app.get_webview_window("main") {

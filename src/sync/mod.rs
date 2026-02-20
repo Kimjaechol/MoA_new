@@ -11,10 +11,13 @@
 //! - Broadcast message types
 //! - Order buffer for sequence guarantees
 //! - Manifest comparison for full sync
+//! - Sync coordinator (end-to-end orchestration)
 
+pub mod coordinator;
 pub mod protocol;
 pub mod relay;
 
+pub use coordinator::SyncCoordinator;
 #[allow(unused_imports)]
 pub use protocol::{
     lww_resolve, merge_deltas_lww, BroadcastMessage, FullSyncManifest, FullSyncPlan, OrderBuffer,
