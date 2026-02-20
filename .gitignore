@@ -25,6 +25,9 @@ venv/
 # Node.js
 node_modules/
 
+# Build artifacts
+dist/
+
 # Secret keys and credentials
 .secret_key
 *.key
