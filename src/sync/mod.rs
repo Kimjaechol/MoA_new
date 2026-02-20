@@ -17,6 +17,7 @@ pub mod coordinator;
 pub mod protocol;
 pub mod relay;
 
+#[allow(unused_imports)]
 pub use coordinator::SyncCoordinator;
 #[allow(unused_imports)]
 pub use protocol::{
