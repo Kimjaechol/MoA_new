@@ -53,8 +53,12 @@
         "depends": []
       }
     },
+    "android": {
+      "minSdkVersion": 24
+    },
     "iOS": {
-      "developmentTeam": ""
+      "developmentTeam": "",
+      "minimumSystemVersion": "13.0"
     }
   },
   "plugins": {

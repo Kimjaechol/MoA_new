@@ -199,6 +199,18 @@ pub struct AppState {
     pub telemetry: Option<Arc<crate::telemetry::TelemetryStore>>,
     /// Admin token hash for telemetry API authentication.
     pub telemetry_admin_token_hash: Option<Arc<str>>,
+    /// Multi-user auth store (when auth.enabled = true).
+    pub auth_store: Option<Arc<crate::auth::AuthStore>>,
+    /// Whether new user registration is allowed.
+    pub auth_allow_registration: bool,
+    /// Maximum registered users (0 = unlimited).
+    pub auth_max_users: u64,
+    /// Maximum devices per user.
+    pub auth_max_devices_per_user: u32,
+    /// Temporary relay for sync Layer 1 (TTL-based in-memory storage).
+    pub sync_relay: Option<Arc<crate::sync::SyncRelay>>,
+    /// Broadcast channel for sync WebSocket messages.
+    pub sync_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -318,6 +330,53 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
+    // ── Auth store (multi-user) ─────────────────────────────
+    let auth_store = if config.auth.enabled {
+        let auth_db = config.workspace_dir.join("auth.db");
+        match crate::auth::AuthStore::new(&auth_db, Some(config.auth.session_ttl_secs)) {
+            Ok(store) => {
+                tracing::info!("Multi-user auth store initialized");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize auth store: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let auth_allow_registration = config.auth.allow_registration;
+    let auth_max_users = config.auth.max_users;
+    let auth_max_devices_per_user = config.auth.max_devices_per_user;
+
+    // ── Sync relay + broadcast ───────────────────────────────
+    let (sync_relay, sync_broadcast) = if config.sync.enabled {
+        let relay = Arc::new(crate::sync::SyncRelay::with_ttl(config.sync.relay_ttl_secs));
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(256);
+        tracing::info!(
+            ttl = config.sync.relay_ttl_secs,
+            "Sync relay + broadcast channel initialized"
+        );
+
+        // Periodic relay sweep (every 60 seconds)
+        let relay_for_sweep = Arc::clone(&relay);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let removed = relay_for_sweep.sweep_expired();
+                if removed > 0 {
+                    tracing::debug!(removed, "Swept expired relay entries");
+                }
+            }
+        });
+
+        (Some(relay), Some(tx))
+    } else {
+        (None, None)
+    };
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -362,6 +421,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
     println!("  GET  /health    — health check");
+    if config.sync.enabled {
+        println!("  WS   /sync      — WebSocket sync broadcast channel");
+        println!("  POST /api/sync/relay  — upload encrypted data to relay");
+        println!("  GET  /api/sync/relay  — pickup pending relay entries");
+    }
+    if config.auth.enabled {
+        println!("  POST /api/auth/register            — create new user account");
+        println!("  POST /api/auth/login               — authenticate and get session token");
+        println!("  POST /api/auth/logout              — revoke current session");
+        println!("  GET  /api/auth/me                  — current user info");
+        println!("  GET  /api/auth/devices             — list user devices");
+        println!("  POST /api/auth/devices             — register a device");
+        println!("  DELETE /api/auth/devices/:id       — remove a device");
+    }
     if config.telemetry.enabled {
         println!("  POST /api/telemetry/events        — ingest telemetry events");
         println!("  GET  /api/admin/telemetry/events   — query events (admin)");
@@ -421,6 +494,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         agent,
         telemetry,
         telemetry_admin_token_hash,
+        auth_store,
+        auth_allow_registration,
+        auth_max_users,
+        auth_max_devices_per_user,
+        sync_relay,
+        sync_broadcast,
     };
 
     // ── CORS — allow web/Tauri clients to connect from any origin ──
@@ -429,6 +508,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
+            axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
         .allow_headers([
@@ -447,6 +527,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/api/auth/register", post(handle_auth_register))
+        .route("/api/auth/login", post(handle_auth_login))
+        .route("/api/auth/logout", post(handle_auth_logout))
+        .route("/api/auth/me", get(handle_auth_me))
+        .route("/api/auth/devices", get(handle_auth_devices_list))
+        .route("/api/auth/devices", post(handle_auth_device_register))
+        .route("/api/auth/devices/{device_id}", axum::routing::delete(handle_auth_device_remove))
+        .route("/sync", get(handle_sync_ws))
+        .route("/api/sync/relay", post(handle_sync_relay_upload))
+        .route("/api/sync/relay", get(handle_sync_relay_pickup))
         .route("/api/telemetry/events", post(handle_telemetry_ingest))
         .route("/api/admin/telemetry/events", get(handle_admin_telemetry_events))
         .route("/api/admin/telemetry/summary", get(handle_admin_telemetry_summary))
@@ -930,6 +1020,596 @@ fn authenticate_admin(state: &AppState, headers: &HeaderMap) -> bool {
     crate::security::pairing::constant_time_eq(&provided_hash, expected_hash.as_ref())
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTH HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Concrete return type for auth handlers (avoids `impl IntoResponse` inference issues).
+type AuthResponse = (StatusCode, Json<serde_json::Value>);
+
+/// Request body for user registration.
+#[derive(GatewayDeserialize)]
+struct AuthRegisterBody {
+    username: String,
+    password: String,
+}
+
+/// Request body for login.
+#[derive(GatewayDeserialize)]
+struct AuthLoginBody {
+    username: String,
+    password: String,
+    device_id: Option<String>,
+    device_name: Option<String>,
+}
+
+/// Request body for device registration.
+#[derive(GatewayDeserialize)]
+struct AuthDeviceRegisterBody {
+    device_id: String,
+    device_name: String,
+    platform: Option<String>,
+}
+
+/// Extract bearer token from Authorization header.
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Validate a session token and return the session. Returns error response if invalid.
+fn require_auth_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<crate::auth::Session, (StatusCode, Json<serde_json::Value>)> {
+    let auth_store = state.auth_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Auth not enabled"})),
+        )
+    })?;
+
+    let token = extract_bearer_token(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Missing Authorization header"})),
+        )
+    })?;
+
+    auth_store.validate_session(token).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid or expired session token"})),
+        )
+    })
+}
+
+/// POST /api/auth/register — create a new user account.
+async fn handle_auth_register(
+    State(state): State<AppState>,
+    body: Result<Json<AuthRegisterBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Auth not enabled"})),
+            );
+        }
+    };
+
+    if !state.auth_allow_registration {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Registration is disabled"})),
+        );
+    }
+
+    // Enforce max_users limit (0 = unlimited)
+    if state.auth_max_users > 0 {
+        if let Ok(count) = auth_store.user_count() {
+            if count >= state.auth_max_users {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "Maximum user limit reached"})),
+                );
+            }
+        }
+    }
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    match auth_store.register(&body.username, &body.password) {
+        Ok(user_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "status": "registered",
+                "user_id": user_id,
+            })),
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("already taken") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(serde_json::json!({"error": msg})))
+        }
+    }
+}
+
+/// POST /api/auth/login — authenticate and get a session token.
+async fn handle_auth_login(
+    State(state): State<AppState>,
+    body: Result<Json<AuthLoginBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Auth not enabled"})),
+            );
+        }
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    let user = match auth_store.authenticate(&body.username, &body.password) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid username or password"})),
+            );
+        }
+    };
+
+    match auth_store.create_session(
+        &user.id,
+        body.device_id.as_deref(),
+        body.device_name.as_deref(),
+    ) {
+        Ok(token) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "authenticated",
+                "token": token,
+                "user_id": user.id,
+                "username": user.username,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Session creation failed: {e}")})),
+        ),
+    }
+}
+
+/// POST /api/auth/logout — revoke current session.
+async fn handle_auth_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Auth not enabled"})),
+            );
+        }
+    };
+
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Missing Authorization header"})),
+            );
+        }
+    };
+
+    match auth_store.revoke_session(token) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "logged_out"})),
+        ),
+        Ok(false) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid session"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Logout failed: {e}")})),
+        ),
+    }
+}
+
+/// GET /api/auth/me — get current user info from session token.
+async fn handle_auth_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    match auth_store.get_user(&session.user_id) {
+        Ok(Some(user)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "user_id": user.id,
+                "username": user.username,
+                "device_id": session.device_id,
+                "device_name": session.device_name,
+            })),
+        ),
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "User not found"})),
+        ),
+    }
+}
+
+/// GET /api/auth/devices — list devices for authenticated user.
+async fn handle_auth_devices_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    match auth_store.list_devices(&session.user_id) {
+        Ok(devices) => {
+            let list: Vec<_> = devices
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "device_id": d.device_id,
+                        "device_name": d.device_name,
+                        "last_seen": d.last_seen,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({"devices": list})))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to list devices: {e}")})),
+        ),
+    }
+}
+
+/// POST /api/auth/devices — register a device for authenticated user.
+async fn handle_auth_device_register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<AuthDeviceRegisterBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+
+    // Enforce max_devices_per_user limit
+    if let Ok(devices) = auth_store.list_devices(&session.user_id) {
+        // Only enforce if this is a new device (not an update of an existing one)
+        let is_existing = devices.iter().any(|d| d.device_id == body.device_id);
+        if !is_existing && devices.len() >= state.auth_max_devices_per_user as usize {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": format!("Maximum devices per user ({}) reached", state.auth_max_devices_per_user),
+                })),
+            );
+        }
+    }
+
+    match auth_store.register_device(
+        &session.user_id,
+        &body.device_id,
+        &body.device_name,
+        body.platform.as_deref(),
+    ) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "status": "device_registered",
+                "device_id": body.device_id,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Device registration failed: {e}")})),
+        ),
+    }
+}
+
+/// DELETE /api/auth/devices/:device_id — remove a device.
+async fn handle_auth_device_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    match auth_store.remove_device(&session.user_id, &device_id) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "device_removed"})),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Device not found"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Device removal failed: {e}")})),
+        ),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SYNC HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Request body for relay upload.
+#[derive(GatewayDeserialize)]
+struct SyncRelayUploadBody {
+    encrypted_payload: String,
+    nonce: String,
+}
+
+/// Query params for relay pickup.
+#[derive(GatewayDeserialize)]
+struct SyncRelayPickupQuery {
+    device_id: Option<String>,
+}
+
+/// GET /sync — WebSocket upgrade for sync broadcast channel.
+///
+/// Once connected, clients receive all broadcast messages from peers.
+/// Clients can also send messages that get broadcast to all other
+/// connected WebSocket clients. The server does NOT store any messages.
+async fn handle_sync_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: axum::extract::WebSocketUpgrade,
+) -> impl IntoResponse {
+    // Authenticate via session token (query param or header)
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err((status, json)) => {
+            return (status, json.0.to_string()).into_response();
+        }
+    };
+
+    let broadcast_tx = match state.sync_broadcast.as_ref() {
+        Some(tx) => tx.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Sync not enabled",
+            )
+                .into_response();
+        }
+    };
+
+    let device_id = session.device_id.clone().unwrap_or_default();
+    let user_id = session.user_id.clone();
+
+    ws.on_upgrade(move |socket| {
+        handle_sync_ws_connection(socket, broadcast_tx, device_id, user_id)
+    })
+}
+
+/// Handle a single WebSocket sync connection.
+async fn handle_sync_ws_connection(
+    socket: axum::extract::ws::WebSocket,
+    broadcast_tx: tokio::sync::broadcast::Sender<String>,
+    device_id: String,
+    _user_id: String,
+) {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let mut broadcast_rx = broadcast_tx.subscribe();
+
+    // Spawn task to forward broadcast messages to this client
+    let device_id_clone = device_id.clone();
+    let send_task = tokio::spawn(async move {
+        while let Ok(msg) = broadcast_rx.recv().await {
+            // Don't echo messages back to the sender.
+            // Parse JSON to reliably check from_device_id regardless of field order.
+            let is_own_message = serde_json::from_str::<serde_json::Value>(&msg)
+                .ok()
+                .and_then(|v| v.get("from_device_id")?.as_str().map(String::from))
+                .is_some_and(|id| id == device_id_clone);
+            if is_own_message {
+                continue;
+            }
+            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Receive messages from this client and broadcast to all peers
+    while let Some(Ok(msg)) = ws_receiver.next().await {
+        match msg {
+            Message::Text(text) => {
+                let _ = broadcast_tx.send(text.to_string());
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    send_task.abort();
+    tracing::debug!(device_id, "Sync WebSocket disconnected");
+}
+
+/// POST /api/sync/relay — upload encrypted data to the temporary relay.
+async fn handle_sync_relay_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<SyncRelayUploadBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let relay = match state.sync_relay.as_ref() {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Sync not enabled"})),
+            );
+        }
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    let entry_id = uuid::Uuid::new_v4().to_string();
+    let device_id = session.device_id.clone().unwrap_or_default();
+
+    let entry = crate::sync::relay::RelayEntry {
+        id: entry_id.clone(),
+        sender_device_id: device_id.clone(),
+        user_id: session.user_id.clone(),
+        encrypted_payload: body.encrypted_payload,
+        nonce: body.nonce,
+        created_at_epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    relay.store(entry);
+
+    // Notify connected peers via broadcast
+    if let Some(ref tx) = state.sync_broadcast {
+        let notify = serde_json::json!({
+            "type": "relay_notify",
+            "from_device_id": device_id,
+            "relay_ids": [entry_id],
+        });
+        let _ = tx.send(notify.to_string());
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "status": "stored",
+            "relay_id": entry_id,
+        })),
+    )
+}
+
+/// GET /api/sync/relay — pick up pending relay entries.
+async fn handle_sync_relay_pickup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Query<SyncRelayPickupQuery>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let relay = match state.sync_relay.as_ref() {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Sync not enabled"})),
+            );
+        }
+    };
+
+    let exclude_device = query.device_id.as_deref().or(session.device_id.as_deref());
+    let entries = relay.pickup(&session.user_id, exclude_device);
+
+    let list: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "sender_device_id": e.sender_device_id,
+                "encrypted_payload": e.encrypted_payload,
+                "nonce": e.nonce,
+                "created_at_epoch": e.created_at_epoch,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "entries": list,
+            "count": list.len(),
+        })),
+    )
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TELEMETRY HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
 /// POST /api/telemetry/events — ingest telemetry events from app clients.
 /// Requires bearer token auth (pairing or admin token).
 async fn handle_telemetry_ingest(
@@ -1356,6 +2036,12 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1408,6 +2094,12 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let headers = HeaderMap::new();
@@ -1469,6 +2161,12 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let response = handle_webhook(
@@ -1507,6 +2205,12 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1548,6 +2252,12 @@ mod tests {
             agent: None,
             telemetry: None,
             telemetry_admin_token_hash: None,
+            auth_store: None,
+            auth_allow_registration: false,
+            auth_max_users: 0,
+            auth_max_devices_per_user: 10,
+            sync_relay: None,
+            sync_broadcast: None,
         };
 
         let mut headers = HeaderMap::new();

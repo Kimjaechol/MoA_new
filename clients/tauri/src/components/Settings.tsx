@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { t, type Locale } from "../lib/i18n";
-import { apiClient } from "../lib/api";
+import { apiClient, type SyncStatus, type PlatformInfo } from "../lib/api";
+import { isTauri } from "../lib/tauri-bridge";
 
 interface SettingsProps {
   locale: Locale;
@@ -18,10 +19,19 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
   const [isHealthChecking, setIsHealthChecking] = useState(false);
   const [isConnected, setIsConnected] = useState(apiClient.isConnected());
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [platformInfo, setPlatformInfo] = useState<PlatformInfo | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const inTauri = isTauri();
 
   useEffect(() => {
     setIsConnected(apiClient.isConnected());
-  }, []);
+    // Fetch sync status and platform info when in Tauri
+    if (inTauri) {
+      apiClient.getSyncStatus().then(setSyncStatus).catch(() => {});
+      apiClient.getPlatformInfo().then(setPlatformInfo).catch(() => {});
+    }
+  }, [inTauri]);
 
   const clearMessage = useCallback(() => {
     setTimeout(() => setMessage(null), 5000);
@@ -74,6 +84,28 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
     onConnectionChange(false);
     setMessage(null);
   }, [onConnectionChange]);
+
+  const handleTriggerSync = useCallback(async () => {
+    setIsSyncing(true);
+    setMessage(null);
+    try {
+      const result = await apiClient.triggerFullSync();
+      if (result) {
+        setMessage({ type: "success", text: t("sync_triggered", locale) });
+      }
+      // Refresh sync status
+      const status = await apiClient.getSyncStatus();
+      setSyncStatus(status);
+    } catch (err) {
+      setMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : t("sync_failed", locale),
+      });
+    } finally {
+      setIsSyncing(false);
+      clearMessage();
+    }
+  }, [locale, clearMessage]);
 
   const handleHealthCheck = useCallback(async () => {
     setIsHealthChecking(true);
@@ -237,6 +269,58 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
               </div>
             </div>
           </div>
+
+          {/* Sync section (Tauri only) */}
+          {inTauri && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("sync_status", locale)}</div>
+              <div className="settings-card">
+                {syncStatus ? (
+                  <>
+                    <div className={`settings-status ${syncStatus.connected ? "connected" : "disconnected"}`}>
+                      <div className={`status-dot ${syncStatus.connected ? "connected" : ""}`} />
+                      {syncStatus.connected ? t("sync_connected", locale) : t("sync_disconnected", locale)}
+                    </div>
+                    <div className="settings-field" style={{ marginTop: 12 }}>
+                      <label className="settings-label">{t("sync_device_id", locale)}</label>
+                      <div className="settings-token-display" style={{ fontSize: 11 }}>
+                        {syncStatus.device_id}
+                      </div>
+                    </div>
+                    {isConnected && (
+                      <div className="settings-actions" style={{ marginTop: 12 }}>
+                        <button
+                          className="settings-btn settings-btn-secondary"
+                          onClick={handleTriggerSync}
+                          disabled={isSyncing}
+                        >
+                          {isSyncing ? t("sync_triggering", locale) : t("sync_trigger", locale)}
+                        </button>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="settings-status disconnected">
+                    <div className="status-dot" />
+                    {t("sync_disconnected", locale)}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Platform info (Tauri only) */}
+          {inTauri && platformInfo && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("platform", locale)}</div>
+              <div className="settings-card">
+                <p style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
+                  {platformInfo.os} / {platformInfo.arch}
+                  {platformInfo.is_mobile ? " (Mobile)" : " (Desktop)"}
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* About */}
           <div className="settings-section">

@@ -1,9 +1,10 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { Chat } from "./components/Chat";
 import { Sidebar } from "./components/Sidebar";
 import { Settings } from "./components/Settings";
 import { apiClient } from "./lib/api";
 import { getStoredLocale, setStoredLocale, type Locale } from "./lib/i18n";
+import { isTauri, onLifecycleEvent, isAuthenticated } from "./lib/tauri-bridge";
 import {
   loadChats,
   saveChats,
@@ -25,6 +26,7 @@ function App() {
   const [activeChatId, setActiveChatIdState] = useState<string | null>(() => getActiveChatId());
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isConnected, setIsConnected] = useState(apiClient.isConnected());
+  const lifecycleCleanup = useRef<(() => void) | null>(null);
 
   const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
 
@@ -35,6 +37,31 @@ function App() {
   useEffect(() => {
     setActiveChatId(activeChatId);
   }, [activeChatId]);
+
+  // Mobile lifecycle: handle pause/resume events
+  useEffect(() => {
+    if (!isTauri()) return;
+
+    onLifecycleEvent(async (event, data) => {
+      if (event === "resume" && data) {
+        // Check if token was restored by the backend
+        if (data.has_token) {
+          setIsConnected(true);
+        }
+      }
+    }).then((cleanup) => {
+      lifecycleCleanup.current = cleanup;
+    });
+
+    // On startup in Tauri, check backend auth state
+    isAuthenticated().then((auth) => {
+      if (auth === true) setIsConnected(true);
+    });
+
+    return () => {
+      lifecycleCleanup.current?.();
+    };
+  }, []);
 
   const handleLocaleChange = useCallback((newLocale: Locale) => {
     setLocale(newLocale);

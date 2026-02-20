@@ -1,3 +1,14 @@
+import {
+  isTauri,
+  getSyncStatus,
+  triggerFullSync,
+  getPlatformInfo,
+  disconnectBackend,
+  setServerUrl as setBackendServerUrl,
+  type SyncStatus,
+  type PlatformInfo,
+} from "./tauri-bridge";
+
 const STORAGE_KEY_TOKEN = "moa_token";
 const STORAGE_KEY_SERVER = "moa_server_url";
 
@@ -15,6 +26,8 @@ export interface HealthResponse {
   status: string;
 }
 
+export type { SyncStatus, PlatformInfo };
+
 export class MoAClient {
   private serverUrl: string;
   private token: string | null;
@@ -31,6 +44,10 @@ export class MoAClient {
   setServerUrl(url: string): void {
     this.serverUrl = url.replace(/\/+$/, "");
     localStorage.setItem(STORAGE_KEY_SERVER, this.serverUrl);
+    // Also update Tauri backend if running in Tauri
+    if (isTauri()) {
+      setBackendServerUrl(this.serverUrl).catch(() => {});
+    }
   }
 
   getToken(): string | null {
@@ -50,6 +67,10 @@ export class MoAClient {
   disconnect(): void {
     this.token = null;
     localStorage.removeItem(STORAGE_KEY_TOKEN);
+    // Also disconnect on Tauri backend
+    if (isTauri()) {
+      disconnectBackend().catch(() => {});
+    }
   }
 
   async pair(
@@ -136,6 +157,23 @@ export class MoAClient {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  // ── Sync commands (Tauri backend only) ──────────────────────────
+
+  /** Get sync status from Tauri backend. Returns null when not in Tauri. */
+  async getSyncStatus(): Promise<SyncStatus | null> {
+    return getSyncStatus();
+  }
+
+  /** Trigger a full sync (Layer 3). Returns null when not in Tauri. */
+  async triggerFullSync(): Promise<string | null> {
+    return triggerFullSync();
+  }
+
+  /** Get platform info. Returns null when not in Tauri. */
+  async getPlatformInfo(): Promise<PlatformInfo | null> {
+    return getPlatformInfo();
   }
 }
 

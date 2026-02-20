@@ -134,6 +134,8 @@ pub fn run_wizard() -> Result<Config> {
         hardware: hardware_config,
         gatekeeper: crate::config::GatekeeperConfig::default(),
         telemetry: crate::config::TelemetryConfig::default(),
+        auth: crate::config::AuthConfig::default(),
+        sync: crate::config::SyncConfig::default(),
     };
 
     println!(
@@ -352,6 +354,8 @@ pub fn run_quick_setup(
         hardware: crate::config::HardwareConfig::default(),
         gatekeeper: crate::config::GatekeeperConfig::default(),
         telemetry: crate::config::TelemetryConfig::default(),
+        auth: crate::config::AuthConfig::default(),
+        sync: crate::config::SyncConfig::default(),
     };
 
     config.save()?;

@@ -100,6 +100,14 @@ pub struct Config {
     /// Admin telemetry configuration (usage analytics and suspicious activity alerts).
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    /// Multi-user authentication configuration.
+    #[serde(default)]
+    pub auth: AuthConfig,
+
+    /// Multi-device synchronization configuration.
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -961,13 +969,18 @@ impl Default for AutonomyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    /// Runtime kind (`native` | `docker`).
+    /// Runtime kind (`native` | `docker` | `mobile`).
     #[serde(default = "default_runtime_kind")]
     pub kind: String,
 
     /// Docker runtime settings (used when `kind = "docker"`).
     #[serde(default)]
     pub docker: DockerRuntimeConfig,
+
+    /// App-specific data directory for mobile runtime (used when `kind = "mobile"`).
+    /// Defaults to `.zeroclaw` if not set.
+    #[serde(default)]
+    pub mobile_data_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1040,6 +1053,7 @@ impl Default for RuntimeConfig {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
+            mobile_data_dir: None,
         }
     }
 }
@@ -1336,6 +1350,98 @@ impl Default for TelemetryConfig {
             alert_channel: None,
             alert_to: None,
             suspicious_patterns: default_suspicious_patterns(),
+        }
+    }
+}
+
+// ── Auth ────────────────────────────────────────────────────────
+
+/// Multi-user authentication configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Enable multi-user authentication (default: false).
+    /// When disabled, the gateway uses single-owner pairing mode.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Allow new user registration (default: true when auth is enabled).
+    #[serde(default = "default_true")]
+    pub allow_registration: bool,
+
+    /// Session token TTL in seconds (default: 30 days).
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+
+    /// Maximum devices per user (default: 10).
+    #[serde(default = "default_max_devices_per_user")]
+    pub max_devices_per_user: u32,
+
+    /// Maximum registered users (0 = unlimited, default: 0).
+    #[serde(default)]
+    pub max_users: u64,
+}
+
+fn default_session_ttl_secs() -> u64 {
+    30 * 24 * 3600 // 30 days
+}
+
+fn default_max_devices_per_user() -> u32 {
+    10
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_registration: true,
+            session_ttl_secs: default_session_ttl_secs(),
+            max_devices_per_user: default_max_devices_per_user(),
+            max_users: 0,
+        }
+    }
+}
+
+// ── Sync ────────────────────────────────────────────────────────
+
+/// Multi-device synchronization configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncConfig {
+    /// Enable cross-device memory synchronization (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// TTL for temporary relay entries in seconds (default: 300 = 5 minutes).
+    #[serde(default = "default_relay_ttl_secs")]
+    pub relay_ttl_secs: u64,
+
+    /// Delta journal retention period in days (default: 30).
+    #[serde(default = "default_journal_retention_days")]
+    pub journal_retention_days: u32,
+
+    /// Maximum deltas per sync_response batch (default: 50).
+    #[serde(default = "default_sync_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_relay_ttl_secs() -> u64 {
+    300
+}
+
+fn default_journal_retention_days() -> u32 {
+    30
+}
+
+fn default_sync_batch_size() -> usize {
+    50
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            relay_ttl_secs: default_relay_ttl_secs(),
+            journal_retention_days: default_journal_retention_days(),
+            batch_size: default_sync_batch_size(),
         }
     }
 }
@@ -1850,6 +1956,8 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
+            auth: AuthConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -2385,6 +2493,8 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
+            auth: AuthConfig::default(),
+            sync: SyncConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2496,6 +2606,8 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
+            auth: AuthConfig::default(),
+            sync: SyncConfig::default(),
         };
 
         config.save().unwrap();

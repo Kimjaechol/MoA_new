@@ -208,11 +208,14 @@ impl Agent {
             &config.workspace_dir,
         ));
 
-        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory(
+        // Create memory with sync wrapping when sync is enabled.
+        let (memory, _sync_engine) = memory::create_synced_memory(
             &config.memory,
+            &config.sync,
             &config.workspace_dir,
             config.api_key.as_deref(),
-        )?);
+        )?;
+        let memory: Arc<dyn Memory> = memory;
 
         let composio_key = if config.composio.enabled {
             config.composio.api_key.as_deref()

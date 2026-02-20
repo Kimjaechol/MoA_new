@@ -1,0 +1,18 @@
+// Tauri 2 Android project settings.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+include ':app'
+
+// Include Tauri's generated Rust bridge library.
+include ':tauri-android'
+
+def tauriProjects = file("tauri.settings.gradle")
+if (tauriProjects.exists()) {
+    apply from: tauriProjects
+}
