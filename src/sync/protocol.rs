@@ -275,6 +275,127 @@ impl OrderBuffer {
     }
 }
 
+// ── Last-Writer-Wins Conflict Resolution ─────────────────────────
+
+/// Resolve a concurrent write conflict using Last-Writer-Wins (LWW).
+///
+/// When two deltas are causally concurrent (neither version vector dominates
+/// the other), we break the tie deterministically:
+///   1. **Higher timestamp wins** (wall-clock, seconds).
+///   2. **On timestamp tie**: lexicographically greater `device_id` wins.
+///
+/// This ensures every device converges to the same state without coordination.
+///
+/// Returns `true` if `incoming` should win (overwrite local).
+pub fn lww_resolve(local: &DeltaEntry, incoming: &DeltaEntry) -> bool {
+    if incoming.timestamp != local.timestamp {
+        return incoming.timestamp > local.timestamp;
+    }
+    // Deterministic tiebreaker: higher device_id wins
+    incoming.device_id > local.device_id
+}
+
+/// Merge two sets of deltas, resolving conflicts via LWW for concurrent writes
+/// to the same key.
+///
+/// Returns the winning delta for each key.
+pub fn merge_deltas_lww(
+    local_deltas: &[DeltaEntry],
+    incoming_deltas: &[DeltaEntry],
+) -> Vec<DeltaEntry> {
+    use std::collections::HashMap;
+
+    // Index by key → best delta
+    let mut winners: HashMap<String, DeltaEntry> = HashMap::new();
+
+    let mut insert = |delta: &DeltaEntry| {
+        let key = match &delta.operation {
+            crate::memory::sync::DeltaOperation::Store { key, .. } => key.clone(),
+            crate::memory::sync::DeltaOperation::Forget { key } => key.clone(),
+        };
+
+        match winners.get(&key) {
+            Some(existing) => {
+                if lww_resolve(existing, delta) {
+                    winners.insert(key, delta.clone());
+                }
+            }
+            None => {
+                winners.insert(key, delta.clone());
+            }
+        }
+    };
+
+    for d in local_deltas {
+        insert(d);
+    }
+    for d in incoming_deltas {
+        insert(d);
+    }
+
+    let mut result: Vec<DeltaEntry> = winners.into_values().collect();
+    result.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    result
+}
+
+// ── Full Sync Protocol Handler ──────────────────────────────────
+
+/// Result of processing an incoming full sync manifest comparison.
+pub struct FullSyncPlan {
+    /// Keys that the remote has and we are missing.
+    pub we_need: FullSyncManifest,
+    /// Keys that we have and the remote is missing.
+    pub they_need: FullSyncManifest,
+}
+
+impl FullSyncPlan {
+    /// Compute the bidirectional sync plan from local and remote manifests.
+    pub fn compute(local: &FullSyncManifest, remote: &FullSyncManifest) -> Self {
+        Self {
+            we_need: remote.missing_from(local),
+            they_need: local.missing_from(remote),
+        }
+    }
+
+    /// True if there is nothing to sync in either direction.
+    pub fn is_empty(&self) -> bool {
+        self.we_need.total_count() == 0 && self.they_need.total_count() == 0
+    }
+}
+
+/// Generate batched `BroadcastMessage::FullSyncData` messages for entities
+/// the remote peer is missing.
+pub fn build_full_sync_data_messages(
+    from_device_id: &str,
+    missing_keys: &HashSet<String>,
+    entries: &[(String, String, String, String)], // (key, entity_type, encrypted_payload, iv)
+) -> Vec<BroadcastMessage> {
+    let mut messages = Vec::new();
+
+    for (key, entity_type, encrypted_payload, iv) in entries {
+        if missing_keys.contains(key) {
+            messages.push(BroadcastMessage::FullSyncData {
+                from_device_id: from_device_id.to_string(),
+                entity_type: entity_type.clone(),
+                entity_id: key.clone(),
+                encrypted_payload: encrypted_payload.clone(),
+                iv: iv.clone(),
+                auth_tag: String::new(),
+            });
+        }
+    }
+
+    messages
+}
+
+/// Build the completion message for a full sync transfer.
+pub fn build_full_sync_complete(from_device_id: &str, sent_count: u64) -> BroadcastMessage {
+    BroadcastMessage::FullSyncComplete {
+        from_device_id: from_device_id.to_string(),
+        sent_count,
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -436,6 +557,180 @@ mod tests {
         m.setting_keys.insert("s1".into());
 
         assert_eq!(m.total_count(), 4);
+    }
+
+    // ── LWW Conflict Resolution Tests ─────────────────────────
+
+    #[test]
+    fn lww_higher_timestamp_wins() {
+        let local = DeltaEntry {
+            id: "d1".into(),
+            device_id: "dev_a".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "old".into(),
+                category: "core".into(),
+            },
+            timestamp: 1000,
+        };
+        let incoming = DeltaEntry {
+            id: "d2".into(),
+            device_id: "dev_b".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "new".into(),
+                category: "core".into(),
+            },
+            timestamp: 2000,
+        };
+
+        assert!(super::lww_resolve(&local, &incoming)); // incoming wins (higher ts)
+        assert!(!super::lww_resolve(&incoming, &local)); // local is older
+    }
+
+    #[test]
+    fn lww_same_timestamp_higher_device_id_wins() {
+        let local = DeltaEntry {
+            id: "d1".into(),
+            device_id: "aaa".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "from_aaa".into(),
+                category: "core".into(),
+            },
+            timestamp: 1000,
+        };
+        let incoming = DeltaEntry {
+            id: "d2".into(),
+            device_id: "zzz".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "from_zzz".into(),
+                category: "core".into(),
+            },
+            timestamp: 1000,
+        };
+
+        assert!(super::lww_resolve(&local, &incoming)); // zzz > aaa
+        assert!(!super::lww_resolve(&incoming, &local)); // aaa < zzz
+    }
+
+    #[test]
+    fn merge_deltas_lww_picks_winner_per_key() {
+        let local_deltas = vec![DeltaEntry {
+            id: "d1".into(),
+            device_id: "dev_a".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "shared".into(),
+                content: "from_a".into(),
+                category: "core".into(),
+            },
+            timestamp: 1000,
+        }];
+
+        let incoming_deltas = vec![DeltaEntry {
+            id: "d2".into(),
+            device_id: "dev_b".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "shared".into(),
+                content: "from_b".into(),
+                category: "core".into(),
+            },
+            timestamp: 2000, // newer
+        }];
+
+        let result = super::merge_deltas_lww(&local_deltas, &incoming_deltas);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            &result[0].operation,
+            DeltaOperation::Store { content, .. } if content == "from_b"
+        ));
+    }
+
+    #[test]
+    fn merge_deltas_lww_keeps_distinct_keys() {
+        let local_deltas = vec![DeltaEntry {
+            id: "d1".into(),
+            device_id: "dev_a".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "key_a".into(),
+                content: "val_a".into(),
+                category: "core".into(),
+            },
+            timestamp: 1000,
+        }];
+
+        let incoming_deltas = vec![DeltaEntry {
+            id: "d2".into(),
+            device_id: "dev_b".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "key_b".into(),
+                content: "val_b".into(),
+                category: "core".into(),
+            },
+            timestamp: 2000,
+        }];
+
+        let result = super::merge_deltas_lww(&local_deltas, &incoming_deltas);
+        assert_eq!(result.len(), 2);
+    }
+
+    // ── Full Sync Plan Tests ─────────────────────────────────────
+
+    #[test]
+    fn full_sync_plan_compute_bidirectional() {
+        let mut local = FullSyncManifest::default();
+        local.memory_chunk_ids.insert("m1".into());
+        local.memory_chunk_ids.insert("m2".into());
+
+        let mut remote = FullSyncManifest::default();
+        remote.memory_chunk_ids.insert("m2".into());
+        remote.memory_chunk_ids.insert("m3".into());
+
+        let plan = super::FullSyncPlan::compute(&local, &remote);
+
+        // We need m3 (remote has it, we don't)
+        assert!(plan.we_need.memory_chunk_ids.contains("m3"));
+        assert_eq!(plan.we_need.memory_chunk_ids.len(), 1);
+
+        // They need m1 (we have it, they don't)
+        assert!(plan.they_need.memory_chunk_ids.contains("m1"));
+        assert_eq!(plan.they_need.memory_chunk_ids.len(), 1);
+    }
+
+    #[test]
+    fn full_sync_plan_empty_when_identical() {
+        let mut local = FullSyncManifest::default();
+        local.memory_chunk_ids.insert("m1".into());
+
+        let remote = local.clone();
+
+        let plan = super::FullSyncPlan::compute(&local, &remote);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn build_full_sync_data_messages_filters_by_missing() {
+        let mut missing = HashSet::new();
+        missing.insert("k1".to_string());
+        missing.insert("k3".to_string());
+
+        let entries = vec![
+            ("k1".into(), "memory".into(), "enc1".into(), "iv1".into()),
+            ("k2".into(), "memory".into(), "enc2".into(), "iv2".into()),
+            ("k3".into(), "memory".into(), "enc3".into(), "iv3".into()),
+        ];
+
+        let msgs = super::build_full_sync_data_messages("dev_a", &missing, &entries);
+        assert_eq!(msgs.len(), 2);
     }
 
     #[test]

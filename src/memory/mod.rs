@@ -9,6 +9,7 @@ pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
 pub mod sync;
+pub mod synced;
 pub mod traits;
 pub mod vector;
 
@@ -22,6 +23,7 @@ pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
+pub use synced::SyncedMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
@@ -144,6 +146,34 @@ pub fn create_memory_for_migration(
         || SqliteMemory::new(workspace_dir),
         " during migration",
     )
+}
+
+/// Factory: create a memory backend with optional sync wrapping.
+///
+/// When `sync_config.enabled` is true, the returned memory is a [`SyncedMemory`]
+/// that transparently records every mutation in the sync engine's delta journal.
+/// Otherwise, it returns a plain memory backend.
+pub fn create_synced_memory(
+    config: &MemoryConfig,
+    sync_config: &crate::config::SyncConfig,
+    workspace_dir: &Path,
+    api_key: Option<&str>,
+) -> anyhow::Result<(Arc<dyn Memory>, Option<Arc<parking_lot::Mutex<sync::SyncEngine>>>)> {
+    let base = create_memory(config, workspace_dir, api_key)?;
+
+    if sync_config.enabled {
+        let engine = sync::SyncEngine::new(workspace_dir, true)?;
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let base_arc: Arc<dyn Memory> = Arc::from(base);
+        let synced = SyncedMemory::new(base_arc, engine.clone());
+        tracing::info!(
+            device_id = %engine.lock().device_id().0,
+            "Memory sync enabled — mutations will be recorded for cross-device replication"
+        );
+        Ok((Arc::new(synced), Some(engine)))
+    } else {
+        Ok((Arc::from(base), None))
+    }
 }
 
 /// Factory: create an optional response cache from config.
