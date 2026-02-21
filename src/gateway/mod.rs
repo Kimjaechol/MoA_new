@@ -7,6 +7,8 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod pair;
+
 use crate::agent::agent::Agent;
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
@@ -211,6 +213,10 @@ pub struct AppState {
     pub sync_relay: Option<Arc<crate::sync::SyncRelay>>,
     /// Broadcast channel for sync WebSocket messages.
     pub sync_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
+    /// Shared pairing store for channel connect flow.
+    pub channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>>,
+    /// Base URL for this gateway (e.g. "http://127.0.0.1:3000").
+    pub gateway_base_url: String,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -259,6 +265,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             })
         });
 
+    // ── Channel pairing store (shared SQLite for gateway+channels) ──
+    let pairing_db_path = config.workspace_dir.join("pairing.db");
+    let channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>> =
+        match crate::channels::pairing::ChannelPairingStore::open(&pairing_db_path) {
+            Ok(store) => {
+                tracing::info!("Channel pairing store initialized at {}", pairing_db_path.display());
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open channel pairing store: {e} — pairing disabled");
+                None
+            }
+        };
+
     // WhatsApp channel (if configured)
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
         config.channels_config.whatsapp.as_ref().map(|wa| {
@@ -267,6 +287,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 wa.phone_number_id.clone(),
                 wa.verify_token.clone(),
                 wa.allowed_numbers.clone(),
+                channel_pairing.clone(),
+                Some(format!("http://{}:{}", config.gateway.host, config.gateway.port)),
             ))
         });
 
@@ -420,6 +442,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
+    println!("  GET  /pair/connect/{{channel}} — channel pairing login page");
+    println!("  GET  /pair/signup            — channel pairing signup page");
     println!("  GET  /health    — health check");
     if config.sync.enabled {
         println!("  WS   /sync      — WebSocket sync broadcast channel");
@@ -500,7 +524,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         auth_max_devices_per_user,
         sync_relay,
         sync_broadcast,
+        channel_pairing,
+        gateway_base_url: format!("http://{}:{}", config.gateway.host, config.gateway.port),
     };
+
+    // Ensure channel_links table exists if auth is enabled
+    if let Some(ref auth) = state.auth_store {
+        if let Err(e) = auth.ensure_channel_links_table() {
+            tracing::warn!("Failed to create channel_links table: {e}");
+        }
+    }
 
     // ── CORS — allow web/Tauri clients to connect from any origin ──
     let cors = CorsLayer::new()
@@ -537,6 +570,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/sync", get(handle_sync_ws))
         .route("/api/sync/relay", post(handle_sync_relay_upload))
         .route("/api/sync/relay", get(handle_sync_relay_pickup))
+        .route("/pair/auto/{token}", get(pair::handle_auto_pair_page))
+        .route("/pair/auto/{token}", post(pair::handle_auto_pair_login))
+        .route("/pair/signup", get(pair::handle_pair_signup_page))
+        .route("/pair/signup", post(pair::handle_pair_signup_submit))
         .route("/api/telemetry/events", post(handle_telemetry_ingest))
         .route("/api/admin/telemetry/events", get(handle_admin_telemetry_events))
         .route("/api/admin/telemetry/summary", get(handle_admin_telemetry_summary))
@@ -937,6 +974,24 @@ async fn handle_whatsapp_message(
             Json(serde_json::json!({"error": "Invalid JSON payload"})),
         );
     };
+
+    // Send one-click connect links to unauthorized, unpaired senders
+    let unpaired = wa.extract_unpaired_senders(&payload);
+    if let Some(ref cp) = state.channel_pairing {
+        for sender in &unpaired {
+            let token = cp.create_token("whatsapp", sender);
+            let auto_url =
+                crate::channels::pairing::ChannelPairingStore::auto_pair_url(&state.gateway_base_url, &token);
+            let _ = wa
+                .send(&SendMessage::new(
+                    &format!(
+                        "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
+                    ),
+                    sender,
+                ))
+                .await;
+        }
+    }
 
     // Parse messages from the webhook payload
     let messages = wa.parse_webhook_payload(&payload);
@@ -2042,6 +2097,8 @@ mod tests {
             auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
+            channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let mut headers = HeaderMap::new();
@@ -2100,6 +2157,8 @@ mod tests {
             auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
+            channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let headers = HeaderMap::new();
@@ -2167,6 +2226,8 @@ mod tests {
             auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
+            channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let response = handle_webhook(
@@ -2211,6 +2272,8 @@ mod tests {
             auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
+            channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let mut headers = HeaderMap::new();
@@ -2258,6 +2321,8 @@ mod tests {
             auth_max_devices_per_user: 10,
             sync_relay: None,
             sync_broadcast: None,
+            channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let mut headers = HeaderMap::new();

@@ -8,6 +8,7 @@ pub mod irc;
 pub mod kakao;
 pub mod lark;
 pub mod matrix;
+pub mod pairing;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -833,6 +834,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
             Arc::new(TelegramChannel::new(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
+                None,
+                None,
             )),
         ));
     }
@@ -846,6 +849,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
+                None,
+                None,
             )),
         ));
     }
@@ -857,6 +862,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 sl.bot_token.clone(),
                 sl.channel_id.clone(),
                 sl.allowed_users.clone(),
+                None,
+                None,
             )),
         ));
     }
@@ -864,7 +871,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref im) = config.channels_config.imessage {
         channels.push((
             "iMessage",
-            Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
+            Arc::new(IMessageChannel::new(im.allowed_contacts.clone(), None, None)),
         ));
     }
 
@@ -902,6 +909,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 wa.phone_number_id.clone(),
                 wa.verify_token.clone(),
                 wa.allowed_numbers.clone(),
+                None,
+                None,
             )),
         ));
     }
@@ -955,7 +964,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref kakao) = config.channels_config.kakao {
-        channels.push(("KakaoTalk", Arc::new(KakaoTalkChannel::from_config(kakao))));
+        channels.push(("KakaoTalk", Arc::new(KakaoTalkChannel::from_config(kakao, None, None))));
     }
 
     if channels.is_empty() {
@@ -1145,6 +1154,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
         );
     }
 
+    // ── Channel pairing store (shared SQLite for gateway+channels) ──
+    let pairing_db_path = config.workspace_dir.join("pairing.db");
+    let pairing_store: Option<Arc<pairing::ChannelPairingStore>> =
+        match pairing::ChannelPairingStore::open(&pairing_db_path) {
+            Ok(store) => {
+                tracing::info!("Channel pairing store initialized at {}", pairing_db_path.display());
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open channel pairing store: {e} — pairing disabled");
+                None
+            }
+        };
+
+    let gateway_url = format!("http://{}:{}", config.gateway.host, config.gateway.port);
+
     // Collect active channels
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
 
@@ -1152,6 +1177,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         channels.push(Arc::new(TelegramChannel::new(
             tg.bot_token.clone(),
             tg.allowed_users.clone(),
+            pairing_store.clone(),
+            Some(gateway_url.clone()),
         )));
     }
 
@@ -1162,6 +1189,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             dc.allowed_users.clone(),
             dc.listen_to_bots,
             dc.mention_only,
+            pairing_store.clone(),
+            Some(gateway_url.clone()),
         )));
     }
 
@@ -1170,11 +1199,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
             sl.bot_token.clone(),
             sl.channel_id.clone(),
             sl.allowed_users.clone(),
+            pairing_store.clone(),
+            Some(gateway_url.clone()),
         )));
     }
 
     if let Some(ref im) = config.channels_config.imessage {
-        channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
+        channels.push(Arc::new(IMessageChannel::new(
+            im.allowed_contacts.clone(),
+            pairing_store.clone(),
+            Some(gateway_url.clone()),
+        )));
     }
 
     if let Some(ref mx) = config.channels_config.matrix {
@@ -1203,6 +1238,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             wa.phone_number_id.clone(),
             wa.verify_token.clone(),
             wa.allowed_numbers.clone(),
+            pairing_store.clone(),
+            Some(gateway_url.clone()),
         )));
     }
 
@@ -1246,7 +1283,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref kakao) = config.channels_config.kakao {
-        channels.push(Arc::new(KakaoTalkChannel::from_config(kakao)));
+        channels.push(Arc::new(KakaoTalkChannel::from_config(
+            kakao,
+            pairing_store.clone(),
+            Some(gateway_url.clone()),
+        )));
     }
 
     if channels.is_empty() {

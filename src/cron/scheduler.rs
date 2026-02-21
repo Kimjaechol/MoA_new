@@ -235,7 +235,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .telegram
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let ch = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone());
+            let ch = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone(), None, None);
             ch.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
@@ -250,6 +250,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
+                None,
+                None,
             );
             ch.send(&SendMessage::new(output, target)).await?;
         }
@@ -263,6 +265,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 sl.bot_token.clone(),
                 sl.channel_id.clone(),
                 sl.allowed_users.clone(),
+                None,
+                None,
             );
             ch.send(&SendMessage::new(output, target)).await?;
         }
@@ -278,6 +282,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 kk.webhook_secret.clone(),
                 kk.allowed_users.clone(),
                 kk.port,
+                None,
+                None,
             );
             ch.send(&SendMessage::new(output, target)).await?;
         }
@@ -322,6 +328,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 wa.phone_number_id.clone(),
                 wa.verify_token.clone(),
                 wa.allowed_numbers.clone(),
+                None,
+                None,
             );
             ch.send(&SendMessage::new(output, target)).await?;
         }
@@ -395,7 +403,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .imessage
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("imessage channel not configured"))?;
-            let ch = IMessageChannel::new(im.allowed_contacts.clone());
+            let ch = IMessageChannel::new(im.allowed_contacts.clone(), None, None);
             ch.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
