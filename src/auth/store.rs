@@ -354,6 +354,67 @@ impl AuthStore {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
         Ok(count as u64)
     }
+
+    // ── Channel Linking ─────────────────────────────────────────────
+
+    /// Ensure the channel_links table exists (safe to call multiple times).
+    pub fn ensure_channel_links_table(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_links (
+                channel TEXT NOT NULL,
+                platform_uid TEXT NOT NULL,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                linked_at INTEGER NOT NULL,
+                PRIMARY KEY (channel, platform_uid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_links_user ON channel_links(user_id);",
+        )?;
+        Ok(())
+    }
+
+    /// Link a messaging channel identity to an authenticated MoA user.
+    pub fn link_channel(
+        &self,
+        channel: &str,
+        platform_uid: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        let now = epoch_secs();
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_links (channel, platform_uid, user_id, linked_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![channel, platform_uid, user_id, now as i64],
+        )?;
+        tracing::info!(channel = channel, platform_uid = platform_uid, "Channel identity linked");
+        Ok(())
+    }
+
+    /// Check if a channel identity is linked to any MoA user.
+    pub fn find_channel_link(&self, channel: &str, platform_uid: &str) -> Result<Option<User>> {
+        let conn = self.conn.lock();
+        let row = conn.query_row(
+            "SELECT u.id, u.username, u.created_at
+             FROM channel_links cl
+             JOIN users u ON cl.user_id = u.id
+             WHERE cl.channel = ?1 AND cl.platform_uid = ?2",
+            rusqlite::params![channel, platform_uid],
+            |row| {
+                Ok(User {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            },
+        );
+
+        match row {
+            Ok(user) => Ok(Some(user)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 // ── Cryptographic Helpers ───────────────────────────────────────────

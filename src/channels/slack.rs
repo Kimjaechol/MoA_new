@@ -7,15 +7,25 @@ pub struct SlackChannel {
     channel_id: Option<String>,
     allowed_users: Vec<String>,
     client: reqwest::Client,
+    pairing_store: Option<std::sync::Arc<super::pairing::ChannelPairingStore>>,
+    gateway_url: Option<String>,
 }
 
 impl SlackChannel {
-    pub fn new(bot_token: String, channel_id: Option<String>, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        bot_token: String,
+        channel_id: Option<String>,
+        allowed_users: Vec<String>,
+        pairing_store: Option<std::sync::Arc<super::pairing::ChannelPairingStore>>,
+        gateway_url: Option<String>,
+    ) -> Self {
         Self {
             bot_token,
             channel_id,
             allowed_users,
             client: reqwest::Client::new(),
+            pairing_store,
+            gateway_url,
         }
     }
 
@@ -147,7 +157,51 @@ impl Channel for SlackChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(user) {
-                        tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                        // Try pairing code redemption
+                        if super::pairing::ChannelPairingStore::looks_like_code(text) {
+                            if let Some(ref store) = self.pairing_store {
+                                if let Some(_entry) = store.redeem_code(text.trim(), "slack") {
+                                    let uid = user.to_string();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                                            super::pairing::persist_channel_allowlist("slack", &uid)
+                                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                                            tracing::error!("Slack: failed to persist pairing: {e}");
+                                        }
+                                    });
+                                    let _ = self.client.post("https://slack.com/api/chat.postMessage")
+                                        .bearer_auth(&self.bot_token)
+                                        .json(&serde_json::json!({
+                                            "channel": channel_id.clone(),
+                                            "text": "✅ 연결이 완료되었습니다! 이제 대화를 시작할 수 있습니다.\n\nConnection complete! You can start chatting now."
+                                        }))
+                                        .send().await;
+                                    continue;
+                                }
+                            }
+                            let _ = self.client.post("https://slack.com/api/chat.postMessage")
+                                .bearer_auth(&self.bot_token)
+                                .json(&serde_json::json!({
+                                    "channel": channel_id.clone(),
+                                    "text": "❌ 유효하지 않은 코드입니다.\n\nInvalid code. Please try again."
+                                }))
+                                .send().await;
+                            continue;
+                        }
+
+                        // Send connect link
+                        if let Some(ref gw_url) = self.gateway_url {
+                            let connect_url = super::pairing::ChannelPairingStore::connect_url(gw_url, "slack", user);
+                            let _ = self.client.post("https://slack.com/api/chat.postMessage")
+                                .bearer_auth(&self.bot_token)
+                                .json(&serde_json::json!({
+                                    "channel": channel_id.clone(),
+                                    "text": format!("🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{connect_url}")
+                                }))
+                                .send().await;
+                        } else {
+                            tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                        }
                         continue;
                     }
 
@@ -195,32 +249,32 @@ mod tests {
 
     #[test]
     fn slack_channel_name() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], None, None);
         assert_eq!(ch.name(), "slack");
     }
 
     #[test]
     fn slack_channel_with_channel_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![], None, None);
         assert_eq!(ch.channel_id, Some("C12345".to_string()));
     }
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], None, None);
         assert!(!ch.is_user_allowed("U12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()], None, None);
         assert!(ch.is_user_allowed("U12345"));
     }
 
     #[test]
     fn specific_allowlist_filters() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "U222".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "U222".into()], None, None);
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("U222"));
         assert!(!ch.is_user_allowed("U333"));
@@ -228,27 +282,27 @@ mod tests {
 
     #[test]
     fn allowlist_exact_match_not_substring() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()], None, None);
         assert!(!ch.is_user_allowed("U1111"));
         assert!(!ch.is_user_allowed("U11"));
     }
 
     #[test]
     fn allowlist_empty_user_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()], None, None);
         assert!(!ch.is_user_allowed(""));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()], None, None);
         assert!(ch.is_user_allowed("U111"));
         assert!(!ch.is_user_allowed("u111"));
     }
 
     #[test]
     fn allowlist_wildcard_and_specific() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "*".into()], None, None);
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("anyone"));
     }

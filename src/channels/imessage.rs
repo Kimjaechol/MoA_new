@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// iMessage channel using macOS `AppleScript` bridge.
@@ -11,13 +12,21 @@ use tokio::sync::mpsc;
 pub struct IMessageChannel {
     allowed_contacts: Vec<String>,
     poll_interval_secs: u64,
+    pairing_store: Option<Arc<super::pairing::ChannelPairingStore>>,
+    gateway_url: Option<String>,
 }
 
 impl IMessageChannel {
-    pub fn new(allowed_contacts: Vec<String>) -> Self {
+    pub fn new(
+        allowed_contacts: Vec<String>,
+        pairing_store: Option<Arc<super::pairing::ChannelPairingStore>>,
+        gateway_url: Option<String>,
+    ) -> Self {
         Self {
             allowed_contacts,
             poll_interval_secs: 3,
+            pairing_store,
+            gateway_url,
         }
     }
 
@@ -162,6 +171,40 @@ end tell"#
                         }
 
                         if !self.is_contact_allowed(&sender) {
+                            // Try pairing code redemption
+                            if super::pairing::ChannelPairingStore::looks_like_code(&text) {
+                                if let Some(ref store) = self.pairing_store {
+                                    if let Some(_entry) = store.redeem_code(text.trim(), "imessage") {
+                                        let uid = sender.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = tokio::task::spawn_blocking(move || {
+                                                super::pairing::persist_channel_allowlist("imessage", &uid)
+                                            }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                                                tracing::error!("iMessage: failed to persist pairing: {e}");
+                                            }
+                                        });
+                                        let _ = self.send(&super::traits::SendMessage::new(
+                                            "✅ 연결이 완료되었습니다! 이제 대화를 시작할 수 있습니다.\n\nConnection complete! You can start chatting now.",
+                                            &sender,
+                                        )).await;
+                                        continue;
+                                    }
+                                }
+                                let _ = self.send(&super::traits::SendMessage::new(
+                                    "❌ 유효하지 않은 코드입니다.\n\nInvalid code. Please try again.",
+                                    &sender,
+                                )).await;
+                                continue;
+                            }
+
+                            // Send connect link
+                            if let Some(ref gw_url) = self.gateway_url {
+                                let connect_url = super::pairing::ChannelPairingStore::connect_url(gw_url, "imessage", &sender);
+                                let _ = self.send(&super::traits::SendMessage::new(
+                                    &format!("🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{connect_url}"),
+                                    &sender,
+                                )).await;
+                            }
                             continue;
                         }
 
@@ -266,20 +309,20 @@ mod tests {
 
     #[test]
     fn creates_with_contacts() {
-        let ch = IMessageChannel::new(vec!["+1234567890".into()]);
+        let ch = IMessageChannel::new(vec!["+1234567890".into()], None, None);
         assert_eq!(ch.allowed_contacts.len(), 1);
         assert_eq!(ch.poll_interval_secs, 3);
     }
 
     #[test]
     fn creates_with_empty_contacts() {
-        let ch = IMessageChannel::new(vec![]);
+        let ch = IMessageChannel::new(vec![], None, None);
         assert!(ch.allowed_contacts.is_empty());
     }
 
     #[test]
     fn wildcard_allows_anyone() {
-        let ch = IMessageChannel::new(vec!["*".into()]);
+        let ch = IMessageChannel::new(vec!["*".into()], None, None);
         assert!(ch.is_contact_allowed("+1234567890"));
         assert!(ch.is_contact_allowed("random@icloud.com"));
         assert!(ch.is_contact_allowed(""));
@@ -287,47 +330,47 @@ mod tests {
 
     #[test]
     fn specific_contact_allowed() {
-        let ch = IMessageChannel::new(vec!["+1234567890".into(), "user@icloud.com".into()]);
+        let ch = IMessageChannel::new(vec!["+1234567890".into(), "user@icloud.com".into()], None, None);
         assert!(ch.is_contact_allowed("+1234567890"));
         assert!(ch.is_contact_allowed("user@icloud.com"));
     }
 
     #[test]
     fn unknown_contact_denied() {
-        let ch = IMessageChannel::new(vec!["+1234567890".into()]);
+        let ch = IMessageChannel::new(vec!["+1234567890".into()], None, None);
         assert!(!ch.is_contact_allowed("+9999999999"));
         assert!(!ch.is_contact_allowed("hacker@evil.com"));
     }
 
     #[test]
     fn contact_case_insensitive() {
-        let ch = IMessageChannel::new(vec!["User@iCloud.com".into()]);
+        let ch = IMessageChannel::new(vec!["User@iCloud.com".into()], None, None);
         assert!(ch.is_contact_allowed("user@icloud.com"));
         assert!(ch.is_contact_allowed("USER@ICLOUD.COM"));
     }
 
     #[test]
     fn empty_allowlist_denies_all() {
-        let ch = IMessageChannel::new(vec![]);
+        let ch = IMessageChannel::new(vec![], None, None);
         assert!(!ch.is_contact_allowed("+1234567890"));
         assert!(!ch.is_contact_allowed("anyone"));
     }
 
     #[test]
     fn name_returns_imessage() {
-        let ch = IMessageChannel::new(vec![]);
+        let ch = IMessageChannel::new(vec![], None, None);
         assert_eq!(ch.name(), "imessage");
     }
 
     #[test]
     fn wildcard_among_others_still_allows_all() {
-        let ch = IMessageChannel::new(vec!["+111".into(), "*".into(), "+222".into()]);
+        let ch = IMessageChannel::new(vec!["+111".into(), "*".into(), "+222".into()], None, None);
         assert!(ch.is_contact_allowed("totally-unknown"));
     }
 
     #[test]
     fn contact_with_spaces_exact_match() {
-        let ch = IMessageChannel::new(vec!["  spaced  ".into()]);
+        let ch = IMessageChannel::new(vec!["  spaced  ".into()], None, None);
         assert!(ch.is_contact_allowed("  spaced  "));
         assert!(!ch.is_contact_allowed("spaced"));
     }

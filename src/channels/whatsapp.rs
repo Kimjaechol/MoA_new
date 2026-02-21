@@ -14,6 +14,8 @@ pub struct WhatsAppChannel {
     verify_token: String,
     allowed_numbers: Vec<String>,
     client: reqwest::Client,
+    pairing_store: Option<std::sync::Arc<super::pairing::ChannelPairingStore>>,
+    gateway_url: Option<String>,
 }
 
 impl WhatsAppChannel {
@@ -22,6 +24,8 @@ impl WhatsAppChannel {
         endpoint_id: String,
         verify_token: String,
         allowed_numbers: Vec<String>,
+        pairing_store: Option<std::sync::Arc<super::pairing::ChannelPairingStore>>,
+        gateway_url: Option<String>,
     ) -> Self {
         Self {
             access_token,
@@ -29,6 +33,8 @@ impl WhatsAppChannel {
             verify_token,
             allowed_numbers,
             client: reqwest::Client::new(),
+            pairing_store,
+            gateway_url,
         }
     }
 
@@ -131,6 +137,50 @@ impl WhatsAppChannel {
 
         messages
     }
+
+    /// Handle an incoming message from an unauthorized WhatsApp user.
+    /// Returns `Some(reply_text)` if a reply should be sent, `None` if silently dropped.
+    pub fn handle_pairing_message(&self, from: &str, text: &str) -> Option<String> {
+        // Try pairing code redemption
+        if super::pairing::ChannelPairingStore::looks_like_code(text) {
+            if let Some(ref store) = self.pairing_store {
+                if let Some(_entry) = store.redeem_code(text.trim(), "whatsapp") {
+                    // Persist to config (blocking, but called from async context)
+                    let uid = from.to_string();
+                    std::thread::spawn(move || {
+                        if let Err(e) = super::pairing::persist_channel_allowlist("whatsapp", &uid)
+                        {
+                            tracing::error!("WhatsApp: failed to persist pairing: {e}");
+                        }
+                    });
+                    return Some(
+                        "\u{2705} \u{c5f0}\u{acb0}\u{c774} \u{c644}\u{b8cc}\u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}! \u{c774}\u{c81c} \u{b300}\u{d654}\u{b97c} \u{c2dc}\u{c791}\u{d560} \u{c218} \u{c788}\u{c2b5}\u{b2c8}\u{b2e4}.\n\n\
+                         Connection complete! You can start chatting now."
+                            .to_string(),
+                    );
+                }
+            }
+            return Some(
+                "\u{274c} \u{c720}\u{d6a8}\u{d558}\u{c9c0} \u{c54a}\u{c740} \u{cf54}\u{b4dc}\u{c785}\u{b2c8}\u{b2e4}.\n\n\
+                 Invalid code. Please try again."
+                    .to_string(),
+            );
+        }
+
+        // Send connect link
+        if let Some(ref gw_url) = self.gateway_url {
+            let connect_url =
+                super::pairing::ChannelPairingStore::connect_url(gw_url, "whatsapp", from);
+            return Some(format!(
+                "\u{1f517} MoA\u{c5d0} \u{c5f0}\u{acb0}\u{d558}\u{b824}\u{ba74} \u{c544}\u{b798} \u{b9c1}\u{d06c}\u{b97c} \u{d074}\u{b9ad}\u{d558}\u{c138}\u{c694}.\n\
+                 Tap the link below to connect to MoA.\n\n\
+                 {connect_url}"
+            ));
+        }
+
+        tracing::warn!("WhatsApp: ignoring message from unauthorized number: {from}");
+        None
+    }
 }
 
 #[async_trait]
@@ -221,6 +271,8 @@ mod tests {
             "123456789".into(),
             "verify-me".into(),
             vec!["+1234567890".into()],
+            None,
+            None,
         )
     }
 
@@ -245,14 +297,14 @@ mod tests {
 
     #[test]
     fn whatsapp_number_allowed_wildcard() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
     }
 
     #[test]
     fn whatsapp_number_denied_empty() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec![]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec![], None, None);
         assert!(!ch.is_number_allowed("+1234567890"));
     }
 
@@ -326,7 +378,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_non_text_message_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -348,7 +400,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_multiple_messages() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -375,6 +427,8 @@ mod tests {
             "123".into(),
             "ver".into(),
             vec!["+1234567890".into()],
+            None,
+            None,
         );
         // API sends without +, but we normalize to +
         let payload = serde_json::json!({
@@ -399,7 +453,7 @@ mod tests {
 
     #[test]
     fn whatsapp_empty_text_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -511,7 +565,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_missing_from_field() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -531,7 +585,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_missing_text_body() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -555,7 +609,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_null_text_body() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -576,7 +630,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_invalid_timestamp_uses_current() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -599,7 +653,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_missing_timestamp_uses_current() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -620,7 +674,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_multiple_entries() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [
                 {
@@ -657,7 +711,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_multiple_changes() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [
@@ -713,7 +767,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_audio_message_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -734,7 +788,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_video_message_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -755,7 +809,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_document_message_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -776,7 +830,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_sticker_message_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -797,7 +851,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_location_message_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -818,7 +872,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_contacts_message_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -839,7 +893,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_reaction_message_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -865,6 +919,8 @@ mod tests {
             "123".into(),
             "ver".into(),
             vec!["+1111111111".into()],
+            None,
+            None,
         );
         let payload = serde_json::json!({
             "entry": [{
@@ -887,7 +943,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_unicode_message() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -909,7 +965,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_very_long_message() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let long_text = "A".repeat(10_000);
         let payload = serde_json::json!({
             "entry": [{
@@ -932,7 +988,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_whitespace_only_message_skipped() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -964,6 +1020,8 @@ mod tests {
                 "+2222222222".into(),
                 "+3333333333".into(),
             ],
+            None,
+            None,
         );
         assert!(ch.is_number_allowed("+1111111111"));
         assert!(ch.is_number_allowed("+2222222222"));
@@ -979,6 +1037,8 @@ mod tests {
             "123".into(),
             "ver".into(),
             vec!["+1234567890".into()],
+            None,
+            None,
         );
         assert!(ch.is_number_allowed("+1234567890"));
         // Different number should not match
@@ -992,6 +1052,8 @@ mod tests {
             "123".into(),
             "ver".into(),
             vec!["+1234567890".into()],
+            None,
+            None,
         );
         // If API sends with +, we should still handle it
         let payload = serde_json::json!({
@@ -1020,6 +1082,8 @@ mod tests {
             "phone-id-123".into(),
             "my-verify-token".into(),
             vec!["+111".into(), "+222".into()],
+            None,
+            None,
         );
         assert_eq!(ch.verify_token(), "my-verify-token");
         assert!(ch.is_number_allowed("+111"));
@@ -1067,7 +1131,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_newlines_preserved() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -1089,7 +1153,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_special_characters() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()], None, None);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{

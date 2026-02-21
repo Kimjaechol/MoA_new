@@ -14,6 +14,8 @@ pub struct DiscordChannel {
     mention_only: bool,
     client: reqwest::Client,
     typing_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pairing_store: Option<std::sync::Arc<super::pairing::ChannelPairingStore>>,
+    gateway_url: Option<String>,
 }
 
 impl DiscordChannel {
@@ -23,6 +25,8 @@ impl DiscordChannel {
         allowed_users: Vec<String>,
         listen_to_bots: bool,
         mention_only: bool,
+        pairing_store: Option<std::sync::Arc<super::pairing::ChannelPairingStore>>,
+        gateway_url: Option<String>,
     ) -> Self {
         Self {
             bot_token,
@@ -32,6 +36,8 @@ impl DiscordChannel {
             mention_only,
             client: reqwest::Client::new(),
             typing_handle: std::sync::Mutex::new(None),
+            pairing_store,
+            gateway_url,
         }
     }
 
@@ -367,7 +373,57 @@ impl Channel for DiscordChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(author_id) {
-                        tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+                        let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let channel_id_for_reply = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+
+                        // Try pairing code redemption
+                        if super::pairing::ChannelPairingStore::looks_like_code(content) {
+                            if let Some(ref store) = self.pairing_store {
+                                if let Some(_entry) = store.redeem_code(content.trim(), "discord") {
+                                    // Persist to config
+                                    let uid = author_id.to_string();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                                            super::pairing::persist_channel_allowlist("discord", &uid)
+                                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                                            tracing::error!("Discord: failed to persist pairing: {e}");
+                                        }
+                                    });
+                                    // Send success message
+                                    if !channel_id_for_reply.is_empty() {
+                                        let reply_url = format!("https://discord.com/api/v10/channels/{channel_id_for_reply}/messages");
+                                        let _ = self.client.post(&reply_url)
+                                            .header("Authorization", format!("Bot {}", self.bot_token))
+                                            .json(&serde_json::json!({"content": "✅ 연결이 완료되었습니다! 이제 대화를 시작할 수 있습니다.\n\nConnection complete! You can start chatting now."}))
+                                            .send().await;
+                                    }
+                                    continue;
+                                }
+                            }
+                            // Invalid code
+                            if !channel_id_for_reply.is_empty() {
+                                let reply_url = format!("https://discord.com/api/v10/channels/{channel_id_for_reply}/messages");
+                                let _ = self.client.post(&reply_url)
+                                    .header("Authorization", format!("Bot {}", self.bot_token))
+                                    .json(&serde_json::json!({"content": "❌ 유효하지 않은 코드입니다.\n\nInvalid code. Please try again."}))
+                                    .send().await;
+                            }
+                            continue;
+                        }
+
+                        // Send connect link
+                        if let Some(ref gw_url) = self.gateway_url {
+                            let connect_url = super::pairing::ChannelPairingStore::connect_url(gw_url, "discord", author_id);
+                            if !channel_id_for_reply.is_empty() {
+                                let reply_url = format!("https://discord.com/api/v10/channels/{channel_id_for_reply}/messages");
+                                let _ = self.client.post(&reply_url)
+                                    .header("Authorization", format!("Bot {}", self.bot_token))
+                                    .json(&serde_json::json!({"content": format!("🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{connect_url}")}))
+                                    .send().await;
+                            }
+                        } else {
+                            tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+                        }
                         continue;
                     }
 
@@ -474,7 +530,7 @@ mod tests {
 
     #[test]
     fn discord_channel_name() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, None, None);
         assert_eq!(ch.name(), "discord");
     }
 
@@ -495,14 +551,14 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, None, None);
         assert!(!ch.is_user_allowed("12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false, None, None);
         assert!(ch.is_user_allowed("12345"));
         assert!(ch.is_user_allowed("anyone"));
     }
@@ -515,6 +571,8 @@ mod tests {
             vec!["111".into(), "222".into()],
             false,
             false,
+            None,
+            None,
         );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("222"));
@@ -524,7 +582,7 @@ mod tests {
 
     #[test]
     fn allowlist_is_exact_match_not_substring() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false, None, None);
         assert!(!ch.is_user_allowed("1111"));
         assert!(!ch.is_user_allowed("11"));
         assert!(!ch.is_user_allowed("0111"));
@@ -532,7 +590,7 @@ mod tests {
 
     #[test]
     fn allowlist_empty_string_user_id() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false, None, None);
         assert!(!ch.is_user_allowed(""));
     }
 
@@ -544,6 +602,8 @@ mod tests {
             vec!["111".into(), "*".into()],
             false,
             false,
+            None,
+            None,
         );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("anyone_else"));
@@ -551,7 +611,7 @@ mod tests {
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false, None, None);
         assert!(ch.is_user_allowed("ABC"));
         assert!(!ch.is_user_allowed("abc"));
         assert!(!ch.is_user_allowed("Abc"));
@@ -751,14 +811,14 @@ mod tests {
 
     #[test]
     fn typing_handle_starts_as_none() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, None, None);
         let guard = ch.typing_handle.lock().unwrap();
         assert!(guard.is_none());
     }
 
     #[tokio::test]
     async fn start_typing_sets_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, None, None);
         let _ = ch.start_typing("123456").await;
         let guard = ch.typing_handle.lock().unwrap();
         assert!(guard.is_some());
@@ -766,7 +826,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_clears_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, None, None);
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
         let guard = ch.typing_handle.lock().unwrap();
@@ -775,14 +835,14 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_is_idempotent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, None, None);
         assert!(ch.stop_typing("123456").await.is_ok());
         assert!(ch.stop_typing("123456").await.is_ok());
     }
 
     #[tokio::test]
     async fn start_typing_replaces_existing_task() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, None, None);
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
         let guard = ch.typing_handle.lock().unwrap();
