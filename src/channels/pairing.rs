@@ -1,46 +1,57 @@
-//! Channel Pairing Store — shared pairing code management for all channels.
+//! Channel Pairing Store — one-click pairing for all messaging channels.
 //!
-//! After a user authenticates via the gateway web flow (`/pair/{channel}`),
-//! a 6-digit numeric code is generated and stored here.  The user then
-//! types this code in their messaging app, and the channel validates it
-//! against this store to complete the pairing.
+//! ## Flow
+//!
+//! 1. Unauthorized user sends a message to a channel (KakaoTalk, Telegram, etc.)
+//! 2. Channel creates a **pairing token** (UUID) in SQLite → sends a link
+//! 3. User clicks the link → gateway web page opens
+//! 4. Already-registered user: login → auto-pair → success page
+//!    New user: signup → auto-pair → success page
+//! 5. User returns to chat → next message is auto-accepted
 //!
 //! ## Storage
-//! Uses SQLite for persistence, enabling code sharing between gateway and
+//! Uses SQLite for persistence, enabling token sharing between gateway and
 //! channel processes (e.g., in daemon mode where both run as separate tasks).
 //!
 //! ## Security
-//! - Codes expire after 5 minutes
-//! - Maximum 20 active codes at any time (prevents flooding)
-//! - Codes are single-use (consumed on redemption)
-//! - Brute-force resistant: 6-digit numeric = 1M combinations
+//! - Tokens are UUID v4 (2^122 entropy — brute-force infeasible)
+//! - Tokens expire after 10 minutes (configurable)
+//! - Tokens are single-use (consumed on successful pairing)
+//! - Maximum 50 active tokens at any time (prevents flooding)
 
 use parking_lot::Mutex;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// How long a pairing code remains valid (seconds).
-const CODE_TTL_SECS: u64 = 300; // 5 minutes
+/// How long a pairing token remains valid (seconds).
+const TOKEN_TTL_SECS: u64 = 600; // 10 minutes
 
-/// Maximum number of active (unexpired) codes.
-const MAX_ACTIVE_CODES: usize = 20;
+/// Maximum number of active (unexpired) tokens.
+const MAX_ACTIVE_TOKENS: usize = 50;
 
-/// A pending pairing entry, created after successful web authentication.
+/// A pending pairing token, created when an unauthorized user sends a message.
 #[derive(Debug, Clone)]
-pub struct PairingEntry {
-    /// The 6-digit numeric code the user must type in their chat.
-    pub code: String,
-    /// Which channel this code is for ("kakao", "telegram", "whatsapp", etc.).
+pub struct PairingToken {
+    /// UUID v4 token embedded in the connect URL.
+    pub token: String,
+    /// Which channel this token is for ("kakao", "telegram", etc.).
     pub channel: String,
-    /// The platform-specific user identifier (Kakao user ID, Telegram user ID, phone number, etc.).
+    /// The platform-specific user identifier.
     pub platform_uid: String,
-    /// The authenticated MoA user ID (from auth store).
-    pub user_id: String,
-    /// Unix timestamp when this code expires.
+    /// Unix timestamp when this token expires.
     pub expires_at: u64,
 }
 
-/// Thread-safe store for pending channel pairing codes.
+/// A completed pairing record, written after successful web authentication.
+#[derive(Debug, Clone)]
+pub struct CompletedPair {
+    pub channel: String,
+    pub platform_uid: String,
+    pub user_id: String,
+    pub paired_at: u64,
+}
+
+/// Thread-safe store for channel pairing tokens and completed pairs.
 /// Backed by SQLite for cross-process sharing (gateway + channels).
 #[derive(Debug)]
 pub struct ChannelPairingStore {
@@ -71,139 +82,166 @@ impl ChannelPairingStore {
 
     fn init_tables(conn: &rusqlite::Connection) {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS pairing_codes (
-                code TEXT PRIMARY KEY,
+            "CREATE TABLE IF NOT EXISTS pairing_tokens (
+                token TEXT PRIMARY KEY,
                 channel TEXT NOT NULL,
                 platform_uid TEXT NOT NULL,
-                user_id TEXT NOT NULL,
                 expires_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS completed_pairs (
+                channel TEXT NOT NULL,
+                platform_uid TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
+                paired_at INTEGER NOT NULL,
+                PRIMARY KEY (channel, platform_uid)
             );",
         )
-        .expect("Failed to initialize pairing_codes table");
+        .expect("Failed to initialize pairing tables");
 
-        // Cleanup stale codes on startup
+        // Cleanup stale tokens on startup
         let now = epoch_secs() as i64;
         let _ = conn.execute(
-            "DELETE FROM pairing_codes WHERE expires_at <= ?1",
+            "DELETE FROM pairing_tokens WHERE expires_at <= ?1",
             rusqlite::params![now],
         );
     }
 
-    /// Create a pairing code for a user who just authenticated via the web flow.
-    /// Returns the 6-digit code to display on the success page.
-    pub fn create_pairing(&self, channel: &str, platform_uid: &str, user_id: &str) -> String {
-        let conn = self.conn.lock();
-        let now = epoch_secs() as i64;
+    // ── Token management (called by channels) ────────────────────────
 
-        // Cleanup expired entries
-        let _ = conn.execute(
-            "DELETE FROM pairing_codes WHERE expires_at <= ?1",
-            rusqlite::params![now],
-        );
-
-        // Remove existing code for same channel+uid (prevent duplicates)
-        let _ = conn.execute(
-            "DELETE FROM pairing_codes WHERE channel = ?1 AND platform_uid = ?2",
-            rusqlite::params![channel, platform_uid],
-        );
-
-        // Enforce max active codes — remove oldest if at limit
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pairing_codes", [], |row| row.get(0))
-            .unwrap_or(0);
-        if count >= MAX_ACTIVE_CODES as i64 {
-            let _ = conn.execute(
-                "DELETE FROM pairing_codes WHERE code = \
-                 (SELECT code FROM pairing_codes ORDER BY expires_at ASC LIMIT 1)",
-                [],
-            );
-        }
-
-        let code = generate_code_unique(&conn);
-        let expires_at = now + CODE_TTL_SECS as i64;
-
-        let _ = conn.execute(
-            "INSERT INTO pairing_codes (code, channel, platform_uid, user_id, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![code, channel, platform_uid, user_id, expires_at],
-        );
-
-        tracing::info!(
-            channel = channel,
-            platform_uid = platform_uid,
-            "Channel pairing code created (expires in {}s)",
-            CODE_TTL_SECS
-        );
-
-        code
-    }
-
-    /// Attempt to redeem a pairing code. Returns the entry if valid.
-    /// The code is consumed (single-use) on success.
-    pub fn redeem_code(&self, code: &str, channel: &str) -> Option<PairingEntry> {
+    /// Create a pairing token for an unauthorized user.
+    /// Returns the UUID token to embed in the connect URL.
+    pub fn create_token(&self, channel: &str, platform_uid: &str) -> String {
         let conn = self.conn.lock();
         let now = epoch_secs() as i64;
 
         // Cleanup expired
         let _ = conn.execute(
-            "DELETE FROM pairing_codes WHERE expires_at <= ?1",
+            "DELETE FROM pairing_tokens WHERE expires_at <= ?1",
             rusqlite::params![now],
         );
 
-        // Look up
-        let entry = conn
-            .query_row(
-                "SELECT code, channel, platform_uid, user_id, expires_at \
-                 FROM pairing_codes WHERE code = ?1 AND channel = ?2",
-                rusqlite::params![code, channel],
-                |row| {
-                    Ok(PairingEntry {
-                        code: row.get(0)?,
-                        channel: row.get(1)?,
-                        platform_uid: row.get(2)?,
-                        user_id: row.get(3)?,
-                        expires_at: row.get::<_, i64>(4)? as u64,
-                    })
-                },
-            )
-            .ok()?;
-
-        // Single-use: delete after reading
+        // Remove existing token for same channel+uid
         let _ = conn.execute(
-            "DELETE FROM pairing_codes WHERE code = ?1",
-            rusqlite::params![code],
+            "DELETE FROM pairing_tokens WHERE channel = ?1 AND platform_uid = ?2",
+            rusqlite::params![channel, platform_uid],
+        );
+
+        // Enforce max active tokens
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pairing_tokens", [], |row| row.get(0))
+            .unwrap_or(0);
+        if count >= MAX_ACTIVE_TOKENS as i64 {
+            let _ = conn.execute(
+                "DELETE FROM pairing_tokens WHERE token = \
+                 (SELECT token FROM pairing_tokens ORDER BY expires_at ASC LIMIT 1)",
+                [],
+            );
+        }
+
+        let token = uuid::Uuid::new_v4().to_string();
+        let expires_at = now + TOKEN_TTL_SECS as i64;
+
+        let _ = conn.execute(
+            "INSERT INTO pairing_tokens (token, channel, platform_uid, expires_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![token, channel, platform_uid, expires_at],
         );
 
         tracing::info!(
             channel = channel,
-            platform_uid = entry.platform_uid,
-            "Channel pairing code redeemed successfully"
+            "Pairing token created (expires in {}s)",
+            TOKEN_TTL_SECS
         );
 
+        token
+    }
+
+    /// Look up a pairing token without consuming it.
+    /// Used by the gateway to display the login page.
+    pub fn lookup_token(&self, token: &str) -> Option<PairingToken> {
+        let conn = self.conn.lock();
+        let now = epoch_secs() as i64;
+
+        // Cleanup expired
+        let _ = conn.execute(
+            "DELETE FROM pairing_tokens WHERE expires_at <= ?1",
+            rusqlite::params![now],
+        );
+
+        conn.query_row(
+            "SELECT token, channel, platform_uid, expires_at \
+             FROM pairing_tokens WHERE token = ?1",
+            rusqlite::params![token],
+            |row| {
+                Ok(PairingToken {
+                    token: row.get(0)?,
+                    channel: row.get(1)?,
+                    platform_uid: row.get(2)?,
+                    expires_at: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
+        .ok()
+    }
+
+    /// Consume a pairing token (single-use).
+    /// Called by the gateway after successful authentication.
+    pub fn consume_token(&self, token: &str) -> Option<PairingToken> {
+        let entry = self.lookup_token(token)?;
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "DELETE FROM pairing_tokens WHERE token = ?1",
+            rusqlite::params![token],
+        );
         Some(entry)
     }
 
-    /// Check if a string looks like a pairing code (6 digits).
-    pub fn looks_like_code(text: &str) -> bool {
-        let trimmed = text.trim();
-        trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit())
+    // ── Completed pairs (written by gateway, read by channels) ───────
+
+    /// Record a completed pairing. Called by the gateway after successful auth.
+    pub fn mark_paired(&self, channel: &str, platform_uid: &str, user_id: &str) {
+        let conn = self.conn.lock();
+        let now = epoch_secs() as i64;
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO completed_pairs (channel, platform_uid, user_id, paired_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![channel, platform_uid, user_id, now],
+        );
+        tracing::info!(
+            channel = channel,
+            platform_uid = platform_uid,
+            "Pairing completed and recorded"
+        );
     }
 
-    /// Get the number of active (non-expired) codes.
+    /// Check if a platform identity has been paired via the web flow.
+    /// Called by channels when they see an unauthorized user.
+    pub fn is_paired(&self, channel: &str, platform_uid: &str) -> bool {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM completed_pairs WHERE channel = ?1 AND platform_uid = ?2",
+            rusqlite::params![channel, platform_uid],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    /// Build the one-click auto-pair URL.
+    pub fn auto_pair_url(gateway_base: &str, token: &str) -> String {
+        format!("{gateway_base}/pair/auto/{token}")
+    }
+
+    /// Get the number of active (non-expired) tokens.
     pub fn active_count(&self) -> usize {
         let conn = self.conn.lock();
         let now = epoch_secs() as i64;
         conn.query_row(
-            "SELECT COUNT(*) FROM pairing_codes WHERE expires_at > ?1",
+            "SELECT COUNT(*) FROM pairing_tokens WHERE expires_at > ?1",
             rusqlite::params![now],
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0) as usize
-    }
-
-    /// Build the URL for the pairing web page.
-    pub fn connect_url(gateway_base: &str, channel: &str, platform_uid: &str) -> String {
-        format!("{gateway_base}/pair/connect/{channel}?uid={platform_uid}")
     }
 }
 
@@ -211,36 +249,6 @@ impl Default for ChannelPairingStore {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Generate a unique 6-digit numeric code not already in the DB.
-fn generate_code_unique(conn: &rusqlite::Connection) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    for _ in 0..100 {
-        let id = uuid::Uuid::new_v4();
-        let mut hasher = DefaultHasher::new();
-        id.hash(&mut hasher);
-        let hash = hasher.finish();
-        let code = format!("{:06}", hash % 1_000_000);
-
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pairing_codes WHERE code = ?1",
-                rusqlite::params![code],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-
-        if !exists {
-            return code;
-        }
-    }
-
-    // Fallback (extremely unlikely)
-    format!("{:06}", epoch_secs() % 1_000_000)
 }
 
 fn epoch_secs() -> u64 {
@@ -252,10 +260,7 @@ fn epoch_secs() -> u64 {
 
 /// Persist a newly-paired identity to the channel's allowed-user list in config.toml.
 /// This is a generic helper usable by all channels.
-pub fn persist_channel_allowlist(
-    channel_name: &str,
-    identity: &str,
-) -> anyhow::Result<()> {
+pub fn persist_channel_allowlist(channel_name: &str, identity: &str) -> anyhow::Result<()> {
     use crate::config::Config;
     use directories::UserDirs;
 
@@ -351,9 +356,7 @@ pub fn persist_channel_allowlist(
             }
         }
         _ => {
-            tracing::warn!(
-                "persist_channel_allowlist: unsupported channel '{channel_name}'"
-            );
+            tracing::warn!("persist_channel_allowlist: unsupported channel '{channel_name}'");
             return Ok(());
         }
     };
@@ -376,59 +379,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_and_redeem_code() {
+    fn create_and_lookup_token() {
         let store = ChannelPairingStore::new();
-        let code = store.create_pairing("kakao", "user_123", "auth_abc");
+        let token = store.create_token("kakao", "user_123");
 
-        assert_eq!(code.len(), 6);
-        assert!(code.chars().all(|c| c.is_ascii_digit()));
-
-        let entry = store.redeem_code(&code, "kakao").unwrap();
-        assert_eq!(entry.platform_uid, "user_123");
-        assert_eq!(entry.user_id, "auth_abc");
+        assert_eq!(token.len(), 36); // UUID v4 format
+        let entry = store.lookup_token(&token).unwrap();
         assert_eq!(entry.channel, "kakao");
-
-        // Code should be consumed
-        assert!(store.redeem_code(&code, "kakao").is_none());
+        assert_eq!(entry.platform_uid, "user_123");
     }
 
     #[test]
-    fn wrong_channel_rejects() {
+    fn consume_token_single_use() {
         let store = ChannelPairingStore::new();
-        let code = store.create_pairing("kakao", "user_123", "auth_abc");
+        let token = store.create_token("kakao", "user_123");
 
-        assert!(store.redeem_code(&code, "telegram").is_none());
-        // Original should still be valid
-        assert!(store.redeem_code(&code, "kakao").is_some());
+        let entry = store.consume_token(&token).unwrap();
+        assert_eq!(entry.platform_uid, "user_123");
+
+        // Token should be consumed
+        assert!(store.consume_token(&token).is_none());
     }
 
     #[test]
-    fn duplicate_uid_replaces() {
+    fn duplicate_uid_replaces_token() {
         let store = ChannelPairingStore::new();
-        let code1 = store.create_pairing("kakao", "user_123", "auth_abc");
-        let code2 = store.create_pairing("kakao", "user_123", "auth_abc");
+        let token1 = store.create_token("kakao", "user_123");
+        let token2 = store.create_token("kakao", "user_123");
 
-        assert_ne!(code1, code2);
-        // Old code should be gone
-        assert!(store.redeem_code(&code1, "kakao").is_none());
-        // New code should work
-        assert!(store.redeem_code(&code2, "kakao").is_some());
+        assert_ne!(token1, token2);
+        assert!(store.lookup_token(&token1).is_none());
+        assert!(store.lookup_token(&token2).is_some());
     }
 
     #[test]
-    fn looks_like_code_valid() {
-        assert!(ChannelPairingStore::looks_like_code("123456"));
-        assert!(ChannelPairingStore::looks_like_code("000000"));
-        assert!(ChannelPairingStore::looks_like_code(" 482901 "));
-    }
+    fn mark_and_check_paired() {
+        let store = ChannelPairingStore::new();
+        assert!(!store.is_paired("kakao", "user_123"));
 
-    #[test]
-    fn looks_like_code_invalid() {
-        assert!(!ChannelPairingStore::looks_like_code("12345")); // too short
-        assert!(!ChannelPairingStore::looks_like_code("1234567")); // too long
-        assert!(!ChannelPairingStore::looks_like_code("abcdef")); // not digits
-        assert!(!ChannelPairingStore::looks_like_code("hello world"));
-        assert!(!ChannelPairingStore::looks_like_code(""));
+        store.mark_paired("kakao", "user_123", "auth_abc");
+        assert!(store.is_paired("kakao", "user_123"));
+
+        // Different channel should not be paired
+        assert!(!store.is_paired("telegram", "user_123"));
     }
 
     #[test]
@@ -436,23 +429,24 @@ mod tests {
         let store = ChannelPairingStore::new();
         assert_eq!(store.active_count(), 0);
 
-        store.create_pairing("kakao", "u1", "a1");
-        store.create_pairing("telegram", "u2", "a2");
+        store.create_token("kakao", "u1");
+        store.create_token("telegram", "u2");
         assert_eq!(store.active_count(), 2);
     }
 
     #[test]
-    fn max_codes_evicts_oldest() {
+    fn max_tokens_evicts_oldest() {
         let store = ChannelPairingStore::new();
-        for i in 0..MAX_ACTIVE_CODES + 5 {
-            store.create_pairing("kakao", &format!("user_{i}"), &format!("auth_{i}"));
+        for i in 0..MAX_ACTIVE_TOKENS + 5 {
+            store.create_token("kakao", &format!("user_{i}"));
         }
-        assert!(store.active_count() <= MAX_ACTIVE_CODES);
+        assert!(store.active_count() <= MAX_ACTIVE_TOKENS);
     }
 
     #[test]
-    fn connect_url_format() {
-        let url = ChannelPairingStore::connect_url("http://localhost:3000", "kakao", "uid_123");
-        assert_eq!(url, "http://localhost:3000/pair/connect/kakao?uid=uid_123");
+    fn auto_pair_url_format() {
+        let url =
+            ChannelPairingStore::auto_pair_url("http://localhost:3000", "abc-123-def");
+        assert_eq!(url, "http://localhost:3000/pair/auto/abc-123-def");
     }
 }

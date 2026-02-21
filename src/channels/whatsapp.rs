@@ -87,11 +87,31 @@ impl WhatsAppChannel {
                     };
 
                     if !self.is_number_allowed(&normalized_from) {
-                        tracing::warn!(
-                            "WhatsApp: ignoring message from unauthorized number: {normalized_from}. \
-                            Add to allowed_numbers in config.toml, then run `zeroclaw onboard --channels-only`."
-                        );
-                        continue;
+                        // Check one-click auto-pair: user may have paired via web
+                        if let Some(ref store) = self.pairing_store {
+                            if store.is_paired("whatsapp", &normalized_from) {
+                                let uid = normalized_from.clone();
+                                std::thread::spawn(move || {
+                                    if let Err(e) = super::pairing::persist_channel_allowlist("whatsapp", &uid) {
+                                        tracing::error!("WhatsApp: failed to persist pairing: {e}");
+                                    }
+                                });
+                                // Fall through to process message normally
+                            } else {
+                                // Not yet paired — skip this message
+                                // (Connect link is sent by the gateway webhook handler)
+                                tracing::debug!(
+                                    "WhatsApp: unauthorized number {normalized_from}, awaiting pairing"
+                                );
+                                continue;
+                            }
+                        } else {
+                            tracing::warn!(
+                                "WhatsApp: ignoring message from unauthorized number: {normalized_from}. \
+                                Add to allowed_numbers in config.toml."
+                            );
+                            continue;
+                        }
                     }
 
                     // Extract text content (support text messages only for now)
@@ -138,48 +158,44 @@ impl WhatsAppChannel {
         messages
     }
 
-    /// Handle an incoming message from an unauthorized WhatsApp user.
-    /// Returns `Some(reply_text)` if a reply should be sent, `None` if silently dropped.
-    pub fn handle_pairing_message(&self, from: &str, text: &str) -> Option<String> {
-        // Try pairing code redemption
-        if super::pairing::ChannelPairingStore::looks_like_code(text) {
-            if let Some(ref store) = self.pairing_store {
-                if let Some(_entry) = store.redeem_code(text.trim(), "whatsapp") {
-                    // Persist to config (blocking, but called from async context)
-                    let uid = from.to_string();
-                    std::thread::spawn(move || {
-                        if let Err(e) = super::pairing::persist_channel_allowlist("whatsapp", &uid)
-                        {
-                            tracing::error!("WhatsApp: failed to persist pairing: {e}");
+    /// Extract phone numbers from a webhook payload that are unauthorized and not yet paired.
+    /// The gateway handler uses this to send one-click connect links.
+    pub fn extract_unpaired_senders(&self, payload: &serde_json::Value) -> Vec<String> {
+        let mut senders = Vec::new();
+        let Some(entries) = payload.get("entry").and_then(|e| e.as_array()) else {
+            return senders;
+        };
+        for entry in entries {
+            let Some(changes) = entry.get("changes").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for change in changes {
+                let Some(value) = change.get("value") else {
+                    continue;
+                };
+                let Some(msgs) = value.get("messages").and_then(|m| m.as_array()) else {
+                    continue;
+                };
+                for msg in msgs {
+                    let Some(from) = msg.get("from").and_then(|f| f.as_str()) else {
+                        continue;
+                    };
+                    let normalized = if from.starts_with('+') {
+                        from.to_string()
+                    } else {
+                        format!("+{from}")
+                    };
+                    if !self.is_number_allowed(&normalized) {
+                        if let Some(ref store) = self.pairing_store {
+                            if !store.is_paired("whatsapp", &normalized) && !senders.contains(&normalized) {
+                                senders.push(normalized);
+                            }
                         }
-                    });
-                    return Some(
-                        "\u{2705} \u{c5f0}\u{acb0}\u{c774} \u{c644}\u{b8cc}\u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}! \u{c774}\u{c81c} \u{b300}\u{d654}\u{b97c} \u{c2dc}\u{c791}\u{d560} \u{c218} \u{c788}\u{c2b5}\u{b2c8}\u{b2e4}.\n\n\
-                         Connection complete! You can start chatting now."
-                            .to_string(),
-                    );
+                    }
                 }
             }
-            return Some(
-                "\u{274c} \u{c720}\u{d6a8}\u{d558}\u{c9c0} \u{c54a}\u{c740} \u{cf54}\u{b4dc}\u{c785}\u{b2c8}\u{b2e4}.\n\n\
-                 Invalid code. Please try again."
-                    .to_string(),
-            );
         }
-
-        // Send connect link
-        if let Some(ref gw_url) = self.gateway_url {
-            let connect_url =
-                super::pairing::ChannelPairingStore::connect_url(gw_url, "whatsapp", from);
-            return Some(format!(
-                "\u{1f517} MoA\u{c5d0} \u{c5f0}\u{acb0}\u{d558}\u{b824}\u{ba74} \u{c544}\u{b798} \u{b9c1}\u{d06c}\u{b97c} \u{d074}\u{b9ad}\u{d558}\u{c138}\u{c694}.\n\
-                 Tap the link below to connect to MoA.\n\n\
-                 {connect_url}"
-            ));
-        }
-
-        tracing::warn!("WhatsApp: ignoring message from unauthorized number: {from}");
-        None
+        senders
     }
 }
 

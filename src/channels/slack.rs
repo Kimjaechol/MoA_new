@@ -157,52 +157,44 @@ impl Channel for SlackChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(user) {
-                        // Try pairing code redemption
-                        if super::pairing::ChannelPairingStore::looks_like_code(text) {
-                            if let Some(ref store) = self.pairing_store {
-                                if let Some(_entry) = store.redeem_code(text.trim(), "slack") {
-                                    let uid = user.to_string();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = tokio::task::spawn_blocking(move || {
-                                            super::pairing::persist_channel_allowlist("slack", &uid)
-                                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
-                                            tracing::error!("Slack: failed to persist pairing: {e}");
-                                        }
-                                    });
+                        // One-click auto-pair flow
+                        if let Some(ref store) = self.pairing_store {
+                            if store.is_paired("slack", user) {
+                                let uid = user.to_string();
+                                tokio::spawn(async move {
+                                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                                        super::pairing::persist_channel_allowlist("slack", &uid)
+                                    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                                        tracing::error!("Slack: failed to persist pairing: {e}");
+                                    }
+                                });
+                                let _ = self.client.post("https://slack.com/api/chat.postMessage")
+                                    .bearer_auth(&self.bot_token)
+                                    .json(&serde_json::json!({
+                                        "channel": channel_id.clone(),
+                                        "text": "✅ 연결이 완료되었습니다! 이제 대화를 시작할 수 있습니다.\n\nConnection complete! You can start chatting now."
+                                    }))
+                                    .send().await;
+                                // Fall through to process message normally
+                            } else {
+                                // Send one-click connect link
+                                if let Some(ref gw_url) = self.gateway_url {
+                                    let token = store.create_token("slack", user);
+                                    let auto_url = super::pairing::ChannelPairingStore::auto_pair_url(gw_url, &token);
                                     let _ = self.client.post("https://slack.com/api/chat.postMessage")
                                         .bearer_auth(&self.bot_token)
                                         .json(&serde_json::json!({
                                             "channel": channel_id.clone(),
-                                            "text": "✅ 연결이 완료되었습니다! 이제 대화를 시작할 수 있습니다.\n\nConnection complete! You can start chatting now."
+                                            "text": format!("🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}")
                                         }))
                                         .send().await;
-                                    continue;
                                 }
+                                continue;
                             }
-                            let _ = self.client.post("https://slack.com/api/chat.postMessage")
-                                .bearer_auth(&self.bot_token)
-                                .json(&serde_json::json!({
-                                    "channel": channel_id.clone(),
-                                    "text": "❌ 유효하지 않은 코드입니다.\n\nInvalid code. Please try again."
-                                }))
-                                .send().await;
-                            continue;
-                        }
-
-                        // Send connect link
-                        if let Some(ref gw_url) = self.gateway_url {
-                            let connect_url = super::pairing::ChannelPairingStore::connect_url(gw_url, "slack", user);
-                            let _ = self.client.post("https://slack.com/api/chat.postMessage")
-                                .bearer_auth(&self.bot_token)
-                                .json(&serde_json::json!({
-                                    "channel": channel_id.clone(),
-                                    "text": format!("🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{connect_url}")
-                                }))
-                                .send().await;
                         } else {
                             tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                            continue;
                         }
-                        continue;
                     }
 
                     // Skip empty or already-seen

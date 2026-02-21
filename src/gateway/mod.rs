@@ -215,6 +215,8 @@ pub struct AppState {
     pub sync_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
     /// Shared pairing store for channel connect flow.
     pub channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>>,
+    /// Base URL for this gateway (e.g. "http://127.0.0.1:3000").
+    pub gateway_base_url: String,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -523,6 +525,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         sync_relay,
         sync_broadcast,
         channel_pairing,
+        gateway_base_url: format!("http://{}:{}", config.gateway.host, config.gateway.port),
     };
 
     // Ensure channel_links table exists if auth is enabled
@@ -567,8 +570,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/sync", get(handle_sync_ws))
         .route("/api/sync/relay", post(handle_sync_relay_upload))
         .route("/api/sync/relay", get(handle_sync_relay_pickup))
-        .route("/pair/connect/{channel}", get(pair::handle_pair_page))
-        .route("/pair/connect/{channel}", post(pair::handle_pair_login))
+        .route("/pair/auto/{token}", get(pair::handle_auto_pair_page))
+        .route("/pair/auto/{token}", post(pair::handle_auto_pair_login))
         .route("/pair/signup", get(pair::handle_pair_signup_page))
         .route("/pair/signup", post(pair::handle_pair_signup_submit))
         .route("/api/telemetry/events", post(handle_telemetry_ingest))
@@ -971,6 +974,24 @@ async fn handle_whatsapp_message(
             Json(serde_json::json!({"error": "Invalid JSON payload"})),
         );
     };
+
+    // Send one-click connect links to unauthorized, unpaired senders
+    let unpaired = wa.extract_unpaired_senders(&payload);
+    if let Some(ref cp) = state.channel_pairing {
+        for sender in &unpaired {
+            let token = cp.create_token("whatsapp", sender);
+            let auto_url =
+                crate::channels::pairing::ChannelPairingStore::auto_pair_url(&state.gateway_base_url, &token);
+            let _ = wa
+                .send(&SendMessage::new(
+                    &format!(
+                        "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
+                    ),
+                    sender,
+                ))
+                .await;
+        }
+    }
 
     // Parse messages from the webhook payload
     let messages = wa.parse_webhook_payload(&payload);
@@ -2077,6 +2098,7 @@ mod tests {
             sync_relay: None,
             sync_broadcast: None,
             channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let mut headers = HeaderMap::new();
@@ -2136,6 +2158,7 @@ mod tests {
             sync_relay: None,
             sync_broadcast: None,
             channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let headers = HeaderMap::new();
@@ -2204,6 +2227,7 @@ mod tests {
             sync_relay: None,
             sync_broadcast: None,
             channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let response = handle_webhook(
@@ -2249,6 +2273,7 @@ mod tests {
             sync_relay: None,
             sync_broadcast: None,
             channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let mut headers = HeaderMap::new();
@@ -2297,6 +2322,7 @@ mod tests {
             sync_relay: None,
             sync_broadcast: None,
             channel_pairing: None,
+            gateway_base_url: "http://127.0.0.1:3000".into(),
         };
 
         let mut headers = HeaderMap::new();

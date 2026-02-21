@@ -373,58 +373,49 @@ impl Channel for DiscordChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(author_id) {
-                        let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
                         let channel_id_for_reply = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
 
-                        // Try pairing code redemption
-                        if super::pairing::ChannelPairingStore::looks_like_code(content) {
-                            if let Some(ref store) = self.pairing_store {
-                                if let Some(_entry) = store.redeem_code(content.trim(), "discord") {
-                                    // Persist to config
-                                    let uid = author_id.to_string();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = tokio::task::spawn_blocking(move || {
-                                            super::pairing::persist_channel_allowlist("discord", &uid)
-                                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
-                                            tracing::error!("Discord: failed to persist pairing: {e}");
-                                        }
-                                    });
-                                    // Send success message
+                        // One-click auto-pair flow
+                        if let Some(ref store) = self.pairing_store {
+                            // Check if user was paired via web flow
+                            if store.is_paired("discord", author_id) {
+                                let uid = author_id.to_string();
+                                tokio::spawn(async move {
+                                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                                        super::pairing::persist_channel_allowlist("discord", &uid)
+                                    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                                        tracing::error!("Discord: failed to persist pairing: {e}");
+                                    }
+                                });
+                                if !channel_id_for_reply.is_empty() {
+                                    let reply_url = format!("https://discord.com/api/v10/channels/{channel_id_for_reply}/messages");
+                                    let _ = self.client.post(&reply_url)
+                                        .header("Authorization", format!("Bot {}", self.bot_token))
+                                        .json(&serde_json::json!({"content": "✅ 연결이 완료되었습니다! 이제 대화를 시작할 수 있습니다.\n\nConnection complete! You can start chatting now."}))
+                                        .send().await;
+                                }
+                                // Fall through to process message normally
+                            } else {
+                                // Send one-click connect link
+                                if let Some(ref gw_url) = self.gateway_url {
+                                    let token = store.create_token("discord", author_id);
+                                    let auto_url = super::pairing::ChannelPairingStore::auto_pair_url(gw_url, &token);
                                     if !channel_id_for_reply.is_empty() {
                                         let reply_url = format!("https://discord.com/api/v10/channels/{channel_id_for_reply}/messages");
                                         let _ = self.client.post(&reply_url)
                                             .header("Authorization", format!("Bot {}", self.bot_token))
-                                            .json(&serde_json::json!({"content": "✅ 연결이 완료되었습니다! 이제 대화를 시작할 수 있습니다.\n\nConnection complete! You can start chatting now."}))
+                                            .json(&serde_json::json!({"content": format!("🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}")}))
                                             .send().await;
                                     }
-                                    continue;
+                                } else {
+                                    tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
                                 }
-                            }
-                            // Invalid code
-                            if !channel_id_for_reply.is_empty() {
-                                let reply_url = format!("https://discord.com/api/v10/channels/{channel_id_for_reply}/messages");
-                                let _ = self.client.post(&reply_url)
-                                    .header("Authorization", format!("Bot {}", self.bot_token))
-                                    .json(&serde_json::json!({"content": "❌ 유효하지 않은 코드입니다.\n\nInvalid code. Please try again."}))
-                                    .send().await;
-                            }
-                            continue;
-                        }
-
-                        // Send connect link
-                        if let Some(ref gw_url) = self.gateway_url {
-                            let connect_url = super::pairing::ChannelPairingStore::connect_url(gw_url, "discord", author_id);
-                            if !channel_id_for_reply.is_empty() {
-                                let reply_url = format!("https://discord.com/api/v10/channels/{channel_id_for_reply}/messages");
-                                let _ = self.client.post(&reply_url)
-                                    .header("Authorization", format!("Bot {}", self.bot_token))
-                                    .json(&serde_json::json!({"content": format!("🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{connect_url}")}))
-                                    .send().await;
+                                continue;
                             }
                         } else {
                             tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+                            continue;
                         }
-                        continue;
                     }
 
                     // Guild filter

@@ -372,81 +372,65 @@ impl TelegramChannel {
             return;
         }
 
-        // --- New unified ChannelPairingStore flow: 6-digit code redemption ---
+        // --- One-click auto-pair flow via ChannelPairingStore ---
         if let Some(ref store) = self.pairing_store {
-            if super::pairing::ChannelPairingStore::looks_like_code(text) {
-                let code = text.trim();
-                let bind_identity = normalized_user_id.clone().or_else(|| {
+            let platform_uid = normalized_user_id
+                .as_deref()
+                .filter(|s| !s.is_empty() && *s != "unknown")
+                .or_else(|| {
                     if normalized_username.is_empty() || normalized_username == "unknown" {
                         None
                     } else {
-                        Some(normalized_username.clone())
+                        Some(normalized_username.as_str())
                     }
                 });
 
-                if let Some(entry) = store.redeem_code(code, "telegram") {
-                    if let Some(identity) = bind_identity {
-                        self.add_allowed_identity_runtime(&identity);
+            if let Some(uid) = platform_uid {
+                // Check if user was paired via web flow
+                if store.is_paired("telegram", uid) {
+                    self.add_allowed_identity_runtime(uid);
 
-                        let persist_identity = identity.clone();
-                        let persist_result = tokio::task::spawn_blocking(move || {
-                            super::pairing::persist_channel_allowlist("telegram", &persist_identity)
-                        })
-                        .await;
+                    let persist_id = uid.to_string();
+                    let persist_result = tokio::task::spawn_blocking(move || {
+                        super::pairing::persist_channel_allowlist("telegram", &persist_id)
+                    })
+                    .await;
 
-                        match persist_result {
-                            Ok(Ok(())) => {
-                                let _ = self
-                                    .send(&SendMessage::new(
-                                        "✅ Telegram account bound successfully. You can talk to ZeroClaw now.",
-                                        &chat_id,
-                                    ))
-                                    .await;
-                                tracing::info!(
-                                    "Telegram: paired via ChannelPairingStore identity={identity}, user_id={}",
-                                    entry.user_id
-                                );
-                            }
-                            Ok(Err(e)) => {
-                                tracing::error!(
-                                    "Telegram: failed to persist allowlist after pairing-store bind: {e}"
-                                );
-                                let _ = self
-                                    .send(&SendMessage::new(
-                                        "⚠️ Bound for this runtime, but failed to persist config. Access may be lost after restart; check config file permissions.",
-                                        &chat_id,
-                                    ))
-                                    .await;
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Telegram: spawn_blocking failed during pairing persist: {e}"
-                                );
-                                let _ = self
-                                    .send(&SendMessage::new(
-                                        "⚠️ Bound for this runtime, but failed to persist config. Access may be lost after restart.",
-                                        &chat_id,
-                                    ))
-                                    .await;
-                            }
+                    match persist_result {
+                        Ok(Ok(())) => {
+                            let _ = self
+                                .send(&SendMessage::new(
+                                    "✅ Telegram account connected. You can talk to ZeroClaw now.",
+                                    &chat_id,
+                                ))
+                                .await;
+                            tracing::info!("Telegram: paired via one-click flow, identity={uid}");
                         }
-                    } else {
-                        let _ = self
-                            .send(&SendMessage::new(
-                                "❌ Could not identify your Telegram account. Ensure your account has a username or stable user ID, then retry.",
-                                &chat_id,
-                            ))
-                            .await;
+                        Ok(Err(e)) => {
+                            tracing::error!("Telegram: failed to persist allowlist: {e}");
+                        }
+                        Err(e) => {
+                            tracing::error!("Telegram: spawn_blocking failed: {e}");
+                        }
                     }
-                } else {
+                    return;
+                }
+
+                // Send one-click connect link
+                if let Some(ref gw_url) = self.gateway_url {
+                    let token = store.create_token("telegram", uid);
+                    let auto_url =
+                        super::pairing::ChannelPairingStore::auto_pair_url(gw_url, &token);
                     let _ = self
                         .send(&SendMessage::new(
-                            "❌ Invalid or expired pairing code. Please request a new code and try again.",
+                            &format!(
+                                "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
+                            ),
                             &chat_id,
                         ))
                         .await;
+                    return;
                 }
-                return;
             }
         }
 
@@ -539,34 +523,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // --- New pairing store: show connect link ---
         if self.pairing_store.is_some() {
-            if let Some(ref gw_url) = self.gateway_url {
-                let platform_uid = normalized_user_id
-                    .clone()
-                    .or_else(|| {
-                        if normalized_username.is_empty() || normalized_username == "unknown" {
-                            None
-                        } else {
-                            Some(normalized_username.clone())
-                        }
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                let connect_url = super::pairing::ChannelPairingStore::connect_url(
-                    gw_url,
-                    "telegram",
-                    &platform_uid,
-                );
-
-                let _ = self
-                    .send(&SendMessage::new(
-                        format!(
-                            "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{connect_url}"
-                        ),
-                        &chat_id,
-                    ))
-                    .await;
-            } else {
-                // pairing_store exists but no gateway_url configured
+            // One-click connect link was already sent above if pairing_store+gateway_url are set.
+            // If we reach here, it means we couldn't identify the user or no gateway_url.
+            if self.gateway_url.is_none() {
                 let _ = self
                     .send(&SendMessage::new(
                         "🔐 This bot requires authentication, but no gateway URL is configured. Contact the operator.",

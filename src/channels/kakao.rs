@@ -480,58 +480,48 @@ async fn handle_webhook(
 
         // Check user allowlist
         if !state.allowed_users.iter().any(|u| u == "*" || u == user_id) {
-            // Check if the message is a 6-digit pairing code
-            let utterance_for_pairing = user_req
-                .get("utterance")
-                .and_then(|u| u.as_str())
-                .unwrap_or("")
-                .trim();
-
-            if super::pairing::ChannelPairingStore::looks_like_code(utterance_for_pairing) {
-                if let Some(ref store) = state.pairing_store {
-                    if let Some(_entry) = store.redeem_code(utterance_for_pairing.trim(), "kakao") {
-                        // Persist to config.toml (blocking IO in spawn_blocking)
-                        let uid = user_id.to_string();
-                        tokio::spawn(async move {
-                            if let Err(e) = tokio::task::spawn_blocking(move || {
-                                super::pairing::persist_channel_allowlist("kakao", &uid)
-                            }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
-                                tracing::error!("KakaoTalk: failed to persist pairing: {e}");
+            // Check if user was paired via web flow (one-click auto-pair)
+            if let Some(ref store) = state.pairing_store {
+                if store.is_paired("kakao", user_id) {
+                    let uid = user_id.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            super::pairing::persist_channel_allowlist("kakao", &uid)
+                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                            tracing::error!("KakaoTalk: failed to persist pairing: {e}");
+                        }
+                    });
+                    // Fall through to process message normally
+                } else {
+                    // Create token and show one-click connect button
+                    if let Some(ref gw_url) = state.gateway_url {
+                        let token = store.create_token("kakao", user_id);
+                        let auto_url = super::pairing::ChannelPairingStore::auto_pair_url(gw_url, &token);
+                        return Json(serde_json::json!({
+                            "version": "2.0",
+                            "template": {
+                                "outputs": [{
+                                    "simpleText": {
+                                        "text": "MoA에 연결하려면 아래 버튼을 눌러주세요.\n\nTap the button below to connect to MoA."
+                                    }
+                                }],
+                                "quickReplies": [{
+                                    "messageText": "연결하기",
+                                    "action": "webLink",
+                                    "label": "🔗 연결하기 / Connect",
+                                    "webLinkUrl": auto_url
+                                }]
                             }
-                        });
-                        return kakao_skill_response(
-                            "✅ 연결이 완료되었습니다! 이제 대화를 시작할 수 있습니다.\n\nConnection complete! You can start chatting now."
-                        ).into_response();
+                        })).into_response();
                     }
+
+                    tracing::warn!("KakaoTalk: ignoring message from unauthorized user: {user_id}");
+                    return kakao_skill_response("접근이 허용되지 않은 사용자입니다.\n\nAccess denied. Please contact the operator.").into_response();
                 }
-                return kakao_skill_response(
-                    "❌ 유효하지 않은 코드입니다. 다시 시도해주세요.\n\nInvalid code. Please try again."
-                ).into_response();
+            } else {
+                tracing::warn!("KakaoTalk: ignoring message from unauthorized user: {user_id}");
+                return kakao_skill_response("접근이 허용되지 않은 사용자입니다.\n\nAccess denied. Please contact the operator.").into_response();
             }
-
-            // Show connect button
-            if let Some(ref gw_url) = state.gateway_url {
-                let connect_url = super::pairing::ChannelPairingStore::connect_url(gw_url, "kakao", user_id);
-                return Json(serde_json::json!({
-                    "version": "2.0",
-                    "template": {
-                        "outputs": [{
-                            "simpleText": {
-                                "text": "MoA에 연결하려면 아래 버튼을 눌러주세요.\n\nTap the button below to connect to MoA."
-                            }
-                        }],
-                        "quickReplies": [{
-                            "messageText": "연결하기",
-                            "action": "webLink",
-                            "label": "🔗 연결하기 / Connect",
-                            "webLinkUrl": connect_url
-                        }]
-                    }
-                })).into_response();
-            }
-
-            tracing::warn!("KakaoTalk: ignoring message from unauthorized user: {user_id}");
-            return kakao_skill_response("접근이 허용되지 않은 사용자입니다.\n\nAccess denied. Please contact the operator.").into_response();
         }
 
         let utterance = user_req
@@ -617,24 +607,24 @@ async fn handle_webhook(
             .unwrap_or("unknown");
 
         if !state.allowed_users.iter().any(|u| u == "*" || u == user_id) {
-            // For direct callback format, try pairing code redemption
-            let text = content.as_str().unwrap_or("").trim();
-            if super::pairing::ChannelPairingStore::looks_like_code(text) {
-                if let Some(ref store) = state.pairing_store {
-                    if let Some(_entry) = store.redeem_code(text.trim(), "kakao") {
-                        let uid = user_id.to_string();
-                        tokio::spawn(async move {
-                            if let Err(e) = tokio::task::spawn_blocking(move || {
-                                super::pairing::persist_channel_allowlist("kakao", &uid)
-                            }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
-                                tracing::error!("KakaoTalk: failed to persist pairing: {e}");
-                            }
-                        });
-                        return StatusCode::OK.into_response();
-                    }
+            // Check if user was paired via one-click web flow
+            if let Some(ref store) = state.pairing_store {
+                if store.is_paired("kakao", user_id) {
+                    let uid = user_id.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            super::pairing::persist_channel_allowlist("kakao", &uid)
+                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                            tracing::error!("KakaoTalk: failed to persist pairing: {e}");
+                        }
+                    });
+                    // Fall through to process message
+                } else {
+                    return StatusCode::FORBIDDEN.into_response();
                 }
+            } else {
+                return StatusCode::FORBIDDEN.into_response();
             }
-            return StatusCode::FORBIDDEN.into_response();
         }
 
         let text = content.as_str().unwrap_or("").trim();
