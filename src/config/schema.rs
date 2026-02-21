@@ -2214,6 +2214,34 @@ impl Config {
                 }
             }
         }
+
+        // ── Channel overrides (env vars → config) ──────────────────
+
+        // LINE: ZEROCLAW_LINE_CHANNEL_ACCESS_TOKEN + ZEROCLAW_LINE_CHANNEL_SECRET
+        if let Ok(token) = std::env::var("ZEROCLAW_LINE_CHANNEL_ACCESS_TOKEN") {
+            if !token.is_empty() {
+                let line = self.channels_config.line.get_or_insert_with(|| LineConfig {
+                    channel_access_token: String::new(),
+                    channel_secret: String::new(),
+                    allowed_users: vec![],
+                });
+                line.channel_access_token = token;
+            }
+        }
+        if let Ok(secret) = std::env::var("ZEROCLAW_LINE_CHANNEL_SECRET") {
+            if !secret.is_empty() {
+                if let Some(ref mut line) = self.channels_config.line {
+                    line.channel_secret = secret;
+                }
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_LINE_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut line) = self.channels_config.line {
+                    line.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {
