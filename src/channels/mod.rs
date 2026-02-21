@@ -7,6 +7,7 @@ pub mod imessage;
 pub mod irc;
 pub mod kakao;
 pub mod lark;
+pub mod line;
 pub mod matrix;
 pub mod pairing;
 pub mod qq;
@@ -24,6 +25,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use kakao::KakaoTalkChannel;
 pub use lark::LarkChannel;
+pub use line::LineChannel;
 pub use matrix::MatrixChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
@@ -782,6 +784,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
                 ("QQ", config.channels_config.qq.is_some()),
                 ("KakaoTalk", config.channels_config.kakao.is_some()),
+                ("LINE", config.channels_config.line.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -965,6 +968,16 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref kakao) = config.channels_config.kakao {
         channels.push(("KakaoTalk", Arc::new(KakaoTalkChannel::from_config(kakao, None, None))));
+    }
+
+    if let Some(ref line) = config.channels_config.line {
+        channels.push(("LINE", Arc::new(LineChannel::new(
+            line.channel_access_token.clone(),
+            line.channel_secret.clone(),
+            line.allowed_users.clone(),
+            None,
+            None,
+        ))));
     }
 
     if channels.is_empty() {
@@ -1285,6 +1298,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
     if let Some(ref kakao) = config.channels_config.kakao {
         channels.push(Arc::new(KakaoTalkChannel::from_config(
             kakao,
+            pairing_store.clone(),
+            Some(gateway_url.clone()),
+        )));
+    }
+
+    if let Some(ref line) = config.channels_config.line {
+        channels.push(Arc::new(LineChannel::new(
+            line.channel_access_token.clone(),
+            line.channel_secret.clone(),
+            line.allowed_users.clone(),
             pairing_store.clone(),
             Some(gateway_url.clone()),
         )));

@@ -2439,6 +2439,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         dingtalk: None,
         qq: None,
         kakao: None,
+        line: None,
     };
 
     loop {

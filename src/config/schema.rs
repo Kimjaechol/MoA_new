@@ -1531,6 +1531,7 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     pub qq: Option<QQConfig>,
     pub kakao: Option<KakaoTalkConfig>,
+    pub line: Option<LineConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -1551,6 +1552,7 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             qq: None,
             kakao: None,
+            line: None,
         }
     }
 }
@@ -1914,6 +1916,18 @@ pub struct KakaoTalkConfig {
 
 fn default_kakao_port() -> u16 {
     8787
+}
+
+/// LINE Messaging API channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineConfig {
+    /// Channel access token from LINE Developers Console
+    pub channel_access_token: String,
+    /// Channel secret for webhook signature verification
+    pub channel_secret: String,
+    /// Allowed LINE user IDs. Empty = deny all (use pairing), "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -2477,6 +2491,7 @@ default_temperature = 0.7
                 dingtalk: None,
                 qq: None,
                 kakao: None,
+                line: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -2901,6 +2916,7 @@ tool_dispatcher = "xml"
             dingtalk: None,
             qq: None,
             kakao: None,
+            line: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -3064,6 +3080,7 @@ channel_id = "C123"
             dingtalk: None,
             qq: None,
             kakao: None,
+            line: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
