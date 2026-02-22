@@ -1,13 +1,6 @@
 import type { Metadata, Viewport } from "next";
-import { Inter } from "next/font/google";
 import "./globals.css";
 import Header from "@/components/Header";
-
-const inter = Inter({
-  subsets: ["latin"],
-  variable: "--font-inter",
-  display: "swap",
-});
 
 export const viewport: Viewport = {
   width: "device-width",
@@ -70,7 +63,7 @@ export default function RootLayout({
   return (
     <html lang="ko" className="dark">
       <body
-        className={`${inter.variable} font-sans bg-dark-950 text-dark-100 antialiased`}
+        className="font-sans bg-dark-950 text-dark-100 antialiased"
       >
         <Header />
         <main className="min-h-screen">{children}</main>
