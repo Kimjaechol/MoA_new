@@ -364,7 +364,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             server_url: std::sync::Mutex::new(
-                "https://moanew-production.up.railway.app".to_string(),
+                std::env::var("MOA_SERVER_URL")
+                    .unwrap_or_else(|_| "https://moanew-production.up.railway.app".to_string()),
             ),
             token: std::sync::Mutex::new(None),
             sync_connected: AtomicBool::new(false),

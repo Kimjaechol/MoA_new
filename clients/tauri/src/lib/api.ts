@@ -11,6 +11,7 @@ import {
 
 const STORAGE_KEY_TOKEN = "moa_token";
 const STORAGE_KEY_SERVER = "moa_server_url";
+const DEFAULT_SERVER_URL = "https://moanew-production.up.railway.app";
 
 export interface PairResponse {
   paired: boolean;
@@ -33,7 +34,7 @@ export class MoAClient {
   private token: string | null;
 
   constructor() {
-    this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || "https://moanew-production.up.railway.app";
+    this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || DEFAULT_SERVER_URL;
     this.token = localStorage.getItem(STORAGE_KEY_TOKEN);
   }
 
