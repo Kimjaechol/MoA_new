@@ -9,6 +9,7 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://moa-web.vercel.app"),
   title: "MoA - Master of AI | \uB2F9\uC2E0\uC758 AI \uC5D0\uC774\uC804\uD2B8",
   description:
     "MoA\uB294 ZeroClaw \uB7F0\uD0C0\uC784 \uAE30\uBC18\uC758 \uC790\uC728 AI \uC5D0\uC774\uC804\uD2B8\uC785\uB2C8\uB2E4. \uB2E4\uC911 AI \uBAA8\uB378, \uC5D4\uB4DC\uD22C\uC5D4\uB4DC \uC554\uD638\uD654, \uBA40\uD2F0\uCC44\uB110 \uD1B5\uD569\uC744 \uC9C0\uC6D0\uD569\uB2C8\uB2E4. MoA is an autonomous AI agent powered by ZeroClaw runtime. Multi-model, encrypted, cross-platform.",
