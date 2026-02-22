@@ -28,6 +28,518 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+// ═══════════════════════════════════════════════════════════════════
+// Part 1 — Coding Workflow (structured methodology)
+// ═══════════════════════════════════════════════════════════════════
+
+/// The six-phase workflow that drives expert-level coding.
+///
+/// Each phase has a clear purpose, entry criteria, outputs, and
+/// transition rules.  The sandbox loop (Part 2) is embedded inside
+/// Phase 4 (Implement → Verify).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingPhase {
+    /// Phase 1 — Read and understand the existing codebase before touching it.
+    Comprehend,
+    /// Phase 2 — Define the precise scope: what changes, what doesn't, what the
+    /// acceptance criteria are.
+    Plan,
+    /// Phase 3 — Prepare the environment: install deps, create branches,
+    /// snapshot working state.
+    Prepare,
+    /// Phase 4 — Write code + run→observe→fix loop until all checks pass.
+    Implement,
+    /// Phase 5 — Final validation: full test suite, lint, type-check, build.
+    Validate,
+    /// Phase 6 — Deliver: commit with clear message, report to user.
+    Deliver,
+}
+
+impl CodingPhase {
+    pub const ALL: &'static [CodingPhase] = &[
+        CodingPhase::Comprehend,
+        CodingPhase::Plan,
+        CodingPhase::Prepare,
+        CodingPhase::Implement,
+        CodingPhase::Validate,
+        CodingPhase::Deliver,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            CodingPhase::Comprehend => "Comprehend",
+            CodingPhase::Plan => "Plan",
+            CodingPhase::Prepare => "Prepare",
+            CodingPhase::Implement => "Implement",
+            CodingPhase::Validate => "Validate",
+            CodingPhase::Deliver => "Deliver",
+        }
+    }
+
+    /// Next phase in the normal forward flow.
+    pub fn next(self) -> Option<Self> {
+        match self {
+            CodingPhase::Comprehend => Some(CodingPhase::Plan),
+            CodingPhase::Plan => Some(CodingPhase::Prepare),
+            CodingPhase::Prepare => Some(CodingPhase::Implement),
+            CodingPhase::Implement => Some(CodingPhase::Validate),
+            CodingPhase::Validate => Some(CodingPhase::Deliver),
+            CodingPhase::Deliver => None,
+        }
+    }
+}
+
+/// Detailed instructions for each coding phase, derived from the actual
+/// methodology that makes expert coding agents effective.
+pub fn phase_instructions(phase: CodingPhase) -> &'static str {
+    match phase {
+        CodingPhase::Comprehend => PHASE_COMPREHEND,
+        CodingPhase::Plan => PHASE_PLAN,
+        CodingPhase::Prepare => PHASE_PREPARE,
+        CodingPhase::Implement => PHASE_IMPLEMENT,
+        CodingPhase::Validate => PHASE_VALIDATE,
+        CodingPhase::Deliver => PHASE_DELIVER,
+    }
+}
+
+const PHASE_COMPREHEND: &str = "\
+## Phase 1: Comprehend (Read Before Write)
+
+Before writing ANY code, you MUST fully understand the existing codebase:
+
+### Required Actions
+1. **Read the target files** — Open and read every file you plan to modify.
+   Never propose changes to code you haven't read.
+2. **Understand the architecture** — Identify:
+   - Module boundaries and dependency direction
+   - Naming conventions and code style already in use
+   - How similar features are implemented elsewhere
+   - Extension points (traits, interfaces, factories)
+3. **Search for related code** — Use grep/search to find:
+   - All callers of functions you'll change
+   - All tests that cover the target code
+   - Configuration or schema that references the target
+4. **Identify constraints** — Note:
+   - What must NOT break (public API, backward compat)
+   - Security-sensitive surfaces
+   - Performance-critical paths
+
+### Exit Criteria
+- You can describe the current behavior of the code you'll change
+- You know which files will be modified and which won't
+- You've identified existing tests and conventions
+
+### Anti-Patterns to Avoid
+- Starting to write code before reading the existing implementation
+- Guessing at module structure instead of exploring it
+- Ignoring existing patterns and inventing incompatible ones";
+
+const PHASE_PLAN: &str = "\
+## Phase 2: Plan (Define Scope and Strategy)
+
+Define a precise, minimal plan before implementation:
+
+### Required Actions
+1. **State the change** — One sentence: what will be different after this change?
+2. **List files to modify** — Explicit list with what changes in each.
+3. **Define acceptance criteria** — What must pass for this to be done?
+   - Specific test cases (existing or new)
+   - Build/lint/type-check requirements
+   - Runtime behavior expectations
+4. **Identify risk** — What could go wrong?
+   - Breaking changes
+   - Edge cases
+   - Cross-module side effects
+5. **Choose the minimal approach** — Apply:
+   - KISS: simplest control flow that works
+   - YAGNI: no speculative features
+   - DRY (rule of three): don't extract until pattern repeats
+
+### Exit Criteria
+- Clear scope boundary: one concern, no mixed refactor+feature
+- Each planned change maps to a specific acceptance criterion
+
+### Decision Framework
+- If extending behavior: implement existing traits/interfaces first
+- If fixing a bug: write a failing test first, then fix
+- If refactoring: ensure identical behavior via existing tests
+- If uncertain about approach: try the simplest thing first";
+
+const PHASE_PREPARE: &str = "\
+## Phase 3: Prepare (Environment Setup)
+
+Set up a safe environment for implementation:
+
+### Required Actions
+1. **Snapshot current state** — Create a checkpoint you can rollback to:
+   - `git stash` or `git commit` the current working state
+   - Note the commit hash or stash ID
+2. **Install dependencies** — If new packages are needed:
+   - Add them explicitly (don't rely on auto-install)
+   - Pin versions when stability matters
+   - Verify they install cleanly before proceeding
+3. **Set up validation** — Identify and prepare:
+   - The test command (`cargo test`, `npm test`, `pytest`, etc.)
+   - The lint/format command
+   - The build command
+   - The dev server start command (if web app)
+4. **Verify baseline** — Run the test suite BEFORE making changes:
+   - If tests already fail, note which ones and why
+   - This prevents blaming your changes for pre-existing failures
+
+### Exit Criteria
+- Rollback checkpoint exists
+- You know the exact commands to validate your changes
+- Baseline test results are recorded";
+
+const PHASE_IMPLEMENT: &str = "\
+## Phase 4: Implement (Write Code + Run→Observe→Fix Loop)
+
+Write code in small, verifiable increments:
+
+### Core Methodology: Incremental Implementation
+1. **Make one logical change at a time** — Don't write 500 lines then test.
+   Write a function, test it. Add an endpoint, test it.
+2. **Run after every change** — Execute the relevant test/build/run command
+   immediately after each modification.
+3. **Read error messages completely** — Don't skim. The error message tells
+   you exactly what's wrong. Parse it systematically:
+   - File and line number
+   - Error type (syntax, type, runtime, dependency)
+   - The actual vs expected value/type
+4. **Fix the root cause, not the symptom** — When you see an error:
+   - Trace it back to the source (not just the line that crashed)
+   - Understand WHY it happened before writing a fix
+   - Don't add try/catch around everything as a band-aid
+
+### Run → Observe → Fix Loop
+For each iteration:
+```
+1. EXECUTE: Run build/test/server
+2. OBSERVE: Collect stdout, stderr, exit code, server response
+3. CLASSIFY: What type of error? (syntax/type/runtime/dep/network)
+4. ANALYSE: What is the root cause? Read the FULL error message.
+5. FIX: Apply the minimal targeted patch
+6. CHECKPOINT: If working state improved, save a checkpoint
+7. REPEAT: Go back to step 1
+```
+
+### Intelligent Error Resolution
+- **Syntax errors**: Fix the exact line indicated. Check brackets, quotes, semicolons.
+- **Type errors**: Check function signatures, imports, variable declarations.
+  Don't just cast — fix the type mismatch at its source.
+- **Dependency errors**: Install the package. If version conflict, check
+  compatibility matrix. If unavailable, use an alternative.
+- **Runtime errors**: Add logging before the crash point to understand state.
+  Check for null/undefined, out-of-bounds, division by zero.
+- **Test failures**: Compare expected vs actual. The test is usually right —
+  fix the implementation, not the test (unless the test is wrong).
+- **Same error 3+ times**: STOP. The current approach is wrong.
+  Step back and try a fundamentally different solution.
+
+### Web App Specific
+When building web applications:
+1. Start the dev server and capture its output
+2. Make HTTP requests or browser-check the preview URL
+3. Check both server logs AND client response
+4. If server returns 500, read the server-side stack trace
+5. If UI is wrong, check the DOM structure / API response
+
+### Anti-Patterns to Avoid
+- Writing all the code then testing at the very end
+- Ignoring warnings (they often become errors later)
+- Adding complexity to work around a misunderstood problem
+- Copy-pasting error messages into fixes without understanding them";
+
+const PHASE_VALIDATE: &str = "\
+## Phase 5: Validate (Full Verification)
+
+Run the complete validation suite:
+
+### Required Checks (in order)
+1. **Format check** — Auto-format or verify formatting
+2. **Lint check** — All warnings resolved (not suppressed without reason)
+3. **Type check** — Full type verification passes
+4. **Unit tests** — All existing tests pass + new tests for new code
+5. **Build** — Production build succeeds
+6. **Integration/E2E** — If applicable, verify end-to-end behavior
+
+### Regression Detection
+- Compare test results against the Phase 3 baseline
+- Any NEW failures must be fixed before delivery
+- If you cannot fix a regression, document it and report to user
+
+### Quality Checks
+- No hardcoded secrets, passwords, or tokens
+- No debug print statements left in code
+- No commented-out code blocks (delete unused code)
+- No TODO comments without clear context
+- Error messages are meaningful (not just 'error occurred')
+
+### Exit Criteria
+- All validation commands pass
+- No regressions from baseline
+- Code is clean and production-ready";
+
+const PHASE_DELIVER: &str = "\
+## Phase 6: Deliver (Report Results)
+
+Communicate clearly what was done:
+
+### Required Actions
+1. **Summarize changes** — What was changed and why
+2. **List modified files** — Explicit file list
+3. **Report validation results** — Which checks passed
+4. **Note any caveats** — Edge cases, known limitations, follow-up items
+5. **Commit** — With a clear, descriptive commit message (if user wants it)
+
+### Communication Style
+- Lead with the outcome, not the process
+- Be specific: 'Added X to Y' not 'Made some changes'
+- If something didn't work as planned, say so upfront";
+
+/// The complete coding methodology as a single system prompt.
+/// This replaces the short `category_system_prompt` for Coding mode.
+pub fn coding_system_prompt() -> String {
+    let mut prompt = String::from(
+        "## Active Mode: Coding (Expert Sandbox)\n\n\
+         You are an expert software engineer. Follow this structured methodology \
+         for every coding task. Do NOT skip phases.\n\n",
+    );
+
+    // ── Principles ──
+    prompt.push_str(
+        "### Core Principles\n\n\
+         1. **Read before write** — Never modify code you haven't read and understood.\n\
+         2. **Incremental verification** — Test after every small change, not at the end.\n\
+         3. **Root-cause fixing** — Understand WHY an error occurs before writing a fix.\n\
+         4. **Minimal changes** — The best patch is the smallest one that works.\n\
+         5. **Fail fast, rollback fast** — If an approach isn't working after 3 attempts, \
+            try a different strategy. Don't accumulate broken patches.\n\
+         6. **Always have a checkpoint** — Before risky changes, ensure you can revert.\n\
+         7. **Read the FULL error** — Error messages contain the answer. Don't skim.\n\
+         8. **One concern per change** — Don't mix feature work with refactoring.\n\n",
+    );
+
+    // ── Phase instructions ──
+    for phase in CodingPhase::ALL {
+        prompt.push_str(phase_instructions(*phase));
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    // ── Meta-cognitive rules ──
+    prompt.push_str(
+        "### Meta-Cognitive Rules (Self-Monitoring)\n\n\
+         While coding, continuously check yourself:\n\n\
+         - **Am I reading the error message completely?** Don't just see 'error' and guess.\n\
+         - **Am I fixing the root cause?** Or am I papering over a symptom?\n\
+         - **Have I been stuck on the same error?** If 3+ attempts on the same issue, \
+           step back and reconsider the approach.\n\
+         - **Am I making the code more complex than necessary?** Three lines of clear code \
+           beat a premature abstraction.\n\
+         - **Did I test after my last change?** Never batch multiple untested changes.\n\
+         - **Would I be able to revert this?** If not, create a checkpoint first.\n\
+         - **Am I respecting existing patterns?** Don't invent new conventions when the \
+           codebase has established ones.\n",
+    );
+
+    prompt
+}
+
+/// Tracks which coding phase the workflow is in.
+#[derive(Debug)]
+pub struct CodingWorkflow {
+    current_phase: CodingPhase,
+    phase_history: Vec<(CodingPhase, PhaseOutcome)>,
+    baseline_test_result: Option<BaselineResult>,
+    checkpoint_ref: Option<String>,
+    files_read: Vec<String>,
+    files_modified: Vec<String>,
+    validation_commands: Vec<String>,
+}
+
+/// Outcome recorded when a phase completes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseOutcome {
+    pub phase: CodingPhase,
+    pub status: PhaseStatus,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseStatus {
+    Completed,
+    Skipped,
+    Failed,
+}
+
+/// Baseline test result captured in Phase 3 (Prepare).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineResult {
+    pub total_tests: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub pre_existing_failures: Vec<String>,
+}
+
+impl CodingWorkflow {
+    pub fn new() -> Self {
+        Self {
+            current_phase: CodingPhase::Comprehend,
+            phase_history: Vec::new(),
+            baseline_test_result: None,
+            checkpoint_ref: None,
+            files_read: Vec::new(),
+            files_modified: Vec::new(),
+            validation_commands: Vec::new(),
+        }
+    }
+
+    pub fn current_phase(&self) -> CodingPhase {
+        self.current_phase
+    }
+
+    /// Record a file as having been read (Phase 1).
+    pub fn record_file_read(&mut self, path: &str) {
+        if !self.files_read.contains(&path.to_string()) {
+            self.files_read.push(path.to_string());
+        }
+    }
+
+    /// Record a file as having been modified (Phase 4).
+    pub fn record_file_modified(&mut self, path: &str) {
+        if !self.files_modified.contains(&path.to_string()) {
+            self.files_modified.push(path.to_string());
+        }
+    }
+
+    /// Record the baseline test result (Phase 3).
+    pub fn record_baseline(&mut self, result: BaselineResult) {
+        self.baseline_test_result = Some(result);
+    }
+
+    /// Record a rollback checkpoint reference (Phase 3).
+    pub fn record_checkpoint(&mut self, reference: &str) {
+        self.checkpoint_ref = Some(reference.to_string());
+    }
+
+    /// Record which validation commands to use (Phase 3).
+    pub fn record_validation_commands(&mut self, commands: Vec<String>) {
+        self.validation_commands = commands;
+    }
+
+    /// Check if a file was read before being modified (Phase 1 rule).
+    pub fn was_read_before_modify(&self, path: &str) -> bool {
+        self.files_read.iter().any(|f| f == path)
+    }
+
+    /// Complete the current phase and advance to the next.
+    pub fn advance(&mut self, notes: &str) -> Option<CodingPhase> {
+        let outcome = PhaseOutcome {
+            phase: self.current_phase,
+            status: PhaseStatus::Completed,
+            notes: notes.to_string(),
+        };
+        self.phase_history.push((self.current_phase, outcome));
+
+        if let Some(next) = self.current_phase.next() {
+            self.current_phase = next;
+            Some(next)
+        } else {
+            None
+        }
+    }
+
+    /// Skip the current phase (e.g., trivial task doesn't need full Prepare).
+    pub fn skip(&mut self, reason: &str) -> Option<CodingPhase> {
+        let outcome = PhaseOutcome {
+            phase: self.current_phase,
+            status: PhaseStatus::Skipped,
+            notes: reason.to_string(),
+        };
+        self.phase_history.push((self.current_phase, outcome));
+
+        if let Some(next) = self.current_phase.next() {
+            self.current_phase = next;
+            Some(next)
+        } else {
+            None
+        }
+    }
+
+    /// Go back to a previous phase (e.g., Validate fails → back to Implement).
+    pub fn rewind_to(&mut self, phase: CodingPhase, reason: &str) {
+        let outcome = PhaseOutcome {
+            phase: self.current_phase,
+            status: PhaseStatus::Failed,
+            notes: reason.to_string(),
+        };
+        self.phase_history.push((self.current_phase, outcome));
+        self.current_phase = phase;
+    }
+
+    /// Build a status summary for progress reporting.
+    pub fn status_summary(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push("### Coding Workflow Status".to_string());
+        for phase in CodingPhase::ALL {
+            let marker = if *phase == self.current_phase {
+                "▶"
+            } else if self.phase_history.iter().any(|(p, o)| {
+                *p == *phase && o.status == PhaseStatus::Completed
+            }) {
+                "✓"
+            } else if self.phase_history.iter().any(|(p, o)| {
+                *p == *phase && o.status == PhaseStatus::Skipped
+            }) {
+                "⊘"
+            } else {
+                "○"
+            };
+            lines.push(format!("{marker} {}", phase.label()));
+        }
+        if !self.files_read.is_empty() {
+            lines.push(format!("\nFiles read: {}", self.files_read.len()));
+        }
+        if !self.files_modified.is_empty() {
+            lines.push(format!("Files modified: {}", self.files_modified.len()));
+        }
+        if let Some(ref baseline) = self.baseline_test_result {
+            lines.push(format!(
+                "Baseline: {}/{} tests passed",
+                baseline.passed, baseline.total_tests
+            ));
+        }
+        lines.join("\n")
+    }
+
+    pub fn files_read(&self) -> &[String] {
+        &self.files_read
+    }
+
+    pub fn files_modified(&self) -> &[String] {
+        &self.files_modified
+    }
+
+    pub fn baseline(&self) -> Option<&BaselineResult> {
+        self.baseline_test_result.as_ref()
+    }
+
+    pub fn checkpoint_ref(&self) -> Option<&str> {
+        self.checkpoint_ref.as_deref()
+    }
+
+    pub fn validation_commands(&self) -> &[String] {
+        &self.validation_commands
+    }
+
+    pub fn phase_history(&self) -> &[(CodingPhase, PhaseOutcome)] {
+        &self.phase_history
+    }
+}
+
 // ── Error classification ───────────────────────────────────────────
 
 /// Coarse error category used to select fix strategy.
@@ -889,5 +1401,149 @@ mod tests {
         assert_eq!(cfg.max_duration, Duration::from_secs(600));
         assert_eq!(cfg.max_same_error_retries, 3);
         assert!(cfg.enable_checkpoints);
+    }
+
+    // ── CodingWorkflow tests ──────────────────────────────────────
+
+    #[test]
+    fn coding_workflow_starts_at_comprehend() {
+        let wf = CodingWorkflow::new();
+        assert_eq!(wf.current_phase(), CodingPhase::Comprehend);
+    }
+
+    #[test]
+    fn coding_workflow_advances_through_all_phases() {
+        let mut wf = CodingWorkflow::new();
+        let expected = [
+            CodingPhase::Plan,
+            CodingPhase::Prepare,
+            CodingPhase::Implement,
+            CodingPhase::Validate,
+            CodingPhase::Deliver,
+        ];
+        for &exp in &expected {
+            let next = wf.advance("done");
+            assert_eq!(next, Some(exp));
+            assert_eq!(wf.current_phase(), exp);
+        }
+        // After Deliver, no more phases.
+        assert_eq!(wf.advance("done"), None);
+    }
+
+    #[test]
+    fn coding_workflow_skip_phase() {
+        let mut wf = CodingWorkflow::new();
+        // Skip Comprehend (trivial task).
+        let next = wf.skip("trivial one-liner");
+        assert_eq!(next, Some(CodingPhase::Plan));
+        assert_eq!(wf.current_phase(), CodingPhase::Plan);
+    }
+
+    #[test]
+    fn coding_workflow_rewind() {
+        let mut wf = CodingWorkflow::new();
+        wf.advance("read files");
+        wf.advance("planned");
+        wf.advance("prepared");
+        wf.advance("implemented");
+        assert_eq!(wf.current_phase(), CodingPhase::Validate);
+
+        // Validation fails, rewind to Implement.
+        wf.rewind_to(CodingPhase::Implement, "tests failed");
+        assert_eq!(wf.current_phase(), CodingPhase::Implement);
+    }
+
+    #[test]
+    fn coding_workflow_tracks_files() {
+        let mut wf = CodingWorkflow::new();
+        wf.record_file_read("src/main.rs");
+        wf.record_file_read("src/lib.rs");
+        wf.record_file_read("src/main.rs"); // duplicate
+        assert_eq!(wf.files_read().len(), 2);
+
+        wf.record_file_modified("src/main.rs");
+        assert!(wf.was_read_before_modify("src/main.rs"));
+        assert!(!wf.was_read_before_modify("src/unknown.rs"));
+    }
+
+    #[test]
+    fn coding_workflow_baseline_recording() {
+        let mut wf = CodingWorkflow::new();
+        wf.record_baseline(BaselineResult {
+            total_tests: 100,
+            passed: 98,
+            failed: 2,
+            pre_existing_failures: vec!["test_flaky".into(), "test_slow".into()],
+        });
+        let baseline = wf.baseline().unwrap();
+        assert_eq!(baseline.total_tests, 100);
+        assert_eq!(baseline.passed, 98);
+        assert_eq!(baseline.pre_existing_failures.len(), 2);
+    }
+
+    #[test]
+    fn coding_workflow_checkpoint() {
+        let mut wf = CodingWorkflow::new();
+        assert!(wf.checkpoint_ref().is_none());
+        wf.record_checkpoint("abc123");
+        assert_eq!(wf.checkpoint_ref(), Some("abc123"));
+    }
+
+    #[test]
+    fn coding_workflow_validation_commands() {
+        let mut wf = CodingWorkflow::new();
+        wf.record_validation_commands(vec![
+            "cargo test".into(),
+            "cargo clippy".into(),
+        ]);
+        assert_eq!(wf.validation_commands().len(), 2);
+    }
+
+    #[test]
+    fn coding_workflow_status_summary() {
+        let mut wf = CodingWorkflow::new();
+        wf.record_file_read("foo.rs");
+        wf.advance("done");
+        let summary = wf.status_summary();
+        assert!(summary.contains("Comprehend"));
+        assert!(summary.contains("Plan"));
+        assert!(summary.contains("Files read: 1"));
+    }
+
+    #[test]
+    fn coding_phase_all_has_six_phases() {
+        assert_eq!(CodingPhase::ALL.len(), 6);
+    }
+
+    #[test]
+    fn phase_instructions_non_empty() {
+        for phase in CodingPhase::ALL {
+            assert!(!phase_instructions(*phase).is_empty());
+        }
+    }
+
+    #[test]
+    fn coding_system_prompt_contains_all_phases() {
+        let prompt = coding_system_prompt();
+        assert!(prompt.contains("Phase 1: Comprehend"));
+        assert!(prompt.contains("Phase 2: Plan"));
+        assert!(prompt.contains("Phase 3: Prepare"));
+        assert!(prompt.contains("Phase 4: Implement"));
+        assert!(prompt.contains("Phase 5: Validate"));
+        assert!(prompt.contains("Phase 6: Deliver"));
+        assert!(prompt.contains("Meta-Cognitive Rules"));
+        assert!(prompt.contains("Root-cause fixing"));
+    }
+
+    #[test]
+    fn coding_phase_next_chain() {
+        let mut phase = CodingPhase::Comprehend;
+        let mut count = 0;
+        while let Some(next) = phase.next() {
+            phase = next;
+            count += 1;
+        }
+        assert_eq!(count, 5); // 5 transitions from Comprehend → Deliver
+        assert_eq!(phase, CodingPhase::Deliver);
     }
 }

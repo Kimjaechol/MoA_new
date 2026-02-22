@@ -265,14 +265,20 @@ pub fn filter_tools_by_category<T: crate::tools::Tool + ?Sized>(
 
 /// Returns an additional system prompt section tailored to the active
 /// task category, guiding the LLM's behaviour.
-pub fn category_system_prompt(category: &TaskCategory) -> &'static str {
+///
+/// For Coding mode, the full structured methodology is returned via
+/// `crate::sandbox::coding_system_prompt()` which includes all 6 phases,
+/// meta-cognitive rules, and the run→observe→fix loop.
+pub fn category_system_prompt(category: &TaskCategory) -> String {
     match category {
+        TaskCategory::Coding => crate::sandbox::coding_system_prompt(),
         TaskCategory::WebGeneral => {
             "## Active Mode: Web / General\n\n\
              You are a general-purpose assistant with web browsing capabilities.\n\
              - Use the browser and http_request tools to fetch live information.\n\
              - Summarize findings clearly with sources.\n\
              - Store important facts to memory for future reference."
+                .to_string()
         }
         TaskCategory::Document => {
             "## Active Mode: Document\n\n\
@@ -281,16 +287,7 @@ pub fn category_system_prompt(category: &TaskCategory) -> &'static str {
              - Use file_read/file_write to work with local files.\n\
              - Use browser tools for research when needed.\n\
              - Maintain clear formatting and structure."
-        }
-        TaskCategory::Coding => {
-            "## Active Mode: Coding (Sandbox)\n\n\
-             You are an expert software engineer with full sandbox capabilities.\n\
-             - Write, execute, test, and iteratively fix code.\n\
-             - When building web apps, start the dev server, observe output, and fix errors automatically.\n\
-             - Follow the run→observe→fix loop: execute code, collect logs/errors, analyze, patch, repeat.\n\
-             - Generate tests (unit, integration, E2E) alongside implementation.\n\
-             - If an error persists after 3 fix attempts, try an alternative approach.\n\
-             - Keep the user informed of progress at each iteration."
+                .to_string()
         }
         TaskCategory::Image => {
             "## Active Mode: Image\n\n\
@@ -299,6 +296,7 @@ pub fn category_system_prompt(category: &TaskCategory) -> &'static str {
              - Use vision tools (screenshot, image_info) for analysis.\n\
              - Use shell for image processing commands (ImageMagick, ffmpeg, etc.).\n\
              - Use browser tools to find reference images when needed."
+                .to_string()
         }
         TaskCategory::Music => {
             "## Active Mode: Music\n\n\
@@ -307,6 +305,7 @@ pub fn category_system_prompt(category: &TaskCategory) -> &'static str {
              - Use shell for audio processing (ffmpeg, sox, etc.).\n\
              - Use browser tools to find music resources and references.\n\
              - Assist with MIDI, notation, and audio format conversions."
+                .to_string()
         }
         TaskCategory::Video => {
             "## Active Mode: Video\n\n\
@@ -315,6 +314,7 @@ pub fn category_system_prompt(category: &TaskCategory) -> &'static str {
              - Use shell for video processing (ffmpeg, etc.).\n\
              - Use vision tools to analyze frames and screenshots.\n\
              - Assist with format conversion, trimming, merging, and effects."
+                .to_string()
         }
         TaskCategory::Translation => {
             "## Active Mode: Translation / Interpretation\n\n\
@@ -324,6 +324,7 @@ pub fn category_system_prompt(category: &TaskCategory) -> &'static str {
              - Use browser tools for terminology lookup when needed.\n\
              - For documents, use file_read/file_write to process files.\n\
              - Store recurring terminology to memory for consistency."
+                .to_string()
         }
     }
 }
