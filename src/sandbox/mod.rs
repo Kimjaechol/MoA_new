@@ -24,6 +24,8 @@
 //! - **Severity scoring** — prioritises critical errors (crash, compile
 //!   failure) over warnings, avoiding infinite cosmetic-fix loops
 
+pub mod layout;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

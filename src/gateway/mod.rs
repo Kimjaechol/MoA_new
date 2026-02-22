@@ -575,6 +575,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/api/navigation", get(handle_navigation))
+        .route("/api/coding/layout", get(handle_coding_layout))
+        .route("/api/coding/layout/mobile", get(handle_coding_layout_mobile))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -629,6 +631,16 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 /// GET /api/navigation — returns the navigation manifest for the web chat UI.
 async fn handle_navigation() -> impl IntoResponse {
     Json(serde_json::to_value(crate::task_category::NavigationManifest::build()).unwrap())
+}
+
+/// GET /api/coding/layout — returns the default split-screen coding layout.
+async fn handle_coding_layout() -> impl IntoResponse {
+    Json(serde_json::to_value(crate::sandbox::layout::CodingLayout::default()).unwrap())
+}
+
+/// GET /api/coding/layout/mobile — returns the mobile-optimized coding layout.
+async fn handle_coding_layout_mobile() -> impl IntoResponse {
+    Json(serde_json::to_value(crate::sandbox::layout::CodingLayout::mobile()).unwrap())
 }
 
 /// Optional JSON body for pairing with credentials.
