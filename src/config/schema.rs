@@ -399,6 +399,13 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
 
     // Google models
     prices.insert(
+        "google/gemini-3.1-pro-preview".into(),
+        ModelPricing {
+            input: 2.50,
+            output: 15.0,
+        },
+    );
+    prices.insert(
         "google/gemini-2.0-flash".into(),
         ModelPricing {
             input: 0.10,
@@ -1944,7 +1951,7 @@ impl Default for Config {
             api_key: None,
             api_url: None,
             default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4".to_string()),
+            default_model: Some("google/gemini-3.1-pro-preview".to_string()),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -2641,7 +2648,7 @@ mod tests {
     fn config_default_has_sane_values() {
         let c = Config::default();
         assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
-        assert!(c.default_model.as_deref().unwrap().contains("claude"));
+        assert!(c.default_model.as_deref().unwrap().contains("gemini-3.1-pro"));
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
