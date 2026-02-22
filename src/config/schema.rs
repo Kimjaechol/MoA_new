@@ -657,9 +657,19 @@ pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in Brave without scraping)
     #[serde(default)]
     pub enabled: bool,
-    /// Allowed domains for `browser_open` (exact or subdomain match)
+
+    /// Include the built-in default domain preset (search engines, developer
+    /// tools, documentation, reference sites, etc.). Default: true.
+    /// Set to false for strict manual-only allowlisting.
+    #[serde(default = "default_true")]
+    pub include_default_domains: bool,
+
+    /// Additional allowed domains beyond the defaults (exact or subdomain match).
+    /// These are merged with the default preset when `include_default_domains` is true.
+    /// When `include_default_domains` is false, ONLY these domains are allowed.
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
@@ -688,10 +698,235 @@ fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
 
+/// Built-in default domain preset — well-known, legitimate sites across
+/// major categories. All entries use subdomain-inclusive matching
+/// (e.g. "github.com" also allows "api.github.com", "docs.github.com").
+///
+/// Users can extend this with `allowed_domains` or disable it entirely
+/// with `include_default_domains = false`.
+pub fn default_browser_domains() -> Vec<String> {
+    [
+        // ── Search engines ──────────────────────────────
+        "google.com",
+        "google.co.kr",
+        "google.co.jp",
+        "google.co.uk",
+        "google.de",
+        "google.fr",
+        "naver.com",
+        "daum.net",
+        "bing.com",
+        "duckduckgo.com",
+        "search.yahoo.com",
+        "baidu.com",
+        "yandex.com",
+        // ── Developer platforms ──────────────────────────
+        "github.com",
+        "gitlab.com",
+        "bitbucket.org",
+        "sourceforge.net",
+        "codeberg.org",
+        // ── Package registries ──────────────────────────
+        "npmjs.com",
+        "crates.io",
+        "pypi.org",
+        "rubygems.org",
+        "pkg.go.dev",
+        "packagist.org",
+        "nuget.org",
+        "mvnrepository.com",
+        "hub.docker.com",
+        // ── Documentation & reference ───────────────────
+        "docs.rs",
+        "doc.rust-lang.org",
+        "developer.mozilla.org",
+        "devdocs.io",
+        "w3.org",
+        "w3schools.com",
+        "whatwg.org",
+        "tc39.es",
+        "web.dev",
+        "developer.chrome.com",
+        "developer.apple.com",
+        "learn.microsoft.com",
+        "docs.microsoft.com",
+        "docs.oracle.com",
+        "docs.python.org",
+        "docs.djangoproject.com",
+        "flask.palletsprojects.com",
+        "fastapi.tiangolo.com",
+        "nodejs.org",
+        "react.dev",
+        "vuejs.org",
+        "angular.io",
+        "angular.dev",
+        "svelte.dev",
+        "nextjs.org",
+        "nuxt.com",
+        "tailwindcss.com",
+        "getbootstrap.com",
+        "kotlinlang.org",
+        "go.dev",
+        "typescriptlang.org",
+        "swift.org",
+        "www.php.net",
+        "elixir-lang.org",
+        "www.scala-lang.org",
+        "www.haskell.org",
+        "ziglang.org",
+        // ── Cloud provider docs ─────────────────────────
+        "aws.amazon.com",
+        "docs.aws.amazon.com",
+        "cloud.google.com",
+        "azure.microsoft.com",
+        "docs.digitalocean.com",
+        "vercel.com",
+        "netlify.com",
+        "render.com",
+        "railway.app",
+        "fly.io",
+        "heroku.com",
+        "firebase.google.com",
+        "supabase.com",
+        // ── AI / ML ─────────────────────────────────────
+        "openai.com",
+        "platform.openai.com",
+        "docs.anthropic.com",
+        "huggingface.co",
+        "pytorch.org",
+        "tensorflow.org",
+        "keras.io",
+        "scikit-learn.org",
+        "jupyter.org",
+        "kaggle.com",
+        "paperswithcode.com",
+        "arxiv.org",
+        // ── Q&A / Community ─────────────────────────────
+        "stackoverflow.com",
+        "stackexchange.com",
+        "superuser.com",
+        "serverfault.com",
+        "askubuntu.com",
+        "reddit.com",
+        "dev.to",
+        "hashnode.com",
+        "medium.com",
+        "news.ycombinator.com",
+        "lobste.rs",
+        "discourse.org",
+        // ── Encyclopedia / Reference ────────────────────
+        "wikipedia.org",
+        "wikimedia.org",
+        "wiktionary.org",
+        "britannica.com",
+        "namu.wiki",
+        // ── Standards / Specs ───────────────────────────
+        "ietf.org",
+        "rfc-editor.org",
+        "unicode.org",
+        "json.org",
+        "yaml.org",
+        "toml.io",
+        "semver.org",
+        "spec.graphql.org",
+        "graphql.org",
+        "grpc.io",
+        "protobuf.dev",
+        // ── Security ────────────────────────────────────
+        "owasp.org",
+        "cve.mitre.org",
+        "nvd.nist.gov",
+        "security.googleblog.com",
+        "letsencrypt.org",
+        // ── DevOps / Infra ──────────────────────────────
+        "docker.com",
+        "docs.docker.com",
+        "kubernetes.io",
+        "helm.sh",
+        "terraform.io",
+        "ansible.com",
+        "prometheus.io",
+        "grafana.com",
+        "nginx.org",
+        "httpd.apache.org",
+        "caddyserver.com",
+        // ── Database docs ───────────────────────────────
+        "postgresql.org",
+        "dev.mysql.com",
+        "www.sqlite.org",
+        "redis.io",
+        "mongodb.com",
+        "elastic.co",
+        "clickhouse.com",
+        "cassandra.apache.org",
+        // ── OS / Linux ──────────────────────────────────
+        "kernel.org",
+        "man7.org",
+        "archlinux.org",
+        "wiki.archlinux.org",
+        "ubuntu.com",
+        "debian.org",
+        "fedoraproject.org",
+        "linuxfoundation.org",
+        // ── Design / Assets ─────────────────────────────
+        "figma.com",
+        "fonts.google.com",
+        "fontawesome.com",
+        "icons8.com",
+        "unsplash.com",
+        "dribbble.com",
+        // ── Collaboration / Productivity ────────────────
+        "notion.so",
+        "trello.com",
+        "asana.com",
+        "linear.app",
+        "jira.atlassian.com",
+        "confluence.atlassian.com",
+        "slack.com",
+        "discord.com",
+        // ── Education / MOOC ────────────────────────────
+        "coursera.org",
+        "edx.org",
+        "khanacademy.org",
+        "freecodecamp.org",
+        "codecademy.com",
+        "leetcode.com",
+        "hackerrank.com",
+        "exercism.org",
+        "www.acmicpc.net",
+        "programmers.co.kr",
+        // ── News / Tech media ───────────────────────────
+        "techcrunch.com",
+        "theverge.com",
+        "arstechnica.com",
+        "wired.com",
+        "zdnet.com",
+        "infoq.com",
+        "theregister.com",
+        // ── Korean portals / services ───────────────────
+        "tistory.com",
+        "velog.io",
+        "brunch.co.kr",
+        "blog.naver.com",
+        "cafe.naver.com",
+        "developers.kakao.com",
+        "tech.kakao.com",
+        "d2.naver.com",
+        "engineering.linecorp.com",
+        "techblog.woowahan.com",
+        "tech.musinsa.com",
+        "hyperconnect.github.io",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            include_default_domains: true,
             allowed_domains: Vec::new(),
             session_name: None,
             backend: default_browser_backend(),
@@ -700,6 +935,26 @@ impl Default for BrowserConfig {
             native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
         }
+    }
+}
+
+impl BrowserConfig {
+    /// Compute the effective allowed domain list by merging the default
+    /// preset (if enabled) with user-specified additional domains.
+    /// Deduplicates and lowercases all entries.
+    pub fn effective_allowed_domains(&self) -> Vec<String> {
+        let mut domains = Vec::new();
+        if self.include_default_domains {
+            domains.extend(default_browser_domains());
+        }
+        domains.extend(self.allowed_domains.clone());
+        // Deduplicate (case-insensitive).
+        let mut seen = std::collections::HashSet::new();
+        domains.retain(|d| {
+            let lower = d.to_lowercase();
+            seen.insert(lower)
+        });
+        domains
     }
 }
 
@@ -3642,7 +3897,26 @@ default_temperature = 0.7
     fn browser_config_default_disabled() {
         let b = BrowserConfig::default();
         assert!(!b.enabled);
+        assert!(b.include_default_domains);
+        // User-specified domains are empty, but effective list has defaults.
         assert!(b.allowed_domains.is_empty());
+        let effective = b.effective_allowed_domains();
+        assert!(
+            !effective.is_empty(),
+            "Default preset should populate effective domains"
+        );
+        assert!(
+            effective.iter().any(|d| d == "github.com"),
+            "github.com must be in default preset"
+        );
+        assert!(
+            effective.iter().any(|d| d == "google.com"),
+            "google.com must be in default preset"
+        );
+        assert!(
+            effective.iter().any(|d| d == "stackoverflow.com"),
+            "stackoverflow.com must be in default preset"
+        );
         assert_eq!(b.backend, "agent_browser");
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
@@ -3659,6 +3933,7 @@ default_temperature = 0.7
     fn browser_config_serde_roundtrip() {
         let b = BrowserConfig {
             enabled: true,
+            include_default_domains: false,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
@@ -3709,6 +3984,95 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(!parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
+        // But effective domains include the preset.
+        assert!(!parsed.browser.effective_allowed_domains().is_empty());
+    }
+
+    #[test]
+    fn effective_domains_merges_user_and_defaults() {
+        let b = BrowserConfig {
+            include_default_domains: true,
+            allowed_domains: vec!["my-internal-tool.example.com".into()],
+            ..BrowserConfig::default()
+        };
+        let effective = b.effective_allowed_domains();
+        assert!(
+            effective.iter().any(|d| d == "github.com"),
+            "Must include default"
+        );
+        assert!(
+            effective
+                .iter()
+                .any(|d| d == "my-internal-tool.example.com"),
+            "Must include user domain"
+        );
+    }
+
+    #[test]
+    fn effective_domains_only_user_when_defaults_disabled() {
+        let b = BrowserConfig {
+            include_default_domains: false,
+            allowed_domains: vec!["only-this.com".into()],
+            ..BrowserConfig::default()
+        };
+        let effective = b.effective_allowed_domains();
+        assert_eq!(effective, vec!["only-this.com"]);
+        assert!(
+            !effective.iter().any(|d| d == "github.com"),
+            "Defaults must be excluded"
+        );
+    }
+
+    #[test]
+    fn effective_domains_deduplicates() {
+        let b = BrowserConfig {
+            include_default_domains: true,
+            allowed_domains: vec!["github.com".into(), "GITHUB.COM".into()],
+            ..BrowserConfig::default()
+        };
+        let effective = b.effective_allowed_domains();
+        let github_count = effective
+            .iter()
+            .filter(|d| d.to_lowercase() == "github.com")
+            .count();
+        assert_eq!(github_count, 1, "Duplicates must be removed");
+    }
+
+    #[test]
+    fn default_browser_domains_comprehensive() {
+        let domains = default_browser_domains();
+        // Must cover major categories.
+        let must_include = [
+            "google.com",
+            "naver.com",
+            "github.com",
+            "stackoverflow.com",
+            "npmjs.com",
+            "crates.io",
+            "docs.rs",
+            "developer.mozilla.org",
+            "wikipedia.org",
+            "arxiv.org",
+            "kubernetes.io",
+            "postgresql.org",
+        ];
+        for domain in must_include {
+            assert!(
+                domains.iter().any(|d| d == domain),
+                "Default preset must include {domain}"
+            );
+        }
+        // Must not include any private/dangerous entries.
+        for domain in &domains {
+            assert!(
+                !domain.contains("localhost"),
+                "Must not include localhost"
+            );
+            assert!(
+                !domain.contains("127.0.0.1"),
+                "Must not include loopback"
+            );
+        }
     }
 
     // ── Environment variable overrides (Docker support) ─────────

@@ -153,15 +153,16 @@ pub fn all_tools_with_runtime(
     ];
 
     if browser_config.enabled {
+        let effective_domains = browser_config.effective_allowed_domains();
         // Add legacy browser_open tool for simple URL opening
         tools.push(Box::new(BrowserOpenTool::new(
             security.clone(),
-            browser_config.allowed_domains.clone(),
+            effective_domains.clone(),
         )));
         // Add full browser automation tool (pluggable backend)
         tools.push(Box::new(BrowserTool::new_with_backend(
             security.clone(),
-            browser_config.allowed_domains.clone(),
+            effective_domains,
             browser_config.session_name.clone(),
             browser_config.backend.clone(),
             browser_config.native_headless,
