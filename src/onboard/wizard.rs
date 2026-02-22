@@ -496,7 +496,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
         "gemini" => "gemini-2.5-pro".into(),
-        _ => "anthropic/claude-sonnet-4.5".into(),
+        _ => "google/gemini-3.1-pro-preview".into(),
     }
 }
 
@@ -504,20 +504,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (
+                "google/gemini-3.1-pro-preview".to_string(),
+                "Gemini 3.1 Pro Preview (latest, recommended)".to_string(),
+            ),
+            (
                 "anthropic/claude-sonnet-4.5".to_string(),
-                "Claude Sonnet 4.5 (balanced, recommended)".to_string(),
+                "Claude Sonnet 4.5 (balanced)".to_string(),
             ),
             (
                 "openai/gpt-5.2".to_string(),
-                "GPT-5.2 (latest flagship)".to_string(),
+                "GPT-5.2 (flagship)".to_string(),
             ),
             (
                 "openai/gpt-5-mini".to_string(),
                 "GPT-5 mini (fast, cost-efficient)".to_string(),
-            ),
-            (
-                "google/gemini-3-pro-preview".to_string(),
-                "Gemini 3 Pro Preview (frontier reasoning)".to_string(),
             ),
             (
                 "x-ai/grok-4.1-fast".to_string(),
@@ -2439,6 +2439,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         dingtalk: None,
         qq: None,
         kakao: None,
+        line: None,
     };
 
     loop {

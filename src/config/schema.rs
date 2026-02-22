@@ -399,6 +399,13 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
 
     // Google models
     prices.insert(
+        "google/gemini-3.1-pro-preview".into(),
+        ModelPricing {
+            input: 2.50,
+            output: 15.0,
+        },
+    );
+    prices.insert(
         "google/gemini-2.0-flash".into(),
         ModelPricing {
             input: 0.10,
@@ -1531,6 +1538,7 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     pub qq: Option<QQConfig>,
     pub kakao: Option<KakaoTalkConfig>,
+    pub line: Option<LineConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -1551,6 +1559,7 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             qq: None,
             kakao: None,
+            line: None,
         }
     }
 }
@@ -1916,6 +1925,18 @@ fn default_kakao_port() -> u16 {
     8787
 }
 
+/// LINE Messaging API channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineConfig {
+    /// Channel access token from LINE Developers Console
+    pub channel_access_token: String,
+    /// Channel secret for webhook signature verification
+    pub channel_secret: String,
+    /// Allowed LINE user IDs. Empty = deny all (use pairing), "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -1930,7 +1951,7 @@ impl Default for Config {
             api_key: None,
             api_url: None,
             default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4".to_string()),
+            default_model: Some("google/gemini-3.1-pro-preview".to_string()),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -2200,6 +2221,312 @@ impl Config {
                 }
             }
         }
+
+        // ── Channel overrides (env vars → config) ──────────────────
+        // Pattern: the primary token env var creates the config via
+        // get_or_insert_with(); secondary vars only apply if config exists.
+
+        // Telegram: ZEROCLAW_TELEGRAM_TOKEN
+        if let Ok(token) = std::env::var("ZEROCLAW_TELEGRAM_TOKEN") {
+            if !token.is_empty() {
+                let tg = self.channels_config.telegram.get_or_insert_with(|| TelegramConfig {
+                    bot_token: String::new(),
+                    allowed_users: vec![],
+                });
+                tg.bot_token = token;
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_TELEGRAM_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut tg) = self.channels_config.telegram {
+                    tg.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // Discord: ZEROCLAW_DISCORD_TOKEN
+        if let Ok(token) = std::env::var("ZEROCLAW_DISCORD_TOKEN") {
+            if !token.is_empty() {
+                let dc = self.channels_config.discord.get_or_insert_with(|| DiscordConfig {
+                    bot_token: String::new(),
+                    guild_id: None,
+                    allowed_users: vec![],
+                    listen_to_bots: false,
+                    mention_only: false,
+                });
+                dc.bot_token = token;
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_DISCORD_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut dc) = self.channels_config.discord {
+                    dc.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // Slack: ZEROCLAW_SLACK_TOKEN
+        if let Ok(token) = std::env::var("ZEROCLAW_SLACK_TOKEN") {
+            if !token.is_empty() {
+                let sl = self.channels_config.slack.get_or_insert_with(|| SlackConfig {
+                    bot_token: String::new(),
+                    app_token: None,
+                    channel_id: None,
+                    allowed_users: vec![],
+                });
+                sl.bot_token = token;
+            }
+        }
+        if let Ok(app_token) = std::env::var("ZEROCLAW_SLACK_APP_TOKEN") {
+            if !app_token.is_empty() {
+                if let Some(ref mut sl) = self.channels_config.slack {
+                    sl.app_token = Some(app_token);
+                }
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_SLACK_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut sl) = self.channels_config.slack {
+                    sl.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // WhatsApp: ZEROCLAW_WHATSAPP_ACCESS_TOKEN
+        if let Ok(token) = std::env::var("ZEROCLAW_WHATSAPP_ACCESS_TOKEN") {
+            if !token.is_empty() {
+                let wa = self.channels_config.whatsapp.get_or_insert_with(|| WhatsAppConfig {
+                    access_token: String::new(),
+                    phone_number_id: String::new(),
+                    verify_token: String::new(),
+                    app_secret: None,
+                    allowed_numbers: vec![],
+                });
+                wa.access_token = token;
+            }
+        }
+        if let Ok(pid) = std::env::var("ZEROCLAW_WHATSAPP_PHONE_NUMBER_ID") {
+            if !pid.is_empty() {
+                if let Some(ref mut wa) = self.channels_config.whatsapp {
+                    wa.phone_number_id = pid;
+                }
+            }
+        }
+        if let Ok(vt) = std::env::var("ZEROCLAW_WHATSAPP_VERIFY_TOKEN") {
+            if !vt.is_empty() {
+                if let Some(ref mut wa) = self.channels_config.whatsapp {
+                    wa.verify_token = vt;
+                }
+            }
+        }
+        // ZEROCLAW_WHATSAPP_APP_SECRET is handled separately in gateway/mod.rs
+        if let Ok(nums) = std::env::var("ZEROCLAW_WHATSAPP_ALLOWED_NUMBERS") {
+            if !nums.is_empty() {
+                if let Some(ref mut wa) = self.channels_config.whatsapp {
+                    wa.allowed_numbers = nums.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // LINE: ZEROCLAW_LINE_CHANNEL_ACCESS_TOKEN
+        if let Ok(token) = std::env::var("ZEROCLAW_LINE_CHANNEL_ACCESS_TOKEN") {
+            if !token.is_empty() {
+                let line = self.channels_config.line.get_or_insert_with(|| LineConfig {
+                    channel_access_token: String::new(),
+                    channel_secret: String::new(),
+                    allowed_users: vec![],
+                });
+                line.channel_access_token = token;
+            }
+        }
+        if let Ok(secret) = std::env::var("ZEROCLAW_LINE_CHANNEL_SECRET") {
+            if !secret.is_empty() {
+                if let Some(ref mut line) = self.channels_config.line {
+                    line.channel_secret = secret;
+                }
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_LINE_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut line) = self.channels_config.line {
+                    line.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // KakaoTalk: ZEROCLAW_KAKAO_REST_API_KEY
+        if let Ok(key) = std::env::var("ZEROCLAW_KAKAO_REST_API_KEY") {
+            if !key.is_empty() {
+                let kk = self.channels_config.kakao.get_or_insert_with(|| KakaoTalkConfig {
+                    rest_api_key: String::new(),
+                    admin_key: String::new(),
+                    webhook_secret: None,
+                    allowed_users: vec![],
+                    port: default_kakao_port(),
+                });
+                kk.rest_api_key = key;
+            }
+        }
+        if let Ok(key) = std::env::var("ZEROCLAW_KAKAO_ADMIN_KEY") {
+            if !key.is_empty() {
+                if let Some(ref mut kk) = self.channels_config.kakao {
+                    kk.admin_key = key;
+                }
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_KAKAO_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut kk) = self.channels_config.kakao {
+                    kk.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // Lark / Feishu: ZEROCLAW_LARK_APP_ID
+        if let Ok(id) = std::env::var("ZEROCLAW_LARK_APP_ID") {
+            if !id.is_empty() {
+                let lk = self.channels_config.lark.get_or_insert_with(|| LarkConfig {
+                    app_id: String::new(),
+                    app_secret: String::new(),
+                    encrypt_key: None,
+                    verification_token: None,
+                    allowed_users: vec![],
+                    use_feishu: false,
+                    receive_mode: LarkReceiveMode::default(),
+                    port: None,
+                });
+                lk.app_id = id;
+            }
+        }
+        if let Ok(secret) = std::env::var("ZEROCLAW_LARK_APP_SECRET") {
+            if !secret.is_empty() {
+                if let Some(ref mut lk) = self.channels_config.lark {
+                    lk.app_secret = secret;
+                }
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_LARK_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut lk) = self.channels_config.lark {
+                    lk.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // DingTalk: ZEROCLAW_DINGTALK_CLIENT_ID
+        if let Ok(id) = std::env::var("ZEROCLAW_DINGTALK_CLIENT_ID") {
+            if !id.is_empty() {
+                let dt = self.channels_config.dingtalk.get_or_insert_with(|| DingTalkConfig {
+                    client_id: String::new(),
+                    client_secret: String::new(),
+                    allowed_users: vec![],
+                });
+                dt.client_id = id;
+            }
+        }
+        if let Ok(secret) = std::env::var("ZEROCLAW_DINGTALK_CLIENT_SECRET") {
+            if !secret.is_empty() {
+                if let Some(ref mut dt) = self.channels_config.dingtalk {
+                    dt.client_secret = secret;
+                }
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_DINGTALK_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut dt) = self.channels_config.dingtalk {
+                    dt.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // QQ: ZEROCLAW_QQ_APP_ID
+        if let Ok(id) = std::env::var("ZEROCLAW_QQ_APP_ID") {
+            if !id.is_empty() {
+                let qq = self.channels_config.qq.get_or_insert_with(|| QQConfig {
+                    app_id: String::new(),
+                    app_secret: String::new(),
+                    allowed_users: vec![],
+                });
+                qq.app_id = id;
+            }
+        }
+        if let Ok(secret) = std::env::var("ZEROCLAW_QQ_APP_SECRET") {
+            if !secret.is_empty() {
+                if let Some(ref mut qq) = self.channels_config.qq {
+                    qq.app_secret = secret;
+                }
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_QQ_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut qq) = self.channels_config.qq {
+                    qq.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // Matrix: ZEROCLAW_MATRIX_ACCESS_TOKEN
+        if let Ok(token) = std::env::var("ZEROCLAW_MATRIX_ACCESS_TOKEN") {
+            if !token.is_empty() {
+                let mx = self.channels_config.matrix.get_or_insert_with(|| MatrixConfig {
+                    homeserver: String::new(),
+                    access_token: String::new(),
+                    room_id: String::new(),
+                    allowed_users: vec![],
+                });
+                mx.access_token = token;
+            }
+        }
+        if let Ok(hs) = std::env::var("ZEROCLAW_MATRIX_HOMESERVER") {
+            if !hs.is_empty() {
+                if let Some(ref mut mx) = self.channels_config.matrix {
+                    mx.homeserver = hs;
+                }
+            }
+        }
+        if let Ok(rid) = std::env::var("ZEROCLAW_MATRIX_ROOM_ID") {
+            if !rid.is_empty() {
+                if let Some(ref mut mx) = self.channels_config.matrix {
+                    mx.room_id = rid;
+                }
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_MATRIX_ALLOWED_USERS") {
+            if !users.is_empty() {
+                if let Some(ref mut mx) = self.channels_config.matrix {
+                    mx.allowed_users = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
+
+        // Signal: ZEROCLAW_SIGNAL_HTTP_URL
+        if let Ok(url) = std::env::var("ZEROCLAW_SIGNAL_HTTP_URL") {
+            if !url.is_empty() {
+                let sig = self.channels_config.signal.get_or_insert_with(|| SignalConfig {
+                    http_url: String::new(),
+                    account: String::new(),
+                    group_id: None,
+                    allowed_from: vec![],
+                    ignore_attachments: false,
+                    ignore_stories: false,
+                });
+                sig.http_url = url;
+            }
+        }
+        if let Ok(acct) = std::env::var("ZEROCLAW_SIGNAL_ACCOUNT") {
+            if !acct.is_empty() {
+                if let Some(ref mut sig) = self.channels_config.signal {
+                    sig.account = acct;
+                }
+            }
+        }
+        if let Ok(users) = std::env::var("ZEROCLAW_SIGNAL_ALLOWED_FROM") {
+            if !users.is_empty() {
+                if let Some(ref mut sig) = self.channels_config.signal {
+                    sig.allowed_from = users.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -2321,7 +2648,7 @@ mod tests {
     fn config_default_has_sane_values() {
         let c = Config::default();
         assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
-        assert!(c.default_model.as_deref().unwrap().contains("claude"));
+        assert!(c.default_model.as_deref().unwrap().contains("gemini-3.1-pro"));
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
@@ -2477,6 +2804,7 @@ default_temperature = 0.7
                 dingtalk: None,
                 qq: None,
                 kakao: None,
+                line: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -2901,6 +3229,7 @@ tool_dispatcher = "xml"
             dingtalk: None,
             qq: None,
             kakao: None,
+            line: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -3064,6 +3393,7 @@ channel_id = "C123"
             dingtalk: None,
             qq: None,
             kakao: None,
+            line: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

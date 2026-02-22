@@ -1,7 +1,7 @@
 use crate::channels::{
     Channel, DingTalkChannel, DiscordChannel, EmailChannel, IMessageChannel, IrcChannel,
-    KakaoTalkChannel, LarkChannel, MatrixChannel, QQChannel, SendMessage, SignalChannel,
-    SlackChannel, TelegramChannel, WhatsAppChannel,
+    KakaoTalkChannel, LarkChannel, LineChannel, MatrixChannel, QQChannel, SendMessage,
+    SignalChannel, SlackChannel, TelegramChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -328,6 +328,21 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 wa.phone_number_id.clone(),
                 wa.verify_token.clone(),
                 wa.allowed_numbers.clone(),
+                None,
+                None,
+            );
+            ch.send(&SendMessage::new(output, target)).await?;
+        }
+        "line" => {
+            let ln = config
+                .channels_config
+                .line
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("line channel not configured"))?;
+            let ch = LineChannel::new(
+                ln.channel_access_token.clone(),
+                ln.channel_secret.clone(),
+                ln.allowed_users.clone(),
                 None,
                 None,
             );

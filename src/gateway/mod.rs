@@ -189,6 +189,8 @@ pub struct AppState {
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
+    /// LINE channel (if configured) for webhook-based message handling.
+    pub line: Option<Arc<crate::channels::line::LineChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
     /// SLM gatekeeper for local intent classification + simple response.
@@ -246,7 +248,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let model = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+        .unwrap_or_else(|| "google/gemini-3.1-pro-preview".into());
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,
@@ -278,6 +280,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 None
             }
         };
+
+    // LINE channel (if configured)
+    let line_channel: Option<Arc<crate::channels::line::LineChannel>> =
+        config.channels_config.line.as_ref().map(|line| {
+            Arc::new(crate::channels::line::LineChannel::new(
+                line.channel_access_token.clone(),
+                line.channel_secret.clone(),
+                line.allowed_users.clone(),
+                channel_pairing.clone(),
+                Some(format!("http://{}:{}", config.gateway.host, config.gateway.port)),
+            ))
+        });
 
     // WhatsApp channel (if configured)
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
@@ -442,6 +456,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
+    if line_channel.is_some() {
+        println!("  POST /line      — LINE message webhook");
+    }
     println!("  GET  /pair/connect/{{channel}} — channel pairing login page");
     println!("  GET  /pair/signup            — channel pairing signup page");
     println!("  GET  /health    — health check");
@@ -513,6 +530,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         rate_limiter,
         idempotency_store,
         whatsapp: whatsapp_channel,
+        line: line_channel,
         whatsapp_app_secret,
         gatekeeper,
         agent,
@@ -560,6 +578,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/line", post(handle_line_message))
         .route("/api/auth/register", post(handle_auth_register))
         .route("/api/auth/login", post(handle_auth_login))
         .route("/api/auth/logout", post(handle_auth_logout))
@@ -1046,6 +1065,121 @@ async fn handle_whatsapp_message(
     }
 
     // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /line — incoming LINE webhook
+async fn handle_line_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref line) = state.line else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "LINE not configured"})),
+        );
+    };
+
+    // Verify X-Line-Signature
+    let signature = headers
+        .get("X-Line-Signature")
+        .or_else(|| headers.get("x-line-signature"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !line.verify_signature(&body, signature) {
+        tracing::warn!(
+            "LINE webhook signature verification failed (signature: {})",
+            if signature.is_empty() { "missing" } else { "invalid" }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages and unpaired senders
+    let (messages, unpaired) = line.parse_webhook_payload(&payload);
+
+    // Send one-click connect links to unpaired senders
+    if let Some(ref cp) = state.channel_pairing {
+        for sender in &unpaired {
+            let token = cp.create_token("line", sender);
+            let auto_url = crate::channels::pairing::ChannelPairingStore::auto_pair_url(
+                &state.gateway_base_url,
+                &token,
+            );
+            let _ = line
+                .send(&SendMessage::new(
+                    &format!(
+                        "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
+                    ),
+                    sender,
+                ))
+                .await;
+        }
+    }
+
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Process each message
+    for msg in &messages {
+        tracing::info!(
+            "LINE message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        // Auto-save to memory
+        if state.auto_save {
+            let key = format!(
+                "line_msg_{}_{}",
+                msg.sender,
+                msg.timestamp
+            );
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        // Call the LLM
+        match state
+            .provider
+            .simple_chat(&msg.content, &state.model, state.temperature)
+            .await
+        {
+            Ok(response) => {
+                if let Err(e) = line
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send LINE reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for LINE message: {e:#}");
+                let _ = line
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -2086,6 +2220,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
+            line: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
@@ -2146,6 +2281,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
+            line: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
@@ -2215,6 +2351,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
+            line: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
@@ -2261,6 +2398,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
+            line: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
@@ -2310,6 +2448,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
+            line: None,
             whatsapp_app_secret: None,
             gatekeeper: None,
             agent: None,
