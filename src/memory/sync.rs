@@ -315,6 +315,7 @@ impl SyncEngine {
         }
 
         self.version.increment(&self.device_id.0);
+        let seq = self.version.get(&self.device_id.0);
 
         let entry = DeltaEntry {
             id: uuid::Uuid::new_v4().to_string(),
@@ -330,6 +331,15 @@ impl SyncEngine {
 
         self.journal.push(entry);
 
+        tracing::debug!(
+            key,
+            category,
+            seq,
+            device_id = %self.device_id.0,
+            journal_size = self.journal.len(),
+            "Sync: recorded store delta"
+        );
+
         // Persist to SQLite (best-effort; log errors but don't fail)
         if let Err(e) = self.save() {
             tracing::warn!("Failed to persist sync journal: {e}");
@@ -343,6 +353,7 @@ impl SyncEngine {
         }
 
         self.version.increment(&self.device_id.0);
+        let seq = self.version.get(&self.device_id.0);
 
         let entry = DeltaEntry {
             id: uuid::Uuid::new_v4().to_string(),
@@ -355,6 +366,14 @@ impl SyncEngine {
         };
 
         self.journal.push(entry);
+
+        tracing::debug!(
+            key,
+            seq,
+            device_id = %self.device_id.0,
+            journal_size = self.journal.len(),
+            "Sync: recorded forget delta"
+        );
 
         // Persist to SQLite (best-effort)
         if let Err(e) = self.save() {
@@ -377,6 +396,8 @@ impl SyncEngine {
     /// Returns the list of operations applied.
     pub fn apply_deltas(&mut self, deltas: Vec<DeltaEntry>) -> Vec<DeltaOperation> {
         let mut applied = Vec::new();
+        let total_incoming = deltas.len();
+        let mut skipped = 0usize;
 
         for delta in deltas {
             let local_clock = self.version.get(&delta.device_id);
@@ -384,16 +405,36 @@ impl SyncEngine {
 
             // Only apply if this is newer than what we've seen from this device
             if remote_clock > local_clock {
+                tracing::debug!(
+                    from_device = %delta.device_id,
+                    remote_clock,
+                    local_clock,
+                    op = ?delta.operation,
+                    "Sync: applying remote delta"
+                );
                 self.version.merge(&delta.version);
                 applied.push(delta.operation.clone());
                 self.journal.push(delta);
+            } else {
+                skipped += 1;
             }
         }
 
         if !applied.is_empty() {
+            tracing::info!(
+                applied = applied.len(),
+                skipped,
+                total_incoming,
+                "Sync: applied incoming deltas from remote"
+            );
             if let Err(e) = self.save() {
                 tracing::warn!("Failed to persist sync journal after apply: {e}");
             }
+        } else if total_incoming > 0 {
+            tracing::debug!(
+                skipped = total_incoming,
+                "Sync: all incoming deltas already seen"
+            );
         }
 
         applied
@@ -452,8 +493,14 @@ impl SyncEngine {
         let before = self.journal.len();
         self.journal.retain(|entry| entry.timestamp >= cutoff);
 
-        // Persist pruned state if entries were removed
-        if self.journal.len() < before {
+        let pruned = before - self.journal.len();
+        if pruned > 0 {
+            tracing::info!(
+                pruned,
+                remaining = self.journal.len(),
+                cutoff_secs_ago = JOURNAL_RETENTION_SECS,
+                "Sync: pruned old journal entries"
+            );
             // Delete pruned entries from SQLite too
             if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
                 let _ = conn.execute(

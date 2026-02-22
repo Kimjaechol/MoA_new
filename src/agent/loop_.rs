@@ -835,7 +835,7 @@ pub async fn run(
     let model_name = model_override
         .as_deref()
         .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+        .unwrap_or("google/gemini-3.1-pro-preview");
 
     let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
@@ -1216,7 +1216,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let model_name = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        .unwrap_or_else(|| "google/gemini-3.1-pro-preview".into());
     let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
         config.api_key.as_deref(),

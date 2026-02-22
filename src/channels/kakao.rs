@@ -55,6 +55,10 @@ pub struct KakaoTalkChannel {
     token_cache: Arc<RwLock<Option<(String, u64)>>>,
     /// Per-user reply context (user_id -> last known channel context)
     reply_contexts: Arc<RwLock<HashMap<String, ReplyContext>>>,
+    /// Shared pairing store for channel connect flow.
+    pairing_store: Option<Arc<super::pairing::ChannelPairingStore>>,
+    /// Gateway base URL for pairing web pages.
+    gateway_url: Option<String>,
 }
 
 /// Cached reply context for a KakaoTalk user session.
@@ -73,6 +77,8 @@ struct WebhookState {
     webhook_secret: Option<String>,
     allowed_users: Vec<String>,
     reply_contexts: Arc<RwLock<HashMap<String, ReplyContext>>>,
+    pairing_store: Option<Arc<super::pairing::ChannelPairingStore>>,
+    gateway_url: Option<String>,
 }
 
 impl KakaoTalkChannel {
@@ -82,6 +88,8 @@ impl KakaoTalkChannel {
         webhook_secret: Option<String>,
         allowed_users: Vec<String>,
         port: u16,
+        pairing_store: Option<Arc<super::pairing::ChannelPairingStore>>,
+        gateway_url: Option<String>,
     ) -> Self {
         Self {
             rest_api_key,
@@ -92,17 +100,25 @@ impl KakaoTalkChannel {
             client: reqwest::Client::new(),
             token_cache: Arc::new(RwLock::new(None)),
             reply_contexts: Arc::new(RwLock::new(HashMap::new())),
+            pairing_store,
+            gateway_url,
         }
     }
 
     /// Build from config struct (convenience for factory wiring).
-    pub fn from_config(config: &crate::config::schema::KakaoTalkConfig) -> Self {
+    pub fn from_config(
+        config: &crate::config::schema::KakaoTalkConfig,
+        pairing_store: Option<Arc<super::pairing::ChannelPairingStore>>,
+        gateway_url: Option<String>,
+    ) -> Self {
         Self::new(
             config.rest_api_key.clone(),
             config.admin_key.clone(),
             config.webhook_secret.clone(),
             config.allowed_users.clone(),
             config.port,
+            pairing_store,
+            gateway_url,
         )
     }
 
@@ -464,8 +480,48 @@ async fn handle_webhook(
 
         // Check user allowlist
         if !state.allowed_users.iter().any(|u| u == "*" || u == user_id) {
-            tracing::warn!("KakaoTalk: ignoring message from unauthorized user: {user_id}");
-            return kakao_skill_response("접근이 허용되지 않은 사용자입니다.").into_response();
+            // Check if user was paired via web flow (one-click auto-pair)
+            if let Some(ref store) = state.pairing_store {
+                if store.is_paired("kakao", user_id) {
+                    let uid = user_id.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            super::pairing::persist_channel_allowlist("kakao", &uid)
+                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                            tracing::error!("KakaoTalk: failed to persist pairing: {e}");
+                        }
+                    });
+                    // Fall through to process message normally
+                } else {
+                    // Create token and show one-click connect button
+                    if let Some(ref gw_url) = state.gateway_url {
+                        let token = store.create_token("kakao", user_id);
+                        let auto_url = super::pairing::ChannelPairingStore::auto_pair_url(gw_url, &token);
+                        return Json(serde_json::json!({
+                            "version": "2.0",
+                            "template": {
+                                "outputs": [{
+                                    "simpleText": {
+                                        "text": "MoA에 연결하려면 아래 버튼을 눌러주세요.\n\nTap the button below to connect to MoA."
+                                    }
+                                }],
+                                "quickReplies": [{
+                                    "messageText": "연결하기",
+                                    "action": "webLink",
+                                    "label": "🔗 연결하기 / Connect",
+                                    "webLinkUrl": auto_url
+                                }]
+                            }
+                        })).into_response();
+                    }
+
+                    tracing::warn!("KakaoTalk: ignoring message from unauthorized user: {user_id}");
+                    return kakao_skill_response("접근이 허용되지 않은 사용자입니다.\n\nAccess denied. Please contact the operator.").into_response();
+                }
+            } else {
+                tracing::warn!("KakaoTalk: ignoring message from unauthorized user: {user_id}");
+                return kakao_skill_response("접근이 허용되지 않은 사용자입니다.\n\nAccess denied. Please contact the operator.").into_response();
+            }
         }
 
         let utterance = user_req
@@ -551,7 +607,24 @@ async fn handle_webhook(
             .unwrap_or("unknown");
 
         if !state.allowed_users.iter().any(|u| u == "*" || u == user_id) {
-            return StatusCode::FORBIDDEN.into_response();
+            // Check if user was paired via one-click web flow
+            if let Some(ref store) = state.pairing_store {
+                if store.is_paired("kakao", user_id) {
+                    let uid = user_id.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            super::pairing::persist_channel_allowlist("kakao", &uid)
+                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                            tracing::error!("KakaoTalk: failed to persist pairing: {e}");
+                        }
+                    });
+                    // Fall through to process message
+                } else {
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+            } else {
+                return StatusCode::FORBIDDEN.into_response();
+            }
         }
 
         let text = content.as_str().unwrap_or("").trim();
@@ -605,6 +678,8 @@ impl Channel for KakaoTalkChannel {
             webhook_secret: self.webhook_secret.clone(),
             allowed_users: self.allowed_users.clone(),
             reply_contexts: Arc::clone(&self.reply_contexts),
+            pairing_store: self.pairing_store.clone(),
+            gateway_url: self.gateway_url.clone(),
         };
 
         let app = Router::new()
@@ -646,13 +721,13 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let ch = KakaoTalkChannel::new("key".into(), "admin".into(), None, vec![], 8080);
+        let ch = KakaoTalkChannel::new("key".into(), "admin".into(), None, vec![], 8080, None, None);
         assert_eq!(ch.name(), "kakao");
     }
 
     #[test]
     fn test_user_allowed_wildcard() {
-        let ch = KakaoTalkChannel::new("key".into(), "admin".into(), None, vec!["*".into()], 8080);
+        let ch = KakaoTalkChannel::new("key".into(), "admin".into(), None, vec!["*".into()], 8080, None, None);
         assert!(ch.is_user_allowed("anyone"));
     }
 
@@ -664,6 +739,8 @@ mod tests {
             None,
             vec!["user_123".into()],
             8080,
+            None,
+            None,
         );
         assert!(ch.is_user_allowed("user_123"));
         assert!(!ch.is_user_allowed("other"));
@@ -671,7 +748,7 @@ mod tests {
 
     #[test]
     fn test_user_denied_empty() {
-        let ch = KakaoTalkChannel::new("key".into(), "admin".into(), None, vec![], 8080);
+        let ch = KakaoTalkChannel::new("key".into(), "admin".into(), None, vec![], 8080, None, None);
         assert!(!ch.is_user_allowed("anyone"));
     }
 

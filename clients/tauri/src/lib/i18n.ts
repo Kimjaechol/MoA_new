@@ -25,6 +25,8 @@ type TranslationKey =
   | "error_occurred"
   | "retry"
   | "server_url"
+  | "username"
+  | "password"
   | "pairing_code"
   | "pair"
   | "pairing"
@@ -48,7 +50,16 @@ type TranslationKey =
   | "delete_confirm"
   | "model"
   | "back_to_chat"
-  | "not_connected_hint";
+  | "not_connected_hint"
+  | "sync_status"
+  | "sync_connected"
+  | "sync_disconnected"
+  | "sync_device_id"
+  | "sync_trigger"
+  | "sync_triggering"
+  | "sync_triggered"
+  | "sync_failed"
+  | "platform";
 
 const translations: Record<Locale, Record<TranslationKey, string>> = {
   en: {
@@ -62,6 +73,8 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     error_occurred: "An error occurred",
     retry: "Retry",
     server_url: "Server URL",
+    username: "Username",
+    password: "Password",
     pairing_code: "Pairing Code",
     pair: "Pair",
     pairing: "Pairing...",
@@ -86,6 +99,15 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     model: "Model",
     back_to_chat: "Back to Chat",
     not_connected_hint: "Connect to a server in Settings to start chatting",
+    sync_status: "Sync Status",
+    sync_connected: "Sync connected",
+    sync_disconnected: "Sync not connected",
+    sync_device_id: "Device ID",
+    sync_trigger: "Full Sync",
+    sync_triggering: "Syncing...",
+    sync_triggered: "Full sync triggered successfully",
+    sync_failed: "Sync failed",
+    platform: "Platform",
   },
   ko: {
     app_title: "MoA",
@@ -98,6 +120,8 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     error_occurred: "\uC624\uB958\uAC00 \uBC1C\uC0DD\uD588\uC2B5\uB2C8\uB2E4",
     retry: "\uC7AC\uC2DC\uB3C4",
     server_url: "\uC11C\uBC84 URL",
+    username: "\uC544\uC774\uB514",
+    password: "\uBE44\uBC00\uBC88\uD638",
     pairing_code: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC",
     pair: "\uD398\uC5B4\uB9C1",
     pairing: "\uD398\uC5B4\uB9C1 \uC911...",
@@ -122,6 +146,15 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     model: "\uBAA8\uB378",
     back_to_chat: "\uCC44\uD305\uC73C\uB85C \uB3CC\uC544\uAC00\uAE30",
     not_connected_hint: "\uCC44\uD305\uC744 \uC2DC\uC791\uD558\uB824\uBA74 \uC124\uC815\uC5D0\uC11C \uC11C\uBC84\uC5D0 \uC5F0\uACB0\uD558\uC138\uC694",
+    sync_status: "\uB3D9\uAE30\uD654 \uC0C1\uD0DC",
+    sync_connected: "\uB3D9\uAE30\uD654 \uC5F0\uACB0\uB428",
+    sync_disconnected: "\uB3D9\uAE30\uD654 \uC5F0\uACB0 \uC548 \uB428",
+    sync_device_id: "\uB514\uBC14\uC774\uC2A4 ID",
+    sync_trigger: "\uC804\uCCB4 \uB3D9\uAE30\uD654",
+    sync_triggering: "\uB3D9\uAE30\uD654 \uC911...",
+    sync_triggered: "\uC804\uCCB4 \uB3D9\uAE30\uD654\uAC00 \uC131\uACF5\uC801\uC73C\uB85C \uC2DC\uC791\uB418\uC5C8\uC2B5\uB2C8\uB2E4",
+    sync_failed: "\uB3D9\uAE30\uD654 \uC2E4\uD328",
+    platform: "\uD50C\uB7AB\uD3FC",
   },
 };
 

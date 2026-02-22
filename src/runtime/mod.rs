@@ -1,8 +1,10 @@
 pub mod docker;
+pub mod mobile;
 pub mod native;
 pub mod traits;
 
 pub use docker::DockerRuntime;
+pub use mobile::MobileRuntime;
 pub use native::NativeRuntime;
 pub use traits::RuntimeAdapter;
 
@@ -13,13 +15,23 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
     match config.kind.as_str() {
         "native" => Ok(Box::new(NativeRuntime::new())),
         "docker" => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
+        "mobile" => {
+            let data_dir = config
+                .mobile_data_dir
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw"));
+            Ok(Box::new(MobileRuntime::new(data_dir)))
+        }
         "cloudflare" => anyhow::bail!(
             "runtime.kind='cloudflare' is not implemented yet. Use runtime.kind='native' for now."
         ),
         other if other.trim().is_empty() => {
-            anyhow::bail!("runtime.kind cannot be empty. Supported values: native, docker")
+            anyhow::bail!("runtime.kind cannot be empty. Supported values: native, docker, mobile")
         }
-        other => anyhow::bail!("Unknown runtime kind '{other}'. Supported values: native, docker"),
+        other => anyhow::bail!(
+            "Unknown runtime kind '{other}'. Supported values: native, docker, mobile"
+        ),
     }
 }
 

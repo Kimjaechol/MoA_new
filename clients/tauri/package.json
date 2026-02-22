@@ -12,7 +12,14 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:android": "tauri android dev",
-    "tauri:ios": "tauri ios dev"
+    "tauri:android:build": "tauri android build",
+    "tauri:android:init": "tauri android init",
+    "tauri:ios": "tauri ios dev",
+    "tauri:ios:build": "tauri ios build",
+    "tauri:ios:init": "tauri ios init",
+    "mobile:setup": "bash scripts/mobile-setup.sh all",
+    "mobile:setup:android": "bash scripts/mobile-setup.sh android",
+    "mobile:setup:ios": "bash scripts/mobile-setup.sh ios"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -172,7 +172,7 @@ impl AgentBuilder {
             config: self.config.unwrap_or_default(),
             model_name: self
                 .model_name
-                .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
+                .unwrap_or_else(|| "google/gemini-3.1-pro-preview".into()),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -208,11 +208,14 @@ impl Agent {
             &config.workspace_dir,
         ));
 
-        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory(
+        // Create memory with sync wrapping when sync is enabled.
+        let (memory, _sync_engine) = memory::create_synced_memory(
             &config.memory,
+            &config.sync,
             &config.workspace_dir,
             config.api_key.as_deref(),
-        )?);
+        )?;
+        let memory: Arc<dyn Memory> = memory;
 
         let composio_key = if config.composio.enabled {
             config.composio.api_key.as_deref()
@@ -245,7 +248,7 @@ impl Agent {
         let model_name = config
             .default_model
             .as_deref()
-            .unwrap_or("anthropic/claude-sonnet-4-20250514")
+            .unwrap_or("google/gemini-3.1-pro-preview")
             .to_string();
 
         let provider: Box<dyn Provider> = providers::create_routed_provider(
@@ -540,7 +543,7 @@ pub async fn run(
     let model_name = effective_config
         .default_model
         .as_deref()
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
+        .unwrap_or("google/gemini-3.1-pro-preview")
         .to_string();
 
     agent.observer.record_event(&ObserverEvent::AgentStart {

@@ -1,5 +1,17 @@
+import {
+  isTauri,
+  getSyncStatus,
+  triggerFullSync,
+  getPlatformInfo,
+  disconnectBackend,
+  setServerUrl as setBackendServerUrl,
+  type SyncStatus,
+  type PlatformInfo,
+} from "./tauri-bridge";
+
 const STORAGE_KEY_TOKEN = "moa_token";
 const STORAGE_KEY_SERVER = "moa_server_url";
+const DEFAULT_SERVER_URL = "https://moanew-production.up.railway.app";
 
 export interface PairResponse {
   paired: boolean;
@@ -15,12 +27,14 @@ export interface HealthResponse {
   status: string;
 }
 
+export type { SyncStatus, PlatformInfo };
+
 export class MoAClient {
   private serverUrl: string;
   private token: string | null;
 
   constructor() {
-    this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || "http://localhost:3000";
+    this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || DEFAULT_SERVER_URL;
     this.token = localStorage.getItem(STORAGE_KEY_TOKEN);
   }
 
@@ -31,6 +45,10 @@ export class MoAClient {
   setServerUrl(url: string): void {
     this.serverUrl = url.replace(/\/+$/, "");
     localStorage.setItem(STORAGE_KEY_SERVER, this.serverUrl);
+    // Also update Tauri backend if running in Tauri
+    if (isTauri()) {
+      setBackendServerUrl(this.serverUrl).catch(() => {});
+    }
   }
 
   getToken(): string | null {
@@ -50,15 +68,30 @@ export class MoAClient {
   disconnect(): void {
     this.token = null;
     localStorage.removeItem(STORAGE_KEY_TOKEN);
+    // Also disconnect on Tauri backend
+    if (isTauri()) {
+      disconnectBackend().catch(() => {});
+    }
   }
 
-  async pair(code: string): Promise<PairResponse> {
+  async pair(
+    code: string,
+    username?: string,
+    password?: string,
+  ): Promise<PairResponse> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-Pairing-Code": code,
+    };
+
+    const body: Record<string, string> = {};
+    if (username) body.username = username;
+    if (password) body.password = password;
+
     const res = await fetch(`${this.serverUrl}/pair`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Pairing-Code": code,
-      },
+      headers,
+      body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined,
     });
 
     if (!res.ok) {
@@ -125,6 +158,23 @@ export class MoAClient {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  // ── Sync commands (Tauri backend only) ──────────────────────────
+
+  /** Get sync status from Tauri backend. Returns null when not in Tauri. */
+  async getSyncStatus(): Promise<SyncStatus | null> {
+    return getSyncStatus();
+  }
+
+  /** Trigger a full sync (Layer 3). Returns null when not in Tauri. */
+  async triggerFullSync(): Promise<string | null> {
+    return triggerFullSync();
+  }
+
+  /** Get platform info. Returns null when not in Tauri. */
+  async getPlatformInfo(): Promise<PlatformInfo | null> {
+    return getPlatformInfo();
   }
 }
 

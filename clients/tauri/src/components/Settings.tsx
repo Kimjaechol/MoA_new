@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { t, type Locale } from "../lib/i18n";
-import { apiClient } from "../lib/api";
+import { apiClient, type SyncStatus, type PlatformInfo } from "../lib/api";
+import { isTauri } from "../lib/tauri-bridge";
 
 interface SettingsProps {
   locale: Locale;
@@ -12,14 +13,25 @@ interface SettingsProps {
 export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }: SettingsProps) {
   const [serverUrl, setServerUrl] = useState(apiClient.getServerUrl());
   const [pairingCode, setPairingCode] = useState("");
+  const [pairUsername, setPairUsername] = useState("");
+  const [pairPassword, setPairPassword] = useState("");
   const [isPairing, setIsPairing] = useState(false);
   const [isHealthChecking, setIsHealthChecking] = useState(false);
   const [isConnected, setIsConnected] = useState(apiClient.isConnected());
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [platformInfo, setPlatformInfo] = useState<PlatformInfo | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const inTauri = isTauri();
 
   useEffect(() => {
     setIsConnected(apiClient.isConnected());
-  }, []);
+    // Fetch sync status and platform info when in Tauri
+    if (inTauri) {
+      apiClient.getSyncStatus().then(setSyncStatus).catch(() => {});
+      apiClient.getPlatformInfo().then(setPlatformInfo).catch(() => {});
+    }
+  }, [inTauri]);
 
   const clearMessage = useCallback(() => {
     setTimeout(() => setMessage(null), 5000);
@@ -40,12 +52,18 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
     setMessage(null);
 
     try {
-      const result = await apiClient.pair(pairingCode.trim());
+      const result = await apiClient.pair(
+        pairingCode.trim(),
+        pairUsername.trim() || undefined,
+        pairPassword || undefined,
+      );
       if (result.paired) {
         setIsConnected(true);
         onConnectionChange(true);
         setMessage({ type: "success", text: t("pair_success", locale) });
         setPairingCode("");
+        setPairUsername("");
+        setPairPassword("");
       } else {
         setMessage({ type: "error", text: t("pair_failed", locale) });
       }
@@ -58,7 +76,7 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
       setIsPairing(false);
       clearMessage();
     }
-  }, [pairingCode, locale, onConnectionChange, clearMessage]);
+  }, [pairingCode, pairUsername, pairPassword, locale, onConnectionChange, clearMessage]);
 
   const handleDisconnect = useCallback(() => {
     apiClient.disconnect();
@@ -66,6 +84,28 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
     onConnectionChange(false);
     setMessage(null);
   }, [onConnectionChange]);
+
+  const handleTriggerSync = useCallback(async () => {
+    setIsSyncing(true);
+    setMessage(null);
+    try {
+      const result = await apiClient.triggerFullSync();
+      if (result) {
+        setMessage({ type: "success", text: t("sync_triggered", locale) });
+      }
+      // Refresh sync status
+      const status = await apiClient.getSyncStatus();
+      setSyncStatus(status);
+    } catch (err) {
+      setMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : t("sync_failed", locale),
+      });
+    } finally {
+      setIsSyncing(false);
+      clearMessage();
+    }
+  }, [locale, clearMessage]);
 
   const handleHealthCheck = useCallback(async () => {
     setIsHealthChecking(true);
@@ -142,7 +182,7 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                     type="url"
                     value={serverUrl}
                     onChange={(e) => handleServerUrlChange(e.target.value)}
-                    placeholder="http://localhost:3000"
+                    placeholder="https://moanew-production.up.railway.app"
                   />
                   <button
                     className="settings-btn settings-btn-secondary"
@@ -155,28 +195,52 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
               </div>
 
               {!isConnected && (
-                <div className="settings-field">
-                  <label className="settings-label">{t("pairing_code", locale)}</label>
-                  <div className="settings-input-row">
+                <>
+                  <div className="settings-field">
+                    <label className="settings-label">{t("username", locale)}</label>
                     <input
                       className="settings-input"
                       type="text"
-                      value={pairingCode}
-                      onChange={(e) => setPairingCode(e.target.value)}
-                      placeholder="Enter pairing code"
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") handlePair();
-                      }}
+                      value={pairUsername}
+                      onChange={(e) => setPairUsername(e.target.value)}
+                      placeholder="Enter username"
+                      autoComplete="username"
                     />
-                    <button
-                      className="settings-btn settings-btn-primary"
-                      onClick={handlePair}
-                      disabled={isPairing || !pairingCode.trim()}
-                    >
-                      {isPairing ? t("pairing", locale) : t("pair", locale)}
-                    </button>
                   </div>
-                </div>
+                  <div className="settings-field">
+                    <label className="settings-label">{t("password", locale)}</label>
+                    <input
+                      className="settings-input"
+                      type="password"
+                      value={pairPassword}
+                      onChange={(e) => setPairPassword(e.target.value)}
+                      placeholder="Enter password"
+                      autoComplete="current-password"
+                    />
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-label">{t("pairing_code", locale)}</label>
+                    <div className="settings-input-row">
+                      <input
+                        className="settings-input"
+                        type="text"
+                        value={pairingCode}
+                        onChange={(e) => setPairingCode(e.target.value)}
+                        placeholder="Enter pairing code"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") handlePair();
+                        }}
+                      />
+                      <button
+                        className="settings-btn settings-btn-primary"
+                        onClick={handlePair}
+                        disabled={isPairing || !pairingCode.trim()}
+                      >
+                        {isPairing ? t("pairing", locale) : t("pair", locale)}
+                      </button>
+                    </div>
+                  </div>
+                </>
               )}
 
               {message && (
@@ -205,6 +269,58 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
               </div>
             </div>
           </div>
+
+          {/* Sync section (Tauri only) */}
+          {inTauri && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("sync_status", locale)}</div>
+              <div className="settings-card">
+                {syncStatus ? (
+                  <>
+                    <div className={`settings-status ${syncStatus.connected ? "connected" : "disconnected"}`}>
+                      <div className={`status-dot ${syncStatus.connected ? "connected" : ""}`} />
+                      {syncStatus.connected ? t("sync_connected", locale) : t("sync_disconnected", locale)}
+                    </div>
+                    <div className="settings-field" style={{ marginTop: 12 }}>
+                      <label className="settings-label">{t("sync_device_id", locale)}</label>
+                      <div className="settings-token-display" style={{ fontSize: 11 }}>
+                        {syncStatus.device_id}
+                      </div>
+                    </div>
+                    {isConnected && (
+                      <div className="settings-actions" style={{ marginTop: 12 }}>
+                        <button
+                          className="settings-btn settings-btn-secondary"
+                          onClick={handleTriggerSync}
+                          disabled={isSyncing}
+                        >
+                          {isSyncing ? t("sync_triggering", locale) : t("sync_trigger", locale)}
+                        </button>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="settings-status disconnected">
+                    <div className="status-dot" />
+                    {t("sync_disconnected", locale)}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Platform info (Tauri only) */}
+          {inTauri && platformInfo && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("platform", locale)}</div>
+              <div className="settings-card">
+                <p style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
+                  {platformInfo.os} / {platformInfo.arch}
+                  {platformInfo.is_mobile ? " (Mobile)" : " (Desktop)"}
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* About */}
           <div className="settings-section">
