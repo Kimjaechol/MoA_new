@@ -507,8 +507,16 @@ async fn main() -> Result<()> {
                 config.autonomy.allowed_commands.join(", ")
             );
             println!(
-                "  Max actions/hour:  {}",
+                "  Max actions/min:   {} (burst limit)",
+                config.autonomy.max_actions_per_minute
+            );
+            println!(
+                "  Max actions/hour:  {} (total budget)",
                 config.autonomy.max_actions_per_hour
+            );
+            println!(
+                "  Loop detect after: {} identical repeats",
+                config.autonomy.max_loop_repeats
             );
             println!(
                 "  Max cost/day:      ${:.2}",

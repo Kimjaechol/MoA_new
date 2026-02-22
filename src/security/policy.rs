@@ -1,7 +1,8 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,47 +25,330 @@ pub enum CommandRiskLevel {
     High,
 }
 
-/// Sliding-window action tracker for rate limiting.
+/// Strike level applied when burst rate limit is exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrikeLevel {
+    /// No strikes — normal operation.
+    None,
+    /// Strike 1: 30-second cooldown.
+    First,
+    /// Strike 2: 2-minute cooldown.
+    Second,
+    /// Strike 3: 10-minute cooldown (admin reset required to clear).
+    Third,
+}
+
+/// Result of a rate-limit check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitResult {
+    /// Action is allowed.
+    Allowed,
+    /// Action is blocked due to burst rate limit.
+    BurstLimited {
+        strike: StrikeLevel,
+        cooldown_remaining_secs: u64,
+    },
+    /// Action is blocked due to hourly total limit.
+    HourlyLimited { count: usize, limit: usize },
+}
+
+/// Dual-window action tracker: per-minute burst + per-hour total.
+///
+/// Burst limiting prevents DDoS-like rapid-fire requests.
+/// Hourly limiting provides a global action budget.
+/// Progressive penalties (strikes) escalate cooldowns on repeated violations.
 #[derive(Debug)]
 pub struct ActionTracker {
     /// Timestamps of recent actions (kept within the last hour).
     actions: Mutex<Vec<Instant>>,
+    /// Per-minute burst limit (default: 20).
+    burst_limit_per_minute: usize,
+    /// Per-hour total limit (default: 600).
+    max_actions_per_hour: usize,
+    /// Strike state for progressive penalties.
+    strike_state: Mutex<StrikeState>,
+}
+
+#[derive(Debug, Clone)]
+struct StrikeState {
+    level: StrikeLevel,
+    /// When the current cooldown expires (if any).
+    cooldown_until: Option<Instant>,
 }
 
 impl ActionTracker {
     pub fn new() -> Self {
         Self {
             actions: Mutex::new(Vec::new()),
+            burst_limit_per_minute: 20,
+            max_actions_per_hour: 600,
+            strike_state: Mutex::new(StrikeState {
+                level: StrikeLevel::None,
+                cooldown_until: None,
+            }),
         }
     }
 
-    /// Record an action and return the current count within the window.
+    /// Create a tracker with custom limits.
+    pub fn with_limits(burst_per_minute: u32, max_per_hour: u32) -> Self {
+        Self {
+            actions: Mutex::new(Vec::new()),
+            burst_limit_per_minute: burst_per_minute as usize,
+            max_actions_per_hour: max_per_hour as usize,
+            strike_state: Mutex::new(StrikeState {
+                level: StrikeLevel::None,
+                cooldown_until: None,
+            }),
+        }
+    }
+
+    /// Record an action and return the current hourly count.
     pub fn record(&self) -> usize {
         let mut actions = self.actions.lock();
         let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
+            .checked_sub(Duration::from_secs(3600))
             .unwrap_or_else(Instant::now);
         actions.retain(|t| *t > cutoff);
         actions.push(Instant::now());
         actions.len()
     }
 
-    /// Count of actions in the current window without recording.
+    /// Count of actions in the current hour without recording.
     pub fn count(&self) -> usize {
         let mut actions = self.actions.lock();
         let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
+            .checked_sub(Duration::from_secs(3600))
             .unwrap_or_else(Instant::now);
         actions.retain(|t| *t > cutoff);
         actions.len()
+    }
+
+    /// Count of actions in the last 60 seconds (burst window).
+    pub fn count_last_minute(&self) -> usize {
+        let mut actions = self.actions.lock();
+        let cutoff = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        // Prune old entries beyond 1 hour for memory hygiene.
+        let hour_cutoff = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or_else(Instant::now);
+        actions.retain(|t| *t > hour_cutoff);
+        actions.iter().filter(|t| **t > cutoff).count()
+    }
+
+    /// Check rate limits and apply progressive penalties.
+    /// Returns `RateLimitResult` indicating whether the action is allowed.
+    pub fn check_and_record(&self) -> RateLimitResult {
+        // Check cooldown first.
+        {
+            let state = self.strike_state.lock();
+            if let Some(until) = state.cooldown_until {
+                if Instant::now() < until {
+                    let remaining = until.duration_since(Instant::now()).as_secs();
+                    return RateLimitResult::BurstLimited {
+                        strike: state.level,
+                        cooldown_remaining_secs: remaining,
+                    };
+                }
+            }
+        }
+
+        // Check burst limit (per-minute).
+        let minute_count = self.count_last_minute();
+        if minute_count >= self.burst_limit_per_minute {
+            let mut state = self.strike_state.lock();
+            state.level = match state.level {
+                StrikeLevel::None => StrikeLevel::First,
+                StrikeLevel::First => StrikeLevel::Second,
+                StrikeLevel::Second | StrikeLevel::Third => StrikeLevel::Third,
+            };
+            let cooldown = match state.level {
+                StrikeLevel::None => Duration::from_secs(0),
+                StrikeLevel::First => Duration::from_secs(30),
+                StrikeLevel::Second => Duration::from_secs(120),
+                StrikeLevel::Third => Duration::from_secs(600),
+            };
+            state.cooldown_until = Some(Instant::now() + cooldown);
+            let remaining = cooldown.as_secs();
+            return RateLimitResult::BurstLimited {
+                strike: state.level,
+                cooldown_remaining_secs: remaining,
+            };
+        }
+
+        // Check hourly total.
+        let hourly_count = self.record();
+        if hourly_count > self.max_actions_per_hour {
+            return RateLimitResult::HourlyLimited {
+                count: hourly_count,
+                limit: self.max_actions_per_hour,
+            };
+        }
+
+        // Clear strikes when operating normally (no burst violations).
+        {
+            let mut state = self.strike_state.lock();
+            if state.cooldown_until.is_some_and(|u| Instant::now() >= u) {
+                // Cooldown expired; don't reset level (it persists as a warning).
+                state.cooldown_until = None;
+            }
+        }
+
+        RateLimitResult::Allowed
+    }
+
+    /// Current strike level.
+    pub fn strike_level(&self) -> StrikeLevel {
+        self.strike_state.lock().level
+    }
+
+    /// Reset strikes (admin action).
+    pub fn reset_strikes(&self) {
+        let mut state = self.strike_state.lock();
+        state.level = StrikeLevel::None;
+        state.cooldown_until = None;
     }
 }
 
 impl Clone for ActionTracker {
     fn clone(&self) -> Self {
         let actions = self.actions.lock();
+        let strike = self.strike_state.lock().clone();
         Self {
             actions: Mutex::new(actions.clone()),
+            burst_limit_per_minute: self.burst_limit_per_minute,
+            max_actions_per_hour: self.max_actions_per_hour,
+            strike_state: Mutex::new(strike),
+        }
+    }
+}
+
+/// Detects repeated identical action patterns (infinite loops).
+///
+/// An infinite loop is defined as the same action signature being executed
+/// `max_identical_repeats` times consecutively without producing a new result.
+/// The signature is computed from the action name + key parameters (URL, selector, etc.).
+#[derive(Debug)]
+pub struct LoopDetector {
+    /// Recent action signatures with their result hashes.
+    history: Mutex<VecDeque<ActionEntry>>,
+    /// Maximum number of consecutive identical actions before triggering.
+    max_identical_repeats: usize,
+    /// Maximum history size to keep.
+    max_history: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActionEntry {
+    /// Opaque signature identifying the action (e.g. "browser:open:https://example.com").
+    signature: String,
+    /// Whether the action produced a meaningful (non-empty, non-error) result.
+    produced_result: bool,
+    /// Timestamp for expiry.
+    timestamp: Instant,
+}
+
+/// Result of a loop detection check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopCheckResult {
+    /// No loop detected — proceed.
+    Ok,
+    /// Loop detected — the same action has been repeated too many times without effect.
+    LoopDetected {
+        signature: String,
+        repeat_count: usize,
+        max_allowed: usize,
+    },
+}
+
+impl LoopDetector {
+    /// Create a new detector. `max_identical_repeats` is how many consecutive
+    /// identical fruitless actions trigger a block (default: 5).
+    pub fn new(max_identical_repeats: u32) -> Self {
+        Self {
+            history: Mutex::new(VecDeque::new()),
+            max_identical_repeats: max_identical_repeats as usize,
+            max_history: 100,
+        }
+    }
+
+    /// Build an action signature from tool name and key parameters.
+    /// Callers should pass a stable, deterministic representation.
+    pub fn make_signature(tool: &str, action: &str, target: &str) -> String {
+        format!("{tool}:{action}:{target}")
+    }
+
+    /// Record an action and check for loops.
+    ///
+    /// `signature`: action identity (from `make_signature`).
+    /// `produced_result`: true if the action returned a non-empty, non-error result.
+    ///
+    /// Returns `LoopCheckResult::LoopDetected` if the same signature has been
+    /// repeated `max_identical_repeats` times in a row without producing a result.
+    pub fn record_and_check(&self, signature: &str, produced_result: bool) -> LoopCheckResult {
+        let mut history = self.history.lock();
+
+        // Prune entries older than 10 minutes.
+        let cutoff = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap_or_else(Instant::now);
+        while history.front().is_some_and(|e| e.timestamp < cutoff) {
+            history.pop_front();
+        }
+
+        // Trim to max_history.
+        while history.len() >= self.max_history {
+            history.pop_front();
+        }
+
+        history.push_back(ActionEntry {
+            signature: signature.to_string(),
+            produced_result,
+            timestamp: Instant::now(),
+        });
+
+        // Count consecutive identical fruitless actions from the tail.
+        let consecutive_fruitless = history
+            .iter()
+            .rev()
+            .take_while(|e| e.signature == signature && !e.produced_result)
+            .count();
+
+        if consecutive_fruitless >= self.max_identical_repeats {
+            LoopCheckResult::LoopDetected {
+                signature: signature.to_string(),
+                repeat_count: consecutive_fruitless,
+                max_allowed: self.max_identical_repeats,
+            }
+        } else {
+            LoopCheckResult::Ok
+        }
+    }
+
+    /// Reset all history (e.g. when a new task starts).
+    pub fn reset(&self) {
+        self.history.lock().clear();
+    }
+
+    /// Current consecutive count for a given signature (for diagnostics).
+    pub fn consecutive_count(&self, signature: &str) -> usize {
+        let history = self.history.lock();
+        history
+            .iter()
+            .rev()
+            .take_while(|e| e.signature == signature && !e.produced_result)
+            .count()
+    }
+}
+
+impl Clone for LoopDetector {
+    fn clone(&self) -> Self {
+        let history = self.history.lock();
+        Self {
+            history: Mutex::new(history.clone()),
+            max_identical_repeats: self.max_identical_repeats,
+            max_history: self.max_history,
         }
     }
 }
@@ -77,15 +361,26 @@ pub struct SecurityPolicy {
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
+    /// Legacy field — kept for backward compatibility with configs that set it.
+    /// Actual enforcement now uses `tracker.max_actions_per_hour`.
     pub max_actions_per_hour: u32,
+    /// Burst rate limit: max actions per minute before progressive penalties.
+    pub max_actions_per_minute: u32,
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub tracker: ActionTracker,
+    /// Detects repeated identical actions that indicate an infinite loop.
+    pub loop_detector: LoopDetector,
+    /// Maximum consecutive identical fruitless actions before blocking.
+    pub max_loop_repeats: u32,
 }
 
 impl Default for SecurityPolicy {
     fn default() -> Self {
+        let burst_per_min: u32 = 20;
+        let max_per_hour: u32 = 600;
+        let max_loop: u32 = 5;
         Self {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
@@ -126,11 +421,14 @@ impl Default for SecurityPolicy {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
+            max_actions_per_hour: max_per_hour,
+            max_actions_per_minute: burst_per_min,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
-            tracker: ActionTracker::new(),
+            tracker: ActionTracker::with_limits(burst_per_min, max_per_hour),
+            loop_detector: LoopDetector::new(max_loop),
+            max_loop_repeats: max_loop,
         }
     }
 }
@@ -530,16 +828,65 @@ impl SecurityPolicy {
         self.autonomy != AutonomyLevel::ReadOnly
     }
 
-    /// Record an action and check if the rate limit has been exceeded.
+    /// Record an action and check rate limits (burst + hourly).
     /// Returns `true` if the action is allowed, `false` if rate-limited.
+    ///
+    /// Checks both the tracker's internal limits and the policy-level
+    /// `max_actions_per_hour` field (whichever is stricter wins).
     pub fn record_action(&self) -> bool {
-        let count = self.tracker.record();
-        count <= self.max_actions_per_hour as usize
+        matches!(self.record_action_detailed(), RateLimitResult::Allowed)
+    }
+
+    /// Record an action with detailed result information.
+    /// Returns `RateLimitResult` for callers that need specific error messages.
+    pub fn record_action_detailed(&self) -> RateLimitResult {
+        // Check policy-level hourly cap (may differ from tracker if overridden).
+        let hourly_count = self.tracker.count();
+        if hourly_count >= self.max_actions_per_hour as usize {
+            return RateLimitResult::HourlyLimited {
+                count: hourly_count,
+                limit: self.max_actions_per_hour as usize,
+            };
+        }
+        self.tracker.check_and_record()
     }
 
     /// Check if the rate limit would be exceeded without recording.
     pub fn is_rate_limited(&self) -> bool {
-        self.tracker.count() >= self.max_actions_per_hour as usize
+        self.tracker.count_last_minute() >= self.max_actions_per_minute as usize
+            || self.tracker.count() >= self.max_actions_per_hour as usize
+    }
+
+    /// Record a tool action for loop detection and check for infinite loops.
+    ///
+    /// `tool`: tool name (e.g. "browser", "shell").
+    /// `action`: action name (e.g. "open", "click").
+    /// `target`: key parameter (e.g. URL, selector).
+    /// `produced_result`: whether the action returned a non-empty, non-error result.
+    pub fn check_loop(
+        &self,
+        tool: &str,
+        action: &str,
+        target: &str,
+        produced_result: bool,
+    ) -> LoopCheckResult {
+        let sig = LoopDetector::make_signature(tool, action, target);
+        self.loop_detector.record_and_check(&sig, produced_result)
+    }
+
+    /// Current strike level from burst rate limiting.
+    pub fn strike_level(&self) -> StrikeLevel {
+        self.tracker.strike_level()
+    }
+
+    /// Reset rate limit strikes (admin action).
+    pub fn reset_strikes(&self) {
+        self.tracker.reset_strikes();
+    }
+
+    /// Reset loop detector history (e.g. when a new task starts).
+    pub fn reset_loop_detector(&self) {
+        self.loop_detector.reset();
     }
 
     /// Build from config sections
@@ -547,17 +894,23 @@ impl SecurityPolicy {
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
     ) -> Self {
+        let burst = autonomy_config.max_actions_per_minute;
+        let hourly = autonomy_config.max_actions_per_hour;
+        let max_loop = autonomy_config.max_loop_repeats;
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
-            max_actions_per_hour: autonomy_config.max_actions_per_hour,
+            max_actions_per_hour: hourly,
+            max_actions_per_minute: burst,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
-            tracker: ActionTracker::new(),
+            tracker: ActionTracker::with_limits(burst, hourly),
+            loop_detector: LoopDetector::new(max_loop),
+            max_loop_repeats: max_loop,
         }
     }
 }
@@ -846,6 +1199,8 @@ mod tests {
             allowed_commands: vec!["docker".into()],
             forbidden_paths: vec!["/secret".into()],
             max_actions_per_hour: 100,
+            max_actions_per_minute: 15,
+            max_loop_repeats: 8,
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
@@ -859,6 +1214,8 @@ mod tests {
         assert_eq!(policy.allowed_commands, vec!["docker"]);
         assert_eq!(policy.forbidden_paths, vec!["/secret"]);
         assert_eq!(policy.max_actions_per_hour, 100);
+        assert_eq!(policy.max_actions_per_minute, 15);
+        assert_eq!(policy.max_loop_repeats, 8);
         assert_eq!(policy.max_cost_per_day_cents, 1000);
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
@@ -875,6 +1232,8 @@ mod tests {
         assert!(!p.allowed_commands.is_empty());
         assert!(!p.forbidden_paths.is_empty());
         assert!(p.max_actions_per_hour > 0);
+        assert!(p.max_actions_per_minute > 0);
+        assert!(p.max_loop_repeats > 0);
         assert!(p.max_cost_per_day_cents > 0);
         assert!(p.require_approval_for_medium_risk);
         assert!(p.block_high_risk_commands);
@@ -1146,6 +1505,8 @@ mod tests {
     fn rate_limit_high_allows_many() {
         let p = SecurityPolicy {
             max_actions_per_hour: 10000,
+            max_actions_per_minute: 10000,
+            tracker: ActionTracker::with_limits(10000, 10000),
             ..SecurityPolicy::default()
         };
         for _ in 0..100 {
@@ -1324,5 +1685,312 @@ mod tests {
                 "Default forbidden_paths must include {dot}"
             );
         }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // BURST RATE LIMITER TESTS
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn burst_limiter_allows_under_limit() {
+        let tracker = ActionTracker::with_limits(5, 1000);
+        for _ in 0..5 {
+            assert!(matches!(
+                tracker.check_and_record(),
+                RateLimitResult::Allowed
+            ));
+        }
+    }
+
+    #[test]
+    fn burst_limiter_blocks_at_limit() {
+        let tracker = ActionTracker::with_limits(3, 1000);
+        // Use up burst budget.
+        for _ in 0..3 {
+            assert!(matches!(
+                tracker.check_and_record(),
+                RateLimitResult::Allowed
+            ));
+        }
+        // 4th should trigger burst limit.
+        let result = tracker.check_and_record();
+        assert!(
+            matches!(result, RateLimitResult::BurstLimited { .. }),
+            "Expected BurstLimited, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn burst_limiter_progressive_strikes() {
+        let tracker = ActionTracker::with_limits(1, 1000);
+
+        // First action allowed.
+        assert!(matches!(
+            tracker.check_and_record(),
+            RateLimitResult::Allowed
+        ));
+
+        // Second triggers strike 1.
+        let r1 = tracker.check_and_record();
+        match r1 {
+            RateLimitResult::BurstLimited { strike, .. } => {
+                assert_eq!(strike, StrikeLevel::First);
+            }
+            other => panic!("Expected BurstLimited strike 1, got {other:?}"),
+        }
+        assert_eq!(tracker.strike_level(), StrikeLevel::First);
+    }
+
+    #[test]
+    fn burst_limiter_strike_escalation() {
+        // With burst_limit=0 every action triggers burst.
+        let tracker = ActionTracker::with_limits(0, 1000);
+
+        let r1 = tracker.check_and_record();
+        match &r1 {
+            RateLimitResult::BurstLimited { strike, .. } => {
+                assert_eq!(*strike, StrikeLevel::First);
+            }
+            other => panic!("Expected strike 1, got {other:?}"),
+        }
+
+        // During cooldown, further attempts also blocked.
+        let r2 = tracker.check_and_record();
+        match &r2 {
+            RateLimitResult::BurstLimited { strike, .. } => {
+                // Still in first strike cooldown.
+                assert_eq!(*strike, StrikeLevel::First);
+            }
+            other => panic!("Expected cooldown block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn burst_limiter_reset_clears_strikes() {
+        let tracker = ActionTracker::with_limits(0, 1000);
+        // Trigger a strike.
+        tracker.check_and_record();
+        assert_eq!(tracker.strike_level(), StrikeLevel::First);
+        // Reset.
+        tracker.reset_strikes();
+        assert_eq!(tracker.strike_level(), StrikeLevel::None);
+    }
+
+    #[test]
+    fn hourly_limit_blocks_after_budget() {
+        let tracker = ActionTracker::with_limits(1000, 3);
+        for _ in 0..3 {
+            assert!(matches!(
+                tracker.check_and_record(),
+                RateLimitResult::Allowed
+            ));
+        }
+        let result = tracker.check_and_record();
+        assert!(
+            matches!(result, RateLimitResult::HourlyLimited { .. }),
+            "Expected HourlyLimited, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn policy_detailed_rate_limit_burst_message() {
+        let p = SecurityPolicy {
+            max_actions_per_minute: 1,
+            max_actions_per_hour: 1000,
+            tracker: ActionTracker::with_limits(1, 1000),
+            ..SecurityPolicy::default()
+        };
+
+        // First: allowed.
+        assert!(matches!(
+            p.record_action_detailed(),
+            RateLimitResult::Allowed
+        ));
+
+        // Second: burst limited.
+        let result = p.record_action_detailed();
+        assert!(
+            matches!(result, RateLimitResult::BurstLimited { .. }),
+            "Expected BurstLimited, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn policy_detailed_rate_limit_hourly_message() {
+        let p = SecurityPolicy {
+            max_actions_per_minute: 1000,
+            max_actions_per_hour: 2,
+            tracker: ActionTracker::with_limits(1000, 1000),
+            ..SecurityPolicy::default()
+        };
+
+        assert!(matches!(
+            p.record_action_detailed(),
+            RateLimitResult::Allowed
+        ));
+        assert!(matches!(
+            p.record_action_detailed(),
+            RateLimitResult::Allowed
+        ));
+        let result = p.record_action_detailed();
+        assert!(
+            matches!(result, RateLimitResult::HourlyLimited { .. }),
+            "Expected HourlyLimited, got {result:?}"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // LOOP DETECTOR TESTS
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn loop_detector_allows_varied_actions() {
+        let det = LoopDetector::new(3);
+        for i in 0..10 {
+            let sig = format!("browser:click:button_{i}");
+            assert_eq!(det.record_and_check(&sig, false), LoopCheckResult::Ok);
+        }
+    }
+
+    #[test]
+    fn loop_detector_allows_fruitful_repeats() {
+        let det = LoopDetector::new(3);
+        // Same action but always produces a result — never triggers.
+        for _ in 0..10 {
+            assert_eq!(
+                det.record_and_check("browser:open:https://example.com", true),
+                LoopCheckResult::Ok
+            );
+        }
+    }
+
+    #[test]
+    fn loop_detector_triggers_on_fruitless_repeats() {
+        let det = LoopDetector::new(3);
+        let sig = "browser:click:#submit";
+
+        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
+        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
+        // 3rd fruitless repeat triggers.
+        match det.record_and_check(sig, false) {
+            LoopCheckResult::LoopDetected {
+                repeat_count,
+                max_allowed,
+                ..
+            } => {
+                assert_eq!(repeat_count, 3);
+                assert_eq!(max_allowed, 3);
+            }
+            other => panic!("Expected LoopDetected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_detector_resets_on_success() {
+        let det = LoopDetector::new(3);
+        let sig = "browser:click:#submit";
+
+        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
+        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
+        // Successful result breaks the chain.
+        assert_eq!(det.record_and_check(sig, true), LoopCheckResult::Ok);
+        // Counter resets — can do 2 more fruitless.
+        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
+        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
+    }
+
+    #[test]
+    fn loop_detector_different_actions_dont_interfere() {
+        let det = LoopDetector::new(3);
+
+        assert_eq!(
+            det.record_and_check("browser:click:#a", false),
+            LoopCheckResult::Ok
+        );
+        assert_eq!(
+            det.record_and_check("browser:click:#a", false),
+            LoopCheckResult::Ok
+        );
+        // Different action breaks the chain for #a.
+        assert_eq!(
+            det.record_and_check("browser:click:#b", false),
+            LoopCheckResult::Ok
+        );
+        // Back to #a — chain restarts from 1.
+        assert_eq!(
+            det.record_and_check("browser:click:#a", false),
+            LoopCheckResult::Ok
+        );
+    }
+
+    #[test]
+    fn loop_detector_make_signature() {
+        assert_eq!(
+            LoopDetector::make_signature("browser", "open", "https://example.com"),
+            "browser:open:https://example.com"
+        );
+    }
+
+    #[test]
+    fn loop_detector_consecutive_count() {
+        let det = LoopDetector::new(5);
+        let sig = "shell:exec:ls";
+
+        det.record_and_check(sig, false);
+        det.record_and_check(sig, false);
+        assert_eq!(det.consecutive_count(sig), 2);
+
+        det.record_and_check(sig, true); // produces result
+        assert_eq!(det.consecutive_count(sig), 0);
+    }
+
+    #[test]
+    fn loop_detector_reset_clears_history() {
+        let det = LoopDetector::new(3);
+        let sig = "browser:click:#submit";
+
+        det.record_and_check(sig, false);
+        det.record_and_check(sig, false);
+        assert_eq!(det.consecutive_count(sig), 2);
+
+        det.reset();
+        assert_eq!(det.consecutive_count(sig), 0);
+    }
+
+    #[test]
+    fn policy_check_loop_integration() {
+        let p = SecurityPolicy {
+            max_loop_repeats: 2,
+            loop_detector: LoopDetector::new(2),
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            p.check_loop("browser", "click", "#btn", false),
+            LoopCheckResult::Ok
+        );
+        match p.check_loop("browser", "click", "#btn", false) {
+            LoopCheckResult::LoopDetected { repeat_count, .. } => {
+                assert_eq!(repeat_count, 2);
+            }
+            other => panic!("Expected LoopDetected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_reset_loop_detector() {
+        let p = SecurityPolicy {
+            max_loop_repeats: 2,
+            loop_detector: LoopDetector::new(2),
+            ..SecurityPolicy::default()
+        };
+
+        p.check_loop("browser", "click", "#btn", false);
+        p.reset_loop_detector();
+        // After reset, counter should be back to 0.
+        assert_eq!(
+            p.check_loop("browser", "click", "#btn", false),
+            LoopCheckResult::Ok
+        );
     }
 }

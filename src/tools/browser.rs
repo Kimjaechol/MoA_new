@@ -984,6 +984,8 @@ impl Tool for BrowserTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        use crate::security::{LoopCheckResult, RateLimitResult};
+
         // Security checks
         if !self.security.can_act() {
             return Ok(ToolResult {
@@ -993,12 +995,36 @@ impl Tool for BrowserTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
+        match self.security.record_action_detailed() {
+            RateLimitResult::Allowed => {}
+            RateLimitResult::BurstLimited {
+                strike,
+                cooldown_remaining_secs,
+            } => {
+                let strike_desc = match strike {
+                    crate::security::StrikeLevel::First => "Strike 1/3",
+                    crate::security::StrikeLevel::Second => "Strike 2/3",
+                    crate::security::StrikeLevel::Third => "Strike 3/3 (admin reset required)",
+                    crate::security::StrikeLevel::None => "Warning",
+                };
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Action blocked: burst rate limit exceeded ({strike_desc}). \
+                         Cooldown: {cooldown_remaining_secs}s remaining."
+                    )),
+                });
+            }
+            RateLimitResult::HourlyLimited { count, limit } => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Action blocked: hourly rate limit exceeded ({count}/{limit})."
+                    )),
+                });
+            }
         }
 
         let backend = match self.resolve_backend().await {
@@ -1026,8 +1052,39 @@ impl Tool for BrowserTool {
             });
         }
 
+        // Build loop detection target from the action's key parameter.
+        let loop_target = args
+            .get("url")
+            .or_else(|| args.get("selector"))
+            .or_else(|| args.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
         if backend == ResolvedBackend::ComputerUse {
-            return self.execute_computer_use_action(action_str, &args).await;
+            let result = self.execute_computer_use_action(action_str, &args).await?;
+
+            // Record for loop detection after execution.
+            let produced = result.success && !result.output.is_empty();
+            if let LoopCheckResult::LoopDetected {
+                repeat_count,
+                max_allowed,
+                ..
+            } = self
+                .security
+                .check_loop("browser", action_str, loop_target, produced)
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Infinite loop detected: action '{action_str}' repeated \
+                         {repeat_count} times without result (limit: {max_allowed}). \
+                         Try a different approach."
+                    )),
+                });
+            }
+
+            return Ok(result);
         }
 
         if is_computer_use_only_action(action_str) {
@@ -1049,7 +1106,30 @@ impl Tool for BrowserTool {
             }
         };
 
-        self.execute_action(action, backend).await
+        let result = self.execute_action(action, backend).await?;
+
+        // Record for loop detection after execution.
+        let produced = result.success && !result.output.is_empty();
+        if let LoopCheckResult::LoopDetected {
+            repeat_count,
+            max_allowed,
+            ..
+        } = self
+            .security
+            .check_loop("browser", action_str, loop_target, produced)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Infinite loop detected: action '{action_str}' repeated \
+                     {repeat_count} times without result (limit: {max_allowed}). \
+                     Try a different approach."
+                )),
+            });
+        }
+
+        Ok(result)
     }
 }
 

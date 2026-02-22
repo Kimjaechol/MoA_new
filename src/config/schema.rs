@@ -895,7 +895,21 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
+
+    /// Maximum actions per hour (total budget). Default: 600.
     pub max_actions_per_hour: u32,
+
+    /// Maximum actions per minute (burst limit). Exceeding this triggers
+    /// progressive cooldowns: Strike 1 → 30s, Strike 2 → 2min, Strike 3 → 10min.
+    /// Default: 20.
+    #[serde(default = "default_burst_per_minute")]
+    pub max_actions_per_minute: u32,
+
+    /// Maximum consecutive identical fruitless actions before the loop detector
+    /// blocks further execution. Default: 5.
+    #[serde(default = "default_max_loop_repeats")]
+    pub max_loop_repeats: u32,
+
     pub max_cost_per_day_cents: u32,
 
     /// Require explicit approval for medium-risk shell commands.
@@ -913,6 +927,14 @@ pub struct AutonomyConfig {
     /// Tools that always require interactive approval, even after "Always".
     #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
+}
+
+fn default_burst_per_minute() -> u32 {
+    20
+}
+
+fn default_max_loop_repeats() -> u32 {
+    5
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -962,7 +984,9 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
+            max_actions_per_hour: 600,
+            max_actions_per_minute: default_burst_per_minute(),
+            max_loop_repeats: default_max_loop_repeats(),
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
@@ -2669,7 +2693,9 @@ mod tests {
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
+        assert_eq!(a.max_actions_per_hour, 600);
+        assert_eq!(a.max_actions_per_minute, 20);
+        assert_eq!(a.max_loop_repeats, 5);
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
@@ -2766,7 +2792,9 @@ default_temperature = 0.7
                 workspace_only: false,
                 allowed_commands: vec!["docker".into()],
                 forbidden_paths: vec!["/secret".into()],
-                max_actions_per_hour: 50,
+                max_actions_per_hour: 1000,
+                max_actions_per_minute: 30,
+                max_loop_repeats: 10,
                 max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
