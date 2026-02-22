@@ -574,6 +574,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/api/navigation", get(handle_navigation))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -623,6 +624,11 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+/// GET /api/navigation — returns the navigation manifest for the web chat UI.
+async fn handle_navigation() -> impl IntoResponse {
+    Json(serde_json::to_value(crate::task_category::NavigationManifest::build()).unwrap())
 }
 
 /// Optional JSON body for pairing with credentials.
@@ -706,6 +712,9 @@ async fn handle_pair(
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// Optional task category — when set, the agent selects tools for this mode.
+    /// Values: "web_general", "document", "coding", "image", "music", "video", "translation".
+    pub task_category: Option<String>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -2240,6 +2249,7 @@ mod tests {
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
 
         let body = Ok(Json(WebhookBody {
+            task_category: None,
             message: "hello".into(),
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body)
@@ -2248,6 +2258,7 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
 
         let body = Ok(Json(WebhookBody {
+            task_category: None,
             message: "hello".into(),
         }));
         let second = handle_webhook(State(state), headers, body)
@@ -2300,6 +2311,7 @@ mod tests {
         let headers = HeaderMap::new();
 
         let body1 = Ok(Json(WebhookBody {
+            task_category: None,
             message: "hello one".into(),
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body1)
@@ -2308,6 +2320,7 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
 
         let body2 = Ok(Json(WebhookBody {
+            task_category: None,
             message: "hello two".into(),
         }));
         let second = handle_webhook(State(state), headers, body2)
@@ -2371,6 +2384,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Ok(Json(WebhookBody {
+                task_category: None,
                 message: "hello".into(),
             })),
         )
@@ -2421,6 +2435,7 @@ mod tests {
             State(state),
             headers,
             Ok(Json(WebhookBody {
+                task_category: None,
                 message: "hello".into(),
             })),
         )
@@ -2471,6 +2486,7 @@ mod tests {
             State(state),
             headers,
             Ok(Json(WebhookBody {
+                task_category: None,
                 message: "hello".into(),
             })),
         )

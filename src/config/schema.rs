@@ -220,6 +220,47 @@ pub struct AgentConfig {
     pub parallel_tools: bool,
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Sandbox loop settings for Coding mode.
+    #[serde(default)]
+    pub sandbox: SandboxSettings,
+}
+
+/// Sandbox loop tunables (used in Coding mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxSettings {
+    /// Maximum run→observe→fix iterations before handing back to user.
+    #[serde(default = "default_sandbox_max_iterations")]
+    pub max_iterations: usize,
+    /// Maximum wall-clock seconds for the entire sandbox session.
+    #[serde(default = "default_sandbox_max_duration_secs")]
+    pub max_duration_secs: u64,
+    /// How many times the same error class can recur before strategy switch.
+    #[serde(default = "default_sandbox_max_same_error_retries")]
+    pub max_same_error_retries: usize,
+    /// Whether to create git checkpoints for rollback.
+    #[serde(default = "default_true")]
+    pub enable_checkpoints: bool,
+}
+
+fn default_sandbox_max_iterations() -> usize {
+    25
+}
+fn default_sandbox_max_duration_secs() -> u64 {
+    600
+}
+fn default_sandbox_max_same_error_retries() -> usize {
+    3
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            max_iterations: default_sandbox_max_iterations(),
+            max_duration_secs: default_sandbox_max_duration_secs(),
+            max_same_error_retries: default_sandbox_max_same_error_retries(),
+            enable_checkpoints: true,
+        }
+    }
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -242,6 +283,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            sandbox: SandboxSettings::default(),
         }
     }
 }
