@@ -10,19 +10,23 @@ export const viewport: Viewport = {
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://moa-web.vercel.app"),
-  title: "MoA - Master of AI | \uB2F9\uC2E0\uC758 AI \uC5D0\uC774\uC804\uD2B8",
+  title: "MoA - Master of AI | \uD074\uB85C\uB4DC\uBD07\uC758 \uD55C\uACC4\uB97C \uB118\uC740 \uC790\uC728 AI \uC5D0\uC774\uC804\uD2B8",
   description:
-    "MoA\uB294 ZeroClaw \uB7F0\uD0C0\uC784 \uAE30\uBC18\uC758 \uC790\uC728 AI \uC5D0\uC774\uC804\uD2B8\uC785\uB2C8\uB2E4. \uB2E4\uC911 AI \uBAA8\uB378, \uC5D4\uB4DC\uD22C\uC5D4\uB4DC \uC554\uD638\uD654, \uBA40\uD2F0\uCC44\uB110 \uD1B5\uD569\uC744 \uC9C0\uC6D0\uD569\uB2C8\uB2E4. MoA is an autonomous AI agent powered by ZeroClaw runtime. Multi-model, encrypted, cross-platform.",
+    "MoA\uB294 ChaCha20 + AES-256 \uC774\uC911 \uC554\uD638\uD654, 23\uAC1C+ AI \uBAA8\uB378, 18\uAC1C+ \uCC44\uB110(\uCE74\uCE74\uC624\uD1A1 \uD3EC\uD568), 25\uAC1C+ \uB3C4\uAD6C\uB97C \uD0D1\uC7AC\uD55C \uCC28\uC138\uB300 AI \uC5D0\uC774\uC804\uD2B8\uC785\uB2C8\uB2E4. 3.4MB \uCD08\uACBD\uB7C9 \uBC14\uC774\uB108\uB9AC, \uC6D0\uD074\uB9AD \uC124\uCE58, \uC2E4\uC2DC\uAC04 \uB3D9\uAE30\uD654. MoA: next-gen AI agent with military-grade encryption, 23+ models, 18+ channels including KakaoTalk, and 25+ tools.",
   keywords: [
     "MoA",
     "Master of AI",
     "AI agent",
     "ZeroClaw",
-    "chatbot",
+    "\uCE74\uCE74\uC624\uD1A1 AI",
     "AI \uC5D0\uC774\uC804\uD2B8",
     "\uC790\uC728 AI",
     "\uBA40\uD2F0\uBAA8\uB378",
     "cross-platform",
+    "\uD074\uB85C\uB4DC\uBD07 \uB300\uC548",
+    "OpenClaw alternative",
+    "AI \uBCF4\uC548",
+    "ChaCha20 AES-256",
   ],
   authors: [{ name: "ZeroClaw Team" }],
   openGraph: {
@@ -31,9 +35,9 @@ export const metadata: Metadata = {
     alternateLocale: "en_US",
     url: "https://moa-agent.com",
     siteName: "MoA - Master of AI",
-    title: "MoA - Master of AI | \uB2F9\uC2E0\uC758 AI \uC5D0\uC774\uC804\uD2B8",
+    title: "MoA - Master of AI | \uD074\uB85C\uB4DC\uBD07\uC758 \uD55C\uACC4\uB97C \uB118\uC740 AI \uC5D0\uC774\uC804\uD2B8",
     description:
-      "ZeroClaw \uB7F0\uD0C0\uC784 \uAE30\uBC18\uC758 \uC790\uC728 AI \uC5D0\uC774\uC804\uD2B8. \uB2E4\uC911 AI \uBAA8\uB378, \uC5D4\uB4DC\uD22C\uC5D4\uB4DC \uC554\uD638\uD654, \uBA40\uD2F0\uCC44\uB110 \uD1B5\uD569.",
+      "ChaCha20 + AES-256 \uC774\uC911 \uC554\uD638\uD654, 23\uAC1C+ AI \uBAA8\uB378, 18\uAC1C+ \uCC44\uB110, 25\uAC1C+ \uB3C4\uAD6C. \uD074\uB85C\uB4DC\uBD07\uC758 \uD55C\uACC4\uB97C \uB118\uC740 \uCC28\uC138\uB300 AI \uC5D0\uC774\uC804\uD2B8.",
     images: [
       {
         url: "/og-image.png",
@@ -47,7 +51,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "MoA - Master of AI",
     description:
-      "ZeroClaw \uB7F0\uD0C0\uC784 \uAE30\uBC18\uC758 \uC790\uC728 AI \uC5D0\uC774\uC804\uD2B8",
+      "\uD074\uB85C\uB4DC\uBD07\uC758 \uD55C\uACC4\uB97C \uB118\uC740 \uCC28\uC138\uB300 AI \uC5D0\uC774\uC804\uD2B8. 23+ \uBAA8\uB378, 18+ \uCC44\uB110, \uCE74\uCE74\uC624\uD1A1 \uC5F0\uB3D9.",
     images: ["/og-image.png"],
   },
   robots: {
