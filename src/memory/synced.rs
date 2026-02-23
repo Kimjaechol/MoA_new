@@ -65,17 +65,15 @@ impl SyncedMemory {
                     tracing::debug!(key, "Applied remote store delta");
                     applied += 1;
                 }
-                DeltaOperation::Forget { key } => {
-                    match self.inner.forget(key).await {
-                        Ok(_) => {
-                            tracing::debug!(key, "Applied remote forget delta");
-                            applied += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!(key, "Failed to apply remote forget delta: {e}");
-                        }
+                DeltaOperation::Forget { key } => match self.inner.forget(key).await {
+                    Ok(_) => {
+                        tracing::debug!(key, "Applied remote forget delta");
+                        applied += 1;
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(key, "Failed to apply remote forget delta: {e}");
+                    }
+                },
             }
         }
 
@@ -212,7 +210,9 @@ impl Memory for SyncedMemory {
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
         // 1. Persist to the actual backend first.
-        self.inner.store(key, content, category.clone(), session_id).await?;
+        self.inner
+            .store(key, content, category.clone(), session_id)
+            .await?;
 
         // 2. Record the delta in the sync journal (best-effort).
         {
@@ -451,7 +451,12 @@ mod tests {
 
         // Device A stores a memory
         synced_a
-            .store("shared_fact", "42 is the answer", MemoryCategory::Core, None)
+            .store(
+                "shared_fact",
+                "42 is the answer",
+                MemoryCategory::Core,
+                None,
+            )
             .await
             .unwrap();
 

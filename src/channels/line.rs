@@ -41,9 +41,7 @@ impl LineChannel {
 
     /// Check if a LINE user ID is in the allowlist.
     pub fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users
-            .iter()
-            .any(|u| u == "*" || u == user_id)
+        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
     /// Verify the X-Line-Signature header using HMAC-SHA256.
@@ -52,7 +50,8 @@ impl LineChannel {
             return false;
         };
         mac.update(body);
-        let computed = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let computed =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
         computed == signature
     }
 
@@ -309,29 +308,16 @@ mod tests {
 
     #[test]
     fn line_user_denied_empty() {
-        let ch = LineChannel::new(
-            "tok".into(),
-            "sec".into(),
-            vec![],
-            None,
-            None,
-        );
+        let ch = LineChannel::new("tok".into(), "sec".into(), vec![], None, None);
         assert!(!ch.is_user_allowed("+U1234567890"));
     }
 
     #[test]
     fn line_verify_signature_valid() {
-        let ch = LineChannel::new(
-            "tok".into(),
-            "my_channel_secret".into(),
-            vec![],
-            None,
-            None,
-        );
+        let ch = LineChannel::new("tok".into(), "my_channel_secret".into(), vec![], None, None);
         let body = b"test body content";
         // Compute expected signature
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(b"my_channel_secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"my_channel_secret").unwrap();
         mac.update(body);
         let expected =
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
@@ -341,13 +327,7 @@ mod tests {
 
     #[test]
     fn line_verify_signature_invalid() {
-        let ch = LineChannel::new(
-            "tok".into(),
-            "my_channel_secret".into(),
-            vec![],
-            None,
-            None,
-        );
+        let ch = LineChannel::new("tok".into(), "my_channel_secret".into(), vec![], None, None);
         assert!(!ch.verify_signature(b"body", "invalid_signature"));
     }
 
@@ -376,7 +356,7 @@ mod tests {
                     "userId": "U1234"
                 },
                 "replyToken": "abc123",
-                "timestamp": 1700000000000_u64
+                "timestamp": 1_700_000_000_000_u64
             }]
         });
         let (msgs, unpaired) = ch.parse_webhook_payload(&payload);
@@ -385,7 +365,7 @@ mod tests {
         assert_eq!(msgs[0].content, "Hello ZeroClaw");
         assert_eq!(msgs[0].id, "msg001");
         assert_eq!(msgs[0].channel, "line");
-        assert_eq!(msgs[0].timestamp, 1700000000);
+        assert_eq!(msgs[0].timestamp, 1_700_000_000);
         assert!(unpaired.is_empty());
     }
 
@@ -405,7 +385,7 @@ mod tests {
                     "userId": "U_unauthorized"
                 },
                 "replyToken": "abc123",
-                "timestamp": 1700000000000_u64
+                "timestamp": 1_700_000_000_000_u64
             }]
         });
         let (msgs, unpaired) = ch.parse_webhook_payload(&payload);
@@ -429,7 +409,7 @@ mod tests {
                     "userId": "U1234"
                 },
                 "replyToken": "abc123",
-                "timestamp": 1700000000000_u64
+                "timestamp": 1_700_000_000_000_u64
             }]
         });
         let (msgs, _) = ch.parse_webhook_payload(&payload);
@@ -447,7 +427,7 @@ mod tests {
                     "userId": "U1234"
                 },
                 "replyToken": "abc123",
-                "timestamp": 1700000000000_u64
+                "timestamp": 1_700_000_000_000_u64
             }]
         });
         let (msgs, _) = ch.parse_webhook_payload(&payload);
@@ -470,7 +450,7 @@ mod tests {
                     "userId": "U1234"
                 },
                 "replyToken": "abc123",
-                "timestamp": 1700000000000_u64
+                "timestamp": 1_700_000_000_000_u64
             }]
         });
         let (msgs, _) = ch.parse_webhook_payload(&payload);
@@ -492,7 +472,7 @@ mod tests {
                     "type": "group"
                 },
                 "replyToken": "abc123",
-                "timestamp": 1700000000000_u64
+                "timestamp": 1_700_000_000_000_u64
             }]
         });
         let (msgs, _) = ch.parse_webhook_payload(&payload);
@@ -509,14 +489,14 @@ mod tests {
                     "message": { "type": "text", "id": "m1", "text": "First" },
                     "source": { "type": "user", "userId": "U1" },
                     "replyToken": "t1",
-                    "timestamp": 1700000000000_u64
+                    "timestamp": 1_700_000_000_000_u64
                 },
                 {
                     "type": "message",
                     "message": { "type": "text", "id": "m2", "text": "Second" },
                     "source": { "type": "user", "userId": "U2" },
                     "replyToken": "t2",
-                    "timestamp": 1700000001000_u64
+                    "timestamp": 1_700_000_001_000_u64
                 }
             ]
         });
@@ -542,7 +522,7 @@ mod tests {
                 "type": "message",
                 "source": { "type": "user", "userId": "U1" },
                 "replyToken": "t1",
-                "timestamp": 1700000000000_u64
+                "timestamp": 1_700_000_000_000_u64
             }]
         });
         let (msgs, _) = ch.parse_webhook_payload(&payload);

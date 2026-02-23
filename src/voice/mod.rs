@@ -10,10 +10,17 @@
 //! - Formality levels (formal / neutral / casual)
 //! - Domain specialization (general / business / medical / legal / technical)
 //! - Per-session billing integration (token-equivalent credit deduction)
+//! - Gemini Live WebSocket client with automatic VAD for hands-free interpretation
 
+pub mod gemini_live;
 pub mod pipeline;
 
+#[allow(unused_imports)]
+pub use gemini_live::{
+    ConnectionState, GeminiLiveEvent, GeminiLiveSession, VadConfig, VadSensitivity,
+};
+#[allow(unused_imports)]
 pub use pipeline::{
     Domain, Formality, InterpreterConfig, InterpreterSession, InterpreterStats, InterpreterStatus,
-    LanguageCode, VoiceProvider, VoiceProviderKind,
+    LanguageCode, VoiceProvider, VoiceProviderKind, VoiceSessionManager,
 };

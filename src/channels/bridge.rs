@@ -55,57 +55,129 @@ pub fn channel_capabilities(channel: &str) -> ChannelCapabilities {
     match channel {
         "telegram" => ChannelCapabilities {
             channel: "telegram".into(),
-            dm: true, group: true, threading: true, reactions: true,
-            polls: true, edit: true, unsend: true, media: true,
-            native_commands: true, block_streaming: true, text_chunk_limit: 4096,
+            dm: true,
+            group: true,
+            threading: true,
+            reactions: true,
+            polls: true,
+            edit: true,
+            unsend: true,
+            media: true,
+            native_commands: true,
+            block_streaming: true,
+            text_chunk_limit: 4096,
         },
         "discord" => ChannelCapabilities {
             channel: "discord".into(),
-            dm: true, group: true, threading: true, reactions: true,
-            polls: true, edit: true, unsend: true, media: true,
-            native_commands: true, block_streaming: true, text_chunk_limit: 2000,
+            dm: true,
+            group: true,
+            threading: true,
+            reactions: true,
+            polls: true,
+            edit: true,
+            unsend: true,
+            media: true,
+            native_commands: true,
+            block_streaming: true,
+            text_chunk_limit: 2000,
         },
         "slack" => ChannelCapabilities {
             channel: "slack".into(),
-            dm: true, group: true, threading: true, reactions: true,
-            polls: false, edit: true, unsend: true, media: true,
-            native_commands: false, block_streaming: true, text_chunk_limit: 4000,
+            dm: true,
+            group: true,
+            threading: true,
+            reactions: true,
+            polls: false,
+            edit: true,
+            unsend: true,
+            media: true,
+            native_commands: false,
+            block_streaming: true,
+            text_chunk_limit: 4000,
         },
         "whatsapp" => ChannelCapabilities {
             channel: "whatsapp".into(),
-            dm: true, group: true, threading: false, reactions: true,
-            polls: true, edit: false, unsend: true, media: true,
-            native_commands: false, block_streaming: true, text_chunk_limit: 65536,
+            dm: true,
+            group: true,
+            threading: false,
+            reactions: true,
+            polls: true,
+            edit: false,
+            unsend: true,
+            media: true,
+            native_commands: false,
+            block_streaming: true,
+            text_chunk_limit: 65536,
         },
         "signal" => ChannelCapabilities {
             channel: "signal".into(),
-            dm: true, group: true, threading: false, reactions: false,
-            polls: false, edit: true, unsend: true, media: true,
-            native_commands: false, block_streaming: true, text_chunk_limit: 65536,
+            dm: true,
+            group: true,
+            threading: false,
+            reactions: false,
+            polls: false,
+            edit: true,
+            unsend: true,
+            media: true,
+            native_commands: false,
+            block_streaming: true,
+            text_chunk_limit: 65536,
         },
         "line" => ChannelCapabilities {
             channel: "line".into(),
-            dm: true, group: true, threading: false, reactions: false,
-            polls: false, edit: false, unsend: false, media: true,
-            native_commands: false, block_streaming: true, text_chunk_limit: 5000,
+            dm: true,
+            group: true,
+            threading: false,
+            reactions: false,
+            polls: false,
+            edit: false,
+            unsend: false,
+            media: true,
+            native_commands: false,
+            block_streaming: true,
+            text_chunk_limit: 5000,
         },
         "kakao" => ChannelCapabilities {
             channel: "kakao".into(),
-            dm: true, group: false, threading: false, reactions: false,
-            polls: false, edit: false, unsend: false, media: true,
-            native_commands: false, block_streaming: false, text_chunk_limit: 1000,
+            dm: true,
+            group: false,
+            threading: false,
+            reactions: false,
+            polls: false,
+            edit: false,
+            unsend: false,
+            media: true,
+            native_commands: false,
+            block_streaming: false,
+            text_chunk_limit: 1000,
         },
         "matrix" => ChannelCapabilities {
             channel: "matrix".into(),
-            dm: true, group: true, threading: false, reactions: false,
-            polls: false, edit: false, unsend: false, media: true,
-            native_commands: false, block_streaming: true, text_chunk_limit: 65536,
+            dm: true,
+            group: true,
+            threading: false,
+            reactions: false,
+            polls: false,
+            edit: false,
+            unsend: false,
+            media: true,
+            native_commands: false,
+            block_streaming: true,
+            text_chunk_limit: 65536,
         },
         _ => ChannelCapabilities {
             channel: channel.into(),
-            dm: true, group: false, threading: false, reactions: false,
-            polls: false, edit: false, unsend: false, media: false,
-            native_commands: false, block_streaming: false, text_chunk_limit: 4096,
+            dm: true,
+            group: false,
+            threading: false,
+            reactions: false,
+            polls: false,
+            edit: false,
+            unsend: false,
+            media: false,
+            native_commands: false,
+            block_streaming: false,
+            text_chunk_limit: 4096,
         },
     }
 }
@@ -230,10 +302,7 @@ impl ChannelBridge {
     ///
     /// Returns a list of (target_channel_name, SendMessage) pairs
     /// that should be dispatched to the corresponding channels.
-    pub async fn prepare_relays(
-        &self,
-        message: &ChannelMessage,
-    ) -> Vec<(String, SendMessage)> {
+    pub async fn prepare_relays(&self, message: &ChannelMessage) -> Vec<(String, SendMessage)> {
         if !self.enabled {
             return Vec::new();
         }
@@ -257,12 +326,8 @@ impl ChannelBridge {
 
             // Format for target channel
             let target_caps = channel_capabilities(&rule.target_channel);
-            let formatted = format_for_channel(
-                &content,
-                &message.sender,
-                &message.channel,
-                &target_caps,
-            );
+            let formatted =
+                format_for_channel(&content, &message.sender, &message.channel, &target_caps);
 
             result.push((
                 rule.target_channel.clone(),
@@ -319,7 +384,10 @@ fn format_for_channel(
     if content.chars().count() <= max_content {
         format!("{header}{content}")
     } else {
-        let truncated: String = content.chars().take(max_content.saturating_sub(3)).collect();
+        let truncated: String = content
+            .chars()
+            .take(max_content.saturating_sub(3))
+            .collect();
         format!("{header}{truncated}...")
     }
 }
@@ -457,9 +525,16 @@ mod tests {
     fn format_for_channel_truncates_long_message() {
         let caps = ChannelCapabilities {
             channel: "test".into(),
-            dm: true, group: false, threading: false, reactions: false,
-            polls: false, edit: false, unsend: false, media: false,
-            native_commands: false, block_streaming: false,
+            dm: true,
+            group: false,
+            threading: false,
+            reactions: false,
+            polls: false,
+            edit: false,
+            unsend: false,
+            media: false,
+            native_commands: false,
+            block_streaming: false,
             text_chunk_limit: 50,
         };
 

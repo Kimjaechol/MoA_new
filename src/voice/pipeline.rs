@@ -15,9 +15,9 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguageCode {
     // East Asia
-    Ko, // Korean
-    Ja, // Japanese
-    Zh, // Chinese (Simplified)
+    Ko,   // Korean
+    Ja,   // Japanese
+    Zh,   // Chinese (Simplified)
     ZhTw, // Chinese (Traditional)
 
     // Southeast Asia
@@ -54,7 +54,7 @@ pub enum LanguageCode {
 
 impl LanguageCode {
     /// Get the ISO 639-1 code string.
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Ko => "ko",
             Self::Ja => "ja",
@@ -85,7 +85,7 @@ impl LanguageCode {
     }
 
     /// Get the human-readable language name.
-    pub fn display_name(&self) -> &'static str {
+    pub fn display_name(self) -> &'static str {
         match self {
             Self::Ko => "Korean",
             Self::Ja => "Japanese",
@@ -291,7 +291,7 @@ pub enum VoiceProviderKind {
 
 impl VoiceProviderKind {
     /// Get the model identifier string for API calls.
-    pub fn model_id(&self) -> &'static str {
+    pub fn model_id(self) -> &'static str {
         match self {
             Self::GeminiLive => "gemini-2.5-flash-preview-native-audio-dialog",
             Self::OpenAiRealtime => "gpt-4o-realtime-preview",
@@ -305,8 +305,7 @@ impl VoiceProviderKind {
 #[async_trait]
 pub trait VoiceProvider: Send + Sync {
     /// Connect to the voice API for a given user session.
-    async fn connect(&self, session_id: &str, config: &InterpreterConfig)
-        -> anyhow::Result<()>;
+    async fn connect(&self, session_id: &str, config: &InterpreterConfig) -> anyhow::Result<()>;
 
     /// Send an audio chunk (PCM/opus bytes) to the provider.
     async fn send_audio(&self, session_id: &str, chunk: &[u8]) -> anyhow::Result<()>;
@@ -363,9 +362,13 @@ impl InterpreterConfig {
     /// Build a system prompt for the interpretation session.
     pub fn build_system_prompt(&self) -> String {
         let formality_instruction = match self.formality {
-            Formality::Formal => "Use formal, polite language appropriate for professional or official settings.",
+            Formality::Formal => {
+                "Use formal, polite language appropriate for professional or official settings."
+            }
             Formality::Neutral => "Use standard, everyday language.",
-            Formality::Casual => "Use casual, friendly language appropriate for informal conversations.",
+            Formality::Casual => {
+                "Use casual, friendly language appropriate for informal conversations."
+            }
         };
 
         let domain_instruction = match self.domain {
@@ -384,14 +387,23 @@ impl InterpreterConfig {
 
         let direction = if self.bidirectional {
             format!(
-                "Interpret bidirectionally between {} and {}. Automatically detect which language the speaker is using and interpret to the other.",
+                "You operate in bidirectional mode between {} and {}. \
+                 When the speaker speaks {}, immediately interpret into {}. \
+                 When the speaker speaks {}, immediately interpret into {}. \
+                 Detect the language automatically from each utterance and always \
+                 output in the opposite language. Never repeat the input language.",
                 self.source_language.display_name(),
                 self.target_language.display_name(),
+                self.source_language.display_name(),
+                self.target_language.display_name(),
+                self.target_language.display_name(),
+                self.source_language.display_name(),
             )
         } else {
             format!(
-                "Interpret from {} to {}.",
+                "Interpret from {} to {} only. All output must be in {}.",
                 self.source_language.display_name(),
+                self.target_language.display_name(),
                 self.target_language.display_name(),
             )
         };
@@ -446,7 +458,12 @@ pub struct InterpreterStats {
 
 impl InterpreterStats {
     /// Record a completed utterance interpretation.
-    pub fn record_utterance(&mut self, latency_ms: u64, source_word_count: u64, target_word_count: u64) {
+    pub fn record_utterance(
+        &mut self,
+        latency_ms: u64,
+        source_word_count: u64,
+        target_word_count: u64,
+    ) {
         self.utterance_count += 1;
         self.source_words += source_word_count;
         self.target_words += target_word_count;
@@ -511,6 +528,10 @@ pub struct VoiceSessionManager {
     max_sessions_per_user: usize,
     /// Whether voice features are enabled.
     enabled: bool,
+    /// Default source language code (from config).
+    default_source_language: String,
+    /// Default target language code (from config).
+    default_target_language: String,
 }
 
 impl VoiceSessionManager {
@@ -520,7 +541,35 @@ impl VoiceSessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             max_sessions_per_user,
             enabled,
+            default_source_language: "ko".to_string(),
+            default_target_language: "en".to_string(),
         }
+    }
+
+    /// Create a new session manager with explicit default languages.
+    pub fn with_defaults(
+        enabled: bool,
+        max_sessions_per_user: usize,
+        default_source_language: String,
+        default_target_language: String,
+    ) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            max_sessions_per_user,
+            enabled,
+            default_source_language,
+            default_target_language,
+        }
+    }
+
+    /// Get the default source language code.
+    pub fn default_source_language(&self) -> &str {
+        &self.default_source_language
+    }
+
+    /// Get the default target language code.
+    pub fn default_target_language(&self) -> &str {
+        &self.default_target_language
     }
 
     /// Create a new interpretation session.
@@ -679,11 +728,7 @@ impl GeminiLiveProvider {
 
 #[async_trait]
 impl VoiceProvider for GeminiLiveProvider {
-    async fn connect(
-        &self,
-        session_id: &str,
-        config: &InterpreterConfig,
-    ) -> anyhow::Result<()> {
+    async fn connect(&self, session_id: &str, config: &InterpreterConfig) -> anyhow::Result<()> {
         if self.api_key.is_none() {
             anyhow::bail!("Gemini API key is required for voice sessions");
         }
@@ -756,11 +801,7 @@ impl OpenAiRealtimeProvider {
 
 #[async_trait]
 impl VoiceProvider for OpenAiRealtimeProvider {
-    async fn connect(
-        &self,
-        session_id: &str,
-        config: &InterpreterConfig,
-    ) -> anyhow::Result<()> {
+    async fn connect(&self, session_id: &str, config: &InterpreterConfig) -> anyhow::Result<()> {
         if self.api_key.is_none() {
             anyhow::bail!("OpenAI API key is required for voice sessions");
         }
@@ -869,8 +910,14 @@ mod tests {
     fn language_code_case_insensitive_parse() {
         assert_eq!(LanguageCode::from_str_code("KO"), Some(LanguageCode::Ko));
         assert_eq!(LanguageCode::from_str_code("En"), Some(LanguageCode::En));
-        assert_eq!(LanguageCode::from_str_code("ZH-TW"), Some(LanguageCode::ZhTw));
-        assert_eq!(LanguageCode::from_str_code("zh_tw"), Some(LanguageCode::ZhTw));
+        assert_eq!(
+            LanguageCode::from_str_code("ZH-TW"),
+            Some(LanguageCode::ZhTw)
+        );
+        assert_eq!(
+            LanguageCode::from_str_code("zh_tw"),
+            Some(LanguageCode::ZhTw)
+        );
     }
 
     #[test]
@@ -929,7 +976,10 @@ mod tests {
     #[test]
     fn detect_ascii_returns_default() {
         // Pure ASCII text can't be distinguished between Latin-script languages
-        assert_eq!(detect_language("hello world", LanguageCode::En), LanguageCode::En);
+        assert_eq!(
+            detect_language("hello world", LanguageCode::En),
+            LanguageCode::En
+        );
     }
 
     #[test]
@@ -970,18 +1020,23 @@ mod tests {
         assert!(prompt.contains("formal"));
         assert!(prompt.contains("business"));
         assert!(prompt.contains("tone"));
-        assert!(!prompt.contains("bidirectionally"));
+        assert!(!prompt.contains("bidirectional mode"));
     }
 
     #[test]
     fn interpreter_config_system_prompt_bidirectional() {
         let config = InterpreterConfig {
+            source_language: LanguageCode::Ja,
+            target_language: LanguageCode::Ko,
             bidirectional: true,
             ..Default::default()
         };
 
         let prompt = config.build_system_prompt();
-        assert!(prompt.contains("bidirectionally"));
+        assert!(prompt.contains("bidirectional mode"));
+        // Should mention both directions explicitly
+        assert!(prompt.contains("speaks Japanese, immediately interpret into Korean"));
+        assert!(prompt.contains("speaks Korean, immediately interpret into Japanese"));
     }
 
     #[test]

@@ -177,7 +177,7 @@ impl ChannelPairingStore {
                     token: row.get(0)?,
                     channel: row.get(1)?,
                     platform_uid: row.get(2)?,
-                    expires_at: row.get::<_, i64>(3)? as u64,
+                    expires_at: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
                 })
             },
         )
@@ -241,7 +241,8 @@ impl ChannelPairingStore {
             rusqlite::params![now],
             |row| row.get::<_, i64>(0),
         )
-        .unwrap_or(0) as usize
+        .map(|c| usize::try_from(c).unwrap_or(0))
+        .unwrap_or(0)
     }
 }
 
@@ -285,11 +286,11 @@ pub fn persist_channel_allowlist(channel_name: &str, identity: &str) -> anyhow::
     let added = match channel_name {
         "kakao" => {
             if let Some(ref mut kakao) = config.channels_config.kakao {
-                if !kakao.allowed_users.iter().any(|u| u == &identity) {
+                if kakao.allowed_users.contains(&identity) {
+                    false
+                } else {
                     kakao.allowed_users.push(identity.clone());
                     true
-                } else {
-                    false
                 }
             } else {
                 false
@@ -297,11 +298,11 @@ pub fn persist_channel_allowlist(channel_name: &str, identity: &str) -> anyhow::
         }
         "telegram" => {
             if let Some(ref mut tg) = config.channels_config.telegram {
-                if !tg.allowed_users.iter().any(|u| u == &identity) {
+                if tg.allowed_users.contains(&identity) {
+                    false
+                } else {
                     tg.allowed_users.push(identity.clone());
                     true
-                } else {
-                    false
                 }
             } else {
                 false
@@ -309,11 +310,11 @@ pub fn persist_channel_allowlist(channel_name: &str, identity: &str) -> anyhow::
         }
         "discord" => {
             if let Some(ref mut dc) = config.channels_config.discord {
-                if !dc.allowed_users.iter().any(|u| u == &identity) {
+                if dc.allowed_users.contains(&identity) {
+                    false
+                } else {
                     dc.allowed_users.push(identity.clone());
                     true
-                } else {
-                    false
                 }
             } else {
                 false
@@ -321,11 +322,11 @@ pub fn persist_channel_allowlist(channel_name: &str, identity: &str) -> anyhow::
         }
         "slack" => {
             if let Some(ref mut sl) = config.channels_config.slack {
-                if !sl.allowed_users.iter().any(|u| u == &identity) {
+                if sl.allowed_users.contains(&identity) {
+                    false
+                } else {
                     sl.allowed_users.push(identity.clone());
                     true
-                } else {
-                    false
                 }
             } else {
                 false
@@ -333,11 +334,11 @@ pub fn persist_channel_allowlist(channel_name: &str, identity: &str) -> anyhow::
         }
         "whatsapp" => {
             if let Some(ref mut wa) = config.channels_config.whatsapp {
-                if !wa.allowed_numbers.iter().any(|n| n == &identity) {
+                if wa.allowed_numbers.contains(&identity) {
+                    false
+                } else {
                     wa.allowed_numbers.push(identity.clone());
                     true
-                } else {
-                    false
                 }
             } else {
                 false
@@ -345,11 +346,11 @@ pub fn persist_channel_allowlist(channel_name: &str, identity: &str) -> anyhow::
         }
         "imessage" => {
             if let Some(ref mut im) = config.channels_config.imessage {
-                if !im.allowed_contacts.iter().any(|c| c == &identity) {
+                if im.allowed_contacts.contains(&identity) {
+                    false
+                } else {
                     im.allowed_contacts.push(identity.clone());
                     true
-                } else {
-                    false
                 }
             } else {
                 false
@@ -445,8 +446,7 @@ mod tests {
 
     #[test]
     fn auto_pair_url_format() {
-        let url =
-            ChannelPairingStore::auto_pair_url("http://localhost:3000", "abc-123-def");
+        let url = ChannelPairingStore::auto_pair_url("http://localhost:3000", "abc-123-def");
         assert_eq!(url, "http://localhost:3000/pair/auto/abc-123-def");
     }
 }

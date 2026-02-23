@@ -174,14 +174,33 @@ impl OfflineQueue {
 
 /// Greeting patterns (Korean + English).
 const GREETING_PATTERNS: &[&str] = &[
-    "안녕", "하이", "헬로", "ㅎㅇ", "반가", "좋은 아침", "좋은 저녁",
-    "hello", "hi", "hey", "good morning", "good evening", "howdy",
+    "안녕",
+    "하이",
+    "헬로",
+    "ㅎㅇ",
+    "반가",
+    "좋은 아침",
+    "좋은 저녁",
+    "hello",
+    "hi",
+    "hey",
+    "good morning",
+    "good evening",
+    "howdy",
 ];
 
 /// Simple query patterns that SLM can handle locally.
 const SIMPLE_PATTERNS: &[&str] = &[
-    "몇 시", "날짜", "오늘", "내일", "뭐야", "누구",
-    "what time", "what day", "today", "tomorrow",
+    "몇 시",
+    "날짜",
+    "오늘",
+    "내일",
+    "뭐야",
+    "누구",
+    "what time",
+    "what day",
+    "today",
+    "tomorrow",
 ];
 
 /// Tool-invoking patterns.
@@ -206,10 +225,26 @@ const TOOL_PATTERNS: &[(&str, &str)] = &[
 
 /// Complex patterns that require cloud LLM.
 const COMPLEX_PATTERNS: &[&str] = &[
-    "분석", "코드", "코딩", "프로그래밍", "작성", "요약",
-    "설명해", "비교", "추천", "전략",
-    "analyze", "code", "coding", "programming", "write", "summarize",
-    "explain", "compare", "recommend", "strategy",
+    "분석",
+    "코드",
+    "코딩",
+    "프로그래밍",
+    "작성",
+    "요약",
+    "설명해",
+    "비교",
+    "추천",
+    "전략",
+    "analyze",
+    "code",
+    "coding",
+    "programming",
+    "write",
+    "summarize",
+    "explain",
+    "compare",
+    "recommend",
+    "strategy",
 ];
 
 /// Specialized patterns requiring specific tools.
@@ -230,9 +265,18 @@ const SPECIALIZED_PATTERNS: &[(&str, &str)] = &[
 
 /// Privacy-sensitive patterns.
 const PRIVACY_PATTERNS: &[&str] = &[
-    "주민등록", "비밀번호", "계좌", "카드번호", "여권",
-    "ssn", "password", "account number", "card number", "passport",
-    "개인정보", "personal info",
+    "주민등록",
+    "비밀번호",
+    "계좌",
+    "카드번호",
+    "여권",
+    "ssn",
+    "password",
+    "account number",
+    "card number",
+    "passport",
+    "개인정보",
+    "personal info",
 ];
 
 // ── Gatekeeper router ────────────────────────────────────────────
@@ -517,7 +561,8 @@ impl GatekeeperRouter {
                 tool_needed: None,
                 target: RoutingTarget::Cloud,
                 confidence: 0.5,
-                reason: "Privacy-sensitive content detected — requires careful cloud handling".into(),
+                reason: "Privacy-sensitive content detected — requires careful cloud handling"
+                    .into(),
             };
         }
 
@@ -574,15 +619,14 @@ impl GatekeeperRouter {
     }
 
     /// Generate a cloud delegation payload when SLM determines cloud is needed.
-    pub fn prepare_delegation(
-        &self,
-        message: &str,
-        context: Option<&str>,
-    ) -> CloudDelegation {
+    pub fn prepare_delegation(&self, message: &str, context: Option<&str>) -> CloudDelegation {
         let context_summary = context
             .map(|c| {
                 if c.len() > 500 {
-                    format!("{}...", &c[..c.char_indices().nth(500).map_or(c.len(), |(i, _)| i)])
+                    format!(
+                        "{}...",
+                        &c[..c.char_indices().nth(500).map_or(c.len(), |(i, _)| i)]
+                    )
                 } else {
                     c.to_string()
                 }
@@ -764,10 +808,7 @@ mod tests {
 
     #[test]
     fn router_custom_config() {
-        let router = GatekeeperRouter::new(
-            Some("http://10.0.0.1:11434/v1"),
-            Some("llama3:latest"),
-        );
+        let router = GatekeeperRouter::new(Some("http://10.0.0.1:11434/v1"), Some("llama3:latest"));
         assert_eq!(router.model(), "llama3:latest");
         assert_eq!(router.ollama_url(), "http://10.0.0.1:11434/v1");
     }

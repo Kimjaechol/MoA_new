@@ -352,7 +352,7 @@ impl AuthStore {
     pub fn user_count(&self) -> Result<u64> {
         let conn = self.conn.lock();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
-        Ok(count as u64)
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     // ── Channel Linking ─────────────────────────────────────────────
@@ -374,12 +374,7 @@ impl AuthStore {
     }
 
     /// Link a messaging channel identity to an authenticated MoA user.
-    pub fn link_channel(
-        &self,
-        channel: &str,
-        platform_uid: &str,
-        user_id: &str,
-    ) -> Result<()> {
+    pub fn link_channel(&self, channel: &str, platform_uid: &str, user_id: &str) -> Result<()> {
         let conn = self.conn.lock();
         let now = epoch_secs();
         conn.execute(
@@ -387,7 +382,11 @@ impl AuthStore {
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![channel, platform_uid, user_id, now as i64],
         )?;
-        tracing::info!(channel = channel, platform_uid = platform_uid, "Channel identity linked");
+        tracing::info!(
+            channel = channel,
+            platform_uid = platform_uid,
+            "Channel identity linked"
+        );
         Ok(())
     }
 
@@ -499,7 +498,9 @@ mod tests {
         let user_id = store.register("test_user", "securepassword123").unwrap();
         assert!(!user_id.is_empty());
 
-        let user = store.authenticate("test_user", "securepassword123").unwrap();
+        let user = store
+            .authenticate("test_user", "securepassword123")
+            .unwrap();
         assert_eq!(user.id, user_id);
         assert_eq!(user.username, "test_user");
     }

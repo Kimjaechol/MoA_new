@@ -423,7 +423,7 @@ impl TelegramChannel {
                         super::pairing::ChannelPairingStore::auto_pair_url(gw_url, &token);
                     let _ = self
                         .send(&SendMessage::new(
-                            &format!(
+                            format!(
                                 "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
                             ),
                             &chat_id,
@@ -1361,7 +1361,12 @@ mod tests {
 
     #[test]
     fn telegram_user_denied_when_none_of_identities_match() {
-        let ch = TelegramChannel::new("t".into(), vec!["alice".into(), "987654321".into()], None, None);
+        let ch = TelegramChannel::new(
+            "t".into(),
+            vec!["alice".into(), "987654321".into()],
+            None,
+            None,
+        );
         assert!(!ch.is_any_user_allowed(["unknown", "123456789"]));
     }
 

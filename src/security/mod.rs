@@ -25,7 +25,7 @@ pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 pub use detect::create_sandbox;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
-pub use policy::{AutonomyLevel, SecurityPolicy};
+pub use policy::{AutonomyLevel, LoopCheckResult, RateLimitResult, SecurityPolicy, StrikeLevel};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
 #[allow(unused_imports)]

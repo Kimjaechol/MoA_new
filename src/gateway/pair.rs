@@ -157,6 +157,7 @@ pub async fn handle_auto_pair_login(
 
 /// GET /pair/signup?token={token}
 /// Renders the signup page.
+#[allow(clippy::implicit_hasher)]
 pub async fn handle_pair_signup_page(
     State(state): State<AppState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -168,8 +169,9 @@ pub async fn handle_pair_signup_page(
         if let Some(ref store) = state.channel_pairing {
             if store.lookup_token(token).is_none() {
                 return Html(render_error(
-                    "이 링크는 만료되었습니다.\n\nThis link has expired."
-                )).into_response();
+                    "이 링크는 만료되었습니다.\n\nThis link has expired.",
+                ))
+                .into_response();
             }
         }
     }

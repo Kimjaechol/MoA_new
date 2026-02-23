@@ -129,7 +129,10 @@ mod tests {
     #[test]
     fn mobile_storage_path() {
         let rt = MobileRuntime::new(PathBuf::from("/data/com.moa.agent/files"));
-        assert_eq!(rt.storage_path(), PathBuf::from("/data/com.moa.agent/files"));
+        assert_eq!(
+            rt.storage_path(),
+            PathBuf::from("/data/com.moa.agent/files")
+        );
     }
 
     #[test]

@@ -29,6 +29,7 @@
     clippy::unnecessary_literal_bound,
     clippy::unnecessary_map_or,
     clippy::unnecessary_wraps,
+    clippy::large_stack_arrays,
     dead_code
 )]
 
@@ -62,15 +63,18 @@ mod onboard;
 mod peripherals;
 mod providers;
 mod runtime;
+mod sandbox;
 mod security;
 mod service;
 mod skillforge;
 mod skills;
 mod sync;
+mod task_category;
 mod telemetry;
 mod tools;
 mod tunnel;
 mod util;
+mod voice;
 
 use config::Config;
 
@@ -507,8 +511,16 @@ async fn main() -> Result<()> {
                 config.autonomy.allowed_commands.join(", ")
             );
             println!(
-                "  Max actions/hour:  {}",
+                "  Max actions/min:   {} (burst limit)",
+                config.autonomy.max_actions_per_minute
+            );
+            println!(
+                "  Max actions/hour:  {} (total budget)",
                 config.autonomy.max_actions_per_hour
+            );
+            println!(
+                "  Loop detect after: {} identical repeats",
+                config.autonomy.max_loop_repeats
             );
             println!(
                 "  Max cost/day:      ${:.2}",

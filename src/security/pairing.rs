@@ -510,9 +510,7 @@ mod tests {
         let guard = guard_no_creds(true, &[]);
         let code = guard.pairing_code().unwrap();
         // Even if client sends credentials, they are ignored
-        let token = guard
-            .try_pair(&with_creds(&code, "any", "thing"))
-            .unwrap();
+        let token = guard.try_pair(&with_creds(&code, "any", "thing")).unwrap();
         assert!(token.is_some());
     }
 
@@ -684,6 +682,9 @@ mod tests {
             let _ = guard.try_pair(&with_creds(&code, "hacker", "wrong"));
         }
         let result = guard.try_pair(&with_creds(&code, "admin", "secret"));
-        assert!(result.is_err(), "Should be locked out after bad cred attempts");
+        assert!(
+            result.is_err(),
+            "Should be locked out after bad cred attempts"
+        );
     }
 }

@@ -12,7 +12,6 @@ pub mod pair;
 use crate::agent::agent::Agent;
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
-use serde::Deserialize as GatewayDeserialize;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
@@ -27,6 +26,7 @@ use axum::{
     Router,
 };
 use parking_lot::Mutex;
+use serde::Deserialize as GatewayDeserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -219,6 +219,8 @@ pub struct AppState {
     pub channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>>,
     /// Base URL for this gateway (e.g. "http://127.0.0.1:3000").
     pub gateway_base_url: String,
+    /// Voice session manager for real-time interpretation.
+    pub voice_sessions: Arc<crate::voice::VoiceSessionManager>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -272,7 +274,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>> =
         match crate::channels::pairing::ChannelPairingStore::open(&pairing_db_path) {
             Ok(store) => {
-                tracing::info!("Channel pairing store initialized at {}", pairing_db_path.display());
+                tracing::info!(
+                    "Channel pairing store initialized at {}",
+                    pairing_db_path.display()
+                );
                 Some(Arc::new(store))
             }
             Err(e) => {
@@ -289,7 +294,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 line.channel_secret.clone(),
                 line.allowed_users.clone(),
                 channel_pairing.clone(),
-                Some(format!("http://{}:{}", config.gateway.host, config.gateway.port)),
+                Some(format!(
+                    "http://{}:{}",
+                    config.gateway.host, config.gateway.port
+                )),
             ))
         });
 
@@ -302,7 +310,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 wa.verify_token.clone(),
                 wa.allowed_numbers.clone(),
                 channel_pairing.clone(),
-                Some(format!("http://{}:{}", config.gateway.host, config.gateway.port)),
+                Some(format!(
+                    "http://{}:{}",
+                    config.gateway.host, config.gateway.port
+                )),
             ))
         });
 
@@ -493,7 +504,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("     │  {code}  │");
         println!("     └──────────────┘");
         if pairing.requires_credentials() {
-            println!("     Send: POST /pair with X-Pairing-Code header + {{username, password}} body");
+            println!(
+                "     Send: POST /pair with X-Pairing-Code header + {{username, password}} body"
+            );
         } else {
             println!("     Send: POST /pair with header X-Pairing-Code: {code}");
         }
@@ -544,6 +557,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         sync_broadcast,
         channel_pairing,
         gateway_base_url: format!("http://{}:{}", config.gateway.host, config.gateway.port),
+        voice_sessions: Arc::new(crate::voice::VoiceSessionManager::with_defaults(
+            config.voice.enabled,
+            config.voice.max_sessions_per_user,
+            config.voice.default_source_language.clone(),
+            config.voice.default_target_language.clone(),
+        )),
     };
 
     // Ensure channel_links table exists if auth is enabled
@@ -574,6 +593,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/api/navigation", get(handle_navigation))
+        .route("/api/coding/layout", get(handle_coding_layout))
+        .route(
+            "/api/coding/layout/mobile",
+            get(handle_coding_layout_mobile),
+        )
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -585,7 +610,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/auth/me", get(handle_auth_me))
         .route("/api/auth/devices", get(handle_auth_devices_list))
         .route("/api/auth/devices", post(handle_auth_device_register))
-        .route("/api/auth/devices/{device_id}", axum::routing::delete(handle_auth_device_remove))
+        .route(
+            "/api/auth/devices/{device_id}",
+            axum::routing::delete(handle_auth_device_remove),
+        )
         .route("/sync", get(handle_sync_ws))
         .route("/api/sync/relay", post(handle_sync_relay_upload))
         .route("/api/sync/relay", get(handle_sync_relay_pickup))
@@ -594,9 +622,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/pair/signup", get(pair::handle_pair_signup_page))
         .route("/pair/signup", post(pair::handle_pair_signup_submit))
         .route("/api/telemetry/events", post(handle_telemetry_ingest))
-        .route("/api/admin/telemetry/events", get(handle_admin_telemetry_events))
-        .route("/api/admin/telemetry/summary", get(handle_admin_telemetry_summary))
-        .route("/api/admin/telemetry/alerts", get(handle_admin_telemetry_alerts))
+        .route(
+            "/api/admin/telemetry/events",
+            get(handle_admin_telemetry_events),
+        )
+        .route(
+            "/api/admin/telemetry/summary",
+            get(handle_admin_telemetry_summary),
+        )
+        .route(
+            "/api/admin/telemetry/alerts",
+            get(handle_admin_telemetry_alerts),
+        )
+        .route("/api/voice/ui", get(handle_voice_ui))
+        .route("/api/voice/interpret", get(handle_voice_interpret_ws))
+        .route("/api/voice/sessions", get(handle_voice_sessions_list))
+        .route("/api/voice/sessions", post(handle_voice_session_create))
         .with_state(state)
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
@@ -623,6 +664,21 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+/// GET /api/navigation — returns the navigation manifest for the web chat UI.
+async fn handle_navigation() -> Json<crate::task_category::NavigationManifest> {
+    Json(crate::task_category::NavigationManifest::build())
+}
+
+/// GET /api/coding/layout — returns the default split-screen coding layout.
+async fn handle_coding_layout() -> Json<crate::sandbox::layout::CodingLayout> {
+    Json(crate::sandbox::layout::CodingLayout::default())
+}
+
+/// GET /api/coding/layout/mobile — returns the mobile-optimized coding layout.
+async fn handle_coding_layout_mobile() -> Json<crate::sandbox::layout::CodingLayout> {
+    Json(crate::sandbox::layout::CodingLayout::mobile())
 }
 
 /// Optional JSON body for pairing with credentials.
@@ -706,6 +762,9 @@ async fn handle_pair(
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// Optional task category — when set, the agent selects tools for this mode.
+    /// Values: "web_general", "document", "coding", "image", "music", "video", "translation".
+    pub task_category: Option<String>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -999,11 +1058,13 @@ async fn handle_whatsapp_message(
     if let Some(ref cp) = state.channel_pairing {
         for sender in &unpaired {
             let token = cp.create_token("whatsapp", sender);
-            let auto_url =
-                crate::channels::pairing::ChannelPairingStore::auto_pair_url(&state.gateway_base_url, &token);
+            let auto_url = crate::channels::pairing::ChannelPairingStore::auto_pair_url(
+                &state.gateway_base_url,
+                &token,
+            );
             let _ = wa
                 .send(&SendMessage::new(
-                    &format!(
+                    format!(
                         "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
                     ),
                     sender,
@@ -1091,7 +1152,11 @@ async fn handle_line_message(
     if !line.verify_signature(&body, signature) {
         tracing::warn!(
             "LINE webhook signature verification failed (signature: {})",
-            if signature.is_empty() { "missing" } else { "invalid" }
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
         );
         return (
             StatusCode::UNAUTHORIZED,
@@ -1120,7 +1185,7 @@ async fn handle_line_message(
             );
             let _ = line
                 .send(&SendMessage::new(
-                    &format!(
+                    format!(
                         "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
                     ),
                     sender,
@@ -1143,11 +1208,7 @@ async fn handle_line_message(
 
         // Auto-save to memory
         if state.auto_save {
-            let key = format!(
-                "line_msg_{}_{}",
-                msg.sender,
-                msg.timestamp
-            );
+            let key = format!("line_msg_{}_{}", msg.sender, msg.timestamp);
             let _ = state
                 .mem
                 .store(&key, &msg.content, MemoryCategory::Conversation, None)
@@ -1396,10 +1457,7 @@ async fn handle_auth_login(
 }
 
 /// POST /api/auth/logout — revoke current session.
-async fn handle_auth_logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AuthResponse {
+async fn handle_auth_logout(State(state): State<AppState>, headers: HeaderMap) -> AuthResponse {
     let auth_store = match state.auth_store.as_ref() {
         Some(s) => s,
         None => {
@@ -1437,10 +1495,7 @@ async fn handle_auth_logout(
 }
 
 /// GET /api/auth/me — get current user info from session token.
-async fn handle_auth_me(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AuthResponse {
+async fn handle_auth_me(State(state): State<AppState>, headers: HeaderMap) -> AuthResponse {
     let session = match require_auth_session(&state, &headers) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -1619,20 +1674,14 @@ async fn handle_sync_ws(
     let broadcast_tx = match state.sync_broadcast.as_ref() {
         Some(tx) => tx.clone(),
         None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Sync not enabled",
-            )
-                .into_response();
+            return (StatusCode::SERVICE_UNAVAILABLE, "Sync not enabled").into_response();
         }
     };
 
     let device_id = session.device_id.clone().unwrap_or_default();
     let user_id = session.user_id.clone();
 
-    ws.on_upgrade(move |socket| {
-        handle_sync_ws_connection(socket, broadcast_tx, device_id, user_id)
-    })
+    ws.on_upgrade(move |socket| handle_sync_ws_connection(socket, broadcast_tx, device_id, user_id))
 }
 
 /// Handle a single WebSocket sync connection.
@@ -1940,6 +1989,461 @@ async fn handle_admin_telemetry_alerts(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// VOICE / INTERPRETATION HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /api/voice/ui — returns the translation UI manifest.
+///
+/// Provides the frontend with everything needed to render the translation
+/// panel: language list (25 languages with native labels and flags),
+/// direction modes (bidirectional/unidirectional), domain options,
+/// formality levels, and default values from server config.
+async fn handle_voice_ui(
+    State(state): State<AppState>,
+) -> Json<crate::task_category::TranslationUiManifest> {
+    Json(crate::task_category::TranslationUiManifest::build(
+        state.voice_sessions.default_source_language(),
+        state.voice_sessions.default_target_language(),
+    ))
+}
+
+/// Request body for creating a voice interpretation session.
+#[derive(Debug, GatewayDeserialize)]
+struct VoiceSessionCreateBody {
+    /// Source language code (e.g. "ko", "en").
+    source_language: String,
+    /// Target language code (e.g. "en", "ko").
+    target_language: String,
+    /// Enable bidirectional auto-switching.
+    #[serde(default)]
+    bidirectional: bool,
+    /// Formality level: "formal", "neutral", "casual".
+    #[serde(default)]
+    formality: Option<String>,
+    /// Domain: "general", "business", "medical", "legal", "technical".
+    #[serde(default)]
+    domain: Option<String>,
+}
+
+/// POST /api/voice/sessions — create a voice interpretation session.
+async fn handle_voice_session_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<VoiceSessionCreateBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err((status, json)) => return (status, json).into_response(),
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let source: crate::voice::LanguageCode = match crate::voice::LanguageCode::from_str_code(
+        &body.source_language,
+    ) {
+        Some(l) => l,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Unknown source language: {}", body.source_language)})),
+            )
+                .into_response();
+        }
+    };
+
+    let target: crate::voice::LanguageCode = match crate::voice::LanguageCode::from_str_code(
+        &body.target_language,
+    ) {
+        Some(l) => l,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Unknown target language: {}", body.target_language)})),
+            )
+                .into_response();
+        }
+    };
+
+    let formality = match body.formality.as_deref() {
+        Some("formal") => crate::voice::Formality::Formal,
+        Some("casual") => crate::voice::Formality::Casual,
+        _ => crate::voice::Formality::Neutral,
+    };
+
+    let domain = match body.domain.as_deref() {
+        Some("business") => crate::voice::Domain::Business,
+        Some("medical") => crate::voice::Domain::Medical,
+        Some("legal") => crate::voice::Domain::Legal,
+        Some("technical") => crate::voice::Domain::Technical,
+        _ => crate::voice::Domain::General,
+    };
+
+    let config = crate::voice::InterpreterConfig {
+        source_language: source,
+        target_language: target,
+        bidirectional: body.bidirectional,
+        formality,
+        domain,
+        preserve_tone: true,
+        api_key: None,
+        provider: crate::voice::VoiceProviderKind::GeminiLive,
+    };
+
+    match state
+        .voice_sessions
+        .create_session(&session.user_id, config)
+        .await
+    {
+        Ok(voice_session) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "session_id": voice_session.id,
+                "status": "idle",
+                "source_language": source.as_str(),
+                "target_language": target.as_str(),
+                "bidirectional": body.bidirectional,
+                "ws_url": format!("/api/voice/interpret?session_id={}", voice_session.id),
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": msg})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /api/voice/sessions — list active voice sessions for the authenticated user.
+async fn handle_voice_sessions_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err((status, json)) => return (status, json).into_response(),
+    };
+
+    let sessions = state
+        .voice_sessions
+        .list_user_sessions(&session.user_id)
+        .await;
+
+    let sessions_json: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "session_id": s.id,
+                "status": format!("{:?}", s.status),
+                "source_language": s.config.source_language.as_str(),
+                "target_language": s.config.target_language.as_str(),
+                "bidirectional": s.config.bidirectional,
+                "utterance_count": s.stats.utterance_count,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"sessions": sessions_json})),
+    )
+        .into_response()
+}
+
+/// GET /api/voice/interpret — WebSocket upgrade for real-time voice interpretation.
+///
+/// ## Protocol
+///
+/// 1. Client connects with `?session_id=<id>` query parameter
+/// 2. Server sends JSON text frame: `{"type": "ready", "session_id": "..."}`
+/// 3. Client sends binary frames: raw PCM audio (16kHz, mono, 16-bit LE)
+/// 4. Client sends text frames: JSON control messages
+///    - `{"type": "config", "vad": {...}}` — update VAD settings
+///    - `{"type": "stop"}` — graceful close
+/// 5. Server sends binary frames: translated audio (24kHz PCM)
+/// 6. Server sends text frames: JSON events
+///    - `{"type": "input_transcript", "text": "..."}`
+///    - `{"type": "output_transcript", "text": "..."}`
+///    - `{"type": "turn_complete"}`
+///    - `{"type": "error", "message": "..."}`
+async fn handle_voice_interpret_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    ws: axum::extract::WebSocketUpgrade,
+) -> impl IntoResponse {
+    // Authenticate
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err((status, json)) => {
+            return (status, json.0.to_string()).into_response();
+        }
+    };
+
+    let session_id = match params.get("session_id") {
+        Some(id) => id.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Missing session_id query parameter",
+            )
+                .into_response();
+        }
+    };
+
+    // Verify the session exists and belongs to this user
+    let voice_session = match state.voice_sessions.get_session(&session_id).await {
+        Some(vs) if vs.user_id == session.user_id => vs,
+        Some(_) => {
+            return (StatusCode::FORBIDDEN, "Session does not belong to you").into_response();
+        }
+        None => {
+            return (StatusCode::NOT_FOUND, "Voice session not found").into_response();
+        }
+    };
+
+    let voice_manager = Arc::clone(&state.voice_sessions);
+
+    ws.on_upgrade(move |socket| handle_voice_ws_connection(socket, voice_session, voice_manager))
+}
+
+/// Handle a single voice interpretation WebSocket connection.
+///
+/// This function bridges the browser's audio stream to Gemini Live:
+/// Browser → (binary PCM) → ZeroClaw → (Gemini Live WS) → Gemini API
+///                                                           ↓
+/// Browser ← (binary PCM + text transcripts) ← ZeroClaw ←───┘
+async fn handle_voice_ws_connection(
+    socket: axum::extract::ws::WebSocket,
+    voice_session: crate::voice::InterpreterSession,
+    voice_manager: Arc<crate::voice::VoiceSessionManager>,
+) {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+
+    let session_id = voice_session.id.clone();
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    // Resolve Gemini API key
+    let api_key = voice_session
+        .config
+        .api_key
+        .clone()
+        .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+        .or_else(|| std::env::var("GOOGLE_API_KEY").ok());
+
+    let api_key = match api_key {
+        Some(k) if !k.trim().is_empty() => k,
+        _ => {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": "Gemini API key not configured. Set GEMINI_API_KEY env var."
+            });
+            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
+    };
+
+    let vad = crate::voice::VadConfig::default();
+
+    // Connect to Gemini Live
+    let gemini_session = match crate::voice::GeminiLiveSession::connect(
+        session_id.clone(),
+        &api_key,
+        &voice_session.config,
+        &vad,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(session_id = %session_id, error = %e, "Gemini Live connection failed");
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!("Failed to connect to Gemini Live: {e}")
+            });
+            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
+    };
+
+    // Update session status
+    let _ = voice_manager
+        .update_status(&session_id, crate::voice::InterpreterStatus::Connecting)
+        .await;
+
+    // Wait for setup to complete (with timeout)
+    let event_rx = Arc::clone(&gemini_session.event_rx);
+    let setup_ok = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(event) = event_rx.lock().await.recv().await {
+            if matches!(event, crate::voice::GeminiLiveEvent::SetupComplete) {
+                return true;
+            }
+            if matches!(event, crate::voice::GeminiLiveEvent::Error { .. }) {
+                return false;
+            }
+        }
+        false
+    })
+    .await;
+
+    if !matches!(setup_ok, Ok(true)) {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": "Gemini Live setup timed out or failed"
+        });
+        let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+        gemini_session.close().await;
+        return;
+    }
+
+    let _ = voice_manager
+        .update_status(&session_id, crate::voice::InterpreterStatus::Ready)
+        .await;
+
+    // Send ready message to browser with full config for UI rendering
+    let ready = serde_json::json!({
+        "type": "ready",
+        "session_id": session_id,
+        "source_language": voice_session.config.source_language.as_str(),
+        "target_language": voice_session.config.target_language.as_str(),
+        "source_language_name": voice_session.config.source_language.display_name(),
+        "target_language_name": voice_session.config.target_language.display_name(),
+        "bidirectional": voice_session.config.bidirectional,
+        "domain": format!("{:?}", voice_session.config.domain),
+        "formality": format!("{:?}", voice_session.config.formality),
+    });
+    let _ = ws_sender
+        .send(Message::Text(ready.to_string().into()))
+        .await;
+
+    let _ = voice_manager
+        .update_status(&session_id, crate::voice::InterpreterStatus::Listening)
+        .await;
+
+    // Spawn task: Gemini Live events → browser
+    let gemini_event_rx = Arc::clone(&gemini_session.event_rx);
+    let session_id_events = session_id.clone();
+    let voice_manager_events = Arc::clone(&voice_manager);
+    let send_task = tokio::spawn(async move {
+        let mut sender = ws_sender;
+        while let Some(event) = gemini_event_rx.lock().await.recv().await {
+            let result = match &event {
+                crate::voice::GeminiLiveEvent::Audio { data, .. } => {
+                    // Send translated audio as binary frame
+                    sender.send(Message::Binary(data.clone().into())).await
+                }
+                crate::voice::GeminiLiveEvent::InputTranscript { text } => {
+                    let msg = serde_json::json!({
+                        "type": "input_transcript",
+                        "text": text,
+                    });
+                    sender.send(Message::Text(msg.to_string().into())).await
+                }
+                crate::voice::GeminiLiveEvent::OutputTranscript { text } => {
+                    let msg = serde_json::json!({
+                        "type": "output_transcript",
+                        "text": text,
+                    });
+                    sender.send(Message::Text(msg.to_string().into())).await
+                }
+                crate::voice::GeminiLiveEvent::TurnComplete => {
+                    let msg = serde_json::json!({"type": "turn_complete"});
+                    sender.send(Message::Text(msg.to_string().into())).await
+                }
+                crate::voice::GeminiLiveEvent::Interrupted => {
+                    let msg = serde_json::json!({"type": "interrupted"});
+                    sender.send(Message::Text(msg.to_string().into())).await
+                }
+                crate::voice::GeminiLiveEvent::Error { message } => {
+                    let msg = serde_json::json!({
+                        "type": "error",
+                        "message": message,
+                    });
+                    sender.send(Message::Text(msg.to_string().into())).await
+                }
+                crate::voice::GeminiLiveEvent::SetupComplete => {
+                    // Already handled above
+                    Ok(())
+                }
+            };
+            if result.is_err() {
+                break;
+            }
+        }
+        tracing::debug!(
+            session_id = %session_id_events,
+            "Voice event relay task ended"
+        );
+        let _ = voice_manager_events
+            .update_status(&session_id_events, crate::voice::InterpreterStatus::Closed)
+            .await;
+    });
+
+    // Main loop: browser audio → Gemini Live
+    while let Some(Ok(msg)) = ws_receiver.next().await {
+        match msg {
+            Message::Binary(data) => {
+                // Raw PCM audio from browser → Gemini Live
+                if let Err(e) = gemini_session.send_audio(&data).await {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "Failed to send audio to Gemini Live"
+                    );
+                    break;
+                }
+            }
+            Message::Text(text) => {
+                // JSON control messages from browser
+                if let Ok(ctrl) = serde_json::from_str::<serde_json::Value>(&text) {
+                    match ctrl.get("type").and_then(|v| v.as_str()) {
+                        Some("stop") => {
+                            tracing::info!(session_id = %session_id, "Client requested stop");
+                            break;
+                        }
+                        Some("text") => {
+                            // Text-based interpretation
+                            if let Some(input) = ctrl.get("text").and_then(|v| v.as_str()) {
+                                let _ = gemini_session.send_text(input).await;
+                            }
+                        }
+                        _ => {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                "Unknown control message type"
+                            );
+                        }
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Cleanup
+    gemini_session.close().await;
+    send_task.abort();
+
+    let _ = voice_manager.close_session(&session_id).await;
+
+    tracing::info!(session_id = %session_id, "Voice interpretation session ended");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2234,12 +2738,14 @@ mod tests {
             sync_broadcast: None,
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
+            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
         };
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
 
         let body = Ok(Json(WebhookBody {
+            task_category: None,
             message: "hello".into(),
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body)
@@ -2248,6 +2754,7 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
 
         let body = Ok(Json(WebhookBody {
+            task_category: None,
             message: "hello".into(),
         }));
         let second = handle_webhook(State(state), headers, body)
@@ -2295,11 +2802,13 @@ mod tests {
             sync_broadcast: None,
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
+            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
         };
 
         let headers = HeaderMap::new();
 
         let body1 = Ok(Json(WebhookBody {
+            task_category: None,
             message: "hello one".into(),
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body1)
@@ -2308,6 +2817,7 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
 
         let body2 = Ok(Json(WebhookBody {
+            task_category: None,
             message: "hello two".into(),
         }));
         let second = handle_webhook(State(state), headers, body2)
@@ -2365,12 +2875,14 @@ mod tests {
             sync_broadcast: None,
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
+            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_webhook(
             State(state),
             HeaderMap::new(),
             Ok(Json(WebhookBody {
+                task_category: None,
                 message: "hello".into(),
             })),
         )
@@ -2412,6 +2924,7 @@ mod tests {
             sync_broadcast: None,
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
+            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2421,6 +2934,7 @@ mod tests {
             State(state),
             headers,
             Ok(Json(WebhookBody {
+                task_category: None,
                 message: "hello".into(),
             })),
         )
@@ -2462,6 +2976,7 @@ mod tests {
             sync_broadcast: None,
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
+            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2471,6 +2986,7 @@ mod tests {
             State(state),
             headers,
             Ok(Json(WebhookBody {
+                task_category: None,
                 message: "hello".into(),
             })),
         )

@@ -208,30 +208,9 @@ impl TelemetryStore {
     /// Check for financial transaction keywords.
     fn is_financial_indicator(text: &str) -> bool {
         const FINANCIAL_KEYWORDS: &[&str] = &[
-            "withdraw",
-            "deposit",
-            "transfer",
-            "trade",
-            "buy",
-            "sell",
-            "profit",
-            "earning",
-            "revenue",
-            "payment",
-            "wallet",
-            "bitcoin",
-            "ethereum",
-            "crypto",
-            "출금",
-            "입금",
-            "송금",
-            "거래",
-            "매수",
-            "매도",
-            "수익",
-            "배팅",
-            "베팅",
-            "도박",
+            "withdraw", "deposit", "transfer", "trade", "buy", "sell", "profit", "earning",
+            "revenue", "payment", "wallet", "bitcoin", "ethereum", "crypto", "출금", "입금",
+            "송금", "거래", "매수", "매도", "수익", "배팅", "베팅", "도박",
         ];
         FINANCIAL_KEYWORDS.iter().any(|kw| text.contains(kw))
     }
@@ -269,6 +248,7 @@ impl TelemetryStore {
 
     /// Query events with filters.
     pub fn query(&self, q: &TelemetryQuery) -> Result<Vec<TelemetryEvent>> {
+        use std::fmt::Write;
         let conn = self.conn.lock();
 
         let mut sql = String::from(
@@ -280,46 +260,47 @@ impl TelemetryStore {
         let mut param_idx = 1;
 
         if let Some(ref user_id) = q.user_id {
-            sql.push_str(&format!(" AND user_id = ?{param_idx}"));
+            let _ = write!(sql, " AND user_id = ?{param_idx}");
             bind_values.push(Box::new(user_id.clone()));
             param_idx += 1;
         }
         if let Some(ref country) = q.country {
-            sql.push_str(&format!(" AND country = ?{param_idx}"));
+            let _ = write!(sql, " AND country = ?{param_idx}");
             bind_values.push(Box::new(country.clone()));
             param_idx += 1;
         }
         if let Some(ref channel) = q.channel {
-            sql.push_str(&format!(" AND channel = ?{param_idx}"));
+            let _ = write!(sql, " AND channel = ?{param_idx}");
             bind_values.push(Box::new(channel.clone()));
             param_idx += 1;
         }
         if let Some(ref action) = q.action {
-            sql.push_str(&format!(" AND action = ?{param_idx}"));
+            let _ = write!(sql, " AND action = ?{param_idx}");
             bind_values.push(Box::new(action.clone()));
             param_idx += 1;
         }
         if let Some(ref alert_level) = q.alert_level {
-            sql.push_str(&format!(" AND alert_level = ?{param_idx}"));
+            let _ = write!(sql, " AND alert_level = ?{param_idx}");
             bind_values.push(Box::new(alert_level.clone()));
             param_idx += 1;
         }
         if let Some(ref since) = q.since {
-            sql.push_str(&format!(" AND timestamp >= ?{param_idx}"));
+            let _ = write!(sql, " AND timestamp >= ?{param_idx}");
             bind_values.push(Box::new(since.to_rfc3339()));
             param_idx += 1;
         }
         if let Some(ref until) = q.until {
-            sql.push_str(&format!(" AND timestamp <= ?{param_idx}"));
+            let _ = write!(sql, " AND timestamp <= ?{param_idx}");
             bind_values.push(Box::new(until.to_rfc3339()));
             param_idx += 1;
         }
         if let Some(ref search) = q.search {
             let pattern = format!("%{search}%");
-            sql.push_str(&format!(
+            let _ = write!(
+                sql,
                 " AND (target_url LIKE ?{param_idx} OR details LIKE ?{})",
                 param_idx + 1
-            ));
+            );
             bind_values.push(Box::new(pattern.clone()));
             bind_values.push(Box::new(pattern));
             param_idx += 2;
@@ -328,12 +309,12 @@ impl TelemetryStore {
         sql.push_str(" ORDER BY timestamp DESC");
 
         let limit = q.limit.unwrap_or(100);
-        sql.push_str(&format!(" LIMIT ?{param_idx}"));
+        let _ = write!(sql, " LIMIT ?{param_idx}");
         bind_values.push(Box::new(limit));
         param_idx += 1;
 
         if let Some(offset) = q.offset {
-            sql.push_str(&format!(" OFFSET ?{param_idx}"));
+            let _ = write!(sql, " OFFSET ?{param_idx}");
             bind_values.push(Box::new(offset));
         }
 
@@ -376,11 +357,10 @@ impl TelemetryStore {
     pub fn summary(&self) -> Result<TelemetrySummary> {
         let conn = self.conn.lock();
 
-        let total_events: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM telemetry_events",
-            [],
-            |row| row.get(0),
-        )?;
+        let total_events: i64 =
+            conn.query_row("SELECT COUNT(*) FROM telemetry_events", [], |row| {
+                row.get(0)
+            })?;
 
         let total_users: i64 = conn.query_row(
             "SELECT COUNT(DISTINCT user_id) FROM telemetry_events",
@@ -474,11 +454,9 @@ impl TelemetryStore {
     }
 
     fn prune_if_needed(&self, conn: &Connection) -> Result<()> {
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM telemetry_events",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM telemetry_events", [], |row| {
+            row.get(0)
+        })?;
 
         let max_events = self.config.max_events as i64;
         if count > max_events {
@@ -492,8 +470,7 @@ impl TelemetryStore {
         }
 
         // Prune by retention days
-        let cutoff = Utc::now()
-            - chrono::Duration::days(i64::from(self.config.retention_days));
+        let cutoff = Utc::now() - chrono::Duration::days(i64::from(self.config.retention_days));
         conn.execute(
             "DELETE FROM telemetry_events WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
@@ -513,11 +490,7 @@ mod tests {
             enabled: true,
             admin_token: Some("test-admin-token".into()),
             alerts_enabled: true,
-            suspicious_patterns: vec![
-                "binance.com".into(),
-                "casino".into(),
-                "gambling".into(),
-            ],
+            suspicious_patterns: vec!["binance.com".into(), "casino".into(), "gambling".into()],
             ..TelemetryConfig::default()
         }
     }
@@ -619,11 +592,13 @@ mod tests {
         store
             .record(make_event("user_a", "browse", "https://example.com"))
             .unwrap();
+        store.record(make_event("user_b", "shell", "")).unwrap();
         store
-            .record(make_event("user_b", "shell", ""))
-            .unwrap();
-        store
-            .record(make_event("user_a", "browse", "https://binance.com/deposit"))
+            .record(make_event(
+                "user_a",
+                "browse",
+                "https://binance.com/deposit",
+            ))
             .unwrap();
 
         let summary = store.summary().unwrap();
@@ -668,7 +643,11 @@ mod tests {
 
         for i in 0..5 {
             store
-                .record(make_event(&format!("user_{i}"), "browse", "https://example.com"))
+                .record(make_event(
+                    &format!("user_{i}"),
+                    "browse",
+                    "https://example.com",
+                ))
                 .unwrap();
         }
 

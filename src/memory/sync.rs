@@ -718,11 +718,7 @@ mod tests {
             assert_eq!(engine.journal_len(), 2);
 
             // Verify the operations were preserved
-            let ops: Vec<_> = engine
-                .journal
-                .iter()
-                .map(|e| &e.operation)
-                .collect();
+            let ops: Vec<_> = engine.journal.iter().map(|e| &e.operation).collect();
             assert!(matches!(
                 ops[0],
                 DeltaOperation::Store { key, .. } if key == "persistent_key"

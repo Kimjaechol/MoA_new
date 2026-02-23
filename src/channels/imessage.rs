@@ -177,9 +177,16 @@ end tell"#
                                     let uid = sender.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) = tokio::task::spawn_blocking(move || {
-                                            super::pairing::persist_channel_allowlist("imessage", &uid)
-                                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
-                                            tracing::error!("iMessage: failed to persist pairing: {e}");
+                                            super::pairing::persist_channel_allowlist(
+                                                "imessage", &uid,
+                                            )
+                                        })
+                                        .await
+                                        .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
+                                        {
+                                            tracing::error!(
+                                                "iMessage: failed to persist pairing: {e}"
+                                            );
                                         }
                                     });
                                     let _ = self.send(&super::traits::SendMessage::new(
@@ -191,9 +198,12 @@ end tell"#
                                     // Send one-click connect link
                                     if let Some(ref gw_url) = self.gateway_url {
                                         let token = store.create_token("imessage", &sender);
-                                        let auto_url = super::pairing::ChannelPairingStore::auto_pair_url(gw_url, &token);
+                                        let auto_url =
+                                            super::pairing::ChannelPairingStore::auto_pair_url(
+                                                gw_url, &token,
+                                            );
                                         let _ = self.send(&super::traits::SendMessage::new(
-                                            &format!("🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"),
+                                            format!("🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"),
                                             &sender,
                                         )).await;
                                     }
@@ -326,7 +336,11 @@ mod tests {
 
     #[test]
     fn specific_contact_allowed() {
-        let ch = IMessageChannel::new(vec!["+1234567890".into(), "user@icloud.com".into()], None, None);
+        let ch = IMessageChannel::new(
+            vec!["+1234567890".into(), "user@icloud.com".into()],
+            None,
+            None,
+        );
         assert!(ch.is_contact_allowed("+1234567890"));
         assert!(ch.is_contact_allowed("user@icloud.com"));
     }

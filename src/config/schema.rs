@@ -108,6 +108,68 @@ pub struct Config {
     /// Multi-device synchronization configuration.
     #[serde(default)]
     pub sync: SyncConfig,
+
+    /// Voice / translation / interpretation settings.
+    #[serde(default)]
+    pub voice: VoiceConfig,
+}
+
+// ── Voice / Translation ──────────────────────────────────────────
+
+/// Configuration for real-time voice interpretation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    /// Enable voice interpretation features.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum concurrent voice sessions per user.
+    #[serde(default = "default_voice_max_sessions")]
+    pub max_sessions_per_user: usize,
+    /// Default source language (ISO 639-1 code, e.g. "ko").
+    #[serde(default = "default_voice_source_language")]
+    pub default_source_language: String,
+    /// Default target language (ISO 639-1 code, e.g. "en").
+    #[serde(default = "default_voice_target_language")]
+    pub default_target_language: String,
+    /// Gemini API key override (falls back to GEMINI_API_KEY env var).
+    #[serde(default)]
+    pub gemini_api_key: Option<String>,
+    /// VAD silence duration in ms (how long silence = end-of-speech).
+    #[serde(default = "default_voice_silence_ms")]
+    pub silence_duration_ms: u32,
+    /// VAD prefix padding in ms (audio before speech start to include).
+    #[serde(default = "default_voice_prefix_padding_ms")]
+    pub prefix_padding_ms: u32,
+}
+
+fn default_voice_max_sessions() -> usize {
+    5
+}
+fn default_voice_source_language() -> String {
+    "ko".to_string()
+}
+fn default_voice_target_language() -> String {
+    "en".to_string()
+}
+fn default_voice_silence_ms() -> u32 {
+    300
+}
+fn default_voice_prefix_padding_ms() -> u32 {
+    100
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_sessions_per_user: default_voice_max_sessions(),
+            default_source_language: default_voice_source_language(),
+            default_target_language: default_voice_target_language(),
+            gemini_api_key: None,
+            silence_duration_ms: default_voice_silence_ms(),
+            prefix_padding_ms: default_voice_prefix_padding_ms(),
+        }
+    }
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -220,6 +282,47 @@ pub struct AgentConfig {
     pub parallel_tools: bool,
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Sandbox loop settings for Coding mode.
+    #[serde(default)]
+    pub sandbox: SandboxSettings,
+}
+
+/// Sandbox loop tunables (used in Coding mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxSettings {
+    /// Maximum run→observe→fix iterations before handing back to user.
+    #[serde(default = "default_sandbox_max_iterations")]
+    pub max_iterations: usize,
+    /// Maximum wall-clock seconds for the entire sandbox session.
+    #[serde(default = "default_sandbox_max_duration_secs")]
+    pub max_duration_secs: u64,
+    /// How many times the same error class can recur before strategy switch.
+    #[serde(default = "default_sandbox_max_same_error_retries")]
+    pub max_same_error_retries: usize,
+    /// Whether to create git checkpoints for rollback.
+    #[serde(default = "default_true")]
+    pub enable_checkpoints: bool,
+}
+
+fn default_sandbox_max_iterations() -> usize {
+    25
+}
+fn default_sandbox_max_duration_secs() -> u64 {
+    600
+}
+fn default_sandbox_max_same_error_retries() -> usize {
+    3
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            max_iterations: default_sandbox_max_iterations(),
+            max_duration_secs: default_sandbox_max_duration_secs(),
+            max_same_error_retries: default_sandbox_max_same_error_retries(),
+            enable_checkpoints: true,
+        }
+    }
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -242,6 +345,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            sandbox: SandboxSettings::default(),
         }
     }
 }
@@ -462,7 +566,6 @@ fn default_peripheral_baud() -> u32 {
     115_200
 }
 
-
 impl Default for PeripheralBoardConfig {
     fn default() -> Self {
         Self {
@@ -657,9 +760,19 @@ pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in Brave without scraping)
     #[serde(default)]
     pub enabled: bool,
-    /// Allowed domains for `browser_open` (exact or subdomain match)
+
+    /// Include the built-in default domain preset (search engines, developer
+    /// tools, documentation, reference sites, etc.). Default: true.
+    /// Set to false for strict manual-only allowlisting.
+    #[serde(default = "default_true")]
+    pub include_default_domains: bool,
+
+    /// Additional allowed domains beyond the defaults (exact or subdomain match).
+    /// These are merged with the default preset when `include_default_domains` is true.
+    /// When `include_default_domains` is false, ONLY these domains are allowed.
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
@@ -688,10 +801,235 @@ fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
 
+/// Built-in default domain preset — well-known, legitimate sites across
+/// major categories. All entries use subdomain-inclusive matching
+/// (e.g. "github.com" also allows "api.github.com", "docs.github.com").
+///
+/// Users can extend this with `allowed_domains` or disable it entirely
+/// with `include_default_domains = false`.
+pub fn default_browser_domains() -> Vec<String> {
+    [
+        // ── Search engines ──────────────────────────────
+        "google.com",
+        "google.co.kr",
+        "google.co.jp",
+        "google.co.uk",
+        "google.de",
+        "google.fr",
+        "naver.com",
+        "daum.net",
+        "bing.com",
+        "duckduckgo.com",
+        "search.yahoo.com",
+        "baidu.com",
+        "yandex.com",
+        // ── Developer platforms ──────────────────────────
+        "github.com",
+        "gitlab.com",
+        "bitbucket.org",
+        "sourceforge.net",
+        "codeberg.org",
+        // ── Package registries ──────────────────────────
+        "npmjs.com",
+        "crates.io",
+        "pypi.org",
+        "rubygems.org",
+        "pkg.go.dev",
+        "packagist.org",
+        "nuget.org",
+        "mvnrepository.com",
+        "hub.docker.com",
+        // ── Documentation & reference ───────────────────
+        "docs.rs",
+        "doc.rust-lang.org",
+        "developer.mozilla.org",
+        "devdocs.io",
+        "w3.org",
+        "w3schools.com",
+        "whatwg.org",
+        "tc39.es",
+        "web.dev",
+        "developer.chrome.com",
+        "developer.apple.com",
+        "learn.microsoft.com",
+        "docs.microsoft.com",
+        "docs.oracle.com",
+        "docs.python.org",
+        "docs.djangoproject.com",
+        "flask.palletsprojects.com",
+        "fastapi.tiangolo.com",
+        "nodejs.org",
+        "react.dev",
+        "vuejs.org",
+        "angular.io",
+        "angular.dev",
+        "svelte.dev",
+        "nextjs.org",
+        "nuxt.com",
+        "tailwindcss.com",
+        "getbootstrap.com",
+        "kotlinlang.org",
+        "go.dev",
+        "typescriptlang.org",
+        "swift.org",
+        "www.php.net",
+        "elixir-lang.org",
+        "www.scala-lang.org",
+        "www.haskell.org",
+        "ziglang.org",
+        // ── Cloud provider docs ─────────────────────────
+        "aws.amazon.com",
+        "docs.aws.amazon.com",
+        "cloud.google.com",
+        "azure.microsoft.com",
+        "docs.digitalocean.com",
+        "vercel.com",
+        "netlify.com",
+        "render.com",
+        "railway.app",
+        "fly.io",
+        "heroku.com",
+        "firebase.google.com",
+        "supabase.com",
+        // ── AI / ML ─────────────────────────────────────
+        "openai.com",
+        "platform.openai.com",
+        "docs.anthropic.com",
+        "huggingface.co",
+        "pytorch.org",
+        "tensorflow.org",
+        "keras.io",
+        "scikit-learn.org",
+        "jupyter.org",
+        "kaggle.com",
+        "paperswithcode.com",
+        "arxiv.org",
+        // ── Q&A / Community ─────────────────────────────
+        "stackoverflow.com",
+        "stackexchange.com",
+        "superuser.com",
+        "serverfault.com",
+        "askubuntu.com",
+        "reddit.com",
+        "dev.to",
+        "hashnode.com",
+        "medium.com",
+        "news.ycombinator.com",
+        "lobste.rs",
+        "discourse.org",
+        // ── Encyclopedia / Reference ────────────────────
+        "wikipedia.org",
+        "wikimedia.org",
+        "wiktionary.org",
+        "britannica.com",
+        "namu.wiki",
+        // ── Standards / Specs ───────────────────────────
+        "ietf.org",
+        "rfc-editor.org",
+        "unicode.org",
+        "json.org",
+        "yaml.org",
+        "toml.io",
+        "semver.org",
+        "spec.graphql.org",
+        "graphql.org",
+        "grpc.io",
+        "protobuf.dev",
+        // ── Security ────────────────────────────────────
+        "owasp.org",
+        "cve.mitre.org",
+        "nvd.nist.gov",
+        "security.googleblog.com",
+        "letsencrypt.org",
+        // ── DevOps / Infra ──────────────────────────────
+        "docker.com",
+        "docs.docker.com",
+        "kubernetes.io",
+        "helm.sh",
+        "terraform.io",
+        "ansible.com",
+        "prometheus.io",
+        "grafana.com",
+        "nginx.org",
+        "httpd.apache.org",
+        "caddyserver.com",
+        // ── Database docs ───────────────────────────────
+        "postgresql.org",
+        "dev.mysql.com",
+        "www.sqlite.org",
+        "redis.io",
+        "mongodb.com",
+        "elastic.co",
+        "clickhouse.com",
+        "cassandra.apache.org",
+        // ── OS / Linux ──────────────────────────────────
+        "kernel.org",
+        "man7.org",
+        "archlinux.org",
+        "wiki.archlinux.org",
+        "ubuntu.com",
+        "debian.org",
+        "fedoraproject.org",
+        "linuxfoundation.org",
+        // ── Design / Assets ─────────────────────────────
+        "figma.com",
+        "fonts.google.com",
+        "fontawesome.com",
+        "icons8.com",
+        "unsplash.com",
+        "dribbble.com",
+        // ── Collaboration / Productivity ────────────────
+        "notion.so",
+        "trello.com",
+        "asana.com",
+        "linear.app",
+        "jira.atlassian.com",
+        "confluence.atlassian.com",
+        "slack.com",
+        "discord.com",
+        // ── Education / MOOC ────────────────────────────
+        "coursera.org",
+        "edx.org",
+        "khanacademy.org",
+        "freecodecamp.org",
+        "codecademy.com",
+        "leetcode.com",
+        "hackerrank.com",
+        "exercism.org",
+        "www.acmicpc.net",
+        "programmers.co.kr",
+        // ── News / Tech media ───────────────────────────
+        "techcrunch.com",
+        "theverge.com",
+        "arstechnica.com",
+        "wired.com",
+        "zdnet.com",
+        "infoq.com",
+        "theregister.com",
+        // ── Korean portals / services ───────────────────
+        "tistory.com",
+        "velog.io",
+        "brunch.co.kr",
+        "blog.naver.com",
+        "cafe.naver.com",
+        "developers.kakao.com",
+        "tech.kakao.com",
+        "d2.naver.com",
+        "engineering.linecorp.com",
+        "techblog.woowahan.com",
+        "tech.musinsa.com",
+        "hyperconnect.github.io",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            include_default_domains: true,
             allowed_domains: Vec::new(),
             session_name: None,
             backend: default_browser_backend(),
@@ -700,6 +1038,26 @@ impl Default for BrowserConfig {
             native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
         }
+    }
+}
+
+impl BrowserConfig {
+    /// Compute the effective allowed domain list by merging the default
+    /// preset (if enabled) with user-specified additional domains.
+    /// Deduplicates and lowercases all entries.
+    pub fn effective_allowed_domains(&self) -> Vec<String> {
+        let mut domains = Vec::new();
+        if self.include_default_domains {
+            domains.extend(default_browser_domains());
+        }
+        domains.extend(self.allowed_domains.clone());
+        // Deduplicate (case-insensitive).
+        let mut seen = std::collections::HashSet::new();
+        domains.retain(|d| {
+            let lower = d.to_lowercase();
+            seen.insert(lower)
+        });
+        domains
     }
 }
 
@@ -895,7 +1253,21 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
+
+    /// Maximum actions per hour (total budget). Default: 600.
     pub max_actions_per_hour: u32,
+
+    /// Maximum actions per minute (burst limit). Exceeding this triggers
+    /// progressive cooldowns: Strike 1 → 30s, Strike 2 → 2min, Strike 3 → 10min.
+    /// Default: 20.
+    #[serde(default = "default_burst_per_minute")]
+    pub max_actions_per_minute: u32,
+
+    /// Maximum consecutive identical fruitless actions before the loop detector
+    /// blocks further execution. Default: 5.
+    #[serde(default = "default_max_loop_repeats")]
+    pub max_loop_repeats: u32,
+
     pub max_cost_per_day_cents: u32,
 
     /// Require explicit approval for medium-risk shell commands.
@@ -913,6 +1285,14 @@ pub struct AutonomyConfig {
     /// Tools that always require interactive approval, even after "Always".
     #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
+}
+
+fn default_burst_per_minute() -> u32 {
+    20
+}
+
+fn default_max_loop_repeats() -> u32 {
+    5
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -962,7 +1342,9 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
+            max_actions_per_hour: 600,
+            max_actions_per_minute: default_burst_per_minute(),
+            max_loop_repeats: default_max_loop_repeats(),
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
@@ -1979,6 +2361,7 @@ impl Default for Config {
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
+            voice: VoiceConfig::default(),
         }
     }
 }
@@ -2229,10 +2612,13 @@ impl Config {
         // Telegram: ZEROCLAW_TELEGRAM_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_TELEGRAM_TOKEN") {
             if !token.is_empty() {
-                let tg = self.channels_config.telegram.get_or_insert_with(|| TelegramConfig {
-                    bot_token: String::new(),
-                    allowed_users: vec![],
-                });
+                let tg = self
+                    .channels_config
+                    .telegram
+                    .get_or_insert_with(|| TelegramConfig {
+                        bot_token: String::new(),
+                        allowed_users: vec![],
+                    });
                 tg.bot_token = token;
             }
         }
@@ -2247,13 +2633,16 @@ impl Config {
         // Discord: ZEROCLAW_DISCORD_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_DISCORD_TOKEN") {
             if !token.is_empty() {
-                let dc = self.channels_config.discord.get_or_insert_with(|| DiscordConfig {
-                    bot_token: String::new(),
-                    guild_id: None,
-                    allowed_users: vec![],
-                    listen_to_bots: false,
-                    mention_only: false,
-                });
+                let dc = self
+                    .channels_config
+                    .discord
+                    .get_or_insert_with(|| DiscordConfig {
+                        bot_token: String::new(),
+                        guild_id: None,
+                        allowed_users: vec![],
+                        listen_to_bots: false,
+                        mention_only: false,
+                    });
                 dc.bot_token = token;
             }
         }
@@ -2268,12 +2657,15 @@ impl Config {
         // Slack: ZEROCLAW_SLACK_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_SLACK_TOKEN") {
             if !token.is_empty() {
-                let sl = self.channels_config.slack.get_or_insert_with(|| SlackConfig {
-                    bot_token: String::new(),
-                    app_token: None,
-                    channel_id: None,
-                    allowed_users: vec![],
-                });
+                let sl = self
+                    .channels_config
+                    .slack
+                    .get_or_insert_with(|| SlackConfig {
+                        bot_token: String::new(),
+                        app_token: None,
+                        channel_id: None,
+                        allowed_users: vec![],
+                    });
                 sl.bot_token = token;
             }
         }
@@ -2295,13 +2687,16 @@ impl Config {
         // WhatsApp: ZEROCLAW_WHATSAPP_ACCESS_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_WHATSAPP_ACCESS_TOKEN") {
             if !token.is_empty() {
-                let wa = self.channels_config.whatsapp.get_or_insert_with(|| WhatsAppConfig {
-                    access_token: String::new(),
-                    phone_number_id: String::new(),
-                    verify_token: String::new(),
-                    app_secret: None,
-                    allowed_numbers: vec![],
-                });
+                let wa = self
+                    .channels_config
+                    .whatsapp
+                    .get_or_insert_with(|| WhatsAppConfig {
+                        access_token: String::new(),
+                        phone_number_id: String::new(),
+                        verify_token: String::new(),
+                        app_secret: None,
+                        allowed_numbers: vec![],
+                    });
                 wa.access_token = token;
             }
         }
@@ -2357,13 +2752,16 @@ impl Config {
         // KakaoTalk: ZEROCLAW_KAKAO_REST_API_KEY
         if let Ok(key) = std::env::var("ZEROCLAW_KAKAO_REST_API_KEY") {
             if !key.is_empty() {
-                let kk = self.channels_config.kakao.get_or_insert_with(|| KakaoTalkConfig {
-                    rest_api_key: String::new(),
-                    admin_key: String::new(),
-                    webhook_secret: None,
-                    allowed_users: vec![],
-                    port: default_kakao_port(),
-                });
+                let kk = self
+                    .channels_config
+                    .kakao
+                    .get_or_insert_with(|| KakaoTalkConfig {
+                        rest_api_key: String::new(),
+                        admin_key: String::new(),
+                        webhook_secret: None,
+                        allowed_users: vec![],
+                        port: default_kakao_port(),
+                    });
                 kk.rest_api_key = key;
             }
         }
@@ -2416,11 +2814,14 @@ impl Config {
         // DingTalk: ZEROCLAW_DINGTALK_CLIENT_ID
         if let Ok(id) = std::env::var("ZEROCLAW_DINGTALK_CLIENT_ID") {
             if !id.is_empty() {
-                let dt = self.channels_config.dingtalk.get_or_insert_with(|| DingTalkConfig {
-                    client_id: String::new(),
-                    client_secret: String::new(),
-                    allowed_users: vec![],
-                });
+                let dt = self
+                    .channels_config
+                    .dingtalk
+                    .get_or_insert_with(|| DingTalkConfig {
+                        client_id: String::new(),
+                        client_secret: String::new(),
+                        allowed_users: vec![],
+                    });
                 dt.client_id = id;
             }
         }
@@ -2468,12 +2869,15 @@ impl Config {
         // Matrix: ZEROCLAW_MATRIX_ACCESS_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_MATRIX_ACCESS_TOKEN") {
             if !token.is_empty() {
-                let mx = self.channels_config.matrix.get_or_insert_with(|| MatrixConfig {
-                    homeserver: String::new(),
-                    access_token: String::new(),
-                    room_id: String::new(),
-                    allowed_users: vec![],
-                });
+                let mx = self
+                    .channels_config
+                    .matrix
+                    .get_or_insert_with(|| MatrixConfig {
+                        homeserver: String::new(),
+                        access_token: String::new(),
+                        room_id: String::new(),
+                        allowed_users: vec![],
+                    });
                 mx.access_token = token;
             }
         }
@@ -2502,14 +2906,17 @@ impl Config {
         // Signal: ZEROCLAW_SIGNAL_HTTP_URL
         if let Ok(url) = std::env::var("ZEROCLAW_SIGNAL_HTTP_URL") {
             if !url.is_empty() {
-                let sig = self.channels_config.signal.get_or_insert_with(|| SignalConfig {
-                    http_url: String::new(),
-                    account: String::new(),
-                    group_id: None,
-                    allowed_from: vec![],
-                    ignore_attachments: false,
-                    ignore_stories: false,
-                });
+                let sig = self
+                    .channels_config
+                    .signal
+                    .get_or_insert_with(|| SignalConfig {
+                        http_url: String::new(),
+                        account: String::new(),
+                        group_id: None,
+                        allowed_from: vec![],
+                        ignore_attachments: false,
+                        ignore_stories: false,
+                    });
                 sig.http_url = url;
             }
         }
@@ -2648,7 +3055,11 @@ mod tests {
     fn config_default_has_sane_values() {
         let c = Config::default();
         assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
-        assert!(c.default_model.as_deref().unwrap().contains("gemini-3.1-pro"));
+        assert!(c
+            .default_model
+            .as_deref()
+            .unwrap()
+            .contains("gemini-3.1-pro"));
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
@@ -2669,7 +3080,9 @@ mod tests {
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
+        assert_eq!(a.max_actions_per_hour, 600);
+        assert_eq!(a.max_actions_per_minute, 20);
+        assert_eq!(a.max_loop_repeats, 5);
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
@@ -2766,7 +3179,9 @@ default_temperature = 0.7
                 workspace_only: false,
                 allowed_commands: vec!["docker".into()],
                 forbidden_paths: vec!["/secret".into()],
-                max_actions_per_hour: 50,
+                max_actions_per_hour: 1000,
+                max_actions_per_minute: 30,
+                max_loop_repeats: 10,
                 max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
@@ -2823,6 +3238,7 @@ default_temperature = 0.7
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
+            voice: VoiceConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2936,6 +3352,7 @@ tool_dispatcher = "xml"
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
+            voice: VoiceConfig::default(),
         };
 
         config.save().unwrap();
@@ -3614,7 +4031,26 @@ default_temperature = 0.7
     fn browser_config_default_disabled() {
         let b = BrowserConfig::default();
         assert!(!b.enabled);
+        assert!(b.include_default_domains);
+        // User-specified domains are empty, but effective list has defaults.
         assert!(b.allowed_domains.is_empty());
+        let effective = b.effective_allowed_domains();
+        assert!(
+            !effective.is_empty(),
+            "Default preset should populate effective domains"
+        );
+        assert!(
+            effective.iter().any(|d| d == "github.com"),
+            "github.com must be in default preset"
+        );
+        assert!(
+            effective.iter().any(|d| d == "google.com"),
+            "google.com must be in default preset"
+        );
+        assert!(
+            effective.iter().any(|d| d == "stackoverflow.com"),
+            "stackoverflow.com must be in default preset"
+        );
         assert_eq!(b.backend, "agent_browser");
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
@@ -3631,6 +4067,7 @@ default_temperature = 0.7
     fn browser_config_serde_roundtrip() {
         let b = BrowserConfig {
             enabled: true,
+            include_default_domains: false,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
@@ -3681,6 +4118,89 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(!parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
+        // But effective domains include the preset.
+        assert!(!parsed.browser.effective_allowed_domains().is_empty());
+    }
+
+    #[test]
+    fn effective_domains_merges_user_and_defaults() {
+        let b = BrowserConfig {
+            include_default_domains: true,
+            allowed_domains: vec!["my-internal-tool.example.com".into()],
+            ..BrowserConfig::default()
+        };
+        let effective = b.effective_allowed_domains();
+        assert!(
+            effective.iter().any(|d| d == "github.com"),
+            "Must include default"
+        );
+        assert!(
+            effective
+                .iter()
+                .any(|d| d == "my-internal-tool.example.com"),
+            "Must include user domain"
+        );
+    }
+
+    #[test]
+    fn effective_domains_only_user_when_defaults_disabled() {
+        let b = BrowserConfig {
+            include_default_domains: false,
+            allowed_domains: vec!["only-this.com".into()],
+            ..BrowserConfig::default()
+        };
+        let effective = b.effective_allowed_domains();
+        assert_eq!(effective, vec!["only-this.com"]);
+        assert!(
+            !effective.iter().any(|d| d == "github.com"),
+            "Defaults must be excluded"
+        );
+    }
+
+    #[test]
+    fn effective_domains_deduplicates() {
+        let b = BrowserConfig {
+            include_default_domains: true,
+            allowed_domains: vec!["github.com".into(), "GITHUB.COM".into()],
+            ..BrowserConfig::default()
+        };
+        let effective = b.effective_allowed_domains();
+        let github_count = effective
+            .iter()
+            .filter(|d| d.to_lowercase() == "github.com")
+            .count();
+        assert_eq!(github_count, 1, "Duplicates must be removed");
+    }
+
+    #[test]
+    fn default_browser_domains_comprehensive() {
+        let domains = default_browser_domains();
+        // Must cover major categories.
+        let must_include = [
+            "google.com",
+            "naver.com",
+            "github.com",
+            "stackoverflow.com",
+            "npmjs.com",
+            "crates.io",
+            "docs.rs",
+            "developer.mozilla.org",
+            "wikipedia.org",
+            "arxiv.org",
+            "kubernetes.io",
+            "postgresql.org",
+        ];
+        for domain in must_include {
+            assert!(
+                domains.iter().any(|d| d == domain),
+                "Default preset must include {domain}"
+            );
+        }
+        // Must not include any private/dangerous entries.
+        for domain in &domains {
+            assert!(!domain.contains("localhost"), "Must not include localhost");
+            assert!(!domain.contains("127.0.0.1"), "Must not include loopback");
+        }
     }
 
     // ── Environment variable overrides (Docker support) ─────────
