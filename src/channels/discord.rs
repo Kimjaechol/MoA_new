@@ -549,7 +549,15 @@ mod tests {
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false, None, None);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["*".into()],
+            false,
+            false,
+            None,
+            None,
+        );
         assert!(ch.is_user_allowed("12345"));
         assert!(ch.is_user_allowed("anyone"));
     }
@@ -573,7 +581,15 @@ mod tests {
 
     #[test]
     fn allowlist_is_exact_match_not_substring() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false, None, None);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["111".into()],
+            false,
+            false,
+            None,
+            None,
+        );
         assert!(!ch.is_user_allowed("1111"));
         assert!(!ch.is_user_allowed("11"));
         assert!(!ch.is_user_allowed("0111"));
@@ -581,7 +597,15 @@ mod tests {
 
     #[test]
     fn allowlist_empty_string_user_id() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false, None, None);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["111".into()],
+            false,
+            false,
+            None,
+            None,
+        );
         assert!(!ch.is_user_allowed(""));
     }
 
@@ -602,7 +626,15 @@ mod tests {
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false, None, None);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["ABC".into()],
+            false,
+            false,
+            None,
+            None,
+        );
         assert!(ch.is_user_allowed("ABC"));
         assert!(!ch.is_user_allowed("abc"));
         assert!(!ch.is_user_allowed("Abc"));

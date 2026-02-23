@@ -165,12 +165,12 @@ impl RateLimiter {
             };
 
             let message = match new_strike {
-                StrikeLevel::Strike2 => Some(
-                    "Strike 2: Rate limit cooldown escalated to 1 hour. Final warning.".into(),
-                ),
-                StrikeLevel::Banned => Some(
-                    "Strike 3: Permanently banned. Contact admin to restore access.".into(),
-                ),
+                StrikeLevel::Strike2 => {
+                    Some("Strike 2: Rate limit cooldown escalated to 1 hour. Final warning.".into())
+                }
+                StrikeLevel::Banned => {
+                    Some("Strike 3: Permanently banned. Contact admin to restore access.".into())
+                }
                 _ => Some(format!(
                     "Rate limited. Please wait {} seconds.",
                     remaining_secs
@@ -197,9 +197,7 @@ impl RateLimiter {
 
         // Clean old timestamps outside the window
         let window_start = now.saturating_sub(self.window_secs);
-        state
-            .request_timestamps
-            .retain(|&ts| ts >= window_start);
+        state.request_timestamps.retain(|&ts| ts >= window_start);
 
         // Check rate limit
         if u32::try_from(state.request_timestamps.len()).unwrap_or(u32::MAX) >= self.limit {
@@ -226,13 +224,11 @@ impl RateLimiter {
                     self.limit, self.window_secs,
                 )),
                 StrikeLevel::Strike2 => Some(
-                    "Strike 2: Rate limit exceeded again. 1-hour cooldown. Final warning."
-                        .into(),
+                    "Strike 2: Rate limit exceeded again. 1-hour cooldown. Final warning.".into(),
                 ),
-                StrikeLevel::Banned => Some(
-                    "Strike 3: Permanently banned. Contact admin to restore access."
-                        .into(),
-                ),
+                StrikeLevel::Banned => {
+                    Some("Strike 3: Permanently banned. Contact admin to restore access.".into())
+                }
                 StrikeLevel::None => None,
             };
 
@@ -247,7 +243,8 @@ impl RateLimiter {
 
         // Request allowed — record timestamp
         state.request_timestamps.push(now);
-        let remaining = self.limit - u32::try_from(state.request_timestamps.len()).unwrap_or(u32::MAX);
+        let remaining =
+            self.limit - u32::try_from(state.request_timestamps.len()).unwrap_or(u32::MAX);
 
         RateLimitResult {
             allowed: true,

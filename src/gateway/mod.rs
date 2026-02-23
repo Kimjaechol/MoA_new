@@ -12,7 +12,6 @@ pub mod pair;
 use crate::agent::agent::Agent;
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
-use serde::Deserialize as GatewayDeserialize;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
@@ -27,6 +26,7 @@ use axum::{
     Router,
 };
 use parking_lot::Mutex;
+use serde::Deserialize as GatewayDeserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -274,7 +274,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>> =
         match crate::channels::pairing::ChannelPairingStore::open(&pairing_db_path) {
             Ok(store) => {
-                tracing::info!("Channel pairing store initialized at {}", pairing_db_path.display());
+                tracing::info!(
+                    "Channel pairing store initialized at {}",
+                    pairing_db_path.display()
+                );
                 Some(Arc::new(store))
             }
             Err(e) => {
@@ -291,7 +294,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 line.channel_secret.clone(),
                 line.allowed_users.clone(),
                 channel_pairing.clone(),
-                Some(format!("http://{}:{}", config.gateway.host, config.gateway.port)),
+                Some(format!(
+                    "http://{}:{}",
+                    config.gateway.host, config.gateway.port
+                )),
             ))
         });
 
@@ -304,7 +310,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 wa.verify_token.clone(),
                 wa.allowed_numbers.clone(),
                 channel_pairing.clone(),
-                Some(format!("http://{}:{}", config.gateway.host, config.gateway.port)),
+                Some(format!(
+                    "http://{}:{}",
+                    config.gateway.host, config.gateway.port
+                )),
             ))
         });
 
@@ -495,7 +504,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("     │  {code}  │");
         println!("     └──────────────┘");
         if pairing.requires_credentials() {
-            println!("     Send: POST /pair with X-Pairing-Code header + {{username, password}} body");
+            println!(
+                "     Send: POST /pair with X-Pairing-Code header + {{username, password}} body"
+            );
         } else {
             println!("     Send: POST /pair with header X-Pairing-Code: {code}");
         }
@@ -584,7 +595,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/health", get(handle_health))
         .route("/api/navigation", get(handle_navigation))
         .route("/api/coding/layout", get(handle_coding_layout))
-        .route("/api/coding/layout/mobile", get(handle_coding_layout_mobile))
+        .route(
+            "/api/coding/layout/mobile",
+            get(handle_coding_layout_mobile),
+        )
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -596,7 +610,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/auth/me", get(handle_auth_me))
         .route("/api/auth/devices", get(handle_auth_devices_list))
         .route("/api/auth/devices", post(handle_auth_device_register))
-        .route("/api/auth/devices/{device_id}", axum::routing::delete(handle_auth_device_remove))
+        .route(
+            "/api/auth/devices/{device_id}",
+            axum::routing::delete(handle_auth_device_remove),
+        )
         .route("/sync", get(handle_sync_ws))
         .route("/api/sync/relay", post(handle_sync_relay_upload))
         .route("/api/sync/relay", get(handle_sync_relay_pickup))
@@ -605,9 +622,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/pair/signup", get(pair::handle_pair_signup_page))
         .route("/pair/signup", post(pair::handle_pair_signup_submit))
         .route("/api/telemetry/events", post(handle_telemetry_ingest))
-        .route("/api/admin/telemetry/events", get(handle_admin_telemetry_events))
-        .route("/api/admin/telemetry/summary", get(handle_admin_telemetry_summary))
-        .route("/api/admin/telemetry/alerts", get(handle_admin_telemetry_alerts))
+        .route(
+            "/api/admin/telemetry/events",
+            get(handle_admin_telemetry_events),
+        )
+        .route(
+            "/api/admin/telemetry/summary",
+            get(handle_admin_telemetry_summary),
+        )
+        .route(
+            "/api/admin/telemetry/alerts",
+            get(handle_admin_telemetry_alerts),
+        )
         .route("/api/voice/ui", get(handle_voice_ui))
         .route("/api/voice/interpret", get(handle_voice_interpret_ws))
         .route("/api/voice/sessions", get(handle_voice_sessions_list))
@@ -1032,11 +1058,13 @@ async fn handle_whatsapp_message(
     if let Some(ref cp) = state.channel_pairing {
         for sender in &unpaired {
             let token = cp.create_token("whatsapp", sender);
-            let auto_url =
-                crate::channels::pairing::ChannelPairingStore::auto_pair_url(&state.gateway_base_url, &token);
+            let auto_url = crate::channels::pairing::ChannelPairingStore::auto_pair_url(
+                &state.gateway_base_url,
+                &token,
+            );
             let _ = wa
                 .send(&SendMessage::new(
-                    &format!(
+                    format!(
                         "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
                     ),
                     sender,
@@ -1124,7 +1152,11 @@ async fn handle_line_message(
     if !line.verify_signature(&body, signature) {
         tracing::warn!(
             "LINE webhook signature verification failed (signature: {})",
-            if signature.is_empty() { "missing" } else { "invalid" }
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
         );
         return (
             StatusCode::UNAUTHORIZED,
@@ -1153,7 +1185,7 @@ async fn handle_line_message(
             );
             let _ = line
                 .send(&SendMessage::new(
-                    &format!(
+                    format!(
                         "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
                     ),
                     sender,
@@ -1176,11 +1208,7 @@ async fn handle_line_message(
 
         // Auto-save to memory
         if state.auto_save {
-            let key = format!(
-                "line_msg_{}_{}",
-                msg.sender,
-                msg.timestamp
-            );
+            let key = format!("line_msg_{}_{}", msg.sender, msg.timestamp);
             let _ = state
                 .mem
                 .store(&key, &msg.content, MemoryCategory::Conversation, None)
@@ -1429,10 +1457,7 @@ async fn handle_auth_login(
 }
 
 /// POST /api/auth/logout — revoke current session.
-async fn handle_auth_logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AuthResponse {
+async fn handle_auth_logout(State(state): State<AppState>, headers: HeaderMap) -> AuthResponse {
     let auth_store = match state.auth_store.as_ref() {
         Some(s) => s,
         None => {
@@ -1470,10 +1495,7 @@ async fn handle_auth_logout(
 }
 
 /// GET /api/auth/me — get current user info from session token.
-async fn handle_auth_me(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AuthResponse {
+async fn handle_auth_me(State(state): State<AppState>, headers: HeaderMap) -> AuthResponse {
     let session = match require_auth_session(&state, &headers) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -1652,20 +1674,14 @@ async fn handle_sync_ws(
     let broadcast_tx = match state.sync_broadcast.as_ref() {
         Some(tx) => tx.clone(),
         None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Sync not enabled",
-            )
-                .into_response();
+            return (StatusCode::SERVICE_UNAVAILABLE, "Sync not enabled").into_response();
         }
     };
 
     let device_id = session.device_id.clone().unwrap_or_default();
     let user_id = session.user_id.clone();
 
-    ws.on_upgrade(move |socket| {
-        handle_sync_ws_connection(socket, broadcast_tx, device_id, user_id)
-    })
+    ws.on_upgrade(move |socket| handle_sync_ws_connection(socket, broadcast_tx, device_id, user_id))
 }
 
 /// Handle a single WebSocket sync connection.
@@ -2032,7 +2048,9 @@ async fn handle_voice_session_create(
         }
     };
 
-    let source: crate::voice::LanguageCode = match crate::voice::LanguageCode::from_str_code(&body.source_language) {
+    let source: crate::voice::LanguageCode = match crate::voice::LanguageCode::from_str_code(
+        &body.source_language,
+    ) {
         Some(l) => l,
         None => {
             return (
@@ -2043,7 +2061,9 @@ async fn handle_voice_session_create(
         }
     };
 
-    let target: crate::voice::LanguageCode = match crate::voice::LanguageCode::from_str_code(&body.target_language) {
+    let target: crate::voice::LanguageCode = match crate::voice::LanguageCode::from_str_code(
+        &body.target_language,
+    ) {
         Some(l) => l,
         None => {
             return (
@@ -2136,7 +2156,11 @@ async fn handle_voice_sessions_list(
         })
         .collect();
 
-    (StatusCode::OK, Json(serde_json::json!({"sessions": sessions_json}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"sessions": sessions_json})),
+    )
+        .into_response()
 }
 
 /// GET /api/voice/interpret — WebSocket upgrade for real-time voice interpretation.
@@ -2193,9 +2217,7 @@ async fn handle_voice_interpret_ws(
 
     let voice_manager = Arc::clone(&state.voice_sessions);
 
-    ws.on_upgrade(move |socket| {
-        handle_voice_ws_connection(socket, voice_session, voice_manager)
-    })
+    ws.on_upgrade(move |socket| handle_voice_ws_connection(socket, voice_session, voice_manager))
 }
 
 /// Handle a single voice interpretation WebSocket connection.
@@ -2230,9 +2252,7 @@ async fn handle_voice_ws_connection(
                 "type": "error",
                 "message": "Gemini API key not configured. Set GEMINI_API_KEY env var."
             });
-            let _ = ws_sender
-                .send(Message::Text(err.to_string().into()))
-                .await;
+            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
             return;
         }
     };
@@ -2255,19 +2275,14 @@ async fn handle_voice_ws_connection(
                 "type": "error",
                 "message": format!("Failed to connect to Gemini Live: {e}")
             });
-            let _ = ws_sender
-                .send(Message::Text(err.to_string().into()))
-                .await;
+            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
             return;
         }
     };
 
     // Update session status
     let _ = voice_manager
-        .update_status(
-            &session_id,
-            crate::voice::InterpreterStatus::Connecting,
-        )
+        .update_status(&session_id, crate::voice::InterpreterStatus::Connecting)
         .await;
 
     // Wait for setup to complete (with timeout)
@@ -2290,9 +2305,7 @@ async fn handle_voice_ws_connection(
             "type": "error",
             "message": "Gemini Live setup timed out or failed"
         });
-        let _ = ws_sender
-            .send(Message::Text(err.to_string().into()))
-            .await;
+        let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
         gemini_session.close().await;
         return;
     }
@@ -2376,10 +2389,7 @@ async fn handle_voice_ws_connection(
             "Voice event relay task ended"
         );
         let _ = voice_manager_events
-            .update_status(
-                &session_id_events,
-                crate::voice::InterpreterStatus::Closed,
-            )
+            .update_status(&session_id_events, crate::voice::InterpreterStatus::Closed)
             .await;
     });
 
@@ -2429,9 +2439,7 @@ async fn handle_voice_ws_connection(
     gemini_session.close().await;
     send_task.abort();
 
-    let _ = voice_manager
-        .close_session(&session_id)
-        .await;
+    let _ = voice_manager.close_session(&session_id).await;
 
     tracing::info!(session_id = %session_id, "Voice interpretation session ended");
 }

@@ -487,7 +487,10 @@ async fn handle_webhook(
                     tokio::spawn(async move {
                         if let Err(e) = tokio::task::spawn_blocking(move || {
                             super::pairing::persist_channel_allowlist("kakao", &uid)
-                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
+                        {
                             tracing::error!("KakaoTalk: failed to persist pairing: {e}");
                         }
                     });
@@ -496,7 +499,8 @@ async fn handle_webhook(
                     // Create token and show one-click connect button
                     if let Some(ref gw_url) = state.gateway_url {
                         let token = store.create_token("kakao", user_id);
-                        let auto_url = super::pairing::ChannelPairingStore::auto_pair_url(gw_url, &token);
+                        let auto_url =
+                            super::pairing::ChannelPairingStore::auto_pair_url(gw_url, &token);
                         return Json(serde_json::json!({
                             "version": "2.0",
                             "template": {
@@ -536,15 +540,18 @@ async fn handle_webhook(
 
         // Check for remote commands (e.g., /status, /help, /memory)
         if let Some(cmd) = KakaoTalkChannel::parse_remote_command(utterance) {
-            let cmd_content = format!("[remote_command] {}", match &cmd {
-                RemoteCommand::Status => "/status".to_string(),
-                RemoteCommand::Help => "/help".to_string(),
-                RemoteCommand::CronList => "/cron".to_string(),
-                RemoteCommand::MemoryQuery(q) => format!("/memory {q}"),
-                RemoteCommand::MemoryStore(v) => format!("/remember {v}"),
-                RemoteCommand::MemoryForget(k) => format!("/forget {k}"),
-                RemoteCommand::Shell(c) => format!("/shell {c}"),
-            });
+            let cmd_content = format!(
+                "[remote_command] {}",
+                match &cmd {
+                    RemoteCommand::Status => "/status".to_string(),
+                    RemoteCommand::Help => "/help".to_string(),
+                    RemoteCommand::CronList => "/cron".to_string(),
+                    RemoteCommand::MemoryQuery(q) => format!("/memory {q}"),
+                    RemoteCommand::MemoryStore(v) => format!("/remember {v}"),
+                    RemoteCommand::MemoryForget(k) => format!("/forget {k}"),
+                    RemoteCommand::Shell(c) => format!("/shell {c}"),
+                }
+            );
 
             let channel_msg = ChannelMessage {
                 id: Uuid::new_v4().to_string(),
@@ -557,7 +564,10 @@ async fn handle_webhook(
 
             if state.tx.send(channel_msg).await.is_err() {
                 tracing::warn!("KakaoTalk: message channel closed");
-                return kakao_skill_response("시스템 오류가 발생했습니다. 잠시 후 다시 시도해주세요.").into_response();
+                return kakao_skill_response(
+                    "시스템 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+                )
+                .into_response();
             }
             return kakao_skill_response("명령을 처리 중입니다...").into_response();
         }
@@ -596,7 +606,8 @@ async fn handle_webhook(
             return kakao_skill_response("시스템 오류가 발생했습니다.").into_response();
         }
 
-        return kakao_skill_response("요청을 처리 중입니다. 잠시만 기다려주세요...").into_response();
+        return kakao_skill_response("요청을 처리 중입니다. 잠시만 기다려주세요...")
+            .into_response();
     }
 
     // Also handle direct message callback format (plain StatusCode response)
@@ -614,7 +625,10 @@ async fn handle_webhook(
                     tokio::spawn(async move {
                         if let Err(e) = tokio::task::spawn_blocking(move || {
                             super::pairing::persist_channel_allowlist("kakao", &uid)
-                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
+                        {
                             tracing::error!("KakaoTalk: failed to persist pairing: {e}");
                         }
                     });
@@ -721,13 +735,22 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let ch = KakaoTalkChannel::new("key".into(), "admin".into(), None, vec![], 8080, None, None);
+        let ch =
+            KakaoTalkChannel::new("key".into(), "admin".into(), None, vec![], 8080, None, None);
         assert_eq!(ch.name(), "kakao");
     }
 
     #[test]
     fn test_user_allowed_wildcard() {
-        let ch = KakaoTalkChannel::new("key".into(), "admin".into(), None, vec!["*".into()], 8080, None, None);
+        let ch = KakaoTalkChannel::new(
+            "key".into(),
+            "admin".into(),
+            None,
+            vec!["*".into()],
+            8080,
+            None,
+            None,
+        );
         assert!(ch.is_user_allowed("anyone"));
     }
 
@@ -748,7 +771,8 @@ mod tests {
 
     #[test]
     fn test_user_denied_empty() {
-        let ch = KakaoTalkChannel::new("key".into(), "admin".into(), None, vec![], 8080, None, None);
+        let ch =
+            KakaoTalkChannel::new("key".into(), "admin".into(), None, vec![], 8080, None, None);
         assert!(!ch.is_user_allowed("anyone"));
     }
 

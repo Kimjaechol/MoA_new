@@ -1881,7 +1881,7 @@ mod tests {
                 assert_eq!(repeat_count, 3);
                 assert_eq!(max_allowed, 3);
             }
-            other => panic!("Expected LoopDetected, got {other:?}"),
+            other @ LoopCheckResult::Ok => panic!("Expected LoopDetected, got {other:?}"),
         }
     }
 
@@ -1973,7 +1973,7 @@ mod tests {
             LoopCheckResult::LoopDetected { repeat_count, .. } => {
                 assert_eq!(repeat_count, 2);
             }
-            other => panic!("Expected LoopDetected, got {other:?}"),
+            other @ LoopCheckResult::Ok => panic!("Expected LoopDetected, got {other:?}"),
         }
     }
 

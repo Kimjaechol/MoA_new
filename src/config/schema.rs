@@ -566,7 +566,6 @@ fn default_peripheral_baud() -> u32 {
     115_200
 }
 
-
 impl Default for PeripheralBoardConfig {
     fn default() -> Self {
         Self {
@@ -2613,10 +2612,13 @@ impl Config {
         // Telegram: ZEROCLAW_TELEGRAM_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_TELEGRAM_TOKEN") {
             if !token.is_empty() {
-                let tg = self.channels_config.telegram.get_or_insert_with(|| TelegramConfig {
-                    bot_token: String::new(),
-                    allowed_users: vec![],
-                });
+                let tg = self
+                    .channels_config
+                    .telegram
+                    .get_or_insert_with(|| TelegramConfig {
+                        bot_token: String::new(),
+                        allowed_users: vec![],
+                    });
                 tg.bot_token = token;
             }
         }
@@ -2631,13 +2633,16 @@ impl Config {
         // Discord: ZEROCLAW_DISCORD_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_DISCORD_TOKEN") {
             if !token.is_empty() {
-                let dc = self.channels_config.discord.get_or_insert_with(|| DiscordConfig {
-                    bot_token: String::new(),
-                    guild_id: None,
-                    allowed_users: vec![],
-                    listen_to_bots: false,
-                    mention_only: false,
-                });
+                let dc = self
+                    .channels_config
+                    .discord
+                    .get_or_insert_with(|| DiscordConfig {
+                        bot_token: String::new(),
+                        guild_id: None,
+                        allowed_users: vec![],
+                        listen_to_bots: false,
+                        mention_only: false,
+                    });
                 dc.bot_token = token;
             }
         }
@@ -2652,12 +2657,15 @@ impl Config {
         // Slack: ZEROCLAW_SLACK_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_SLACK_TOKEN") {
             if !token.is_empty() {
-                let sl = self.channels_config.slack.get_or_insert_with(|| SlackConfig {
-                    bot_token: String::new(),
-                    app_token: None,
-                    channel_id: None,
-                    allowed_users: vec![],
-                });
+                let sl = self
+                    .channels_config
+                    .slack
+                    .get_or_insert_with(|| SlackConfig {
+                        bot_token: String::new(),
+                        app_token: None,
+                        channel_id: None,
+                        allowed_users: vec![],
+                    });
                 sl.bot_token = token;
             }
         }
@@ -2679,13 +2687,16 @@ impl Config {
         // WhatsApp: ZEROCLAW_WHATSAPP_ACCESS_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_WHATSAPP_ACCESS_TOKEN") {
             if !token.is_empty() {
-                let wa = self.channels_config.whatsapp.get_or_insert_with(|| WhatsAppConfig {
-                    access_token: String::new(),
-                    phone_number_id: String::new(),
-                    verify_token: String::new(),
-                    app_secret: None,
-                    allowed_numbers: vec![],
-                });
+                let wa = self
+                    .channels_config
+                    .whatsapp
+                    .get_or_insert_with(|| WhatsAppConfig {
+                        access_token: String::new(),
+                        phone_number_id: String::new(),
+                        verify_token: String::new(),
+                        app_secret: None,
+                        allowed_numbers: vec![],
+                    });
                 wa.access_token = token;
             }
         }
@@ -2741,13 +2752,16 @@ impl Config {
         // KakaoTalk: ZEROCLAW_KAKAO_REST_API_KEY
         if let Ok(key) = std::env::var("ZEROCLAW_KAKAO_REST_API_KEY") {
             if !key.is_empty() {
-                let kk = self.channels_config.kakao.get_or_insert_with(|| KakaoTalkConfig {
-                    rest_api_key: String::new(),
-                    admin_key: String::new(),
-                    webhook_secret: None,
-                    allowed_users: vec![],
-                    port: default_kakao_port(),
-                });
+                let kk = self
+                    .channels_config
+                    .kakao
+                    .get_or_insert_with(|| KakaoTalkConfig {
+                        rest_api_key: String::new(),
+                        admin_key: String::new(),
+                        webhook_secret: None,
+                        allowed_users: vec![],
+                        port: default_kakao_port(),
+                    });
                 kk.rest_api_key = key;
             }
         }
@@ -2800,11 +2814,14 @@ impl Config {
         // DingTalk: ZEROCLAW_DINGTALK_CLIENT_ID
         if let Ok(id) = std::env::var("ZEROCLAW_DINGTALK_CLIENT_ID") {
             if !id.is_empty() {
-                let dt = self.channels_config.dingtalk.get_or_insert_with(|| DingTalkConfig {
-                    client_id: String::new(),
-                    client_secret: String::new(),
-                    allowed_users: vec![],
-                });
+                let dt = self
+                    .channels_config
+                    .dingtalk
+                    .get_or_insert_with(|| DingTalkConfig {
+                        client_id: String::new(),
+                        client_secret: String::new(),
+                        allowed_users: vec![],
+                    });
                 dt.client_id = id;
             }
         }
@@ -2852,12 +2869,15 @@ impl Config {
         // Matrix: ZEROCLAW_MATRIX_ACCESS_TOKEN
         if let Ok(token) = std::env::var("ZEROCLAW_MATRIX_ACCESS_TOKEN") {
             if !token.is_empty() {
-                let mx = self.channels_config.matrix.get_or_insert_with(|| MatrixConfig {
-                    homeserver: String::new(),
-                    access_token: String::new(),
-                    room_id: String::new(),
-                    allowed_users: vec![],
-                });
+                let mx = self
+                    .channels_config
+                    .matrix
+                    .get_or_insert_with(|| MatrixConfig {
+                        homeserver: String::new(),
+                        access_token: String::new(),
+                        room_id: String::new(),
+                        allowed_users: vec![],
+                    });
                 mx.access_token = token;
             }
         }
@@ -2886,14 +2906,17 @@ impl Config {
         // Signal: ZEROCLAW_SIGNAL_HTTP_URL
         if let Ok(url) = std::env::var("ZEROCLAW_SIGNAL_HTTP_URL") {
             if !url.is_empty() {
-                let sig = self.channels_config.signal.get_or_insert_with(|| SignalConfig {
-                    http_url: String::new(),
-                    account: String::new(),
-                    group_id: None,
-                    allowed_from: vec![],
-                    ignore_attachments: false,
-                    ignore_stories: false,
-                });
+                let sig = self
+                    .channels_config
+                    .signal
+                    .get_or_insert_with(|| SignalConfig {
+                        http_url: String::new(),
+                        account: String::new(),
+                        group_id: None,
+                        allowed_from: vec![],
+                        ignore_attachments: false,
+                        ignore_stories: false,
+                    });
                 sig.http_url = url;
             }
         }
@@ -3032,7 +3055,11 @@ mod tests {
     fn config_default_has_sane_values() {
         let c = Config::default();
         assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
-        assert!(c.default_model.as_deref().unwrap().contains("gemini-3.1-pro"));
+        assert!(c
+            .default_model
+            .as_deref()
+            .unwrap()
+            .contains("gemini-3.1-pro"));
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
@@ -4171,14 +4198,8 @@ default_temperature = 0.7
         }
         // Must not include any private/dangerous entries.
         for domain in &domains {
-            assert!(
-                !domain.contains("localhost"),
-                "Must not include localhost"
-            );
-            assert!(
-                !domain.contains("127.0.0.1"),
-                "Must not include loopback"
-            );
+            assert!(!domain.contains("localhost"), "Must not include localhost");
+            assert!(!domain.contains("127.0.0.1"), "Must not include loopback");
         }
     }
 

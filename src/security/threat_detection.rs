@@ -256,7 +256,10 @@ static THREAT_PATTERNS: LazyLock<Vec<ThreatPattern>> = LazyLock::new(|| {
 /// Patterns that indicate an inbound (retrieval) operation.
 static INBOUND_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
-        Regex::new(r"(?i)(?:검색|찾|조회|확인|search|find|lookup|query|check|show|get|list|display|read)").unwrap(),
+        Regex::new(
+            r"(?i)(?:검색|찾|조회|확인|search|find|lookup|query|check|show|get|list|display|read)",
+        )
+        .unwrap(),
         Regex::new(r"(?i)(?:크롤링|스크래핑|다운로드|crawl|scrape|download|fetch)").unwrap(),
         Regex::new(r"(?i)(?:날씨|뉴스|주가|환율|weather|news|stock|exchange)").unwrap(),
     ]

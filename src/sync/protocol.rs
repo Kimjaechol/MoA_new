@@ -173,11 +173,7 @@ impl OrderBuffer {
         let device_id = delta.device_id.clone();
         let seq = delta.version.get(&device_id);
 
-        let expected = self
-            .expected_seq
-            .get(&device_id)
-            .copied()
-            .unwrap_or(1);
+        let expected = self.expected_seq.get(&device_id).copied().unwrap_or(1);
 
         // Duplicate / already-seen — discard (idempotency)
         if seq < expected {
@@ -185,10 +181,7 @@ impl OrderBuffer {
         }
 
         // Insert into per-device buffer
-        let device_buf = self
-            .buffers
-            .entry(device_id.clone())
-            .or_default();
+        let device_buf = self.buffers.entry(device_id.clone()).or_default();
         device_buf.insert(seq, delta);
 
         // Enforce buffer size limit
@@ -207,11 +200,7 @@ impl OrderBuffer {
     /// for the given device.
     fn flush(&mut self, device_id: &str) -> Vec<DeltaEntry> {
         let mut ready = Vec::new();
-        let expected = self
-            .expected_seq
-            .get(device_id)
-            .copied()
-            .unwrap_or(1);
+        let expected = self.expected_seq.get(device_id).copied().unwrap_or(1);
 
         let device_buf = match self.buffers.get_mut(device_id) {
             Some(buf) => buf,
@@ -238,11 +227,7 @@ impl OrderBuffer {
             if buf.is_empty() {
                 continue;
             }
-            let expected = self
-                .expected_seq
-                .get(device_id)
-                .copied()
-                .unwrap_or(1);
+            let expected = self.expected_seq.get(device_id).copied().unwrap_or(1);
             let first_buffered = buf.keys().next().copied().unwrap_or(0);
             if first_buffered > expected {
                 return true;
@@ -253,11 +238,7 @@ impl OrderBuffer {
 
     /// Get the set of missing sequences (gaps) for a given device.
     pub fn missing_sequences(&self, device_id: &str) -> Vec<u64> {
-        let expected = self
-            .expected_seq
-            .get(device_id)
-            .copied()
-            .unwrap_or(1);
+        let expected = self.expected_seq.get(device_id).copied().unwrap_or(1);
 
         let buf = match self.buffers.get(device_id) {
             Some(b) => b,
@@ -310,8 +291,8 @@ pub fn merge_deltas_lww(
 
     let mut insert = |delta: &DeltaEntry| {
         let key = match &delta.operation {
-            crate::memory::sync::DeltaOperation::Store { key, .. } => key.clone(),
-            crate::memory::sync::DeltaOperation::Forget { key } => key.clone(),
+            crate::memory::sync::DeltaOperation::Store { key, .. }
+            | crate::memory::sync::DeltaOperation::Forget { key } => key.clone(),
         };
 
         match winners.get(&key) {
@@ -365,9 +346,9 @@ impl FullSyncPlan {
 
 /// Generate batched `BroadcastMessage::FullSyncData` messages for entities
 /// the remote peer is missing.
-pub fn build_full_sync_data_messages(
+pub fn build_full_sync_data_messages<S: std::hash::BuildHasher>(
     from_device_id: &str,
-    missing_keys: &HashSet<String>,
+    missing_keys: &HashSet<String, S>,
     entries: &[(String, String, String, String)], // (key, entity_type, encrypted_payload, iv)
 ) -> Vec<BroadcastMessage> {
     let mut messages = Vec::new();

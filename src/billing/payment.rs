@@ -355,11 +355,7 @@ impl PaymentManager {
     }
 
     /// Store the Kakao Pay TID after successful ready call.
-    pub fn set_provider_tid(
-        &self,
-        transaction_id: &str,
-        provider_tid: &str,
-    ) -> anyhow::Result<()> {
+    pub fn set_provider_tid(&self, transaction_id: &str, provider_tid: &str) -> anyhow::Result<()> {
         let Some(ref conn) = self.conn else {
             return Ok(());
         };
@@ -397,10 +393,7 @@ impl PaymentManager {
         }
 
         if record.status != PaymentStatus::Pending {
-            anyhow::bail!(
-                "Cannot complete payment in status: {:?}",
-                record.status
-            );
+            anyhow::bail!("Cannot complete payment in status: {:?}", record.status);
         }
 
         let now = now_epoch();
@@ -553,16 +546,18 @@ impl PaymentManager {
 
         if updated == 0 {
             let current = self.get_balance(user_id)?;
-            anyhow::bail!(
-                "Insufficient credits: required {amount}, available {current}"
-            );
+            anyhow::bail!("Insufficient credits: required {amount}, available {current}");
         }
 
         self.get_balance(user_id)
     }
 
     /// List payment history for a user, ordered by most recent first.
-    pub fn list_user_payments(&self, user_id: &str, limit: usize) -> anyhow::Result<Vec<PaymentRecord>> {
+    pub fn list_user_payments(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<PaymentRecord>> {
         let Some(ref conn) = self.conn else {
             return Ok(Vec::new());
         };
@@ -700,7 +695,10 @@ mod tests {
         let (_tmp, manager) = make_manager();
         let result = manager.initiate_payment("zeroclaw_user", "nonexistent");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown credit package"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown credit package"));
     }
 
     #[test]
@@ -762,7 +760,10 @@ mod tests {
 
         manager.cancel_payment(&record.transaction_id).unwrap();
 
-        let cancelled = manager.get_payment(&record.transaction_id).unwrap().unwrap();
+        let cancelled = manager
+            .get_payment(&record.transaction_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(cancelled.status, PaymentStatus::Cancelled);
 
         // Should not grant credits
@@ -825,7 +826,10 @@ mod tests {
 
         let result = manager.deduct_credits("zeroclaw_user", 200);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Insufficient credits"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Insufficient credits"));
     }
 
     #[test]
@@ -856,9 +860,7 @@ mod tests {
             .initiate_payment("zeroclaw_user", "premium_5000")
             .unwrap();
 
-        let payments = manager
-            .list_user_payments("zeroclaw_user", 10)
-            .unwrap();
+        let payments = manager.list_user_payments("zeroclaw_user", 10).unwrap();
         assert_eq!(payments.len(), 3);
         // Most recent first
         assert!(payments[0].created_at >= payments[1].created_at);
@@ -874,18 +876,14 @@ mod tests {
                 .unwrap();
         }
 
-        let payments = manager
-            .list_user_payments("zeroclaw_user", 3)
-            .unwrap();
+        let payments = manager.list_user_payments("zeroclaw_user", 3).unwrap();
         assert_eq!(payments.len(), 3);
     }
 
     #[test]
     fn list_user_payments_empty() {
         let (_tmp, manager) = make_manager();
-        let payments = manager
-            .list_user_payments("zeroclaw_user", 10)
-            .unwrap();
+        let payments = manager.list_user_payments("zeroclaw_user", 10).unwrap();
         assert!(payments.is_empty());
     }
 
@@ -931,7 +929,9 @@ mod tests {
         let manager = PaymentManager::new(tmp.path(), None, "https://example.com", false).unwrap();
 
         assert!(!manager.is_enabled());
-        assert!(manager.initiate_payment("zeroclaw_user", "basic_1000").is_err());
+        assert!(manager
+            .initiate_payment("zeroclaw_user", "basic_1000")
+            .is_err());
         assert!(manager.deduct_credits("zeroclaw_user", 10).is_err());
     }
 

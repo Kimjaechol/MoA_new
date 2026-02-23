@@ -83,9 +83,7 @@ impl SyncCoordinator {
             | BroadcastMessage::FullSyncRequest { from_device_id, .. }
             | BroadcastMessage::FullSyncManifestResponse { from_device_id, .. }
             | BroadcastMessage::FullSyncData { from_device_id, .. }
-            | BroadcastMessage::FullSyncComplete { from_device_id, .. } => {
-                from_device_id.clone()
-            }
+            | BroadcastMessage::FullSyncComplete { from_device_id, .. } => from_device_id.clone(),
         };
 
         if from_device == self.device_id() {
@@ -113,7 +111,10 @@ impl SyncCoordinator {
             BroadcastMessage::FullSyncRequest {
                 from_device_id,
                 manifest,
-            } => self.handle_full_sync_request(&from_device_id, &manifest).await,
+            } => {
+                self.handle_full_sync_request(&from_device_id, &manifest)
+                    .await
+            }
 
             BroadcastMessage::FullSyncManifestResponse {
                 from_device_id,
@@ -402,7 +403,10 @@ impl SyncCoordinator {
                 if let Ok(json) = serde_json::to_string(&complete) {
                     responses.push(json);
                 }
-                tracing::info!(sent = sent_count, "Layer 3: Sent our missing entries to peer");
+                tracing::info!(
+                    sent = sent_count,
+                    "Layer 3: Sent our missing entries to peer"
+                );
             }
         }
 
@@ -516,8 +520,8 @@ mod tests {
     use super::*;
     use crate::memory::sync::{DeltaOperation, SyncEngine};
     use crate::memory::traits::MemoryCategory;
-    use crate::memory::SqliteMemory;
     use crate::memory::Memory;
+    use crate::memory::SqliteMemory;
     use tempfile::TempDir;
 
     fn make_coordinator(tmp: &TempDir) -> Arc<SyncCoordinator> {
@@ -541,7 +545,7 @@ mod tests {
                 version_vector,
             } => {
                 assert_eq!(from_device_id, coord.device_id());
-                assert!(version_vector.clocks.is_empty() || true);
+                let _ = &version_vector; // version vector may or may not have clocks
             }
             _ => panic!("Expected SyncRequest"),
         }
@@ -686,7 +690,11 @@ mod tests {
         // 1. FullSyncManifestResponse
         // 2. FullSyncData (for "only_on_b" which A doesn't have)
         // 3. FullSyncComplete
-        assert!(b_responses.len() >= 2, "Expected at least manifest + complete, got {}", b_responses.len());
+        assert!(
+            b_responses.len() >= 2,
+            "Expected at least manifest + complete, got {}",
+            b_responses.len()
+        );
 
         // Verify manifest response
         let first: BroadcastMessage = serde_json::from_str(&b_responses[0]).unwrap();

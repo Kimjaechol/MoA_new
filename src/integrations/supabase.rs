@@ -158,10 +158,7 @@ impl SupabaseClient {
     // ── User operations ──────────────────────────────────────
 
     /// Get or create a user by their KakaoTalk user ID hash.
-    pub async fn get_or_create_user(
-        &self,
-        kakao_user_id: &str,
-    ) -> anyhow::Result<SupabaseUser> {
+    pub async fn get_or_create_user(&self, kakao_user_id: &str) -> anyhow::Result<SupabaseUser> {
         // Try to fetch existing user
         let url = format!(
             "{}?kakao_user_id=eq.{}&select=*",
@@ -264,10 +261,7 @@ impl SupabaseClient {
             "p_amount": amount,
         });
 
-        let mut request = self
-            .http
-            .post(self.rpc_url("add_credits"))
-            .json(&payload);
+        let mut request = self.http.post(self.rpc_url("add_credits")).json(&payload);
 
         for (key, value) in self.auth_headers() {
             request = request.header(key, value);
@@ -292,10 +286,7 @@ impl SupabaseClient {
 
     /// Record a usage event.
     pub async fn log_usage(&self, usage: &UsageRecord) -> anyhow::Result<()> {
-        let mut request = self
-            .http
-            .post(self.table_url("lawcall_usage"))
-            .json(usage);
+        let mut request = self.http.post(self.table_url("lawcall_usage")).json(usage);
 
         for (key, value) in self.auth_headers() {
             request = request.header(key, value);
@@ -368,10 +359,7 @@ impl SupabaseClient {
         channel: &str,
         encrypted_payload: &[u8],
     ) -> anyhow::Result<()> {
-        let broadcast_url = format!(
-            "{}/realtime/v1/api/broadcast",
-            self.config.url
-        );
+        let broadcast_url = format!("{}/realtime/v1/api/broadcast", self.config.url);
 
         let payload = serde_json::json!({
             "channel": channel,
@@ -384,10 +372,7 @@ impl SupabaseClient {
             },
         });
 
-        let mut request = self
-            .http
-            .post(&broadcast_url)
-            .json(&payload);
+        let mut request = self.http.post(&broadcast_url).json(&payload);
 
         for (key, value) in self.auth_headers() {
             request = request.header(key, value);

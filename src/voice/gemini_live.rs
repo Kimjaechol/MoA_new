@@ -225,26 +225,17 @@ pub enum GeminiLiveEvent {
     /// Setup completed — ready to stream.
     SetupComplete,
     /// Translated/interpreted audio chunk from the model.
-    Audio {
-        data: Vec<u8>,
-        mime_type: String,
-    },
+    Audio { data: Vec<u8>, mime_type: String },
     /// Transcription of user's speech (input).
-    InputTranscript {
-        text: String,
-    },
+    InputTranscript { text: String },
     /// Transcription of model's speech (output / translated).
-    OutputTranscript {
-        text: String,
-    },
+    OutputTranscript { text: String },
     /// Model finished a response turn.
     TurnComplete,
     /// The model was interrupted (user started speaking mid-response).
     Interrupted,
     /// Error from the server.
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 /// Parse a JSON text frame from Gemini Live into a list of events.
@@ -287,10 +278,10 @@ pub fn parse_server_message(json_text: &str) -> Vec<GeminiLiveEvent> {
             for part in parts {
                 // Audio data
                 if let Some(inline) = part.get("inlineData") {
-                    if let (Some(data_b64), Some(mime)) =
-                        (inline.get("data").and_then(|v| v.as_str()),
-                         inline.get("mimeType").and_then(|v| v.as_str()))
-                    {
+                    if let (Some(data_b64), Some(mime)) = (
+                        inline.get("data").and_then(|v| v.as_str()),
+                        inline.get("mimeType").and_then(|v| v.as_str()),
+                    ) {
                         if let Ok(audio_bytes) =
                             base64::engine::general_purpose::STANDARD.decode(data_b64)
                         {
@@ -426,7 +417,7 @@ impl GeminiLiveSession {
         ws_sender
             .lock()
             .await
-            .send(WsMessage::Text(setup_json.into()))
+            .send(WsMessage::Text(setup_json))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send setup message: {e}"))?;
 
@@ -503,12 +494,16 @@ impl GeminiLiveSession {
     /// Outbound loop: encode audio and send to Gemini Live WebSocket.
     async fn outbound_loop(
         mut rx: mpsc::Receiver<OutboundMessage>,
-        ws_sender: Arc<Mutex<futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        ws_sender: Arc<
+            Mutex<
+                futures_util::stream::SplitSink<
+                    tokio_tungstenite::WebSocketStream<
+                        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                    >,
+                    WsMessage,
+                >,
             >,
-            WsMessage,
-        >>>,
+        >,
         state: Arc<Mutex<ConnectionState>>,
         session_id: String,
     ) {
@@ -519,7 +514,7 @@ impl GeminiLiveSession {
                     match serde_json::to_string(&audio_msg) {
                         Ok(json) => {
                             let mut sender = ws_sender.lock().await;
-                            if sender.send(WsMessage::Text(json.into())).await.is_err() {
+                            if sender.send(WsMessage::Text(json)).await.is_err() {
                                 tracing::warn!(
                                     session_id = %session_id,
                                     "WebSocket send failed, closing outbound loop"
@@ -549,7 +544,7 @@ impl GeminiLiveSession {
                     });
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let mut sender = ws_sender.lock().await;
-                        if sender.send(WsMessage::Text(json.into())).await.is_err() {
+                        if sender.send(WsMessage::Text(json)).await.is_err() {
                             break;
                         }
                     }
@@ -616,7 +611,7 @@ impl GeminiLiveSession {
                     *state.lock().await = ConnectionState::Closed;
                     break;
                 }
-                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) | Ok(WsMessage::Frame(_)) => {
+                Ok(WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_)) => {
                     // Handled by tungstenite automatically
                 }
                 Err(e) => {
@@ -718,7 +713,9 @@ mod tests {
         assert!(json.contains(INPUT_AUDIO_MIME));
         // Verify base64
         let b64 = &msg.realtime_input.media_chunks[0].data;
-        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
         assert_eq!(decoded, pcm);
     }
 
@@ -734,14 +731,18 @@ mod tests {
     fn parse_turn_complete() {
         let json = r#"{"serverContent": {"turnComplete": true}}"#;
         let events = parse_server_message(json);
-        assert!(events.iter().any(|e| matches!(e, GeminiLiveEvent::TurnComplete)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, GeminiLiveEvent::TurnComplete)));
     }
 
     #[test]
     fn parse_interrupted() {
         let json = r#"{"serverContent": {"interrupted": true}}"#;
         let events = parse_server_message(json);
-        assert!(events.iter().any(|e| matches!(e, GeminiLiveEvent::Interrupted)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, GeminiLiveEvent::Interrupted)));
     }
 
     #[test]
@@ -752,7 +753,9 @@ mod tests {
         );
         let events = parse_server_message(&json);
 
-        let audio = events.iter().find(|e| matches!(e, GeminiLiveEvent::Audio { .. }));
+        let audio = events
+            .iter()
+            .find(|e| matches!(e, GeminiLiveEvent::Audio { .. }));
         assert!(audio.is_some());
         if let GeminiLiveEvent::Audio { data, mime_type } = audio.unwrap() {
             assert_eq!(data, &[10u8, 20, 30]);
@@ -763,7 +766,7 @@ mod tests {
     #[test]
     fn parse_text_response() {
         let json = r#"{"serverContent": {"modelTurn": {"parts": [{"text": "Hello world"}]}}}"#;
-        let events = parse_server_message(&json);
+        let events = parse_server_message(json);
         assert!(events.iter().any(|e| matches!(
             e,
             GeminiLiveEvent::OutputTranscript { text } if text == "Hello world"
@@ -773,7 +776,7 @@ mod tests {
     #[test]
     fn parse_input_transcription() {
         let json = r#"{"inputTranscription": {"text": "안녕하세요"}}"#;
-        let events = parse_server_message(&json);
+        let events = parse_server_message(json);
         assert!(events.iter().any(|e| matches!(
             e,
             GeminiLiveEvent::InputTranscript { text } if text == "안녕하세요"
@@ -783,7 +786,7 @@ mod tests {
     #[test]
     fn parse_output_transcription() {
         let json = r#"{"outputTranscription": {"text": "Hello"}}"#;
-        let events = parse_server_message(&json);
+        let events = parse_server_message(json);
         assert!(events.iter().any(|e| matches!(
             e,
             GeminiLiveEvent::OutputTranscript { text } if text == "Hello"
@@ -793,7 +796,7 @@ mod tests {
     #[test]
     fn parse_error() {
         let json = r#"{"error": {"message": "Rate limit exceeded"}}"#;
-        let events = parse_server_message(&json);
+        let events = parse_server_message(json);
         assert!(events.iter().any(|e| matches!(
             e,
             GeminiLiveEvent::Error { message } if message.contains("Rate limit")
@@ -803,14 +806,18 @@ mod tests {
     #[test]
     fn parse_invalid_json() {
         let events = parse_server_message("not json at all");
-        assert!(events.iter().any(|e| matches!(e, GeminiLiveEvent::Error { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, GeminiLiveEvent::Error { .. })));
     }
 
     #[test]
     fn parse_empty_transcription_ignored() {
         let json = r#"{"inputTranscription": {"text": ""}}"#;
         let events = parse_server_message(json);
-        assert!(!events.iter().any(|e| matches!(e, GeminiLiveEvent::InputTranscript { .. })));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, GeminiLiveEvent::InputTranscript { .. })));
     }
 
     #[test]

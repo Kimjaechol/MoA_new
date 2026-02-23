@@ -237,11 +237,7 @@ mod tests {
 
         // Store MAX_ENTRIES_PER_DEVICE + 1 entries
         for i in 0..=MAX_ENTRIES_PER_DEVICE {
-            relay.store(make_entry(
-                &format!("r{i}"),
-                "dev_a",
-                "user_1",
-            ));
+            relay.store(make_entry(&format!("r{i}"), "dev_a", "user_1"));
         }
 
         // Should be capped at exactly MAX_ENTRIES_PER_DEVICE

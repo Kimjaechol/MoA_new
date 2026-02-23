@@ -42,7 +42,7 @@ impl TaskCategory {
     ];
 
     /// Human-readable label for the UI.
-    pub fn label(&self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             TaskCategory::WebGeneral => "웹/일반",
             TaskCategory::Document => "문서",
@@ -55,7 +55,7 @@ impl TaskCategory {
     }
 
     /// English identifier used in API payloads and config.
-    pub fn id(&self) -> &'static str {
+    pub fn id(self) -> &'static str {
         match self {
             TaskCategory::WebGeneral => "web_general",
             TaskCategory::Document => "document",
@@ -82,7 +82,7 @@ impl TaskCategory {
     }
 
     /// Whether this category enables the coding sandbox loop.
-    pub fn uses_sandbox(&self) -> bool {
+    pub fn uses_sandbox(self) -> bool {
         matches!(self, TaskCategory::Coding)
     }
 }
@@ -114,7 +114,7 @@ impl SidebarCategory {
         SidebarCategory::MyPage,
     ];
 
-    pub fn label(&self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             SidebarCategory::Channels => "채널",
             SidebarCategory::Billing => "결제",
@@ -122,7 +122,7 @@ impl SidebarCategory {
         }
     }
 
-    pub fn id(&self) -> &'static str {
+    pub fn id(self) -> &'static str {
         match self {
             SidebarCategory::Channels => "channels",
             SidebarCategory::Billing => "billing",
@@ -329,31 +329,156 @@ impl TranslationUiManifest {
     /// Generate the full language list with native labels and flags.
     fn all_languages() -> Vec<LanguageOption> {
         vec![
-            LanguageOption { code: "ko".into(), label: "한국어".into(), label_en: "Korean".into(), flag: "\u{1f1f0}\u{1f1f7}".into() },
-            LanguageOption { code: "en".into(), label: "English".into(), label_en: "English".into(), flag: "\u{1f1fa}\u{1f1f8}".into() },
-            LanguageOption { code: "ja".into(), label: "日本語".into(), label_en: "Japanese".into(), flag: "\u{1f1ef}\u{1f1f5}".into() },
-            LanguageOption { code: "zh".into(), label: "中文(简体)".into(), label_en: "Chinese (Simplified)".into(), flag: "\u{1f1e8}\u{1f1f3}".into() },
-            LanguageOption { code: "zh-TW".into(), label: "中文(繁體)".into(), label_en: "Chinese (Traditional)".into(), flag: "\u{1f1f9}\u{1f1fc}".into() },
-            LanguageOption { code: "es".into(), label: "Español".into(), label_en: "Spanish".into(), flag: "\u{1f1ea}\u{1f1f8}".into() },
-            LanguageOption { code: "fr".into(), label: "Français".into(), label_en: "French".into(), flag: "\u{1f1eb}\u{1f1f7}".into() },
-            LanguageOption { code: "de".into(), label: "Deutsch".into(), label_en: "German".into(), flag: "\u{1f1e9}\u{1f1ea}".into() },
-            LanguageOption { code: "it".into(), label: "Italiano".into(), label_en: "Italian".into(), flag: "\u{1f1ee}\u{1f1f9}".into() },
-            LanguageOption { code: "pt".into(), label: "Português".into(), label_en: "Portuguese".into(), flag: "\u{1f1e7}\u{1f1f7}".into() },
-            LanguageOption { code: "ru".into(), label: "Русский".into(), label_en: "Russian".into(), flag: "\u{1f1f7}\u{1f1fa}".into() },
-            LanguageOption { code: "ar".into(), label: "العربية".into(), label_en: "Arabic".into(), flag: "\u{1f1f8}\u{1f1e6}".into() },
-            LanguageOption { code: "hi".into(), label: "हिन्दी".into(), label_en: "Hindi".into(), flag: "\u{1f1ee}\u{1f1f3}".into() },
-            LanguageOption { code: "th".into(), label: "ไทย".into(), label_en: "Thai".into(), flag: "\u{1f1f9}\u{1f1ed}".into() },
-            LanguageOption { code: "vi".into(), label: "Tiếng Việt".into(), label_en: "Vietnamese".into(), flag: "\u{1f1fb}\u{1f1f3}".into() },
-            LanguageOption { code: "id".into(), label: "Bahasa Indonesia".into(), label_en: "Indonesian".into(), flag: "\u{1f1ee}\u{1f1e9}".into() },
-            LanguageOption { code: "ms".into(), label: "Bahasa Melayu".into(), label_en: "Malay".into(), flag: "\u{1f1f2}\u{1f1fe}".into() },
-            LanguageOption { code: "tl".into(), label: "Filipino".into(), label_en: "Filipino".into(), flag: "\u{1f1f5}\u{1f1ed}".into() },
-            LanguageOption { code: "nl".into(), label: "Nederlands".into(), label_en: "Dutch".into(), flag: "\u{1f1f3}\u{1f1f1}".into() },
-            LanguageOption { code: "pl".into(), label: "Polski".into(), label_en: "Polish".into(), flag: "\u{1f1f5}\u{1f1f1}".into() },
-            LanguageOption { code: "cs".into(), label: "Čeština".into(), label_en: "Czech".into(), flag: "\u{1f1e8}\u{1f1ff}".into() },
-            LanguageOption { code: "sv".into(), label: "Svenska".into(), label_en: "Swedish".into(), flag: "\u{1f1f8}\u{1f1ea}".into() },
-            LanguageOption { code: "da".into(), label: "Dansk".into(), label_en: "Danish".into(), flag: "\u{1f1e9}\u{1f1f0}".into() },
-            LanguageOption { code: "uk".into(), label: "Українська".into(), label_en: "Ukrainian".into(), flag: "\u{1f1fa}\u{1f1e6}".into() },
-            LanguageOption { code: "tr".into(), label: "Türkçe".into(), label_en: "Turkish".into(), flag: "\u{1f1f9}\u{1f1f7}".into() },
+            LanguageOption {
+                code: "ko".into(),
+                label: "한국어".into(),
+                label_en: "Korean".into(),
+                flag: "\u{1f1f0}\u{1f1f7}".into(),
+            },
+            LanguageOption {
+                code: "en".into(),
+                label: "English".into(),
+                label_en: "English".into(),
+                flag: "\u{1f1fa}\u{1f1f8}".into(),
+            },
+            LanguageOption {
+                code: "ja".into(),
+                label: "日本語".into(),
+                label_en: "Japanese".into(),
+                flag: "\u{1f1ef}\u{1f1f5}".into(),
+            },
+            LanguageOption {
+                code: "zh".into(),
+                label: "中文(简体)".into(),
+                label_en: "Chinese (Simplified)".into(),
+                flag: "\u{1f1e8}\u{1f1f3}".into(),
+            },
+            LanguageOption {
+                code: "zh-TW".into(),
+                label: "中文(繁體)".into(),
+                label_en: "Chinese (Traditional)".into(),
+                flag: "\u{1f1f9}\u{1f1fc}".into(),
+            },
+            LanguageOption {
+                code: "es".into(),
+                label: "Español".into(),
+                label_en: "Spanish".into(),
+                flag: "\u{1f1ea}\u{1f1f8}".into(),
+            },
+            LanguageOption {
+                code: "fr".into(),
+                label: "Français".into(),
+                label_en: "French".into(),
+                flag: "\u{1f1eb}\u{1f1f7}".into(),
+            },
+            LanguageOption {
+                code: "de".into(),
+                label: "Deutsch".into(),
+                label_en: "German".into(),
+                flag: "\u{1f1e9}\u{1f1ea}".into(),
+            },
+            LanguageOption {
+                code: "it".into(),
+                label: "Italiano".into(),
+                label_en: "Italian".into(),
+                flag: "\u{1f1ee}\u{1f1f9}".into(),
+            },
+            LanguageOption {
+                code: "pt".into(),
+                label: "Português".into(),
+                label_en: "Portuguese".into(),
+                flag: "\u{1f1e7}\u{1f1f7}".into(),
+            },
+            LanguageOption {
+                code: "ru".into(),
+                label: "Русский".into(),
+                label_en: "Russian".into(),
+                flag: "\u{1f1f7}\u{1f1fa}".into(),
+            },
+            LanguageOption {
+                code: "ar".into(),
+                label: "العربية".into(),
+                label_en: "Arabic".into(),
+                flag: "\u{1f1f8}\u{1f1e6}".into(),
+            },
+            LanguageOption {
+                code: "hi".into(),
+                label: "हिन्दी".into(),
+                label_en: "Hindi".into(),
+                flag: "\u{1f1ee}\u{1f1f3}".into(),
+            },
+            LanguageOption {
+                code: "th".into(),
+                label: "ไทย".into(),
+                label_en: "Thai".into(),
+                flag: "\u{1f1f9}\u{1f1ed}".into(),
+            },
+            LanguageOption {
+                code: "vi".into(),
+                label: "Tiếng Việt".into(),
+                label_en: "Vietnamese".into(),
+                flag: "\u{1f1fb}\u{1f1f3}".into(),
+            },
+            LanguageOption {
+                code: "id".into(),
+                label: "Bahasa Indonesia".into(),
+                label_en: "Indonesian".into(),
+                flag: "\u{1f1ee}\u{1f1e9}".into(),
+            },
+            LanguageOption {
+                code: "ms".into(),
+                label: "Bahasa Melayu".into(),
+                label_en: "Malay".into(),
+                flag: "\u{1f1f2}\u{1f1fe}".into(),
+            },
+            LanguageOption {
+                code: "tl".into(),
+                label: "Filipino".into(),
+                label_en: "Filipino".into(),
+                flag: "\u{1f1f5}\u{1f1ed}".into(),
+            },
+            LanguageOption {
+                code: "nl".into(),
+                label: "Nederlands".into(),
+                label_en: "Dutch".into(),
+                flag: "\u{1f1f3}\u{1f1f1}".into(),
+            },
+            LanguageOption {
+                code: "pl".into(),
+                label: "Polski".into(),
+                label_en: "Polish".into(),
+                flag: "\u{1f1f5}\u{1f1f1}".into(),
+            },
+            LanguageOption {
+                code: "cs".into(),
+                label: "Čeština".into(),
+                label_en: "Czech".into(),
+                flag: "\u{1f1e8}\u{1f1ff}".into(),
+            },
+            LanguageOption {
+                code: "sv".into(),
+                label: "Svenska".into(),
+                label_en: "Swedish".into(),
+                flag: "\u{1f1f8}\u{1f1ea}".into(),
+            },
+            LanguageOption {
+                code: "da".into(),
+                label: "Dansk".into(),
+                label_en: "Danish".into(),
+                flag: "\u{1f1e9}\u{1f1f0}".into(),
+            },
+            LanguageOption {
+                code: "uk".into(),
+                label: "Українська".into(),
+                label_en: "Ukrainian".into(),
+                flag: "\u{1f1fa}\u{1f1e6}".into(),
+            },
+            LanguageOption {
+                code: "tr".into(),
+                label: "Türkçe".into(),
+                label_en: "Turkish".into(),
+                flag: "\u{1f1f9}\u{1f1f7}".into(),
+            },
         ]
     }
 }
@@ -409,7 +534,7 @@ impl NavigationManifest {
 /// available tools for the session.
 ///
 /// If `None` is returned, all tools are available (no filtering).
-pub fn tool_preset(category: &TaskCategory) -> Option<HashSet<&'static str>> {
+pub fn tool_preset(category: TaskCategory) -> Option<HashSet<&'static str>> {
     /// Common base tools shared across most categories.
     const BASE: &[&str] = &[
         "shell",
@@ -438,9 +563,7 @@ pub fn tool_preset(category: &TaskCategory) -> Option<HashSet<&'static str>> {
         }
 
         // ── Document, Music: base (no vision) ──
-        TaskCategory::Document | TaskCategory::Music => {
-            Some(BASE.iter().copied().collect())
-        }
+        TaskCategory::Document | TaskCategory::Music => Some(BASE.iter().copied().collect()),
 
         // ── Translation: minimal toolset (mostly LLM-native) ──
         TaskCategory::Translation => Some(
@@ -464,7 +587,7 @@ pub fn tool_preset(category: &TaskCategory) -> Option<HashSet<&'static str>> {
 /// Returns all specs unchanged if the category has no preset (= all tools).
 pub fn filter_tools_by_category<T: crate::tools::Tool + ?Sized>(
     tools: Vec<Box<T>>,
-    category: &TaskCategory,
+    category: TaskCategory,
 ) -> Vec<Box<T>> {
     match tool_preset(category) {
         Some(allowed) => tools
@@ -483,7 +606,7 @@ pub fn filter_tools_by_category<T: crate::tools::Tool + ?Sized>(
 /// For Coding mode, the full structured methodology is returned via
 /// `crate::sandbox::coding_system_prompt()` which includes all 6 phases,
 /// meta-cognitive rules, and the run→observe→fix loop.
-pub fn category_system_prompt(category: &TaskCategory) -> String {
+pub fn category_system_prompt(category: TaskCategory) -> String {
     match category {
         TaskCategory::Coding => crate::sandbox::coding_system_prompt(),
         TaskCategory::WebGeneral => {
@@ -582,12 +705,12 @@ mod tests {
     #[test]
     fn coding_has_no_tool_filter() {
         // Coding mode gets all tools (sandbox handles orchestration).
-        assert!(tool_preset(&TaskCategory::Coding).is_none());
+        assert!(tool_preset(TaskCategory::Coding).is_none());
     }
 
     #[test]
     fn translation_has_minimal_tools() {
-        let preset = tool_preset(&TaskCategory::Translation).unwrap();
+        let preset = tool_preset(TaskCategory::Translation).unwrap();
         assert!(preset.contains("memory_store"));
         assert!(preset.contains("browser_open"));
         // Translation doesn't need shell or git.
@@ -597,7 +720,7 @@ mod tests {
 
     #[test]
     fn web_general_includes_browser() {
-        let preset = tool_preset(&TaskCategory::WebGeneral).unwrap();
+        let preset = tool_preset(TaskCategory::WebGeneral).unwrap();
         assert!(preset.contains("browser"));
         assert!(preset.contains("browser_open"));
         assert!(preset.contains("http_request"));
@@ -638,7 +761,7 @@ mod tests {
     #[test]
     fn category_system_prompts_are_non_empty() {
         for cat in TaskCategory::ALL {
-            assert!(!category_system_prompt(cat).is_empty());
+            assert!(!category_system_prompt(*cat).is_empty());
         }
     }
 
@@ -653,7 +776,10 @@ mod tests {
     fn translation_nav_item_has_voice_interpret_ui_mode() {
         let nav = NavigationManifest::build();
         let translation_item = nav.top_bar.iter().find(|i| i.id == "translation").unwrap();
-        assert_eq!(translation_item.ui_mode, Some("voice_interpret".to_string()));
+        assert_eq!(
+            translation_item.ui_mode,
+            Some("voice_interpret".to_string())
+        );
     }
 
     #[test]

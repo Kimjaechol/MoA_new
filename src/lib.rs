@@ -32,6 +32,7 @@
     clippy::unused_self,
     clippy::cast_precision_loss,
     clippy::unnecessary_wraps,
+    clippy::large_stack_arrays,
     dead_code
 )]
 
@@ -48,8 +49,8 @@ pub mod cost;
 pub mod cron;
 pub mod daemon;
 pub mod doctor;
-pub mod gateway;
 pub mod gatekeeper;
+pub mod gateway;
 pub mod hardware;
 pub mod health;
 pub mod heartbeat;

@@ -32,6 +32,12 @@ use crate::config::MemoryConfig;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Return type for [`create_synced_memory`]: memory backend + optional sync engine.
+pub type SyncedMemoryResult = anyhow::Result<(
+    Arc<dyn Memory>,
+    Option<Arc<parking_lot::Mutex<sync::SyncEngine>>>,
+)>;
+
 fn create_memory_with_sqlite_builder<F>(
     backend_name: &str,
     workspace_dir: &Path,
@@ -158,7 +164,7 @@ pub fn create_synced_memory(
     sync_config: &crate::config::SyncConfig,
     workspace_dir: &Path,
     api_key: Option<&str>,
-) -> anyhow::Result<(Arc<dyn Memory>, Option<Arc<parking_lot::Mutex<sync::SyncEngine>>>)> {
+) -> SyncedMemoryResult {
     let base = create_memory(config, workspace_dir, api_key)?;
 
     if sync_config.enabled {

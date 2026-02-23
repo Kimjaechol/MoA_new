@@ -307,7 +307,9 @@ fn is_valid_luhn(digits: &str) -> bool {
     }
 
     #[allow(clippy::manual_is_multiple_of)]
-    { sum % 10 == 0 }
+    {
+        sum % 10 == 0
+    }
 }
 
 /// Validate that a string is a valid IPv4 address.
@@ -352,7 +354,9 @@ mod tests {
         let text = "Card: 4111 1111 1111 1111";
         let matches = masker.detect(text);
         assert!(
-            matches.iter().any(|m| m.category == PiiCategory::CreditCard),
+            matches
+                .iter()
+                .any(|m| m.category == PiiCategory::CreditCard),
             "Should detect valid Luhn credit card number"
         );
 
@@ -360,7 +364,9 @@ mod tests {
         let text2 = "Number: 1234 5678 9012 3456";
         let matches2 = masker.detect(text2);
         assert!(
-            !matches2.iter().any(|m| m.category == PiiCategory::CreditCard),
+            !matches2
+                .iter()
+                .any(|m| m.category == PiiCategory::CreditCard),
             "Should not detect invalid Luhn number as credit card"
         );
     }

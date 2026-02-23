@@ -874,7 +874,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref im) = config.channels_config.imessage {
         channels.push((
             "iMessage",
-            Arc::new(IMessageChannel::new(im.allowed_contacts.clone(), None, None)),
+            Arc::new(IMessageChannel::new(
+                im.allowed_contacts.clone(),
+                None,
+                None,
+            )),
         ));
     }
 
@@ -967,17 +971,23 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref kakao) = config.channels_config.kakao {
-        channels.push(("KakaoTalk", Arc::new(KakaoTalkChannel::from_config(kakao, None, None))));
+        channels.push((
+            "KakaoTalk",
+            Arc::new(KakaoTalkChannel::from_config(kakao, None, None)),
+        ));
     }
 
     if let Some(ref line) = config.channels_config.line {
-        channels.push(("LINE", Arc::new(LineChannel::new(
-            line.channel_access_token.clone(),
-            line.channel_secret.clone(),
-            line.allowed_users.clone(),
-            None,
-            None,
-        ))));
+        channels.push((
+            "LINE",
+            Arc::new(LineChannel::new(
+                line.channel_access_token.clone(),
+                line.channel_secret.clone(),
+                line.allowed_users.clone(),
+                None,
+                None,
+            )),
+        ));
     }
 
     if channels.is_empty() {
@@ -1172,7 +1182,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let pairing_store: Option<Arc<pairing::ChannelPairingStore>> =
         match pairing::ChannelPairingStore::open(&pairing_db_path) {
             Ok(store) => {
-                tracing::info!("Channel pairing store initialized at {}", pairing_db_path.display());
+                tracing::info!(
+                    "Channel pairing store initialized at {}",
+                    pairing_db_path.display()
+                );
                 Some(Arc::new(store))
             }
             Err(e) => {
@@ -1394,10 +1407,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     // ── Telemetry ──────────────────────────────────────────
     let telemetry = if config.telemetry.enabled {
-        match crate::telemetry::TelemetryStore::new(
-            &config.workspace_dir,
-            config.telemetry.clone(),
-        ) {
+        match crate::telemetry::TelemetryStore::new(&config.workspace_dir, config.telemetry.clone())
+        {
             Ok(store) => Some(Arc::new(store)),
             Err(e) => {
                 tracing::warn!("Failed to initialize channel telemetry: {e}");

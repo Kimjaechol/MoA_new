@@ -65,11 +65,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     use std::fmt::Write;
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let _ = write!(output, "**Last exported:** {now}\n\n");
-    let _ = write!(
-        output,
-        "**Total core memories:** {}\n\n---\n\n",
-        rows.len()
-    );
+    let _ = write!(output, "**Total core memories:** {}\n\n---\n\n", rows.len());
 
     for (key, content, _category, created_at, updated_at) in &rows {
         let _ = write!(output, "### 🔑 `{key}`\n\n");

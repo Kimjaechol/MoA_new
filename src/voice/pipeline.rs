@@ -15,9 +15,9 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguageCode {
     // East Asia
-    Ko, // Korean
-    Ja, // Japanese
-    Zh, // Chinese (Simplified)
+    Ko,   // Korean
+    Ja,   // Japanese
+    Zh,   // Chinese (Simplified)
     ZhTw, // Chinese (Traditional)
 
     // Southeast Asia
@@ -54,7 +54,7 @@ pub enum LanguageCode {
 
 impl LanguageCode {
     /// Get the ISO 639-1 code string.
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Ko => "ko",
             Self::Ja => "ja",
@@ -85,7 +85,7 @@ impl LanguageCode {
     }
 
     /// Get the human-readable language name.
-    pub fn display_name(&self) -> &'static str {
+    pub fn display_name(self) -> &'static str {
         match self {
             Self::Ko => "Korean",
             Self::Ja => "Japanese",
@@ -291,7 +291,7 @@ pub enum VoiceProviderKind {
 
 impl VoiceProviderKind {
     /// Get the model identifier string for API calls.
-    pub fn model_id(&self) -> &'static str {
+    pub fn model_id(self) -> &'static str {
         match self {
             Self::GeminiLive => "gemini-2.5-flash-preview-native-audio-dialog",
             Self::OpenAiRealtime => "gpt-4o-realtime-preview",
@@ -305,8 +305,7 @@ impl VoiceProviderKind {
 #[async_trait]
 pub trait VoiceProvider: Send + Sync {
     /// Connect to the voice API for a given user session.
-    async fn connect(&self, session_id: &str, config: &InterpreterConfig)
-        -> anyhow::Result<()>;
+    async fn connect(&self, session_id: &str, config: &InterpreterConfig) -> anyhow::Result<()>;
 
     /// Send an audio chunk (PCM/opus bytes) to the provider.
     async fn send_audio(&self, session_id: &str, chunk: &[u8]) -> anyhow::Result<()>;
@@ -363,9 +362,13 @@ impl InterpreterConfig {
     /// Build a system prompt for the interpretation session.
     pub fn build_system_prompt(&self) -> String {
         let formality_instruction = match self.formality {
-            Formality::Formal => "Use formal, polite language appropriate for professional or official settings.",
+            Formality::Formal => {
+                "Use formal, polite language appropriate for professional or official settings."
+            }
             Formality::Neutral => "Use standard, everyday language.",
-            Formality::Casual => "Use casual, friendly language appropriate for informal conversations.",
+            Formality::Casual => {
+                "Use casual, friendly language appropriate for informal conversations."
+            }
         };
 
         let domain_instruction = match self.domain {
@@ -455,7 +458,12 @@ pub struct InterpreterStats {
 
 impl InterpreterStats {
     /// Record a completed utterance interpretation.
-    pub fn record_utterance(&mut self, latency_ms: u64, source_word_count: u64, target_word_count: u64) {
+    pub fn record_utterance(
+        &mut self,
+        latency_ms: u64,
+        source_word_count: u64,
+        target_word_count: u64,
+    ) {
         self.utterance_count += 1;
         self.source_words += source_word_count;
         self.target_words += target_word_count;
@@ -720,11 +728,7 @@ impl GeminiLiveProvider {
 
 #[async_trait]
 impl VoiceProvider for GeminiLiveProvider {
-    async fn connect(
-        &self,
-        session_id: &str,
-        config: &InterpreterConfig,
-    ) -> anyhow::Result<()> {
+    async fn connect(&self, session_id: &str, config: &InterpreterConfig) -> anyhow::Result<()> {
         if self.api_key.is_none() {
             anyhow::bail!("Gemini API key is required for voice sessions");
         }
@@ -797,11 +801,7 @@ impl OpenAiRealtimeProvider {
 
 #[async_trait]
 impl VoiceProvider for OpenAiRealtimeProvider {
-    async fn connect(
-        &self,
-        session_id: &str,
-        config: &InterpreterConfig,
-    ) -> anyhow::Result<()> {
+    async fn connect(&self, session_id: &str, config: &InterpreterConfig) -> anyhow::Result<()> {
         if self.api_key.is_none() {
             anyhow::bail!("OpenAI API key is required for voice sessions");
         }
@@ -910,8 +910,14 @@ mod tests {
     fn language_code_case_insensitive_parse() {
         assert_eq!(LanguageCode::from_str_code("KO"), Some(LanguageCode::Ko));
         assert_eq!(LanguageCode::from_str_code("En"), Some(LanguageCode::En));
-        assert_eq!(LanguageCode::from_str_code("ZH-TW"), Some(LanguageCode::ZhTw));
-        assert_eq!(LanguageCode::from_str_code("zh_tw"), Some(LanguageCode::ZhTw));
+        assert_eq!(
+            LanguageCode::from_str_code("ZH-TW"),
+            Some(LanguageCode::ZhTw)
+        );
+        assert_eq!(
+            LanguageCode::from_str_code("zh_tw"),
+            Some(LanguageCode::ZhTw)
+        );
     }
 
     #[test]
@@ -970,7 +976,10 @@ mod tests {
     #[test]
     fn detect_ascii_returns_default() {
         // Pure ASCII text can't be distinguished between Latin-script languages
-        assert_eq!(detect_language("hello world", LanguageCode::En), LanguageCode::En);
+        assert_eq!(
+            detect_language("hello world", LanguageCode::En),
+            LanguageCode::En
+        );
     }
 
     #[test]

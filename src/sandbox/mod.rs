@@ -68,7 +68,7 @@ impl CodingPhase {
         CodingPhase::Deliver,
     ];
 
-    pub fn label(&self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             CodingPhase::Comprehend => "Comprehend",
             CodingPhase::Plan => "Plan",
@@ -489,13 +489,17 @@ impl CodingWorkflow {
         for phase in CodingPhase::ALL {
             let marker = if *phase == self.current_phase {
                 "▶"
-            } else if self.phase_history.iter().any(|(p, o)| {
-                *p == *phase && o.status == PhaseStatus::Completed
-            }) {
+            } else if self
+                .phase_history
+                .iter()
+                .any(|(p, o)| *p == *phase && o.status == PhaseStatus::Completed)
+            {
                 "✓"
-            } else if self.phase_history.iter().any(|(p, o)| {
-                *p == *phase && o.status == PhaseStatus::Skipped
-            }) {
+            } else if self
+                .phase_history
+                .iter()
+                .any(|(p, o)| *p == *phase && o.status == PhaseStatus::Skipped)
+            {
                 "⊘"
             } else {
                 "○"
@@ -570,7 +574,7 @@ pub enum ErrorClass {
 
 impl ErrorClass {
     /// Severity score (higher = more critical, fix first).
-    pub fn severity(&self) -> u8 {
+    pub fn severity(self) -> u8 {
         match self {
             ErrorClass::Syntax => 90,
             ErrorClass::Type => 85,
@@ -801,8 +805,8 @@ impl ErrorTracker {
         self.history.push(class);
     }
 
-    pub fn count(&self, class: &ErrorClass) -> usize {
-        self.counts.get(class).copied().unwrap_or(0)
+    pub fn count(&self, class: ErrorClass) -> usize {
+        self.counts.get(&class).copied().unwrap_or(0)
     }
 
     /// Returns the error class that is stuck (exceeds max retries), if any.
@@ -950,26 +954,20 @@ impl SandboxLoop {
             self.tracker.stuck_error(self.config.max_same_error_retries)
         {
             let recommendation = match stuck_class {
-                ErrorClass::Dependency => {
-                    "Try installing the package with a different version, \
+                ErrorClass::Dependency => "Try installing the package with a different version, \
                      or use an alternative library."
-                        .to_string()
-                }
+                    .to_string(),
                 ErrorClass::Syntax | ErrorClass::Type => {
                     "Rewrite the problematic section from scratch \
                      using a different approach."
                         .to_string()
                 }
-                ErrorClass::Runtime => {
-                    "Add comprehensive error handling and logging, \
+                ErrorClass::Runtime => "Add comprehensive error handling and logging, \
                      then re-examine the control flow."
-                        .to_string()
-                }
-                ErrorClass::Network => {
-                    "Check network configuration, add retry logic, \
+                    .to_string(),
+                ErrorClass::Network => "Check network configuration, add retry logic, \
                      or mock the external service."
-                        .to_string()
-                }
+                    .to_string(),
                 ErrorClass::Timeout => {
                     "Optimise the slow path or increase the timeout limit.".to_string()
                 }
@@ -1027,11 +1025,7 @@ impl SandboxLoop {
     }
 
     /// Generate a summary prompt for the LLM, including relevant history.
-    pub fn build_fix_prompt(
-        &self,
-        action: &SandboxAction,
-        code_context: &str,
-    ) -> String {
+    pub fn build_fix_prompt(&self, action: &SandboxAction, code_context: &str) -> String {
         match action {
             SandboxAction::NeedsFix {
                 error_class,
@@ -1087,7 +1081,10 @@ fn build_error_context(obs: &Observation, class: ErrorClass) -> String {
         parts.push(format!("Exit code: {}", obs.exit_code));
     }
     if !obs.stderr.is_empty() {
-        parts.push(format!("Stderr (truncated):\n{}", truncate(&obs.stderr, 1500)));
+        parts.push(format!(
+            "Stderr (truncated):\n{}",
+            truncate(&obs.stderr, 1500)
+        ));
     }
     if !obs.stdout.is_empty() {
         // Include last 20 lines of stdout for context.
@@ -1116,47 +1113,31 @@ fn build_error_context(obs: &Observation, class: ErrorClass) -> String {
 
 fn suggest_fix(class: ErrorClass) -> String {
     match class {
-        ErrorClass::Syntax => {
-            "Fix the syntax error on the indicated line. Check for missing \
+        ErrorClass::Syntax => "Fix the syntax error on the indicated line. Check for missing \
              brackets, semicolons, or quotes."
-                .to_string()
-        }
-        ErrorClass::Type => {
-            "Resolve the type mismatch. Check function signatures, \
+            .to_string(),
+        ErrorClass::Type => "Resolve the type mismatch. Check function signatures, \
              variable declarations, and import paths."
-                .to_string()
-        }
-        ErrorClass::Dependency => {
-            "Install the missing dependency or fix the import path. \
+            .to_string(),
+        ErrorClass::Dependency => "Install the missing dependency or fix the import path. \
              Run the appropriate package manager command."
-                .to_string()
-        }
-        ErrorClass::Runtime => {
-            "Add proper error handling or fix the logic that causes \
+            .to_string(),
+        ErrorClass::Runtime => "Add proper error handling or fix the logic that causes \
              the runtime error. Check null/undefined access and bounds."
-                .to_string()
-        }
-        ErrorClass::Network => {
-            "Verify network configuration. The target host may be \
+            .to_string(),
+        ErrorClass::Network => "Verify network configuration. The target host may be \
              unreachable — add retry logic or check the URL."
-                .to_string()
-        }
-        ErrorClass::Timeout => {
-            "The operation took too long. Optimize the slow path, \
+            .to_string(),
+        ErrorClass::Timeout => "The operation took too long. Optimize the slow path, \
              add caching, or increase the timeout."
-                .to_string()
-        }
-        ErrorClass::TestFailure => {
-            "A test assertion failed. Compare expected vs actual \
+            .to_string(),
+        ErrorClass::TestFailure => "A test assertion failed. Compare expected vs actual \
              output and adjust the implementation logic."
-                .to_string()
-        }
+            .to_string(),
         ErrorClass::Lint => "Run the auto-formatter and fix any remaining warnings.".to_string(),
-        ErrorClass::Unknown => {
-            "Analyse the error output carefully and apply the most \
+        ErrorClass::Unknown => "Analyse the error output carefully and apply the most \
              appropriate fix."
-                .to_string()
-        }
+            .to_string(),
     }
 }
 
@@ -1272,7 +1253,10 @@ mod tests {
 
     #[test]
     fn classify_unknown() {
-        assert_eq!(ErrorClass::classify("something happened"), ErrorClass::Unknown);
+        assert_eq!(
+            ErrorClass::classify("something happened"),
+            ErrorClass::Unknown
+        );
     }
 
     #[test]
@@ -1333,8 +1317,8 @@ mod tests {
         tracker.record(ErrorClass::Syntax);
         tracker.record(ErrorClass::Syntax);
         tracker.record(ErrorClass::Runtime);
-        assert_eq!(tracker.count(&ErrorClass::Syntax), 2);
-        assert_eq!(tracker.count(&ErrorClass::Runtime), 1);
+        assert_eq!(tracker.count(ErrorClass::Syntax), 2);
+        assert_eq!(tracker.count(ErrorClass::Runtime), 1);
         assert_eq!(tracker.total_errors(), 3);
     }
 
@@ -1528,10 +1512,7 @@ mod tests {
     #[test]
     fn coding_workflow_validation_commands() {
         let mut wf = CodingWorkflow::new();
-        wf.record_validation_commands(vec![
-            "cargo test".into(),
-            "cargo clippy".into(),
-        ]);
+        wf.record_validation_commands(vec!["cargo test".into(), "cargo clippy".into()]);
         assert_eq!(wf.validation_commands().len(), 2);
     }
 

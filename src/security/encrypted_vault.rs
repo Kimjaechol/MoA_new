@@ -421,10 +421,7 @@ mod tests {
     #[test]
     fn extract_timestamp_invalid_filename() {
         let path = PathBuf::from("/tmp/vault/daily/random.enc");
-        assert_eq!(
-            EncryptedVault::extract_timestamp_from_filename(&path),
-            0
-        );
+        assert_eq!(EncryptedVault::extract_timestamp_from_filename(&path), 0);
     }
 
     #[test]

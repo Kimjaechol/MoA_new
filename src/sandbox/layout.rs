@@ -96,7 +96,7 @@ pub enum WorkflowSection {
 }
 
 impl WorkflowSection {
-    pub fn label(&self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             WorkflowSection::PhaseTracker => "진행 상황",
             WorkflowSection::ThinkingProcess => "AI 사고 과정",
@@ -106,7 +106,7 @@ impl WorkflowSection {
         }
     }
 
-    pub fn icon(&self) -> &'static str {
+    pub fn icon(self) -> &'static str {
         match self {
             WorkflowSection::PhaseTracker => "timeline",
             WorkflowSection::ThinkingProcess => "psychology",
@@ -214,7 +214,7 @@ pub enum ProjectType {
 
 impl ProjectType {
     /// Determine the best preview mode for this project type.
-    pub fn default_preview_mode(&self) -> PreviewMode {
+    pub fn default_preview_mode(self) -> PreviewMode {
         match self {
             ProjectType::WebFrontend | ProjectType::FullStack | ProjectType::DesktopApp => {
                 // Will be replaced with actual URL once dev server starts.
@@ -248,7 +248,7 @@ impl ProjectType {
     }
 
     /// Dev server start command hint for this project type.
-    pub fn dev_server_hint(&self) -> Option<&'static str> {
+    pub fn dev_server_hint(self) -> Option<&'static str> {
         match self {
             ProjectType::WebFrontend | ProjectType::FullStack => {
                 Some("npm run dev / yarn dev / pnpm dev")
@@ -267,7 +267,7 @@ impl ProjectType {
 /// The caller passes in a list of filenames present in the project root.
 /// This avoids filesystem access inside the function.
 pub fn detect_project_type(root_files: &[&str]) -> ProjectType {
-    let has = |name: &str| root_files.iter().any(|f| *f == name);
+    let has = |name: &str| root_files.contains(&name);
 
     // ── Mobile frameworks ──
     if has("app.json") && has("babel.config.js") {
@@ -391,8 +391,8 @@ pub enum PhaseProgressStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeChange {
     pub file_path: String,
-    pub change_type: String, // "created", "modified", "deleted"
-    pub summary: String,     // e.g. "+42 -3 lines"
+    pub change_type: String,  // "created", "modified", "deleted"
+    pub summary: String,      // e.g. "+42 -3 lines"
     pub diff_preview: String, // first few lines of diff
 }
 
@@ -478,7 +478,7 @@ pub enum DeviceFrame {
 }
 
 impl DeviceFrame {
-    pub fn dimensions(&self) -> (u32, u32) {
+    pub fn dimensions(self) -> (u32, u32) {
         match self {
             DeviceFrame::Desktop => (1280, 800),
             DeviceFrame::Tablet => (768, 1024),
@@ -487,7 +487,7 @@ impl DeviceFrame {
         }
     }
 
-    pub fn label(&self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             DeviceFrame::Desktop => "Desktop",
             DeviceFrame::Tablet => "Tablet",
