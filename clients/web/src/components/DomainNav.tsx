@@ -102,7 +102,7 @@ export default function DomainNav({
 
   return (
     <div ref={navRef} className="relative border-b border-dark-800/50 bg-dark-950/90 backdrop-blur-sm">
-      <div className="flex items-center gap-1 px-3 py-2 overflow-x-auto custom-scrollbar">
+      <div className="flex items-center gap-1 px-3 py-2 overflow-x-auto custom-scrollbar-x">
         {domains.map((domain) => {
           const colors = colorClasses[domain.color] || colorClasses.primary;
           const isSelected = selectedDomain === domain.id;

@@ -48,6 +48,24 @@
     background-color: rgba(100, 116, 139, 0.5);
   }
 
+  /* Horizontal scrollbar for domain nav */
+  .custom-scrollbar-x::-webkit-scrollbar {
+    height: 4px;
+  }
+
+  .custom-scrollbar-x::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .custom-scrollbar-x::-webkit-scrollbar-thumb {
+    background-color: rgba(100, 116, 139, 0.2);
+    border-radius: 2px;
+  }
+
+  .custom-scrollbar-x::-webkit-scrollbar-thumb:hover {
+    background-color: rgba(100, 116, 139, 0.4);
+  }
+
   /* Gradient backgrounds */
   .bg-gradient-radial {
     background: radial-gradient(
@@ -187,6 +205,36 @@
     transform: scale(1);
     opacity: 1;
   }
+}
+
+@keyframes slideInLeft {
+  0% {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slideInRight {
+  0% {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-slide-in-left {
+  animation: slideInLeft 0.25s ease-out;
+}
+
+.animate-slide-in-right {
+  animation: slideInRight 0.25s ease-out;
 }
 
 /* Markdown content styles for chat */
