@@ -622,7 +622,7 @@ pub struct GatewayConfig {
 }
 
 fn default_gateway_port() -> u16 {
-    3000
+    8080
 }
 
 fn default_gateway_host() -> String {
@@ -2539,17 +2539,20 @@ impl Config {
             }
         }
 
-        // Provider: ZEROCLAW_PROVIDER or PROVIDER
-        if let Ok(provider) =
-            std::env::var("ZEROCLAW_PROVIDER").or_else(|_| std::env::var("PROVIDER"))
+        // Provider: ZEROCLAW_PROVIDER or ZEROCLAW_DEFAULT_PROVIDER or PROVIDER
+        if let Ok(provider) = std::env::var("ZEROCLAW_PROVIDER")
+            .or_else(|_| std::env::var("ZEROCLAW_DEFAULT_PROVIDER"))
+            .or_else(|_| std::env::var("PROVIDER"))
         {
             if !provider.is_empty() {
                 self.default_provider = Some(provider);
             }
         }
 
-        // Model: ZEROCLAW_MODEL
-        if let Ok(model) = std::env::var("ZEROCLAW_MODEL") {
+        // Model: ZEROCLAW_MODEL or ZEROCLAW_DEFAULT_MODEL
+        if let Ok(model) =
+            std::env::var("ZEROCLAW_MODEL").or_else(|_| std::env::var("ZEROCLAW_DEFAULT_MODEL"))
+        {
             if !model.is_empty() {
                 self.default_model = Some(model);
             }
@@ -2562,17 +2565,20 @@ impl Config {
             }
         }
 
-        // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
-        if let Ok(port_str) =
-            std::env::var("ZEROCLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
+        // Gateway port: ZEROCLAW_GATEWAY_PORT or ZEROCLAW_PORT or PORT
+        if let Ok(port_str) = std::env::var("ZEROCLAW_GATEWAY_PORT")
+            .or_else(|_| std::env::var("ZEROCLAW_PORT"))
+            .or_else(|_| std::env::var("PORT"))
         {
             if let Ok(port) = port_str.parse::<u16>() {
                 self.gateway.port = port;
             }
         }
 
-        // Gateway host: ZEROCLAW_GATEWAY_HOST or HOST
-        if let Ok(host) = std::env::var("ZEROCLAW_GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
+        // Gateway host: ZEROCLAW_GATEWAY_HOST or ZEROCLAW_HOST or HOST
+        if let Ok(host) = std::env::var("ZEROCLAW_GATEWAY_HOST")
+            .or_else(|_| std::env::var("ZEROCLAW_HOST"))
+            .or_else(|_| std::env::var("HOST"))
         {
             if !host.is_empty() {
                 self.gateway.host = host;
@@ -2591,9 +2597,22 @@ impl Config {
             }
         }
 
+        // Require pairing: ZEROCLAW_REQUIRE_PAIRING
+        if let Ok(val) = std::env::var("ZEROCLAW_REQUIRE_PAIRING") {
+            self.gateway.require_pairing =
+                val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
         // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
         if let Ok(val) = std::env::var("ZEROCLAW_ALLOW_PUBLIC_BIND") {
             self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
+        // Memory backend: ZEROCLAW_MEMORY_BACKEND
+        if let Ok(val) = std::env::var("ZEROCLAW_MEMORY_BACKEND") {
+            if !val.is_empty() {
+                self.memory.backend = val;
+            }
         }
 
         // Temperature: ZEROCLAW_TEMPERATURE
@@ -4409,11 +4428,11 @@ default_model = "legacy-model"
     fn env_override_gateway_port() {
         let _env_guard = env_override_test_guard();
         let mut config = Config::default();
-        assert_eq!(config.gateway.port, 3000);
-
-        std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080");
-        config.apply_env_overrides();
         assert_eq!(config.gateway.port, 8080);
+
+        std::env::set_var("ZEROCLAW_GATEWAY_PORT", "9090");
+        config.apply_env_overrides();
+        assert_eq!(config.gateway.port, 9090);
 
         std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
     }
@@ -4505,7 +4524,7 @@ default_model = "legacy-model"
     #[test]
     fn gateway_config_default_values() {
         let g = GatewayConfig::default();
-        assert_eq!(g.port, 3000);
+        assert_eq!(g.port, 8080);
         assert_eq!(g.host, "127.0.0.1");
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
