@@ -24,6 +24,7 @@ export default function Header() {
 
   const navItems = [
     { href: "/", label: lang === "ko" ? "\uD648" : "Home" },
+    { href: "/workspace", label: lang === "ko" ? "\uC6CC\uD06C\uC2A4\uD398\uC774\uC2A4" : "Workspace" },
     { href: "/chat", label: lang === "ko" ? "\uCC44\uD305" : "Chat" },
     { href: "/download", label: lang === "ko" ? "\uB2E4\uC6B4\uB85C\uB4DC" : "Download" },
   ];
