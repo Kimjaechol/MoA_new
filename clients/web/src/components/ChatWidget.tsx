@@ -8,6 +8,20 @@ import {
   type ChatMessage,
 } from "@/lib/api";
 
+const STORAGE_KEY_MODEL = "moa_selected_model";
+const DEFAULT_MODEL = "google/gemini-3.1-pro-preview";
+
+const LLM_MODELS = [
+  { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro" },
+  { id: "google/gemini-3.0-pro-preview", label: "Gemini 3.0 Pro" },
+  { id: "google/gemini-3.0-flash-preview", label: "Gemini 3.0 Flash" },
+  { id: "google/gemini-2.5-flash-preview", label: "Gemini 2.5 Flash" },
+  { id: "openai/gpt-4o", label: "GPT-4o" },
+  { id: "openai/gpt-4o-mini", label: "GPT-4o Mini" },
+  { id: "anthropic/claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
+  { id: "anthropic/claude-haiku-3.5", label: "Claude Haiku 3.5" },
+] as const;
+
 interface ChatWidgetProps {
   className?: string;
   compact?: boolean;
@@ -28,10 +42,13 @@ export default function ChatWidget({
   const [pairUsername, setPairUsername] = useState("");
   const [pairPassword, setPairPassword] = useState("");
   const [isPairing, setIsPairing] = useState(false);
+  const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL);
+  const [showModelDropdown, setShowModelDropdown] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const clientRef = useRef<MoAClient | null>(null);
+  const modelDropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const client = getClient();
@@ -39,7 +56,28 @@ export default function ChatWidget({
     setServerUrl(client.getServerUrl());
     setIsConnected(client.isConnected());
     setMessages(MoAClient.loadMessages());
+    // Restore saved model selection
+    const savedModel = localStorage.getItem(STORAGE_KEY_MODEL);
+    if (savedModel && LLM_MODELS.some((m) => m.id === savedModel)) {
+      setSelectedModel(savedModel);
+    }
   }, []);
+
+  // Close model dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (
+        modelDropdownRef.current &&
+        !modelDropdownRef.current.contains(e.target as Node)
+      ) {
+        setShowModelDropdown(false);
+      }
+    }
+    if (showModelDropdown) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () => document.removeEventListener("mousedown", handleClickOutside);
+    }
+  }, [showModelDropdown]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -83,6 +121,14 @@ export default function ChatWidget({
     setMessages([]);
   }, []);
 
+  const handleModelSelect = useCallback((modelId: string) => {
+    setSelectedModel(modelId);
+    setShowModelDropdown(false);
+    if (typeof window !== "undefined") {
+      localStorage.setItem(STORAGE_KEY_MODEL, modelId);
+    }
+  }, []);
+
   const handleSend = useCallback(async () => {
     const trimmed = input.trim();
     if (!trimmed || isLoading || !clientRef.current) return;
@@ -96,7 +142,7 @@ export default function ChatWidget({
     setError(null);
 
     try {
-      const response = await clientRef.current.chat(trimmed);
+      const response = await clientRef.current.chat(trimmed, selectedModel);
       const assistantMsg = MoAClient.createMessage(
         "assistant",
         response.response,
@@ -114,7 +160,7 @@ export default function ChatWidget({
     } finally {
       setIsLoading(false);
     }
-  }, [input, isLoading, messages]);
+  }, [input, isLoading, messages, selectedModel]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -388,30 +434,119 @@ export default function ChatWidget({
             </div>
           </div>
         </div>
-        <button
-          onClick={() => setShowSettings(!showSettings)}
-          className="flex h-8 w-8 items-center justify-center rounded-lg text-dark-400 hover:bg-dark-800 hover:text-dark-200 transition-all"
-          aria-label="Settings"
-        >
-          <svg
-            className="h-4.5 w-4.5"
-            fill="none"
-            viewBox="0 0 24 24"
-            strokeWidth={1.5}
-            stroke="currentColor"
+
+        <div className="flex items-center gap-2">
+          {/* LLM Model selector */}
+          <div className="relative" ref={modelDropdownRef}>
+            <button
+              onClick={() => setShowModelDropdown(!showModelDropdown)}
+              className="flex items-center gap-1.5 rounded-lg border border-dark-700 bg-dark-800/50 px-3 py-1.5 text-xs text-dark-300 hover:border-primary-500/50 hover:text-dark-100 transition-all"
+              aria-label="Select LLM model"
+            >
+              <svg
+                className="h-3.5 w-3.5 text-primary-400"
+                fill="none"
+                viewBox="0 0 24 24"
+                strokeWidth={1.5}
+                stroke="currentColor"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z"
+                />
+              </svg>
+              <span className="max-w-[120px] truncate">
+                {LLM_MODELS.find((m) => m.id === selectedModel)?.label || selectedModel}
+              </span>
+              <svg
+                className={`h-3 w-3 transition-transform ${showModelDropdown ? "rotate-180" : ""}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                strokeWidth={2}
+                stroke="currentColor"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
+              </svg>
+            </button>
+
+            {showModelDropdown && (
+              <div className="absolute right-0 top-full mt-1 z-20 w-64 rounded-xl border border-dark-700 bg-dark-900 shadow-2xl animate-fade-in overflow-hidden">
+                <div className="px-3 py-2 border-b border-dark-800">
+                  <p className="text-[10px] font-medium text-dark-500 uppercase tracking-wider">
+                    LLM {"\uBAA8\uB378 \uC120\uD0DD"} Model Selection
+                  </p>
+                </div>
+                <div className="py-1 max-h-64 overflow-y-auto custom-scrollbar">
+                  {LLM_MODELS.map((model) => (
+                    <button
+                      key={model.id}
+                      onClick={() => handleModelSelect(model.id)}
+                      className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm transition-all ${
+                        selectedModel === model.id
+                          ? "bg-primary-500/10 text-primary-300"
+                          : "text-dark-300 hover:bg-dark-800 hover:text-dark-100"
+                      }`}
+                    >
+                      <div
+                        className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${
+                          selectedModel === model.id
+                            ? "bg-primary-400"
+                            : "bg-dark-600"
+                        }`}
+                      />
+                      <div className="flex-1 min-w-0">
+                        <span className="block truncate font-medium text-xs">
+                          {model.label}
+                        </span>
+                        <span className="block truncate text-[10px] text-dark-500 font-mono">
+                          {model.id}
+                        </span>
+                      </div>
+                      {selectedModel === model.id && (
+                        <svg
+                          className="h-3.5 w-3.5 text-primary-400 flex-shrink-0"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          strokeWidth={2.5}
+                          stroke="currentColor"
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                        </svg>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Settings button */}
+          <button
+            onClick={() => setShowSettings(!showSettings)}
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-dark-400 hover:bg-dark-800 hover:text-dark-200 transition-all"
+            aria-label="Settings"
           >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 010 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 010-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28z"
-            />
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
-            />
-          </svg>
-        </button>
+            <svg
+              className="h-4.5 w-4.5"
+              fill="none"
+              viewBox="0 0 24 24"
+              strokeWidth={1.5}
+              stroke="currentColor"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 010 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 010-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28z"
+              />
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+              />
+            </svg>
+          </button>
+        </div>
       </div>
 
       {/* Messages */}
