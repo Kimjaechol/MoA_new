@@ -2,7 +2,7 @@
 const nextConfig = {
   env: {
     NEXT_PUBLIC_DEFAULT_SERVER_URL:
-      process.env.NEXT_PUBLIC_DEFAULT_SERVER_URL || "http://localhost:3000",
+      process.env.NEXT_PUBLIC_DEFAULT_SERVER_URL || "http://localhost:8080",
     NEXT_PUBLIC_R2_BASE_URL:
       process.env.NEXT_PUBLIC_R2_BASE_URL ||
       "https://downloads.moa-agent.com",
