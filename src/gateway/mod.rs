@@ -629,18 +629,18 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /api/navigation — returns the navigation manifest for the web chat UI.
-async fn handle_navigation() -> impl IntoResponse {
-    Json(serde_json::to_value(crate::task_category::NavigationManifest::build()).unwrap())
+async fn handle_navigation() -> Json<crate::task_category::NavigationManifest> {
+    Json(crate::task_category::NavigationManifest::build())
 }
 
 /// GET /api/coding/layout — returns the default split-screen coding layout.
-async fn handle_coding_layout() -> impl IntoResponse {
-    Json(serde_json::to_value(crate::sandbox::layout::CodingLayout::default()).unwrap())
+async fn handle_coding_layout() -> Json<crate::sandbox::layout::CodingLayout> {
+    Json(crate::sandbox::layout::CodingLayout::default())
 }
 
 /// GET /api/coding/layout/mobile — returns the mobile-optimized coding layout.
-async fn handle_coding_layout_mobile() -> impl IntoResponse {
-    Json(serde_json::to_value(crate::sandbox::layout::CodingLayout::mobile()).unwrap())
+async fn handle_coding_layout_mobile() -> Json<crate::sandbox::layout::CodingLayout> {
+    Json(crate::sandbox::layout::CodingLayout::mobile())
 }
 
 /// Optional JSON body for pairing with credentials.

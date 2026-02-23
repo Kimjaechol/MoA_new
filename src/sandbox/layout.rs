@@ -309,8 +309,10 @@ pub fn detect_project_type(root_files: &[&str]) -> ProjectType {
 
     // ── Rust ──
     if has("Cargo.toml") {
-        // Check for actix/axum/rocket → API server
-        // Otherwise library or CLI
+        // Limitation: distinguishing a Rust API server (axum/actix/rocket)
+        // from a CLI tool requires reading Cargo.toml dependencies, which
+        // this heuristic does not do.  Callers can override the detected
+        // type when more context is available.
         if has("src/main.rs") {
             return ProjectType::CliTool;
         }
@@ -364,11 +366,26 @@ pub struct WorkflowPanelState {
     pub active_error: Option<ActiveError>,
 }
 
+/// Display status of a single phase in the progress bar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseDisplayStatus {
     pub phase: super::CodingPhase,
     pub label: String,
-    pub status: String, // "completed", "active", "skipped", "pending"
+    pub status: PhaseProgressStatus,
+}
+
+/// Visual status of a phase in the progress tracker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseProgressStatus {
+    /// Phase completed successfully.
+    Completed,
+    /// Phase currently in progress.
+    Active,
+    /// Phase was skipped.
+    Skipped,
+    /// Phase not yet reached.
+    Pending,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

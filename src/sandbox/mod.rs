@@ -362,9 +362,12 @@ pub struct CodingWorkflow {
 }
 
 /// Outcome recorded when a phase completes.
+///
+/// The associated `CodingPhase` is stored externally in the tuple
+/// `(CodingPhase, PhaseOutcome)` inside `CodingWorkflow::phase_history`,
+/// avoiding redundant duplication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseOutcome {
-    pub phase: CodingPhase,
     pub status: PhaseStatus,
     pub notes: String,
 }
@@ -440,7 +443,6 @@ impl CodingWorkflow {
     /// Complete the current phase and advance to the next.
     pub fn advance(&mut self, notes: &str) -> Option<CodingPhase> {
         let outcome = PhaseOutcome {
-            phase: self.current_phase,
             status: PhaseStatus::Completed,
             notes: notes.to_string(),
         };
@@ -457,7 +459,6 @@ impl CodingWorkflow {
     /// Skip the current phase (e.g., trivial task doesn't need full Prepare).
     pub fn skip(&mut self, reason: &str) -> Option<CodingPhase> {
         let outcome = PhaseOutcome {
-            phase: self.current_phase,
             status: PhaseStatus::Skipped,
             notes: reason.to_string(),
         };
@@ -474,7 +475,6 @@ impl CodingWorkflow {
     /// Go back to a previous phase (e.g., Validate fails → back to Implement).
     pub fn rewind_to(&mut self, phase: CodingPhase, reason: &str) {
         let outcome = PhaseOutcome {
-            phase: self.current_phase,
             status: PhaseStatus::Failed,
             notes: reason.to_string(),
         };
@@ -744,6 +744,19 @@ impl Default for SandboxConfig {
     }
 }
 
+impl From<&crate::config::schema::SandboxSettings> for SandboxConfig {
+    fn from(settings: &crate::config::schema::SandboxSettings) -> Self {
+        Self {
+            max_iterations: settings.max_iterations,
+            max_duration: Duration::from_secs(settings.max_duration_secs),
+            max_same_error_retries: settings.max_same_error_retries,
+            enable_checkpoints: settings.enable_checkpoints,
+            preview_url: None,
+            work_dir: ".".to_string(),
+        }
+    }
+}
+
 // ── Sandbox loop state machine ─────────────────────────────────────
 
 /// Outcome of a single sandbox step, telling the agent what to do next.
@@ -820,6 +833,7 @@ impl ErrorTracker {
 /// The actual tool execution and LLM calls happen outside this struct —
 /// this is a pure state machine that determines the *next action* given
 /// the current observation.
+#[derive(Debug)]
 pub struct SandboxLoop {
     config: SandboxConfig,
     tracker: ErrorTracker,
@@ -1077,16 +1091,9 @@ fn build_error_context(obs: &Observation, class: ErrorClass) -> String {
     }
     if !obs.stdout.is_empty() {
         // Include last 20 lines of stdout for context.
-        let tail: String = obs
-            .stdout
-            .lines()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
+        let lines: Vec<&str> = obs.stdout.lines().collect();
+        let start = lines.len().saturating_sub(20);
+        let tail = lines[start..].join("\n");
         parts.push(format!("Stdout (last 20 lines):\n{tail}"));
     }
     if let Some(ref health) = obs.server_health {
@@ -1153,11 +1160,18 @@ fn suggest_fix(class: ErrorClass) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+fn truncate(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
         s.to_string()
     } else {
-        format!("{}...[truncated]", &s[..max])
+        // Find the last char boundary at or before `max_bytes` to avoid
+        // panicking on multi-byte UTF-8 sequences.
+        let end = s
+            .char_indices()
+            .take_while(|(i, _)| *i < max_bytes)
+            .last()
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        format!("{}...[truncated]", &s[..end])
     }
 }
 
@@ -1368,6 +1382,26 @@ mod tests {
     fn truncate_helper() {
         assert_eq!(truncate("hello", 10), "hello");
         assert!(truncate("hello world this is long", 10).contains("...[truncated]"));
+    }
+
+    #[test]
+    fn truncate_multibyte_utf8_does_not_panic() {
+        // Korean characters are 3 bytes each in UTF-8.
+        // 안=0..3, 녕=3..6, 하=6..9, 세=9..12, 요=12..15, space=15, 세=16..19, 계=19..22
+        let korean = "안녕하세요 세계";
+
+        // Truncate at byte 2 — falls inside the 1st char (bytes 0..3).
+        // Only chars whose start < 2: 안(0). End = 0 + 3 = 3 bytes kept.
+        let result = truncate(korean, 2);
+        assert!(result.contains("...[truncated]"));
+        assert!(result.starts_with("안"));
+        assert!(!result.starts_with("안녕"));
+
+        // Truncate at byte 5 — 녕 starts at 3 (< 5), so it is included.
+        // End = 3 + 3 = 6 bytes kept → "안녕".
+        let result = truncate(korean, 5);
+        assert!(result.starts_with("안녕"));
+        assert!(!result.starts_with("안녕하")); // 하 starts at 6 (>= 5)
     }
 
     #[test]
