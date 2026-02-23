@@ -546,9 +546,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         sync_broadcast,
         channel_pairing,
         gateway_base_url: format!("http://{}:{}", config.gateway.host, config.gateway.port),
-        voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(
+        voice_sessions: Arc::new(crate::voice::VoiceSessionManager::with_defaults(
             config.voice.enabled,
             config.voice.max_sessions_per_user,
+            config.voice.default_source_language.clone(),
+            config.voice.default_target_language.clone(),
         )),
     };
 
@@ -606,6 +608,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/admin/telemetry/events", get(handle_admin_telemetry_events))
         .route("/api/admin/telemetry/summary", get(handle_admin_telemetry_summary))
         .route("/api/admin/telemetry/alerts", get(handle_admin_telemetry_alerts))
+        .route("/api/voice/ui", get(handle_voice_ui))
         .route("/api/voice/interpret", get(handle_voice_interpret_ws))
         .route("/api/voice/sessions", get(handle_voice_sessions_list))
         .route("/api/voice/sessions", post(handle_voice_session_create))
@@ -1974,6 +1977,21 @@ async fn handle_admin_telemetry_alerts(
 // VOICE / INTERPRETATION HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// GET /api/voice/ui — returns the translation UI manifest.
+///
+/// Provides the frontend with everything needed to render the translation
+/// panel: language list (25 languages with native labels and flags),
+/// direction modes (bidirectional/unidirectional), domain options,
+/// formality levels, and default values from server config.
+async fn handle_voice_ui(
+    State(state): State<AppState>,
+) -> Json<crate::task_category::TranslationUiManifest> {
+    Json(crate::task_category::TranslationUiManifest::build(
+        state.voice_sessions.default_source_language(),
+        state.voice_sessions.default_target_language(),
+    ))
+}
+
 /// Request body for creating a voice interpretation session.
 #[derive(Debug, GatewayDeserialize)]
 struct VoiceSessionCreateBody {
@@ -2283,12 +2301,17 @@ async fn handle_voice_ws_connection(
         .update_status(&session_id, crate::voice::InterpreterStatus::Ready)
         .await;
 
-    // Send ready message to browser
+    // Send ready message to browser with full config for UI rendering
     let ready = serde_json::json!({
         "type": "ready",
         "session_id": session_id,
         "source_language": voice_session.config.source_language.as_str(),
         "target_language": voice_session.config.target_language.as_str(),
+        "source_language_name": voice_session.config.source_language.display_name(),
+        "target_language_name": voice_session.config.target_language.display_name(),
+        "bidirectional": voice_session.config.bidirectional,
+        "domain": format!("{:?}", voice_session.config.domain),
+        "formality": format!("{:?}", voice_session.config.formality),
     });
     let _ = ws_sender
         .send(Message::Text(ready.to_string().into()))

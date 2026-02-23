@@ -148,6 +148,214 @@ pub struct NavigationItem {
     pub kind: String,
     /// Icon hint for the frontend (e.g. Material icon name).
     pub icon: String,
+    /// Optional UI mode hint. When set, the frontend should render a
+    /// specialized UI panel instead of the default chat-only view.
+    /// Values: "voice_interpret" for Translation, "sandbox" for Coding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_mode: Option<String>,
+}
+
+// ── Translation / Interpretation UI manifest ───────────────────────
+
+/// Direction mode for voice interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterpretDirection {
+    /// A → B only (unidirectional).
+    Unidirectional,
+    /// A ↔ B auto-detect (bidirectional).
+    Bidirectional,
+}
+
+/// A single language option for the UI language selector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageOption {
+    /// ISO 639-1 code (e.g. "ko", "ja", "en").
+    pub code: String,
+    /// Display name in the language's own script (e.g. "한국어").
+    pub label: String,
+    /// English name (e.g. "Korean").
+    pub label_en: String,
+    /// Unicode flag emoji for visual cue.
+    pub flag: String,
+}
+
+/// A direction mode option for the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectionOption {
+    pub id: String,
+    pub label: String,
+    /// Description shown as tooltip/subtitle.
+    pub description: String,
+    /// Icon hint (e.g. "arrow_forward" for A→B, "swap_horiz" for A↔B).
+    pub icon: String,
+}
+
+/// A domain option for specialized interpretation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainOption {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// A formality option for interpretation output style.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormalityOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// Full UI manifest for the Translation / Interpretation panel.
+///
+/// Returned by `GET /api/voice/ui` so the frontend can render:
+/// - Language A / Language B selectors
+/// - Direction toggle (A→B or A↔B)
+/// - Domain selector
+/// - Formality selector
+/// - Default values
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslationUiManifest {
+    /// All supported languages for selection.
+    pub languages: Vec<LanguageOption>,
+    /// Available direction modes.
+    pub directions: Vec<DirectionOption>,
+    /// Available domain specializations.
+    pub domains: Vec<DomainOption>,
+    /// Available formality levels.
+    pub formality_levels: Vec<FormalityOption>,
+    /// Default values for initial UI state.
+    pub defaults: TranslationDefaults,
+    /// API endpoints the frontend needs.
+    pub endpoints: TranslationEndpoints,
+}
+
+/// Default values for the translation UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslationDefaults {
+    pub language_a: String,
+    pub language_b: String,
+    pub direction: String,
+    pub domain: String,
+    pub formality: String,
+}
+
+/// API endpoints for translation operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslationEndpoints {
+    /// POST — create a session.
+    pub create_session: String,
+    /// GET — list active sessions.
+    pub list_sessions: String,
+    /// GET (WebSocket) — real-time audio stream. Append `?session_id=<id>`.
+    pub interpret_ws: String,
+}
+
+impl TranslationUiManifest {
+    /// Build the UI manifest with the given default languages from config.
+    pub fn build(default_source: &str, default_target: &str) -> Self {
+        Self {
+            languages: Self::all_languages(),
+            directions: vec![
+                DirectionOption {
+                    id: "bidirectional".to_string(),
+                    label: "양방향 (A ↔ B)".to_string(),
+                    description: "자동으로 언어를 감지하여 상대 언어로 통역합니다".to_string(),
+                    icon: "swap_horiz".to_string(),
+                },
+                DirectionOption {
+                    id: "unidirectional".to_string(),
+                    label: "단방향 (A → B)".to_string(),
+                    description: "A 언어만 B 언어로 통역합니다".to_string(),
+                    icon: "arrow_forward".to_string(),
+                },
+            ],
+            domains: vec![
+                DomainOption {
+                    id: "general".to_string(),
+                    label: "일반".to_string(),
+                    description: "일상 대화 및 일반 주제".to_string(),
+                },
+                DomainOption {
+                    id: "business".to_string(),
+                    label: "비즈니스".to_string(),
+                    description: "회의, 프레젠테이션, 협상".to_string(),
+                },
+                DomainOption {
+                    id: "medical".to_string(),
+                    label: "의료".to_string(),
+                    description: "진료, 의학 용어, 건강 상담".to_string(),
+                },
+                DomainOption {
+                    id: "legal".to_string(),
+                    label: "법률".to_string(),
+                    description: "법률 문서, 계약, 소송".to_string(),
+                },
+                DomainOption {
+                    id: "technical".to_string(),
+                    label: "기술".to_string(),
+                    description: "IT, 공학, 과학 기술".to_string(),
+                },
+            ],
+            formality_levels: vec![
+                FormalityOption {
+                    id: "formal".to_string(),
+                    label: "격식체".to_string(),
+                },
+                FormalityOption {
+                    id: "neutral".to_string(),
+                    label: "표준".to_string(),
+                },
+                FormalityOption {
+                    id: "casual".to_string(),
+                    label: "구어체".to_string(),
+                },
+            ],
+            defaults: TranslationDefaults {
+                language_a: default_source.to_string(),
+                language_b: default_target.to_string(),
+                direction: "bidirectional".to_string(),
+                domain: "general".to_string(),
+                formality: "neutral".to_string(),
+            },
+            endpoints: TranslationEndpoints {
+                create_session: "/api/voice/sessions".to_string(),
+                list_sessions: "/api/voice/sessions".to_string(),
+                interpret_ws: "/api/voice/interpret".to_string(),
+            },
+        }
+    }
+
+    /// Generate the full language list with native labels and flags.
+    fn all_languages() -> Vec<LanguageOption> {
+        vec![
+            LanguageOption { code: "ko".into(), label: "한국어".into(), label_en: "Korean".into(), flag: "\u{1f1f0}\u{1f1f7}".into() },
+            LanguageOption { code: "en".into(), label: "English".into(), label_en: "English".into(), flag: "\u{1f1fa}\u{1f1f8}".into() },
+            LanguageOption { code: "ja".into(), label: "日本語".into(), label_en: "Japanese".into(), flag: "\u{1f1ef}\u{1f1f5}".into() },
+            LanguageOption { code: "zh".into(), label: "中文(简体)".into(), label_en: "Chinese (Simplified)".into(), flag: "\u{1f1e8}\u{1f1f3}".into() },
+            LanguageOption { code: "zh-TW".into(), label: "中文(繁體)".into(), label_en: "Chinese (Traditional)".into(), flag: "\u{1f1f9}\u{1f1fc}".into() },
+            LanguageOption { code: "es".into(), label: "Español".into(), label_en: "Spanish".into(), flag: "\u{1f1ea}\u{1f1f8}".into() },
+            LanguageOption { code: "fr".into(), label: "Français".into(), label_en: "French".into(), flag: "\u{1f1eb}\u{1f1f7}".into() },
+            LanguageOption { code: "de".into(), label: "Deutsch".into(), label_en: "German".into(), flag: "\u{1f1e9}\u{1f1ea}".into() },
+            LanguageOption { code: "it".into(), label: "Italiano".into(), label_en: "Italian".into(), flag: "\u{1f1ee}\u{1f1f9}".into() },
+            LanguageOption { code: "pt".into(), label: "Português".into(), label_en: "Portuguese".into(), flag: "\u{1f1e7}\u{1f1f7}".into() },
+            LanguageOption { code: "ru".into(), label: "Русский".into(), label_en: "Russian".into(), flag: "\u{1f1f7}\u{1f1fa}".into() },
+            LanguageOption { code: "ar".into(), label: "العربية".into(), label_en: "Arabic".into(), flag: "\u{1f1f8}\u{1f1e6}".into() },
+            LanguageOption { code: "hi".into(), label: "हिन्दी".into(), label_en: "Hindi".into(), flag: "\u{1f1ee}\u{1f1f3}".into() },
+            LanguageOption { code: "th".into(), label: "ไทย".into(), label_en: "Thai".into(), flag: "\u{1f1f9}\u{1f1ed}".into() },
+            LanguageOption { code: "vi".into(), label: "Tiếng Việt".into(), label_en: "Vietnamese".into(), flag: "\u{1f1fb}\u{1f1f3}".into() },
+            LanguageOption { code: "id".into(), label: "Bahasa Indonesia".into(), label_en: "Indonesian".into(), flag: "\u{1f1ee}\u{1f1e9}".into() },
+            LanguageOption { code: "ms".into(), label: "Bahasa Melayu".into(), label_en: "Malay".into(), flag: "\u{1f1f2}\u{1f1fe}".into() },
+            LanguageOption { code: "tl".into(), label: "Filipino".into(), label_en: "Filipino".into(), flag: "\u{1f1f5}\u{1f1ed}".into() },
+            LanguageOption { code: "nl".into(), label: "Nederlands".into(), label_en: "Dutch".into(), flag: "\u{1f1f3}\u{1f1f1}".into() },
+            LanguageOption { code: "pl".into(), label: "Polski".into(), label_en: "Polish".into(), flag: "\u{1f1f5}\u{1f1f1}".into() },
+            LanguageOption { code: "cs".into(), label: "Čeština".into(), label_en: "Czech".into(), flag: "\u{1f1e8}\u{1f1ff}".into() },
+            LanguageOption { code: "sv".into(), label: "Svenska".into(), label_en: "Swedish".into(), flag: "\u{1f1f8}\u{1f1ea}".into() },
+            LanguageOption { code: "da".into(), label: "Dansk".into(), label_en: "Danish".into(), flag: "\u{1f1e9}\u{1f1f0}".into() },
+            LanguageOption { code: "uk".into(), label: "Українська".into(), label_en: "Ukrainian".into(), flag: "\u{1f1fa}\u{1f1e6}".into() },
+            LanguageOption { code: "tr".into(), label: "Türkçe".into(), label_en: "Turkish".into(), flag: "\u{1f1f9}\u{1f1f7}".into() },
+        ]
+    }
 }
 
 impl NavigationManifest {
@@ -167,6 +375,11 @@ impl NavigationManifest {
                     TaskCategory::Video => "videocam".to_string(),
                     TaskCategory::Translation => "translate".to_string(),
                 },
+                ui_mode: match cat {
+                    TaskCategory::Translation => Some("voice_interpret".to_string()),
+                    TaskCategory::Coding => Some("sandbox".to_string()),
+                    _ => None,
+                },
             })
             .collect();
 
@@ -181,6 +394,7 @@ impl NavigationManifest {
                     SidebarCategory::Billing => "payment".to_string(),
                     SidebarCategory::MyPage => "person".to_string(),
                 },
+                ui_mode: None,
             })
             .collect();
 
@@ -433,5 +647,88 @@ mod tests {
         for cat in TaskCategory::ALL {
             assert_eq!(format!("{cat}"), cat.id());
         }
+    }
+
+    #[test]
+    fn translation_nav_item_has_voice_interpret_ui_mode() {
+        let nav = NavigationManifest::build();
+        let translation_item = nav.top_bar.iter().find(|i| i.id == "translation").unwrap();
+        assert_eq!(translation_item.ui_mode, Some("voice_interpret".to_string()));
+    }
+
+    #[test]
+    fn coding_nav_item_has_sandbox_ui_mode() {
+        let nav = NavigationManifest::build();
+        let coding_item = nav.top_bar.iter().find(|i| i.id == "coding").unwrap();
+        assert_eq!(coding_item.ui_mode, Some("sandbox".to_string()));
+    }
+
+    #[test]
+    fn regular_nav_items_have_no_ui_mode() {
+        let nav = NavigationManifest::build();
+        let web_item = nav.top_bar.iter().find(|i| i.id == "web_general").unwrap();
+        assert!(web_item.ui_mode.is_none());
+        for item in &nav.sidebar {
+            assert!(item.ui_mode.is_none());
+        }
+    }
+
+    #[test]
+    fn translation_ui_manifest_has_25_languages() {
+        let manifest = TranslationUiManifest::build("ko", "en");
+        assert_eq!(manifest.languages.len(), 25);
+    }
+
+    #[test]
+    fn translation_ui_manifest_languages_have_flags() {
+        let manifest = TranslationUiManifest::build("ko", "en");
+        for lang in &manifest.languages {
+            assert!(!lang.code.is_empty());
+            assert!(!lang.label.is_empty());
+            assert!(!lang.flag.is_empty());
+        }
+    }
+
+    #[test]
+    fn translation_ui_manifest_has_bidirectional_first() {
+        let manifest = TranslationUiManifest::build("ko", "en");
+        assert_eq!(manifest.directions.len(), 2);
+        assert_eq!(manifest.directions[0].id, "bidirectional");
+        assert_eq!(manifest.directions[1].id, "unidirectional");
+    }
+
+    #[test]
+    fn translation_ui_manifest_defaults() {
+        let manifest = TranslationUiManifest::build("ja", "ko");
+        assert_eq!(manifest.defaults.language_a, "ja");
+        assert_eq!(manifest.defaults.language_b, "ko");
+        assert_eq!(manifest.defaults.direction, "bidirectional");
+        assert_eq!(manifest.defaults.domain, "general");
+        assert_eq!(manifest.defaults.formality, "neutral");
+    }
+
+    #[test]
+    fn translation_ui_manifest_has_5_domains() {
+        let manifest = TranslationUiManifest::build("ko", "en");
+        assert_eq!(manifest.domains.len(), 5);
+        let domain_ids: Vec<&str> = manifest.domains.iter().map(|d| d.id.as_str()).collect();
+        assert!(domain_ids.contains(&"general"));
+        assert!(domain_ids.contains(&"business"));
+        assert!(domain_ids.contains(&"medical"));
+        assert!(domain_ids.contains(&"legal"));
+        assert!(domain_ids.contains(&"technical"));
+    }
+
+    #[test]
+    fn translation_ui_manifest_has_3_formality_levels() {
+        let manifest = TranslationUiManifest::build("ko", "en");
+        assert_eq!(manifest.formality_levels.len(), 3);
+    }
+
+    #[test]
+    fn translation_ui_manifest_endpoints() {
+        let manifest = TranslationUiManifest::build("ko", "en");
+        assert_eq!(manifest.endpoints.create_session, "/api/voice/sessions");
+        assert_eq!(manifest.endpoints.interpret_ws, "/api/voice/interpret");
     }
 }
