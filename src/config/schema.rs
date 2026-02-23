@@ -108,6 +108,68 @@ pub struct Config {
     /// Multi-device synchronization configuration.
     #[serde(default)]
     pub sync: SyncConfig,
+
+    /// Voice / translation / interpretation settings.
+    #[serde(default)]
+    pub voice: VoiceConfig,
+}
+
+// ── Voice / Translation ──────────────────────────────────────────
+
+/// Configuration for real-time voice interpretation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    /// Enable voice interpretation features.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum concurrent voice sessions per user.
+    #[serde(default = "default_voice_max_sessions")]
+    pub max_sessions_per_user: usize,
+    /// Default source language (ISO 639-1 code, e.g. "ko").
+    #[serde(default = "default_voice_source_language")]
+    pub default_source_language: String,
+    /// Default target language (ISO 639-1 code, e.g. "en").
+    #[serde(default = "default_voice_target_language")]
+    pub default_target_language: String,
+    /// Gemini API key override (falls back to GEMINI_API_KEY env var).
+    #[serde(default)]
+    pub gemini_api_key: Option<String>,
+    /// VAD silence duration in ms (how long silence = end-of-speech).
+    #[serde(default = "default_voice_silence_ms")]
+    pub silence_duration_ms: u32,
+    /// VAD prefix padding in ms (audio before speech start to include).
+    #[serde(default = "default_voice_prefix_padding_ms")]
+    pub prefix_padding_ms: u32,
+}
+
+fn default_voice_max_sessions() -> usize {
+    5
+}
+fn default_voice_source_language() -> String {
+    "ko".to_string()
+}
+fn default_voice_target_language() -> String {
+    "en".to_string()
+}
+fn default_voice_silence_ms() -> u32 {
+    300
+}
+fn default_voice_prefix_padding_ms() -> u32 {
+    100
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_sessions_per_user: default_voice_max_sessions(),
+            default_source_language: default_voice_source_language(),
+            default_target_language: default_voice_target_language(),
+            gemini_api_key: None,
+            silence_duration_ms: default_voice_silence_ms(),
+            prefix_padding_ms: default_voice_prefix_padding_ms(),
+        }
+    }
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -2300,6 +2362,7 @@ impl Default for Config {
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
+            voice: VoiceConfig::default(),
         }
     }
 }
@@ -3148,6 +3211,7 @@ default_temperature = 0.7
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
+            voice: VoiceConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -3261,6 +3325,7 @@ tool_dispatcher = "xml"
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
+            voice: VoiceConfig::default(),
         };
 
         config.save().unwrap();

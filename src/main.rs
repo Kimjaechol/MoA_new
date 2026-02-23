@@ -73,6 +73,7 @@ mod telemetry;
 mod tools;
 mod tunnel;
 mod util;
+mod voice;
 
 use config::Config;
 

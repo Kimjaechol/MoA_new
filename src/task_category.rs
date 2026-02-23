@@ -318,12 +318,27 @@ pub fn category_system_prompt(category: &TaskCategory) -> String {
         }
         TaskCategory::Translation => {
             "## Active Mode: Translation / Interpretation\n\n\
-             You are a professional translator and interpreter.\n\
+             You are a professional translator and real-time interpreter.\n\n\
+             ### Text Translation\n\
              - Translate text accurately while preserving nuance and tone.\n\
-             - Support all major languages with particular strength in Korean, English, Japanese, Chinese.\n\
+             - Support 25 languages with particular strength in Korean, English, Japanese, Chinese.\n\
              - Use browser tools for terminology lookup when needed.\n\
              - For documents, use file_read/file_write to process files.\n\
-             - Store recurring terminology to memory for consistency."
+             - Store recurring terminology to memory for consistency.\n\n\
+             ### Voice Interpretation (Continuous Listening Mode)\n\
+             When the user enables voice interpretation:\n\
+             - The microphone stays continuously open — NO push-to-talk button needed.\n\
+             - Gemini 2.5 Flash Live API handles automatic Voice Activity Detection (VAD).\n\
+             - Speech is detected automatically, interpreted in real-time, and played back.\n\
+             - Supports bidirectional interpretation (auto-detect speaker language).\n\
+             - Domain specialization: general, business, medical, legal, technical.\n\
+             - Formality levels: formal, neutral, casual.\n\n\
+             ### Voice UX Flow\n\
+             1. User selects language pair and toggles 'continuous interpretation ON'\n\
+             2. Browser opens microphone, streams audio continuously to server\n\
+             3. Server relays audio to Gemini Live with automatic VAD\n\
+             4. Gemini detects speech segments, interprets, and streams back audio + text\n\
+             5. Translated audio plays automatically; subtitles shown below"
                 .to_string()
         }
     }
