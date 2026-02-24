@@ -314,19 +314,23 @@ async fn on_app_resume(state: tauri::State<'_, AppState>) -> Result<serde_json::
         }
     }
 
-    // Try health check to verify connection
-    let is_online = if let Ok(url) = state.server_url.lock() {
+    // Try health check to verify connection.
+    // Clone the URL out of the lock so the MutexGuard is dropped before await.
+    let health_url = state
+        .server_url
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let is_online = {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .unwrap_or_default();
         client
-            .get(format!("{}/health", url))
+            .get(format!("{}/health", health_url))
             .send()
             .await
             .is_ok()
-    } else {
-        false
     };
 
     state.sync_stop.store(false, Ordering::SeqCst);
