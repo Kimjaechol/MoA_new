@@ -155,7 +155,7 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                 {isConnected ? t("connected", locale) : t("disconnected", locale)}
               </div>
 
-              {isConnected && (
+              {isConnected ? (
                 <>
                   <div className="settings-field" style={{ marginTop: 16 }}>
                     <label className="settings-label">{t("token", locale)}</label>
@@ -167,37 +167,9 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                     </button>
                   </div>
                 </>
-              )}
-            </div>
-          </div>
-
-          {/* Server section */}
-          <div className="settings-section">
-            <div className="settings-section-title">{t("server_url", locale)}</div>
-            <div className="settings-card">
-              <div className="settings-field">
-                <label className="settings-label">{t("server_url", locale)}</label>
-                <div className="settings-input-row">
-                  <input
-                    className="settings-input"
-                    type="url"
-                    value={serverUrl}
-                    onChange={(e) => handleServerUrlChange(e.target.value)}
-                    placeholder="https://moanew-production.up.railway.app"
-                  />
-                  <button
-                    className="settings-btn settings-btn-secondary"
-                    onClick={handleHealthCheck}
-                    disabled={isHealthChecking}
-                  >
-                    {isHealthChecking ? t("checking", locale) : t("health_check", locale)}
-                  </button>
-                </div>
-              </div>
-
-              {!isConnected && (
+              ) : (
                 <>
-                  <div className="settings-field">
+                  <div className="settings-field" style={{ marginTop: 16 }}>
                     <label className="settings-label">{t("username", locale)}</label>
                     <input
                       className="settings-input"
@@ -229,29 +201,12 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                     <button
                       className="settings-btn settings-btn-primary"
                       onClick={handleConnect}
-                      disabled={isPairing || (!pairUsername.trim() && !pairPassword && !pairingCode.trim())}
+                      disabled={isPairing || (!pairUsername.trim() && !pairPassword)}
                       style={{ width: "100%" }}
                     >
                       {isPairing ? t("connecting", locale) : t("connect", locale)}
                     </button>
                   </div>
-                  <details style={{ marginTop: 12 }}>
-                    <summary style={{ fontSize: 12, color: "var(--color-text-muted)", cursor: "pointer" }}>
-                      {t("pairing_code_optional", locale)}
-                    </summary>
-                    <div className="settings-field" style={{ marginTop: 8 }}>
-                      <input
-                        className="settings-input"
-                        type="text"
-                        value={pairingCode}
-                        onChange={(e) => setPairingCode(e.target.value)}
-                        placeholder={t("pairing_code", locale)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") handleConnect();
-                        }}
-                      />
-                    </div>
-                  </details>
                 </>
               )}
 
@@ -259,6 +214,51 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                 <div className={`settings-message ${message.type}`}>{message.text}</div>
               )}
             </div>
+          </div>
+
+          {/* Advanced settings (server URL, pairing code) — hidden by default */}
+          <div className="settings-section">
+            <details>
+              <summary className="settings-section-title" style={{ cursor: "pointer" }}>
+                {t("advanced_settings", locale)}
+              </summary>
+              <div className="settings-card" style={{ marginTop: 8 }}>
+                <div className="settings-field">
+                  <label className="settings-label">{t("server_url", locale)}</label>
+                  <div className="settings-input-row">
+                    <input
+                      className="settings-input"
+                      type="url"
+                      value={serverUrl}
+                      onChange={(e) => handleServerUrlChange(e.target.value)}
+                      placeholder="https://moanew-production.up.railway.app"
+                    />
+                    <button
+                      className="settings-btn settings-btn-secondary"
+                      onClick={handleHealthCheck}
+                      disabled={isHealthChecking}
+                    >
+                      {isHealthChecking ? t("checking", locale) : t("health_check", locale)}
+                    </button>
+                  </div>
+                </div>
+                {!isConnected && (
+                  <div className="settings-field" style={{ marginTop: 8 }}>
+                    <label className="settings-label">{t("pairing_code_optional", locale)}</label>
+                    <input
+                      className="settings-input"
+                      type="text"
+                      value={pairingCode}
+                      onChange={(e) => setPairingCode(e.target.value)}
+                      placeholder={t("pairing_code", locale)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleConnect();
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            </details>
           </div>
 
           {/* Language section */}

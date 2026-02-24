@@ -24,6 +24,7 @@ type TranslationKey =
   | "thinking"
   | "error_occurred"
   | "retry"
+  | "advanced_settings"
   | "server_url"
   | "username"
   | "password"
@@ -75,6 +76,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     thinking: "Thinking...",
     error_occurred: "An error occurred",
     retry: "Retry",
+    advanced_settings: "Advanced Settings",
     server_url: "Server URL",
     username: "Username",
     password: "Password",
@@ -125,6 +127,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     thinking: "\uC0DD\uAC01 \uC911...",
     error_occurred: "\uC624\uB958\uAC00 \uBC1C\uC0DD\uD588\uC2B5\uB2C8\uB2E4",
     retry: "\uC7AC\uC2DC\uB3C4",
+    advanced_settings: "\uACE0\uAE09 \uC124\uC815",
     server_url: "\uC11C\uBC84 URL",
     username: "\uC544\uC774\uB514",
     password: "\uBE44\uBC00\uBC88\uD638",
