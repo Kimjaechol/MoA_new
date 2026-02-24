@@ -24,12 +24,16 @@ type TranslationKey =
   | "thinking"
   | "error_occurred"
   | "retry"
+  | "advanced_settings"
   | "server_url"
   | "username"
   | "password"
   | "pairing_code"
+  | "pairing_code_optional"
   | "pair"
   | "pairing"
+  | "connect"
+  | "connecting"
   | "disconnect"
   | "connection_status"
   | "connected"
@@ -72,12 +76,16 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     thinking: "Thinking...",
     error_occurred: "An error occurred",
     retry: "Retry",
+    advanced_settings: "Advanced Settings",
     server_url: "Server URL",
     username: "Username",
     password: "Password",
     pairing_code: "Pairing Code",
+    pairing_code_optional: "Pairing Code (optional, for code-only mode)",
     pair: "Pair",
     pairing: "Pairing...",
+    connect: "Connect",
+    connecting: "Connecting...",
     disconnect: "Disconnect",
     connection_status: "Connection Status",
     connected: "Connected",
@@ -119,12 +127,16 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     thinking: "\uC0DD\uAC01 \uC911...",
     error_occurred: "\uC624\uB958\uAC00 \uBC1C\uC0DD\uD588\uC2B5\uB2C8\uB2E4",
     retry: "\uC7AC\uC2DC\uB3C4",
+    advanced_settings: "\uACE0\uAE09 \uC124\uC815",
     server_url: "\uC11C\uBC84 URL",
     username: "\uC544\uC774\uB514",
     password: "\uBE44\uBC00\uBC88\uD638",
     pairing_code: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC",
+    pairing_code_optional: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC (\uC120\uD0DD\uC0AC\uD56D, \uCF54\uB4DC \uC804\uC6A9 \uBAA8\uB4DC)",
     pair: "\uD398\uC5B4\uB9C1",
     pairing: "\uD398\uC5B4\uB9C1 \uC911...",
+    connect: "\uC5F0\uACB0",
+    connecting: "\uC5F0\uACB0 \uC911...",
     disconnect: "\uC5F0\uACB0 \uD574\uC81C",
     connection_status: "\uC5F0\uACB0 \uC0C1\uD0DC",
     connected: "\uC5F0\uACB0\uB428",

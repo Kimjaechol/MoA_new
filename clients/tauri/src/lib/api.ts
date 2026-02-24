@@ -75,14 +75,16 @@ export class MoAClient {
   }
 
   async pair(
-    code: string,
     username?: string,
     password?: string,
+    code?: string,
   ): Promise<PairResponse> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "X-Pairing-Code": code,
     };
+    if (code) {
+      headers["X-Pairing-Code"] = code;
+    }
 
     const body: Record<string, string> = {};
     if (username) body.username = username;

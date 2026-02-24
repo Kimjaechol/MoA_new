@@ -122,8 +122,14 @@ impl PairingGuard {
     /// Attempt to pair with the given request. Returns a bearer token on success.
     /// Returns `Err(lockout_seconds)` if locked out due to brute force.
     ///
-    /// Each successful pairing consumes the code and generates a new one
-    /// for the next device.
+    /// Pairing modes (tried in order):
+    /// 1. **Credentials-only**: If owner credentials are configured and the client
+    ///    provides valid username + password, a token is issued without requiring
+    ///    a pairing code. This enables direct-client auto-connect (Tauri app).
+    /// 2. **Code + credentials**: If both are provided and valid, pairing succeeds
+    ///    and the code is consumed.
+    /// 3. **Code-only**: If no owner credentials are configured, the pairing code
+    ///    alone is sufficient (original Bluetooth-style flow).
     pub fn try_pair(&self, request: &PairRequest<'_>) -> Result<Option<String>, u64> {
         // Check brute force lockout
         {
@@ -154,9 +160,36 @@ impl PairingGuard {
                 }
                 return Ok(None);
             }
+
+            // Credentials are valid — issue token without requiring pairing code.
+            // This enables direct-client auto-connect (e.g. Tauri desktop/mobile app).
+            // If a pairing code was also provided and matches, consume it;
+            // otherwise just issue the token based on credentials alone.
+            {
+                let mut pairing_code = self.pairing_code.lock();
+                if let Some(ref expected) = *pairing_code {
+                    if !request.code.trim().is_empty()
+                        && constant_time_eq(request.code.trim(), expected.trim())
+                    {
+                        // Code also matched — consume and regenerate
+                        *pairing_code = Some(generate_code());
+                    }
+                    // If code was empty or didn't match, that's fine — creds alone suffice
+                }
+            }
+
+            // Reset failed attempts and issue token
+            {
+                let mut attempts = self.failed_attempts.lock();
+                *attempts = (0, None);
+            }
+            let token = generate_token();
+            let mut tokens = self.paired_tokens.lock();
+            tokens.insert(hash_token(&token));
+            return Ok(Some(token));
         }
 
-        // Validate pairing code
+        // No owner credentials configured — fall back to code-only pairing
         {
             let mut pairing_code = self.pairing_code.lock();
             if let Some(ref expected) = *pairing_code {
@@ -503,6 +536,39 @@ mod tests {
         // Code-only request should fail when credentials are required
         let result = guard.try_pair(&code_only(&code)).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn pair_with_credentials_only_no_code_succeeds() {
+        let guard = guard_with_creds(true, &[], "admin", "secret");
+        // Credentials without pairing code — auto-connect for direct clients
+        let request = PairRequest {
+            code: "",
+            username: Some("admin"),
+            password: Some("secret"),
+        };
+        let token = guard.try_pair(&request).unwrap();
+        assert!(token.is_some(), "Credentials-only pairing should succeed");
+        assert!(guard.is_authenticated(&token.unwrap()));
+    }
+
+    #[test]
+    fn credentials_only_pair_does_not_consume_code() {
+        let guard = guard_with_creds(true, &[], "admin", "secret");
+        let code_before = guard.pairing_code().unwrap();
+
+        // Pair with credentials only (no code)
+        let request = PairRequest {
+            code: "",
+            username: Some("admin"),
+            password: Some("secret"),
+        };
+        let token = guard.try_pair(&request).unwrap();
+        assert!(token.is_some());
+
+        // Pairing code should remain unchanged (not consumed)
+        let code_after = guard.pairing_code().unwrap();
+        assert_eq!(code_before, code_after, "Code should not be consumed when not provided");
     }
 
     #[test]
