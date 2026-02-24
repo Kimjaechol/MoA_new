@@ -183,11 +183,142 @@ html, body {
   border-color: var(--color-border-light);
 }
 
-/* Sidebar chat list */
-.sidebar-chats {
+/* Sidebar scrollable body */
+.sidebar-body {
   flex: 1;
   overflow-y: auto;
-  padding: 8px;
+  padding: 4px 0;
+}
+
+/* Sidebar collapsible sections */
+.sidebar-section {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.sidebar-section:last-child {
+  border-bottom: none;
+}
+
+.sidebar-section-chats {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.sidebar-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-family: var(--font-sans);
+  transition: color var(--transition-fast);
+}
+
+.sidebar-section-header:hover {
+  color: var(--color-text-secondary);
+}
+
+.sidebar-section-header-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sidebar-section-icon {
+  opacity: 0.6;
+}
+
+.sidebar-section-badge {
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--color-primary-bg);
+  color: var(--color-primary);
+  padding: 1px 6px;
+  border-radius: 10px;
+  min-width: 18px;
+  text-align: center;
+}
+
+.sidebar-section-chevron {
+  opacity: 0.5;
+  transition: transform var(--transition-fast);
+}
+
+.sidebar-section-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.sidebar-section-content {
+  padding: 0 8px 6px;
+}
+
+.sidebar-chats-list {
+  overflow-y: auto;
+}
+
+.sidebar-section-empty {
+  text-align: center;
+  padding: 8px 12px;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+/* Sidebar info items (devices, channels, tools) */
+.sidebar-info-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.sidebar-info-item:hover {
+  background: var(--color-bg-hover);
+}
+
+.sidebar-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.sidebar-status-dot.online {
+  background: var(--color-success);
+}
+
+.sidebar-info-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.sidebar-info-meta {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.sidebar-tool-icon {
+  display: flex;
+  align-items: center;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
 }
 
 .sidebar-empty {

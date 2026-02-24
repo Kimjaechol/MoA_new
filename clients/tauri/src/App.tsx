@@ -5,7 +5,7 @@ import { Settings } from "./components/Settings";
 import { Login } from "./components/Login";
 import { SignUp } from "./components/SignUp";
 import { DeviceSelect } from "./components/DeviceSelect";
-import { apiClient, type DeviceInfo } from "./lib/api";
+import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated } from "./lib/tauri-bridge";
 import {
@@ -30,6 +30,9 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isConnected, setIsConnected] = useState(false);
   const [pendingDevices, setPendingDevices] = useState<DeviceInfo[]>([]);
+  const [sidebarDevices, setSidebarDevices] = useState<DeviceInfo[]>([]);
+  const [sidebarChannels, setSidebarChannels] = useState<string[]>([]);
+  const [sidebarTools, setSidebarTools] = useState<ToolInfo[]>([]);
   const lifecycleCleanup = useRef<(() => void) | null>(null);
 
   const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
@@ -79,6 +82,35 @@ function App() {
       lifecycleCleanup.current?.();
     };
   }, []);
+
+  // Fetch sidebar data (devices, channels, tools) when connected
+  useEffect(() => {
+    if (!isConnected) {
+      setSidebarDevices([]);
+      setSidebarChannels([]);
+      setSidebarTools([]);
+      return;
+    }
+
+    const fetchSidebarData = async () => {
+      const [devices, agentInfo] = await Promise.all([
+        apiClient.getDevices().catch(() => [] as DeviceInfo[]),
+        apiClient.getAgentInfo(),
+      ]);
+      setSidebarDevices(devices);
+      setSidebarChannels(agentInfo.channels);
+      setSidebarTools(agentInfo.tools);
+    };
+
+    fetchSidebarData();
+
+    // Refresh devices periodically (every 60s, aligned with heartbeat)
+    const interval = setInterval(() => {
+      apiClient.getDevices().then(setSidebarDevices).catch(() => {});
+    }, 60_000);
+
+    return () => clearInterval(interval);
+  }, [isConnected]);
 
   const handleLocaleChange = useCallback((newLocale: Locale) => {
     setLocale(newLocale);
@@ -296,6 +328,9 @@ function App() {
         activeChatId={activeChatId}
         isOpen={sidebarOpen}
         locale={locale}
+        devices={sidebarDevices}
+        channels={sidebarChannels}
+        tools={sidebarTools}
         onNewChat={handleNewChat}
         onSelectChat={handleSelectChat}
         onDeleteChat={handleDeleteChat}

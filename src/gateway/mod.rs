@@ -221,6 +221,8 @@ pub struct AppState {
     pub gateway_base_url: String,
     /// Voice session manager for real-time interpretation.
     pub voice_sessions: Arc<crate::voice::VoiceSessionManager>,
+    /// Names of active (configured) channels for sidebar display.
+    pub active_channel_names: Vec<String>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -531,6 +533,57 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     };
 
+    // Collect active channel names for sidebar display
+    let mut active_channel_names: Vec<String> = Vec::new();
+    if config.channels_config.cli {
+        active_channel_names.push("CLI".into());
+    }
+    if config.channels_config.webhook.is_some() {
+        active_channel_names.push("Webhook".into());
+    }
+    if config.channels_config.telegram.is_some() {
+        active_channel_names.push("Telegram".into());
+    }
+    if config.channels_config.discord.is_some() {
+        active_channel_names.push("Discord".into());
+    }
+    if config.channels_config.slack.is_some() {
+        active_channel_names.push("Slack".into());
+    }
+    if config.channels_config.whatsapp.is_some() {
+        active_channel_names.push("WhatsApp".into());
+    }
+    if config.channels_config.line.is_some() {
+        active_channel_names.push("LINE".into());
+    }
+    if config.channels_config.signal.is_some() {
+        active_channel_names.push("Signal".into());
+    }
+    if config.channels_config.matrix.is_some() {
+        active_channel_names.push("Matrix".into());
+    }
+    if config.channels_config.irc.is_some() {
+        active_channel_names.push("IRC".into());
+    }
+    if config.channels_config.imessage.is_some() {
+        active_channel_names.push("iMessage".into());
+    }
+    if config.channels_config.email.is_some() {
+        active_channel_names.push("Email".into());
+    }
+    if config.channels_config.lark.is_some() {
+        active_channel_names.push("Lark".into());
+    }
+    if config.channels_config.dingtalk.is_some() {
+        active_channel_names.push("DingTalk".into());
+    }
+    if config.channels_config.qq.is_some() {
+        active_channel_names.push("QQ".into());
+    }
+    if config.channels_config.kakao.is_some() {
+        active_channel_names.push("KakaoTalk".into());
+    }
+
     // Build shared state
     let state = AppState {
         provider,
@@ -563,6 +616,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             config.voice.default_source_language.clone(),
             config.voice.default_target_language.clone(),
         )),
+        active_channel_names,
     };
 
     // Ensure channel_links table exists if auth is enabled
@@ -643,6 +697,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/admin/telemetry/alerts",
             get(handle_admin_telemetry_alerts),
         )
+        .route("/api/agent/info", get(handle_agent_info))
         .route("/api/voice/ui", get(handle_voice_ui))
         .route("/api/voice/interpret", get(handle_voice_interpret_ws))
         .route("/api/voice/sessions", get(handle_voice_sessions_list))
@@ -688,6 +743,30 @@ async fn handle_coding_layout() -> Json<crate::sandbox::layout::CodingLayout> {
 /// GET /api/coding/layout/mobile — returns the mobile-optimized coding layout.
 async fn handle_coding_layout_mobile() -> Json<crate::sandbox::layout::CodingLayout> {
     Json(crate::sandbox::layout::CodingLayout::mobile())
+}
+
+/// GET /api/agent/info — returns available tools and active channels for sidebar display.
+async fn handle_agent_info(State(state): State<AppState>) -> impl IntoResponse {
+    let tools: Vec<serde_json::Value> = if let Some(ref agent) = state.agent {
+        let agent = agent.lock().await;
+        agent
+            .tool_specs()
+            .iter()
+            .map(|spec| {
+                serde_json::json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Json(serde_json::json!({
+        "channels": state.active_channel_names,
+        "tools": tools,
+    }))
 }
 
 /// Optional JSON body for pairing with credentials.

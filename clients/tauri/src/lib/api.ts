@@ -53,6 +53,16 @@ export interface UserInfo {
   username: string;
 }
 
+export interface ToolInfo {
+  name: string;
+  description: string;
+}
+
+export interface AgentInfo {
+  channels: string[];
+  tools: ToolInfo[];
+}
+
 export type { SyncStatus, PlatformInfo };
 
 // ── Client ──────────────────────────────────────────────────────
@@ -261,6 +271,18 @@ export class MoAClient {
     if (!res.ok) return false;
     const data = await res.json();
     return data.verified === true;
+  }
+
+  // ── Agent Info ────────────────────────────────────────────────
+
+  async getAgentInfo(): Promise<AgentInfo> {
+    try {
+      const res = await fetch(`${this.serverUrl}/api/agent/info`);
+      if (!res.ok) return { channels: [], tools: [] };
+      return await res.json();
+    } catch {
+      return { channels: [], tools: [] };
+    }
   }
 
   // ── Heartbeat ──────────────────────────────────────────────────

@@ -111,7 +111,15 @@ type TranslationKey =
   | "pairing_code_removed"
   | "new_pairing_code"
   | "save_pairing_code"
-  | "account_info";
+  | "account_info"
+  // Sidebar sections
+  | "sidebar_devices"
+  | "sidebar_channels"
+  | "sidebar_tools"
+  | "sidebar_no_devices"
+  | "sidebar_no_channels"
+  | "sidebar_no_tools"
+  | "sidebar_chats";
 
 const translations: Record<Locale, Record<TranslationKey, string>> = {
   en: {
@@ -212,6 +220,14 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     new_pairing_code: "New pairing code",
     save_pairing_code: "Save",
     account_info: "Account",
+    // Sidebar sections
+    sidebar_devices: "Devices",
+    sidebar_channels: "Channels",
+    sidebar_tools: "Tools",
+    sidebar_no_devices: "No devices",
+    sidebar_no_channels: "No channels",
+    sidebar_no_tools: "No tools",
+    sidebar_chats: "Chats",
   },
   ko: {
     app_title: "MoA",
@@ -311,6 +327,14 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     new_pairing_code: "\uC0C8 \uD398\uC5B4\uB9C1 \uCF54\uB4DC",
     save_pairing_code: "\uC800\uC7A5",
     account_info: "\uACC4\uC815 \uC815\uBCF4",
+    // Sidebar sections
+    sidebar_devices: "\uB514\uBC14\uC774\uC2A4",
+    sidebar_channels: "\uCC44\uB110",
+    sidebar_tools: "\uB3C4\uAD6C",
+    sidebar_no_devices: "\uB514\uBC14\uC774\uC2A4 \uC5C6\uC74C",
+    sidebar_no_channels: "\uCC44\uB110 \uC5C6\uC74C",
+    sidebar_no_tools: "\uB3C4\uAD6C \uC5C6\uC74C",
+    sidebar_chats: "\uB300\uD654",
   },
 };
 
