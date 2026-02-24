@@ -35,14 +35,14 @@ export class MoAClient {
   constructor() {
     if (typeof window === "undefined") {
       this.serverUrl =
-        process.env.NEXT_PUBLIC_DEFAULT_SERVER_URL || "http://localhost:3000";
+        process.env.NEXT_PUBLIC_DEFAULT_SERVER_URL || "http://localhost:8080";
       this.token = null;
       return;
     }
     this.serverUrl =
       localStorage.getItem(STORAGE_KEY_SERVER) ||
       process.env.NEXT_PUBLIC_DEFAULT_SERVER_URL ||
-      "http://localhost:3000";
+      "http://localhost:8080";
     this.token = localStorage.getItem(STORAGE_KEY_TOKEN);
   }
 
@@ -120,12 +120,15 @@ export class MoAClient {
     return data;
   }
 
-  async chat(message: string): Promise<ChatResponse> {
+  async chat(message: string, model?: string): Promise<ChatResponse> {
     if (!this.token) {
       throw new Error(
         "Not authenticated. Please pair with the server first.",
       );
     }
+
+    const body: Record<string, string> = { message };
+    if (model) body.model = model;
 
     const res = await fetch(`${this.serverUrl}/webhook`, {
       method: "POST",
@@ -133,7 +136,7 @@ export class MoAClient {
         "Content-Type": "application/json",
         Authorization: `Bearer ${this.token}`,
       },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {

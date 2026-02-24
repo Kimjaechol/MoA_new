@@ -77,11 +77,11 @@ COPY --from=builder /build/zeroclaw /usr/local/bin/zeroclaw
 # ZEROCLAW_PORT: Default gateway port; Railway maps its internal PORT to this.
 # HOME: Ensures config discovery works under the non-root user.
 ENV ZEROCLAW_HOST=0.0.0.0
-ENV ZEROCLAW_PORT=3000
+ENV ZEROCLAW_PORT=8080
 ENV HOME=/app
 
 # Expose the gateway port.
-EXPOSE 3000
+EXPOSE 8080
 
 # Run as non-root for security.
 USER zeroclaw
@@ -89,4 +89,4 @@ USER zeroclaw
 # Start the ZeroClaw gateway server.
 # Shell form is required so $PORT is expanded at runtime.
 # Railway injects PORT; falls back to ZEROCLAW_PORT (3000) if unset.
-CMD zeroclaw gateway --host 0.0.0.0 --port ${PORT:-3000}
+CMD zeroclaw gateway --host 0.0.0.0 --port ${PORT:-8080}

@@ -47,7 +47,7 @@ default_model = "google/gemini-3.1-pro-preview"
 default_temperature = 0.7
 
 [gateway]
-port = 3000
+port = 8080
 host = "[::]"
 allow_public_bind = true
 EOF
@@ -81,16 +81,16 @@ ENV HOME=/zeroclaw-data
 # Defaults for local dev (Ollama) - matches config.template.toml
 ENV PROVIDER="ollama"
 ENV ZEROCLAW_MODEL="llama3.2"
-ENV ZEROCLAW_GATEWAY_PORT=3000
+ENV ZEROCLAW_GATEWAY_PORT=8080
 
 # Note: API_KEY is intentionally NOT set here to avoid confusion.
 # It is set in config.toml as the Ollama URL.
 
 WORKDIR /zeroclaw-data
 USER 65534:65534
-EXPOSE 3000
+EXPOSE 8080
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway", "--port", "3000", "--host", "[::]"]
+CMD ["gateway", "--port", "8080", "--host", "[::]"]
 
 # ── Stage 4: Production Runtime (Distroless) ─────────────────
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
@@ -104,12 +104,12 @@ ENV HOME=/zeroclaw-data
 # Default provider (model is set in config.toml, not here,
 # so config file edits are not silently overridden)
 ENV PROVIDER="openrouter"
-ENV ZEROCLAW_GATEWAY_PORT=3000
+ENV ZEROCLAW_GATEWAY_PORT=8080
 
 # API_KEY must be provided at runtime!
 
 WORKDIR /zeroclaw-data
 USER 65534:65534
-EXPOSE 3000
+EXPOSE 8080
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway", "--port", "3000", "--host", "[::]"]
+CMD ["gateway", "--port", "8080", "--host", "[::]"]

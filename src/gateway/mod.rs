@@ -765,6 +765,9 @@ pub struct WebhookBody {
     /// Optional task category — when set, the agent selects tools for this mode.
     /// Values: "web_general", "document", "coding", "image", "music", "video", "translation".
     pub task_category: Option<String>,
+    /// Optional model override — when set, uses this model instead of the server default.
+    /// Format: "provider/model-name" (e.g. "google/gemini-3.1-pro-preview").
+    pub model: Option<String>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -849,6 +852,14 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
+    // Use client-specified model if provided, otherwise fall back to server default.
+    let effective_model = webhook_body
+        .model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .unwrap_or(&state.model)
+        .to_string();
+
     // ── Telemetry: record webhook interaction ──
     if let Some(ref store) = state.telemetry {
         let event = crate::telemetry::TelemetryEvent {
@@ -910,7 +921,7 @@ async fn handle_webhook(
         let mut agent = agent.lock().await;
         match agent.turn(message).await {
             Ok(response) => {
-                let body = serde_json::json!({"response": response, "model": state.model});
+                let body = serde_json::json!({"response": response, "model": effective_model});
                 return (StatusCode::OK, Json(body));
             }
             Err(e) => {
@@ -927,11 +938,11 @@ async fn handle_webhook(
     // Fallback: simple chat without tools
     match state
         .provider
-        .simple_chat(message, &state.model, state.temperature)
+        .simple_chat(message, &effective_model, state.temperature)
         .await
     {
         Ok(response) => {
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({"response": response, "model": effective_model});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
