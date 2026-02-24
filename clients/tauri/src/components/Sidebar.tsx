@@ -6,7 +6,7 @@ interface SidebarProps {
   activeChatId: string | null;
   isOpen: boolean;
   locale: Locale;
-  currentPage: "chat" | "settings";
+  currentPage: string;
   onNewChat: () => void;
   onSelectChat: (id: string) => void;
   onDeleteChat: (id: string) => void;

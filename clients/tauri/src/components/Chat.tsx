@@ -122,7 +122,7 @@ export function Chat({
             </p>
             {!isConnected && (
               <button className="chat-welcome-connect" onClick={onOpenSettings}>
-                {t("settings", locale)}
+                {t("login", locale)}
               </button>
             )}
           </div>

@@ -11,12 +11,11 @@ import {
 
 const STORAGE_KEY_TOKEN = "moa_token";
 const STORAGE_KEY_SERVER = "moa_server_url";
+const STORAGE_KEY_USER = "moa_user";
+const STORAGE_KEY_DEVICE_ID = "moa_device_id";
 const DEFAULT_SERVER_URL = "https://moanew-production.up.railway.app";
 
-export interface PairResponse {
-  paired: boolean;
-  token: string;
-}
+// ── Types ────────────────────────────────────────────────────────
 
 export interface ChatResponse {
   response: string;
@@ -27,16 +26,62 @@ export interface HealthResponse {
   status: string;
 }
 
+export interface DeviceInfo {
+  device_id: string;
+  device_name: string;
+  platform: string | null;
+  last_seen: number;
+  is_online: boolean;
+  has_pairing_code: boolean;
+}
+
+export interface LoginResponse {
+  status: string;
+  token: string;
+  user_id: string;
+  username: string;
+  devices: DeviceInfo[];
+}
+
+export interface RegisterResponse {
+  status: string;
+  user_id: string;
+}
+
+export interface UserInfo {
+  user_id: string;
+  username: string;
+}
+
 export type { SyncStatus, PlatformInfo };
+
+// ── Client ──────────────────────────────────────────────────────
 
 export class MoAClient {
   private serverUrl: string;
   private token: string | null;
+  private user: UserInfo | null;
+  private deviceId: string;
+  private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || DEFAULT_SERVER_URL;
     this.token = localStorage.getItem(STORAGE_KEY_TOKEN);
+    const storedUser = localStorage.getItem(STORAGE_KEY_USER);
+    this.user = storedUser ? JSON.parse(storedUser) : null;
+    this.deviceId = this.getOrCreateDeviceId();
   }
+
+  private getOrCreateDeviceId(): string {
+    let id = localStorage.getItem(STORAGE_KEY_DEVICE_ID);
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem(STORAGE_KEY_DEVICE_ID, id);
+    }
+    return id;
+  }
+
+  // ── Server URL ─────────────────────────────────────────────────
 
   getServerUrl(): string {
     return this.serverUrl;
@@ -45,17 +90,26 @@ export class MoAClient {
   setServerUrl(url: string): void {
     this.serverUrl = url.replace(/\/+$/, "");
     localStorage.setItem(STORAGE_KEY_SERVER, this.serverUrl);
-    // Also update Tauri backend if running in Tauri
     if (isTauri()) {
       setBackendServerUrl(this.serverUrl).catch(() => {});
     }
   }
 
+  // ── Auth State ─────────────────────────────────────────────────
+
   getToken(): string | null {
     return this.token;
   }
 
-  isConnected(): boolean {
+  getDeviceId(): string {
+    return this.deviceId;
+  }
+
+  getUser(): UserInfo | null {
+    return this.user;
+  }
+
+  isLoggedIn(): boolean {
     return this.token !== null && this.token.length > 0;
   }
 
@@ -65,55 +119,186 @@ export class MoAClient {
     return this.token.substring(0, 4) + "..." + this.token.substring(this.token.length - 4);
   }
 
-  disconnect(): void {
+  // ── Auth API ───────────────────────────────────────────────────
+
+  async register(username: string, password: string): Promise<RegisterResponse> {
+    const res = await fetch(`${this.serverUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Registration failed" }));
+      throw new Error(data.error || `Registration failed (${res.status})`);
+    }
+
+    return await res.json();
+  }
+
+  async login(username: string, password: string): Promise<LoginResponse> {
+    const deviceName = await this.getDeviceName();
+    const res = await fetch(`${this.serverUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username,
+        password,
+        device_id: this.deviceId,
+        device_name: deviceName,
+      }),
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Login failed" }));
+      throw new Error(data.error || `Login failed (${res.status})`);
+    }
+
+    const data: LoginResponse = await res.json();
+
+    // Save auth state
+    this.token = data.token;
+    this.user = { user_id: data.user_id, username: data.username };
+    localStorage.setItem(STORAGE_KEY_TOKEN, data.token);
+    localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(this.user));
+
+    return data;
+  }
+
+  async logout(): Promise<void> {
+    if (this.token) {
+      try {
+        await fetch(`${this.serverUrl}/api/auth/logout`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${this.token}` },
+        });
+      } catch {
+        // Ignore network errors during logout
+      }
+    }
+    this.clearAuth();
+  }
+
+  private clearAuth(): void {
     this.token = null;
+    this.user = null;
     localStorage.removeItem(STORAGE_KEY_TOKEN);
-    // Also disconnect on Tauri backend
+    localStorage.removeItem(STORAGE_KEY_USER);
+    this.stopHeartbeat();
     if (isTauri()) {
       disconnectBackend().catch(() => {});
     }
   }
 
-  async pair(
-    username?: string,
-    password?: string,
-    code?: string,
-  ): Promise<PairResponse> {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-    if (code) {
-      headers["X-Pairing-Code"] = code;
-    }
+  // ── Device API ─────────────────────────────────────────────────
 
-    const body: Record<string, string> = {};
-    if (username) body.username = username;
-    if (password) body.password = password;
+  async getDevices(): Promise<DeviceInfo[]> {
+    if (!this.token) return [];
 
-    const res = await fetch(`${this.serverUrl}/pair`, {
-      method: "POST",
-      headers,
-      body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined,
+    const res = await fetch(`${this.serverUrl}/api/auth/devices`, {
+      headers: { Authorization: `Bearer ${this.token}` },
     });
 
     if (!res.ok) {
-      const text = await res.text().catch(() => "Unknown error");
-      throw new Error(`Pairing failed (${res.status}): ${text}`);
+      if (res.status === 401) {
+        this.clearAuth();
+        throw new Error("Session expired");
+      }
+      return [];
     }
 
-    const data: PairResponse = await res.json();
-
-    if (data.paired && data.token) {
-      this.token = data.token;
-      localStorage.setItem(STORAGE_KEY_TOKEN, data.token);
-    }
-
-    return data;
+    const data = await res.json();
+    return data.devices || [];
   }
+
+  async registerDevice(deviceName: string, platform?: string): Promise<void> {
+    if (!this.token) return;
+
+    await fetch(`${this.serverUrl}/api/auth/devices`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        device_id: this.deviceId,
+        device_name: deviceName,
+        platform,
+      }),
+    });
+  }
+
+  async setDevicePairingCode(deviceId: string, code: string | null): Promise<void> {
+    if (!this.token) throw new Error("Not authenticated");
+
+    const res = await fetch(`${this.serverUrl}/api/auth/devices/${deviceId}/pairing-code`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ pairing_code: code }),
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Failed" }));
+      throw new Error(data.error || "Failed to set pairing code");
+    }
+  }
+
+  async verifyDevicePairing(deviceId: string, code: string): Promise<boolean> {
+    if (!this.token) throw new Error("Not authenticated");
+
+    const res = await fetch(`${this.serverUrl}/api/auth/devices/${deviceId}/verify-pairing`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ pairing_code: code }),
+    });
+
+    if (!res.ok) return false;
+    const data = await res.json();
+    return data.verified === true;
+  }
+
+  // ── Heartbeat ──────────────────────────────────────────────────
+
+  startHeartbeat(): void {
+    if (this.heartbeatInterval) return;
+    this.sendHeartbeat();
+    this.heartbeatInterval = setInterval(() => this.sendHeartbeat(), 60_000);
+  }
+
+  stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  private async sendHeartbeat(): Promise<void> {
+    if (!this.token) return;
+    try {
+      await fetch(`${this.serverUrl}/api/auth/heartbeat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({ device_id: this.deviceId }),
+      });
+    } catch {
+      // Heartbeat failures are non-critical
+    }
+  }
+
+  // ── Chat ───────────────────────────────────────────────────────
 
   async chat(message: string): Promise<ChatResponse> {
     if (!this.token) {
-      throw new Error("Not authenticated. Please pair with the server first.");
+      throw new Error("Not authenticated. Please login first.");
     }
 
     const res = await fetch(`${this.serverUrl}/webhook`, {
@@ -127,8 +312,8 @@ export class MoAClient {
 
     if (!res.ok) {
       if (res.status === 401) {
-        this.disconnect();
-        throw new Error("Authentication expired. Please re-pair with the server.");
+        this.clearAuth();
+        throw new Error("Authentication expired. Please login again.");
       }
       const text = await res.text().catch(() => "Unknown error");
       throw new Error(`Chat request failed (${res.status}): ${text}`);
@@ -136,6 +321,8 @@ export class MoAClient {
 
     return await res.json();
   }
+
+  // ── Health ─────────────────────────────────────────────────────
 
   async healthCheck(): Promise<HealthResponse> {
     const controller = new AbortController();
@@ -164,19 +351,28 @@ export class MoAClient {
 
   // ── Sync commands (Tauri backend only) ──────────────────────────
 
-  /** Get sync status from Tauri backend. Returns null when not in Tauri. */
   async getSyncStatus(): Promise<SyncStatus | null> {
     return getSyncStatus();
   }
 
-  /** Trigger a full sync (Layer 3). Returns null when not in Tauri. */
   async triggerFullSync(): Promise<string | null> {
     return triggerFullSync();
   }
 
-  /** Get platform info. Returns null when not in Tauri. */
   async getPlatformInfo(): Promise<PlatformInfo | null> {
     return getPlatformInfo();
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────
+
+  private async getDeviceName(): Promise<string> {
+    if (isTauri()) {
+      const info = await getPlatformInfo();
+      if (info) {
+        return `MoA ${info.os} ${info.is_mobile ? "Mobile" : "Desktop"}`;
+      }
+    }
+    return `MoA ${navigator.platform || "Web"}`;
   }
 }
 

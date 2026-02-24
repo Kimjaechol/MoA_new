@@ -158,6 +158,81 @@ async fn pair(
     Ok(data)
 }
 
+/// Login via /api/auth/login — the new multi-user auth flow.
+#[tauri::command]
+async fn auth_login(
+    username: String,
+    password: String,
+    device_id: Option<String>,
+    device_name: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let url = state.server_url.lock().map_err(|e| e.to_string())?.clone();
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{url}/api/auth/login"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "username": username,
+            "password": password,
+            "device_id": device_id,
+            "device_name": device_name,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Login failed: {text}"));
+    }
+
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("Invalid response: {e}"))?;
+
+    if let Some(token) = data.get("token").and_then(|t| t.as_str()) {
+        *state.token.lock().map_err(|e| e.to_string())? = Some(token.to_string());
+        let token_path = state.data_dir.join("session_token");
+        let _ = std::fs::write(&token_path, token);
+    }
+
+    Ok(data)
+}
+
+/// Register via /api/auth/register.
+#[tauri::command]
+async fn auth_register(
+    username: String,
+    password: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let url = state.server_url.lock().map_err(|e| e.to_string())?.clone();
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{url}/api/auth/register"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "username": username,
+            "password": password,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Registration failed: {text}"));
+    }
+
+    res.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Invalid response: {e}"))
+}
+
 /// Check gateway health.
 #[tauri::command]
 async fn health_check(state: tauri::State<'_, AppState>) -> Result<HealthResponse, String> {
@@ -418,6 +493,8 @@ pub fn run() {
             greet,
             chat,
             pair,
+            auth_login,
+            auth_register,
             health_check,
             get_server_url,
             set_server_url,
