@@ -198,6 +198,11 @@ impl Agent {
         self.history.clear();
     }
 
+    /// Returns the tool specifications (name + description) for all loaded tools.
+    pub fn tool_specs(&self) -> &[ToolSpec] {
+        &self.tool_specs
+    }
+
     pub fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));

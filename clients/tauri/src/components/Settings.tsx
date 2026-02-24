@@ -1,37 +1,39 @@
 import { useState, useCallback, useEffect } from "react";
 import { t, type Locale } from "../lib/i18n";
-import { apiClient, type SyncStatus, type PlatformInfo } from "../lib/api";
+import { apiClient, type SyncStatus, type PlatformInfo, type DeviceInfo } from "../lib/api";
 import { isTauri } from "../lib/tauri-bridge";
 
 interface SettingsProps {
   locale: Locale;
   onLocaleChange: (locale: Locale) => void;
-  onConnectionChange: (connected: boolean) => void;
   onBack: () => void;
+  onLogout: () => void;
 }
 
-export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }: SettingsProps) {
+export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsProps) {
   const [serverUrl, setServerUrl] = useState(apiClient.getServerUrl());
-  const [pairingCode, setPairingCode] = useState("");
-  const [pairUsername, setPairUsername] = useState("");
-  const [pairPassword, setPairPassword] = useState("");
-  const [isPairing, setIsPairing] = useState(false);
   const [isHealthChecking, setIsHealthChecking] = useState(false);
-  const [isConnected, setIsConnected] = useState(apiClient.isConnected());
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [platformInfo, setPlatformInfo] = useState<PlatformInfo | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const [editingPairingDevice, setEditingPairingDevice] = useState<string | null>(null);
+  const [newPairingCode, setNewPairingCode] = useState("");
   const inTauri = isTauri();
+  const user = apiClient.getUser();
+  const isLoggedIn = apiClient.isLoggedIn();
+  const currentDeviceId = apiClient.getDeviceId();
 
   useEffect(() => {
-    setIsConnected(apiClient.isConnected());
-    // Fetch sync status and platform info when in Tauri
     if (inTauri) {
       apiClient.getSyncStatus().then(setSyncStatus).catch(() => {});
       apiClient.getPlatformInfo().then(setPlatformInfo).catch(() => {});
     }
-  }, [inTauri]);
+    if (isLoggedIn) {
+      apiClient.getDevices().then(setDevices).catch(() => {});
+    }
+  }, [inTauri, isLoggedIn]);
 
   const clearMessage = useCallback(() => {
     setTimeout(() => setMessage(null), 5000);
@@ -45,47 +47,6 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
     [],
   );
 
-  const handleConnect = useCallback(async () => {
-    // Need at least credentials or pairing code
-    if (!pairUsername.trim() && !pairPassword && !pairingCode.trim()) return;
-
-    setIsPairing(true);
-    setMessage(null);
-
-    try {
-      const result = await apiClient.pair(
-        pairUsername.trim() || undefined,
-        pairPassword || undefined,
-        pairingCode.trim() || undefined,
-      );
-      if (result.paired) {
-        setIsConnected(true);
-        onConnectionChange(true);
-        setMessage({ type: "success", text: t("pair_success", locale) });
-        setPairingCode("");
-        setPairUsername("");
-        setPairPassword("");
-      } else {
-        setMessage({ type: "error", text: t("pair_failed", locale) });
-      }
-    } catch (err) {
-      setMessage({
-        type: "error",
-        text: err instanceof Error ? err.message : t("pair_failed", locale),
-      });
-    } finally {
-      setIsPairing(false);
-      clearMessage();
-    }
-  }, [pairingCode, pairUsername, pairPassword, locale, onConnectionChange, clearMessage]);
-
-  const handleDisconnect = useCallback(() => {
-    apiClient.disconnect();
-    setIsConnected(false);
-    onConnectionChange(false);
-    setMessage(null);
-  }, [onConnectionChange]);
-
   const handleTriggerSync = useCallback(async () => {
     setIsSyncing(true);
     setMessage(null);
@@ -94,7 +55,6 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
       if (result) {
         setMessage({ type: "success", text: t("sync_triggered", locale) });
       }
-      // Refresh sync status
       const status = await apiClient.getSyncStatus();
       setSyncStatus(status);
     } catch (err) {
@@ -130,6 +90,53 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
     }
   }, [locale, clearMessage]);
 
+  const handleLogout = useCallback(async () => {
+    await onLogout();
+  }, [onLogout]);
+
+  const handleSetPairingCode = useCallback(async (deviceId: string) => {
+    if (!newPairingCode.trim()) return;
+    try {
+      await apiClient.setDevicePairingCode(deviceId, newPairingCode.trim());
+      setMessage({ type: "success", text: t("pairing_code_set", locale) });
+      setEditingPairingDevice(null);
+      setNewPairingCode("");
+      // Refresh devices
+      const updated = await apiClient.getDevices();
+      setDevices(updated);
+    } catch (err) {
+      setMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "Failed",
+      });
+    }
+    clearMessage();
+  }, [newPairingCode, locale, clearMessage]);
+
+  const handleRemovePairingCode = useCallback(async (deviceId: string) => {
+    try {
+      await apiClient.setDevicePairingCode(deviceId, null);
+      setMessage({ type: "success", text: t("pairing_code_removed", locale) });
+      const updated = await apiClient.getDevices();
+      setDevices(updated);
+    } catch (err) {
+      setMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "Failed",
+      });
+    }
+    clearMessage();
+  }, [locale, clearMessage]);
+
+  const formatLastSeen = (timestamp: number) => {
+    const now = Date.now() / 1000;
+    const diff = now - timestamp;
+    if (diff < 120) return locale === "ko" ? "\uBC29\uAE08 \uC804" : "Just now";
+    if (diff < 3600) return `${Math.floor(diff / 60)}${locale === "ko" ? "\uBD84 \uC804" : "m ago"}`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}${locale === "ko" ? "\uC2DC\uAC04 \uC804" : "h ago"}`;
+    return `${Math.floor(diff / 86400)}${locale === "ko" ? "\uC77C \uC804" : "d ago"}`;
+  };
+
   return (
     <div className="settings-container">
       {/* Header */}
@@ -146,77 +153,112 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
       <div className="settings-body">
         <div className="settings-inner">
 
-          {/* Connection section */}
-          <div className="settings-section">
-            <div className="settings-section-title">{t("connection_status", locale)}</div>
-            <div className="settings-card">
-              <div className={`settings-status ${isConnected ? "connected" : "disconnected"}`}>
-                <div className={`status-dot ${isConnected ? "connected" : ""}`} />
-                {isConnected ? t("connected", locale) : t("disconnected", locale)}
+          {/* Account section */}
+          {isLoggedIn && user && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("account_info", locale)}</div>
+              <div className="settings-card">
+                <div className="settings-field">
+                  <label className="settings-label">{t("username", locale)}</label>
+                  <div className="settings-token-display">{user.username}</div>
+                </div>
+                <div className="settings-actions" style={{ marginTop: 12 }}>
+                  <button className="settings-btn settings-btn-danger" onClick={handleLogout}>
+                    {t("logout", locale)}
+                  </button>
+                </div>
               </div>
-
-              {isConnected ? (
-                <>
-                  <div className="settings-field" style={{ marginTop: 16 }}>
-                    <label className="settings-label">{t("token", locale)}</label>
-                    <div className="settings-token-display">{apiClient.getMaskedToken()}</div>
-                  </div>
-                  <div className="settings-actions">
-                    <button className="settings-btn settings-btn-danger" onClick={handleDisconnect}>
-                      {t("disconnect", locale)}
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="settings-field" style={{ marginTop: 16 }}>
-                    <label className="settings-label">{t("username", locale)}</label>
-                    <input
-                      className="settings-input"
-                      type="text"
-                      value={pairUsername}
-                      onChange={(e) => setPairUsername(e.target.value)}
-                      placeholder={t("username", locale)}
-                      autoComplete="username"
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") handleConnect();
-                      }}
-                    />
-                  </div>
-                  <div className="settings-field">
-                    <label className="settings-label">{t("password", locale)}</label>
-                    <input
-                      className="settings-input"
-                      type="password"
-                      value={pairPassword}
-                      onChange={(e) => setPairPassword(e.target.value)}
-                      placeholder={t("password", locale)}
-                      autoComplete="current-password"
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") handleConnect();
-                      }}
-                    />
-                  </div>
-                  <div className="settings-actions" style={{ marginTop: 8 }}>
-                    <button
-                      className="settings-btn settings-btn-primary"
-                      onClick={handleConnect}
-                      disabled={isPairing || (!pairUsername.trim() && !pairPassword)}
-                      style={{ width: "100%" }}
-                    >
-                      {isPairing ? t("connecting", locale) : t("connect", locale)}
-                    </button>
-                  </div>
-                </>
-              )}
-
-              {message && (
-                <div className={`settings-message ${message.type}`}>{message.text}</div>
-              )}
             </div>
-          </div>
+          )}
 
-          {/* Advanced settings (server URL, pairing code) — hidden by default */}
+          {/* Devices section */}
+          {isLoggedIn && devices.length > 0 && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("my_devices", locale)}</div>
+              <div className="settings-card">
+                {devices.map((device) => {
+                  const isLocal = device.device_id === currentDeviceId;
+                  return (
+                    <div key={device.device_id} className="settings-device-item">
+                      <div className="settings-device-header">
+                        <div className="settings-device-name">
+                          {device.device_name}
+                          {isLocal && (
+                            <span className="device-badge device-badge-local">
+                              {t("device_this", locale)}
+                            </span>
+                          )}
+                        </div>
+                        <div className={`device-status-mini ${device.is_online ? "online" : "offline"}`}>
+                          <div className={`status-dot ${device.is_online ? "connected" : ""}`} />
+                          <span>{device.is_online ? t("device_online", locale) : t("device_offline", locale)}</span>
+                        </div>
+                      </div>
+                      <div className="settings-device-meta">
+                        {device.platform && <span>{device.platform}</span>}
+                        <span>{formatLastSeen(device.last_seen)}</span>
+                      </div>
+
+                      {/* Pairing code management */}
+                      <div className="settings-device-pairing">
+                        {editingPairingDevice === device.device_id ? (
+                          <div className="settings-device-pairing-edit">
+                            <input
+                              className="settings-input"
+                              type="password"
+                              value={newPairingCode}
+                              onChange={(e) => setNewPairingCode(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === "Enter") handleSetPairingCode(device.device_id); }}
+                              placeholder={t("new_pairing_code", locale)}
+                              autoFocus
+                            />
+                            <div className="settings-device-pairing-btns">
+                              <button
+                                className="settings-btn settings-btn-primary settings-btn-sm"
+                                onClick={() => handleSetPairingCode(device.device_id)}
+                                disabled={!newPairingCode.trim()}
+                              >
+                                {t("save_pairing_code", locale)}
+                              </button>
+                              <button
+                                className="settings-btn settings-btn-secondary settings-btn-sm"
+                                onClick={() => { setEditingPairingDevice(null); setNewPairingCode(""); }}
+                              >
+                                {locale === "ko" ? "\uCDE8\uC18C" : "Cancel"}
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="settings-device-pairing-btns">
+                            <button
+                              className="settings-btn settings-btn-secondary settings-btn-sm"
+                              onClick={() => { setEditingPairingDevice(device.device_id); setNewPairingCode(""); }}
+                            >
+                              {device.has_pairing_code ? t("change_pairing_code", locale) : t("set_pairing_code", locale)}
+                            </button>
+                            {device.has_pairing_code && (
+                              <button
+                                className="settings-btn settings-btn-danger settings-btn-sm"
+                                onClick={() => handleRemovePairingCode(device.device_id)}
+                              >
+                                {t("remove_pairing_code", locale)}
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {message && (
+            <div className={`settings-message ${message.type}`}>{message.text}</div>
+          )}
+
+          {/* Advanced settings (server URL) */}
           <div className="settings-section">
             <details>
               <summary className="settings-section-title" style={{ cursor: "pointer" }}>
@@ -242,21 +284,6 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                     </button>
                   </div>
                 </div>
-                {!isConnected && (
-                  <div className="settings-field" style={{ marginTop: 8 }}>
-                    <label className="settings-label">{t("pairing_code_optional", locale)}</label>
-                    <input
-                      className="settings-input"
-                      type="text"
-                      value={pairingCode}
-                      onChange={(e) => setPairingCode(e.target.value)}
-                      placeholder={t("pairing_code", locale)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") handleConnect();
-                      }}
-                    />
-                  </div>
-                )}
               </div>
             </details>
           </div>
@@ -299,7 +326,7 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                         {syncStatus.device_id}
                       </div>
                     </div>
-                    {isConnected && (
+                    {isLoggedIn && (
                       <div className="settings-actions" style={{ marginTop: 12 }}>
                         <button
                           className="settings-btn settings-btn-secondary"

@@ -15,4 +15,4 @@
 
 pub mod store;
 
-pub use store::{AuthStore, Session};
+pub use store::{AuthStore, DeviceWithStatus, Session};

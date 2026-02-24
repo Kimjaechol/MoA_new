@@ -50,6 +50,18 @@ pub struct Device {
     pub last_seen: i64,
 }
 
+/// A device with online/offline status information.
+#[derive(Debug, Clone)]
+pub struct DeviceWithStatus {
+    pub device_id: String,
+    pub user_id: String,
+    pub device_name: String,
+    pub platform: Option<String>,
+    pub last_seen: i64,
+    pub is_online: bool,
+    pub has_pairing_code: bool,
+}
+
 /// SQLite-backed authentication store.
 pub struct AuthStore {
     conn: Mutex<rusqlite::Connection>,
@@ -93,10 +105,21 @@ impl AuthStore {
                 user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 device_name TEXT NOT NULL,
                 platform TEXT,
+                pairing_code_hash TEXT,
                 last_seen INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);",
         )?;
+
+        // Migration: add pairing_code_hash column if missing
+        let has_pairing_code: bool = conn
+            .prepare("SELECT pairing_code_hash FROM devices LIMIT 0")
+            .is_ok();
+        if !has_pairing_code {
+            let _ = conn.execute_batch(
+                "ALTER TABLE devices ADD COLUMN pairing_code_hash TEXT;",
+            );
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -346,6 +369,95 @@ impl AuthStore {
             rusqlite::params![now, device_id],
         )?;
         Ok(())
+    }
+
+    /// Set (or clear) the pairing code for a device.
+    pub fn set_device_pairing_code(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        code: Option<&str>,
+    ) -> Result<()> {
+        let hash = code.map(|c| hash_password(c, device_id));
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE devices SET pairing_code_hash = ?1 WHERE device_id = ?2 AND user_id = ?3",
+            rusqlite::params![hash, device_id, user_id],
+        )?;
+        if updated == 0 {
+            bail!("Device not found");
+        }
+        Ok(())
+    }
+
+    /// Verify a pairing code for a device.
+    pub fn verify_device_pairing_code(
+        &self,
+        device_id: &str,
+        code: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let stored_hash: Option<String> = conn
+            .query_row(
+                "SELECT pairing_code_hash FROM devices WHERE device_id = ?1",
+                rusqlite::params![device_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow::anyhow!("Device not found"))?;
+
+        match stored_hash {
+            None => Ok(true), // No pairing code set → open access
+            Some(h) => {
+                let attempt = hash_password(code, device_id);
+                Ok(constant_time_eq(h.as_bytes(), attempt.as_bytes()))
+            }
+        }
+    }
+
+    /// Check if a device has a pairing code set.
+    pub fn device_has_pairing_code(&self, device_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT pairing_code_hash FROM devices WHERE device_id = ?1",
+                rusqlite::params![device_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow::anyhow!("Device not found"))?;
+        Ok(hash.is_some())
+    }
+
+    /// List all devices for a user, including online status.
+    /// A device is considered online if last_seen is within `online_threshold_secs`.
+    pub fn list_devices_with_status(
+        &self,
+        user_id: &str,
+        online_threshold_secs: u64,
+    ) -> Result<Vec<DeviceWithStatus>> {
+        let conn = self.conn.lock();
+        let now = epoch_secs() as i64;
+        let cutoff = now - online_threshold_secs as i64;
+
+        let mut stmt = conn.prepare(
+            "SELECT device_id, user_id, device_name, platform, last_seen, pairing_code_hash
+             FROM devices WHERE user_id = ?1 ORDER BY last_seen DESC",
+        )?;
+        let devices = stmt
+            .query_map(rusqlite::params![user_id], |row| {
+                let last_seen: i64 = row.get(4)?;
+                let pairing_code_hash: Option<String> = row.get(5)?;
+                Ok(DeviceWithStatus {
+                    device_id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    device_name: row.get(2)?,
+                    platform: row.get(3)?,
+                    last_seen,
+                    is_online: last_seen > cutoff,
+                    has_pairing_code: pairing_code_hash.is_some(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(devices)
     }
 
     /// Count registered users.

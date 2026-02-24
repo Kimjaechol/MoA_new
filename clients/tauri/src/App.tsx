@@ -2,7 +2,10 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { Chat } from "./components/Chat";
 import { Sidebar } from "./components/Sidebar";
 import { Settings } from "./components/Settings";
-import { apiClient } from "./lib/api";
+import { Login } from "./components/Login";
+import { SignUp } from "./components/SignUp";
+import { DeviceSelect } from "./components/DeviceSelect";
+import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated } from "./lib/tauri-bridge";
 import {
@@ -17,15 +20,19 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "chat" | "settings";
+type Page = "login" | "signup" | "device_select" | "chat" | "settings";
 
 function App() {
-  const [page, setPage] = useState<Page>("chat");
+  const [page, setPage] = useState<Page>("login");
   const [locale, setLocale] = useState<Locale>(getStoredLocale());
   const [chats, setChats] = useState<ChatSession[]>(() => loadChats());
   const [activeChatId, setActiveChatIdState] = useState<string | null>(() => getActiveChatId());
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [isConnected, setIsConnected] = useState(apiClient.isConnected());
+  const [isConnected, setIsConnected] = useState(false);
+  const [pendingDevices, setPendingDevices] = useState<DeviceInfo[]>([]);
+  const [sidebarDevices, setSidebarDevices] = useState<DeviceInfo[]>([]);
+  const [sidebarChannels, setSidebarChannels] = useState<string[]>([]);
+  const [sidebarTools, setSidebarTools] = useState<ToolInfo[]>([]);
   const lifecycleCleanup = useRef<(() => void) | null>(null);
 
   const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
@@ -38,13 +45,21 @@ function App() {
     setActiveChatId(activeChatId);
   }, [activeChatId]);
 
-  // Mobile lifecycle: handle pause/resume events
+  // Check auth on startup
   useEffect(() => {
+    if (apiClient.isLoggedIn()) {
+      // Already have a token → go to chat
+      setIsConnected(true);
+      setPage("chat");
+      apiClient.startHeartbeat();
+    } else {
+      setPage("login");
+    }
+
     if (!isTauri()) return;
 
     onLifecycleEvent(async (event, data) => {
       if (event === "resume" && data) {
-        // Check if token was restored by the backend
         if (data.has_token) {
           setIsConnected(true);
         }
@@ -53,15 +68,49 @@ function App() {
       lifecycleCleanup.current = cleanup;
     });
 
-    // On startup in Tauri, check backend auth state
+    // In Tauri, also check backend auth state
     isAuthenticated().then((auth) => {
-      if (auth === true) setIsConnected(true);
+      if (auth === true && !apiClient.isLoggedIn()) {
+        // Backend has token but frontend doesn't — sync
+        setIsConnected(true);
+        setPage("chat");
+        apiClient.startHeartbeat();
+      }
     });
 
     return () => {
       lifecycleCleanup.current?.();
     };
   }, []);
+
+  // Fetch sidebar data (devices, channels, tools) when connected
+  useEffect(() => {
+    if (!isConnected) {
+      setSidebarDevices([]);
+      setSidebarChannels([]);
+      setSidebarTools([]);
+      return;
+    }
+
+    const fetchSidebarData = async () => {
+      const [devices, agentInfo] = await Promise.all([
+        apiClient.getDevices().catch(() => [] as DeviceInfo[]),
+        apiClient.getAgentInfo(),
+      ]);
+      setSidebarDevices(devices);
+      setSidebarChannels(agentInfo.channels);
+      setSidebarTools(agentInfo.tools);
+    };
+
+    fetchSidebarData();
+
+    // Refresh devices periodically (every 60s, aligned with heartbeat)
+    const interval = setInterval(() => {
+      apiClient.getDevices().then(setSidebarDevices).catch(() => {});
+    }, 60_000);
+
+    return () => clearInterval(interval);
+  }, [isConnected]);
 
   const handleLocaleChange = useCallback((newLocale: Locale) => {
     setLocale(newLocale);
@@ -151,8 +200,10 @@ function App() {
           }),
         );
 
-        if (err instanceof Error && err.message.includes("Authentication expired")) {
+        if (err instanceof Error && err.message.includes("expired")) {
           setIsConnected(false);
+          apiClient.stopHeartbeat();
+          setPage("login");
         }
       }
     },
@@ -183,10 +234,93 @@ function App() {
     [activeChatId, handleSendMessage],
   );
 
-  const handleConnectionChange = useCallback((connected: boolean) => {
-    setIsConnected(connected);
+  const handleLoginSuccess = useCallback((devices: DeviceInfo[]) => {
+    if (devices.length <= 1) {
+      // 0 or 1 device → auto-connect
+      setIsConnected(true);
+      setPage("chat");
+      apiClient.startHeartbeat();
+      // Auto-register this device if no devices yet
+      if (devices.length === 0) {
+        apiClient.registerDevice("MoA Device").catch(() => {});
+      }
+    } else {
+      // Multiple devices → show device selection
+      const onlineDevices = devices.filter((d) => d.is_online);
+      const currentDeviceId = apiClient.getDeviceId();
+      const currentInList = devices.find((d) => d.device_id === currentDeviceId);
+
+      if (currentInList) {
+        // This device is in the list → auto-connect (local login)
+        setIsConnected(true);
+        setPage("chat");
+        apiClient.startHeartbeat();
+      } else if (onlineDevices.length === 1 && !onlineDevices[0].has_pairing_code) {
+        // Only 1 online device without pairing code → auto-connect
+        setIsConnected(true);
+        setPage("chat");
+        apiClient.startHeartbeat();
+      } else {
+        // Show device selection
+        setPendingDevices(devices);
+        setPage("device_select");
+      }
+    }
   }, []);
 
+  const handleDeviceSelected = useCallback(() => {
+    setIsConnected(true);
+    setPage("chat");
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    await apiClient.logout();
+    setIsConnected(false);
+    setPage("login");
+  }, []);
+
+  // ── Render ─────────────────────────────────────────────────────
+
+  // Auth screens (no sidebar)
+  if (page === "login") {
+    return (
+      <div className="app">
+        <Login
+          locale={locale}
+          onLoginSuccess={handleLoginSuccess}
+          onGoToSignUp={() => setPage("signup")}
+          onGoToSettings={() => setPage("settings")}
+        />
+      </div>
+    );
+  }
+
+  if (page === "signup") {
+    return (
+      <div className="app">
+        <SignUp
+          locale={locale}
+          onSignUpSuccess={() => setPage("login")}
+          onGoToLogin={() => setPage("login")}
+        />
+      </div>
+    );
+  }
+
+  if (page === "device_select") {
+    return (
+      <div className="app">
+        <DeviceSelect
+          locale={locale}
+          devices={pendingDevices}
+          onDeviceSelected={handleDeviceSelected}
+          onLogout={handleLogout}
+        />
+      </div>
+    );
+  }
+
+  // Main app (with sidebar)
   return (
     <div className="app">
       <Sidebar
@@ -194,6 +328,9 @@ function App() {
         activeChatId={activeChatId}
         isOpen={sidebarOpen}
         locale={locale}
+        devices={sidebarDevices}
+        channels={sidebarChannels}
+        tools={sidebarTools}
         onNewChat={handleNewChat}
         onSelectChat={handleSelectChat}
         onDeleteChat={handleDeleteChat}
@@ -217,8 +354,8 @@ function App() {
           <Settings
             locale={locale}
             onLocaleChange={handleLocaleChange}
-            onConnectionChange={handleConnectionChange}
             onBack={() => setPage("chat")}
+            onLogout={handleLogout}
           />
         )}
       </main>

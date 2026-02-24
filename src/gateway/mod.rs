@@ -221,6 +221,8 @@ pub struct AppState {
     pub gateway_base_url: String,
     /// Voice session manager for real-time interpretation.
     pub voice_sessions: Arc<crate::voice::VoiceSessionManager>,
+    /// Names of active (configured) channels for sidebar display.
+    pub active_channel_names: Vec<String>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -531,6 +533,57 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     };
 
+    // Collect active channel names for sidebar display
+    let mut active_channel_names: Vec<String> = Vec::new();
+    if config.channels_config.cli {
+        active_channel_names.push("CLI".into());
+    }
+    if config.channels_config.webhook.is_some() {
+        active_channel_names.push("Webhook".into());
+    }
+    if config.channels_config.telegram.is_some() {
+        active_channel_names.push("Telegram".into());
+    }
+    if config.channels_config.discord.is_some() {
+        active_channel_names.push("Discord".into());
+    }
+    if config.channels_config.slack.is_some() {
+        active_channel_names.push("Slack".into());
+    }
+    if config.channels_config.whatsapp.is_some() {
+        active_channel_names.push("WhatsApp".into());
+    }
+    if config.channels_config.line.is_some() {
+        active_channel_names.push("LINE".into());
+    }
+    if config.channels_config.signal.is_some() {
+        active_channel_names.push("Signal".into());
+    }
+    if config.channels_config.matrix.is_some() {
+        active_channel_names.push("Matrix".into());
+    }
+    if config.channels_config.irc.is_some() {
+        active_channel_names.push("IRC".into());
+    }
+    if config.channels_config.imessage.is_some() {
+        active_channel_names.push("iMessage".into());
+    }
+    if config.channels_config.email.is_some() {
+        active_channel_names.push("Email".into());
+    }
+    if config.channels_config.lark.is_some() {
+        active_channel_names.push("Lark".into());
+    }
+    if config.channels_config.dingtalk.is_some() {
+        active_channel_names.push("DingTalk".into());
+    }
+    if config.channels_config.qq.is_some() {
+        active_channel_names.push("QQ".into());
+    }
+    if config.channels_config.kakao.is_some() {
+        active_channel_names.push("KakaoTalk".into());
+    }
+
     // Build shared state
     let state = AppState {
         provider,
@@ -563,6 +616,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             config.voice.default_source_language.clone(),
             config.voice.default_target_language.clone(),
         )),
+        active_channel_names,
     };
 
     // Ensure channel_links table exists if auth is enabled
@@ -578,6 +632,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
+            axum::http::Method::PUT,
             axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
@@ -614,6 +669,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/auth/devices/{device_id}",
             axum::routing::delete(handle_auth_device_remove),
         )
+        .route(
+            "/api/auth/devices/{device_id}/pairing-code",
+            axum::routing::put(handle_auth_device_set_pairing_code),
+        )
+        .route(
+            "/api/auth/devices/{device_id}/verify-pairing",
+            post(handle_auth_device_verify_pairing),
+        )
+        .route("/api/auth/heartbeat", post(handle_auth_heartbeat))
         .route("/sync", get(handle_sync_ws))
         .route("/api/sync/relay", post(handle_sync_relay_upload))
         .route("/api/sync/relay", get(handle_sync_relay_pickup))
@@ -634,6 +698,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/admin/telemetry/alerts",
             get(handle_admin_telemetry_alerts),
         )
+        .route("/api/agent/info", get(handle_agent_info))
         .route("/api/voice/ui", get(handle_voice_ui))
         .route("/api/voice/interpret", get(handle_voice_interpret_ws))
         .route("/api/voice/sessions", get(handle_voice_sessions_list))
@@ -679,6 +744,30 @@ async fn handle_coding_layout() -> Json<crate::sandbox::layout::CodingLayout> {
 /// GET /api/coding/layout/mobile — returns the mobile-optimized coding layout.
 async fn handle_coding_layout_mobile() -> Json<crate::sandbox::layout::CodingLayout> {
     Json(crate::sandbox::layout::CodingLayout::mobile())
+}
+
+/// GET /api/agent/info — returns available tools and active channels for sidebar display.
+async fn handle_agent_info(State(state): State<AppState>) -> impl IntoResponse {
+    let tools: Vec<serde_json::Value> = if let Some(ref agent) = state.agent {
+        let agent = agent.lock().await;
+        agent
+            .tool_specs()
+            .iter()
+            .map(|spec| {
+                serde_json::json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Json(serde_json::json!({
+        "channels": state.active_channel_names,
+        "tools": tools,
+    }))
 }
 
 /// Optional JSON body for pairing with credentials.
@@ -1451,15 +1540,35 @@ async fn handle_auth_login(
         body.device_id.as_deref(),
         body.device_name.as_deref(),
     ) {
-        Ok(token) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "authenticated",
-                "token": token,
-                "user_id": user.id,
-                "username": user.username,
-            })),
-        ),
+        Ok(token) => {
+            // Include device list in login response
+            let devices = auth_store
+                .list_devices_with_status(&user.id, DEVICE_ONLINE_THRESHOLD_SECS)
+                .unwrap_or_default();
+            let device_list: Vec<_> = devices
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "device_id": d.device_id,
+                        "device_name": d.device_name,
+                        "platform": d.platform,
+                        "last_seen": d.last_seen,
+                        "is_online": d.is_online,
+                        "has_pairing_code": d.has_pairing_code,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "authenticated",
+                    "token": token,
+                    "user_id": user.id,
+                    "username": user.username,
+                    "devices": device_list,
+                })),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Session creation failed: {e}")})),
@@ -1541,7 +1650,7 @@ async fn handle_auth_devices_list(
     };
 
     let auth_store = state.auth_store.as_ref().unwrap();
-    match auth_store.list_devices(&session.user_id) {
+    match auth_store.list_devices_with_status(&session.user_id, DEVICE_ONLINE_THRESHOLD_SECS) {
         Ok(devices) => {
             let list: Vec<_> = devices
                 .iter()
@@ -1549,7 +1658,10 @@ async fn handle_auth_devices_list(
                     serde_json::json!({
                         "device_id": d.device_id,
                         "device_name": d.device_name,
+                        "platform": d.platform,
                         "last_seen": d.last_seen,
+                        "is_online": d.is_online,
+                        "has_pairing_code": d.has_pairing_code,
                     })
                 })
                 .collect();
@@ -1645,6 +1757,145 @@ async fn handle_auth_device_remove(
             Json(serde_json::json!({"error": format!("Device removal failed: {e}")})),
         ),
     }
+}
+
+/// Device online threshold — devices seen within this window are "online".
+const DEVICE_ONLINE_THRESHOLD_SECS: u64 = 120;
+
+/// Request body for setting device pairing code.
+#[derive(GatewayDeserialize)]
+struct DevicePairingCodeBody {
+    pairing_code: Option<String>,
+}
+
+/// Request body for verifying device pairing code.
+#[derive(GatewayDeserialize)]
+struct DeviceVerifyPairingBody {
+    pairing_code: String,
+}
+
+/// Request body for heartbeat.
+#[derive(GatewayDeserialize)]
+struct HeartbeatBody {
+    device_id: String,
+}
+
+/// PUT /api/auth/devices/:device_id/pairing-code — set or clear device pairing code.
+async fn handle_auth_device_set_pairing_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    body: Result<Json<DevicePairingCodeBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    match auth_store.set_device_pairing_code(
+        &session.user_id,
+        &device_id,
+        body.pairing_code.as_deref(),
+    ) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "pairing_code_updated"})),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// POST /api/auth/devices/:device_id/verify-pairing — verify pairing code for a device.
+async fn handle_auth_device_verify_pairing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    body: Result<Json<DeviceVerifyPairingBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let _session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    match auth_store.verify_device_pairing_code(&device_id, &body.pairing_code) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"verified": true})),
+        ),
+        Ok(false) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"verified": false, "error": "Invalid pairing code"})),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// POST /api/auth/heartbeat — update device last_seen and register if needed.
+async fn handle_auth_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<HeartbeatBody>, axum::extract::rejection::JsonRejection>,
+) -> AuthResponse {
+    let session = match require_auth_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
+            );
+        }
+    };
+
+    let auth_store = state.auth_store.as_ref().unwrap();
+    // Touch the device (update last_seen), register it if not yet registered
+    if auth_store.touch_device(&body.device_id).is_err() {
+        // Device not found — auto-register it
+        let platform = format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH);
+        let _ = auth_store.register_device(
+            &session.user_id,
+            &body.device_id,
+            "MoA Device",
+            Some(&platform),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "ok"})),
+    )
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

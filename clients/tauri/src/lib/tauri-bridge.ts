@@ -129,6 +129,35 @@ export async function setServerUrl(url: string): Promise<void> {
   await invoke("set_server_url", { url });
 }
 
+// ── Auth commands (new multi-user flow) ──────────────────────────
+
+/** Login via Tauri backend (proxies to /api/auth/login). */
+export async function authLogin(
+  username: string,
+  password: string,
+  deviceId?: string,
+  deviceName?: string,
+): Promise<unknown | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("auth_login", {
+    username,
+    password,
+    device_id: deviceId,
+    device_name: deviceName,
+  });
+}
+
+/** Register via Tauri backend (proxies to /api/auth/register). */
+export async function authRegister(
+  username: string,
+  password: string,
+): Promise<unknown | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("auth_register", { username, password });
+}
+
 // ── Mobile lifecycle event listeners ─────────────────────────────
 
 /** Register a handler for Tauri lifecycle events. Returns an unlisten fn. */
