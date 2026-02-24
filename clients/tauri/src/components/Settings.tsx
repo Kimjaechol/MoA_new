@@ -45,17 +45,18 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
     [],
   );
 
-  const handlePair = useCallback(async () => {
-    if (!pairingCode.trim()) return;
+  const handleConnect = useCallback(async () => {
+    // Need at least credentials or pairing code
+    if (!pairUsername.trim() && !pairPassword && !pairingCode.trim()) return;
 
     setIsPairing(true);
     setMessage(null);
 
     try {
       const result = await apiClient.pair(
-        pairingCode.trim(),
         pairUsername.trim() || undefined,
         pairPassword || undefined,
+        pairingCode.trim() || undefined,
       );
       if (result.paired) {
         setIsConnected(true);
@@ -203,8 +204,11 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                       type="text"
                       value={pairUsername}
                       onChange={(e) => setPairUsername(e.target.value)}
-                      placeholder="Enter username"
+                      placeholder={t("username", locale)}
                       autoComplete="username"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleConnect();
+                      }}
                     />
                   </div>
                   <div className="settings-field">
@@ -214,32 +218,40 @@ export function Settings({ locale, onLocaleChange, onConnectionChange, onBack }:
                       type="password"
                       value={pairPassword}
                       onChange={(e) => setPairPassword(e.target.value)}
-                      placeholder="Enter password"
+                      placeholder={t("password", locale)}
                       autoComplete="current-password"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleConnect();
+                      }}
                     />
                   </div>
-                  <div className="settings-field">
-                    <label className="settings-label">{t("pairing_code", locale)}</label>
-                    <div className="settings-input-row">
+                  <div className="settings-actions" style={{ marginTop: 8 }}>
+                    <button
+                      className="settings-btn settings-btn-primary"
+                      onClick={handleConnect}
+                      disabled={isPairing || (!pairUsername.trim() && !pairPassword && !pairingCode.trim())}
+                      style={{ width: "100%" }}
+                    >
+                      {isPairing ? t("connecting", locale) : t("connect", locale)}
+                    </button>
+                  </div>
+                  <details style={{ marginTop: 12 }}>
+                    <summary style={{ fontSize: 12, color: "var(--color-text-muted)", cursor: "pointer" }}>
+                      {t("pairing_code_optional", locale)}
+                    </summary>
+                    <div className="settings-field" style={{ marginTop: 8 }}>
                       <input
                         className="settings-input"
                         type="text"
                         value={pairingCode}
                         onChange={(e) => setPairingCode(e.target.value)}
-                        placeholder="Enter pairing code"
+                        placeholder={t("pairing_code", locale)}
                         onKeyDown={(e) => {
-                          if (e.key === "Enter") handlePair();
+                          if (e.key === "Enter") handleConnect();
                         }}
                       />
-                      <button
-                        className="settings-btn settings-btn-primary"
-                        onClick={handlePair}
-                        disabled={isPairing || !pairingCode.trim()}
-                      >
-                        {isPairing ? t("pairing", locale) : t("pair", locale)}
-                      </button>
                     </div>
-                  </div>
+                  </details>
                 </>
               )}
 

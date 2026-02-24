@@ -90,10 +90,17 @@ async fn chat(
         .map_err(|e| format!("Invalid response: {e}"))
 }
 
-/// Pair with a MoA gateway server using a pairing code.
+/// Pair with a MoA gateway server using credentials and/or pairing code.
+///
+/// Supports three modes:
+/// - Credentials only (username + password) — auto-connect
+/// - Pairing code only — legacy Bluetooth-style flow
+/// - Both credentials and code
 #[tauri::command]
 async fn pair(
-    code: String,
+    username: Option<String>,
+    password: Option<String>,
+    code: Option<String>,
     server_url: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<PairResponse, String> {
@@ -104,10 +111,28 @@ async fn pair(
     let url = state.server_url.lock().map_err(|e| e.to_string())?.clone();
 
     let client = reqwest::Client::new();
-    let res = client
+    let mut req = client
         .post(format!("{url}/pair"))
-        .header("Content-Type", "application/json")
-        .header("X-Pairing-Code", &code)
+        .header("Content-Type", "application/json");
+
+    if let Some(ref code) = code {
+        req = req.header("X-Pairing-Code", code);
+    }
+
+    // Build body with credentials
+    let mut body = serde_json::Map::new();
+    if let Some(ref u) = username {
+        body.insert("username".into(), serde_json::Value::String(u.clone()));
+    }
+    if let Some(ref p) = password {
+        body.insert("password".into(), serde_json::Value::String(p.clone()));
+    }
+
+    if !body.is_empty() {
+        req = req.json(&serde_json::Value::Object(body));
+    }
+
+    let res = req
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;

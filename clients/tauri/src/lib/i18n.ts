@@ -28,8 +28,11 @@ type TranslationKey =
   | "username"
   | "password"
   | "pairing_code"
+  | "pairing_code_optional"
   | "pair"
   | "pairing"
+  | "connect"
+  | "connecting"
   | "disconnect"
   | "connection_status"
   | "connected"
@@ -76,8 +79,11 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     username: "Username",
     password: "Password",
     pairing_code: "Pairing Code",
+    pairing_code_optional: "Pairing Code (optional, for code-only mode)",
     pair: "Pair",
     pairing: "Pairing...",
+    connect: "Connect",
+    connecting: "Connecting...",
     disconnect: "Disconnect",
     connection_status: "Connection Status",
     connected: "Connected",
@@ -123,8 +129,11 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     username: "\uC544\uC774\uB514",
     password: "\uBE44\uBC00\uBC88\uD638",
     pairing_code: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC",
+    pairing_code_optional: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC (\uC120\uD0DD\uC0AC\uD56D, \uCF54\uB4DC \uC804\uC6A9 \uBAA8\uB4DC)",
     pair: "\uD398\uC5B4\uB9C1",
     pairing: "\uD398\uC5B4\uB9C1 \uC911...",
+    connect: "\uC5F0\uACB0",
+    connecting: "\uC5F0\uACB0 \uC911...",
     disconnect: "\uC5F0\uACB0 \uD574\uC81C",
     connection_status: "\uC5F0\uACB0 \uC0C1\uD0DC",
     connected: "\uC5F0\uACB0\uB428",
