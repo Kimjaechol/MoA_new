@@ -200,10 +200,7 @@ html, body {
 }
 
 .sidebar-section-chats {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
+  /* Flows naturally inside scrollable .sidebar-body */
 }
 
 .sidebar-section-header {
@@ -263,7 +260,7 @@ html, body {
 }
 
 .sidebar-chats-list {
-  overflow-y: auto;
+  /* Chat items flow inside scrollable .sidebar-body; no nested scroll needed */
 }
 
 .sidebar-section-empty {

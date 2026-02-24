@@ -632,6 +632,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
+            axum::http::Method::PUT,
             axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
