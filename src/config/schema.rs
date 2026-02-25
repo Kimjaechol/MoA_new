@@ -161,7 +161,7 @@ fn default_voice_prefix_padding_ms() -> u32 {
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_sessions_per_user: default_voice_max_sessions(),
             default_source_language: default_voice_source_language(),
             default_target_language: default_voice_target_language(),
