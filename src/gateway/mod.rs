@@ -875,14 +875,21 @@ async fn handle_webhook(
         return (StatusCode::TOO_MANY_REQUESTS, Json(err));
     }
 
-    // ── Bearer token auth (pairing) ──
+    // ── Bearer token auth (pairing OR multi-user session) ──
     if state.pairing.require_pairing() {
         let auth = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
+        let pairing_ok = state.pairing.is_authenticated(token);
+        let session_ok = !pairing_ok
+            && state
+                .auth_store
+                .as_ref()
+                .and_then(|store| store.validate_session(token))
+                .is_some();
+        if !pairing_ok && !session_ok {
             tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
@@ -2124,18 +2131,24 @@ async fn handle_telemetry_ingest(
         );
     };
 
-    // Accept events from paired clients or admin
-    let is_paired = {
+    // Accept events from paired clients, multi-user session, or admin
+    let token_str = {
         let auth = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        state.pairing.is_authenticated(token)
+        auth.strip_prefix("Bearer ").unwrap_or("").to_string()
     };
+    let is_paired = state.pairing.is_authenticated(&token_str);
+    let is_session = !is_paired
+        && state
+            .auth_store
+            .as_ref()
+            .and_then(|s| s.validate_session(&token_str))
+            .is_some();
     let is_admin = authenticate_admin(&state, &headers);
 
-    if !is_paired && !is_admin {
+    if !is_paired && !is_session && !is_admin {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "unauthorized"})),
@@ -3001,6 +3014,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            active_channel_names: Vec::new(),
         };
 
         let mut headers = HeaderMap::new();
@@ -3009,6 +3023,7 @@ mod tests {
         let body = Ok(Json(WebhookBody {
             task_category: None,
             message: "hello".into(),
+            model: None,
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body)
             .await
@@ -3018,6 +3033,7 @@ mod tests {
         let body = Ok(Json(WebhookBody {
             task_category: None,
             message: "hello".into(),
+            model: None,
         }));
         let second = handle_webhook(State(state), headers, body)
             .await
@@ -3065,6 +3081,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            active_channel_names: Vec::new(),
         };
 
         let headers = HeaderMap::new();
@@ -3072,6 +3089,7 @@ mod tests {
         let body1 = Ok(Json(WebhookBody {
             task_category: None,
             message: "hello one".into(),
+            model: None,
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body1)
             .await
@@ -3081,6 +3099,7 @@ mod tests {
         let body2 = Ok(Json(WebhookBody {
             task_category: None,
             message: "hello two".into(),
+            model: None,
         }));
         let second = handle_webhook(State(state), headers, body2)
             .await
@@ -3138,6 +3157,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            active_channel_names: Vec::new(),
         };
 
         let response = handle_webhook(
@@ -3146,6 +3166,7 @@ mod tests {
             Ok(Json(WebhookBody {
                 task_category: None,
                 message: "hello".into(),
+                model: None,
             })),
         )
         .await
@@ -3187,6 +3208,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            active_channel_names: Vec::new(),
         };
 
         let mut headers = HeaderMap::new();
@@ -3198,6 +3220,7 @@ mod tests {
             Ok(Json(WebhookBody {
                 task_category: None,
                 message: "hello".into(),
+                model: None,
             })),
         )
         .await
@@ -3239,6 +3262,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            active_channel_names: Vec::new(),
         };
 
         let mut headers = HeaderMap::new();
@@ -3250,6 +3274,7 @@ mod tests {
             Ok(Json(WebhookBody {
                 task_category: None,
                 message: "hello".into(),
+                model: None,
             })),
         )
         .await
