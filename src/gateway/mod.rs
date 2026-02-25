@@ -2460,6 +2460,10 @@ async fn handle_voice_interpret_ws(
     Query(params): Query<std::collections::HashMap<String, String>>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // TODO: migrate to first-message auth pattern instead of query param token.
+    // Query param exposes token in URLs/logs. First-message auth: client connects,
+    // sends {"type":"auth","token":"..."} as first WS frame, server validates before
+    // accepting further messages. Update Interpreter.tsx client accordingly.
     // Authenticate (header first, then query param fallback for WebSocket)
     let session = match require_auth_session(&state, &headers) {
         Ok(s) => s,
