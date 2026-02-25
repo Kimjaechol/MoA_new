@@ -293,7 +293,7 @@ impl VoiceProviderKind {
     /// Get the model identifier string for API calls.
     pub fn model_id(self) -> &'static str {
         match self {
-            Self::GeminiLive => "gemini-2.5-flash-preview-native-audio-dialog",
+            Self::GeminiLive => "gemini-2.5-flash-native-audio-preview-12-2025",
             Self::OpenAiRealtime => "gpt-4o-realtime-preview",
         }
     }
@@ -1043,7 +1043,7 @@ mod tests {
     fn voice_provider_kind_model_ids() {
         assert_eq!(
             VoiceProviderKind::GeminiLive.model_id(),
-            "gemini-2.5-flash-preview-native-audio-dialog"
+            "gemini-2.5-flash-native-audio-preview-12-2025"
         );
         assert_eq!(
             VoiceProviderKind::OpenAiRealtime.model_id(),
