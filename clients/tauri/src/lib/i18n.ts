@@ -83,6 +83,18 @@ type TranslationKey =
   | "have_account"
   | "logout"
   | "logout_confirm"
+  // Interpreter
+  | "interpreter"
+  | "interpreter_idle"
+  | "interpreter_connecting"
+  | "interpreter_ready"
+  | "interpreter_listening"
+  | "interpreter_error"
+  | "interpreter_start"
+  | "interpreter_stop"
+  | "interpreter_bidirectional"
+  | "interpreter_hint"
+  | "interpreter_listening_hint"
   // Device selection
   | "select_device"
   | "select_device_subtitle"
@@ -191,6 +203,18 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     have_account: "Already have an account?",
     logout: "Logout",
     logout_confirm: "Are you sure you want to logout?",
+    // Interpreter
+    interpreter: "Interpreter",
+    interpreter_idle: "Ready",
+    interpreter_connecting: "Connecting...",
+    interpreter_ready: "Connected",
+    interpreter_listening: "Listening",
+    interpreter_error: "Error",
+    interpreter_start: "Start Interpretation",
+    interpreter_stop: "Stop",
+    interpreter_bidirectional: "Bidirectional",
+    interpreter_hint: "Press Start to begin real-time voice interpretation",
+    interpreter_listening_hint: "Listening... speak now",
     // Device selection
     select_device: "Select Device",
     select_device_subtitle: "Choose which MoA device to connect to",
@@ -298,6 +322,18 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     have_account: "\uC774\uBBF8 \uACC4\uC815\uC774 \uC788\uC73C\uC2E0\uAC00\uC694?",
     logout: "\uB85C\uADF8\uC544\uC6C3",
     logout_confirm: "\uB85C\uADF8\uC544\uC6C3 \uD558\uC2DC\uACA0\uC2B5\uB2C8\uAE4C?",
+    // Interpreter
+    interpreter: "통역",
+    interpreter_idle: "대기",
+    interpreter_connecting: "연결 중...",
+    interpreter_ready: "연결됨",
+    interpreter_listening: "듣는 중",
+    interpreter_error: "오류",
+    interpreter_start: "통역 시작",
+    interpreter_stop: "중지",
+    interpreter_bidirectional: "양방향",
+    interpreter_hint: "시작 버튼을 눌러 실시간 음성 통역을 시작하세요",
+    interpreter_listening_hint: "듣는 중... 말씀하세요",
     // Device selection
     select_device: "\uB514\uBC14\uC774\uC2A4 \uC120\uD0DD",
     select_device_subtitle: "\uC5F0\uACB0\uD560 MoA \uB514\uBC14\uC774\uC2A4\uB97C \uC120\uD0DD\uD558\uC138\uC694",
