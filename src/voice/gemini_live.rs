@@ -11,6 +11,14 @@
 //! 3. **Stream** — send audio chunks as `realtimeInput`, receive
 //!    translated audio/text as `serverContent`
 //! 4. **Close** — gracefully close the WebSocket session
+//!
+//! ## Important: Binary Frame Protocol
+//!
+//! Google Gemini Live sends **all** messages as WebSocket Binary frames,
+//! including JSON control messages like `setupComplete`. This module
+//! detects JSON in Binary frames (content starting with `{`) and parses
+//! them as server messages before falling back to raw audio handling.
+//! See `docs/gemini-live-binary-frames-fix.md` for full investigation.
 
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
