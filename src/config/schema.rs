@@ -1810,6 +1810,18 @@ pub struct SyncConfig {
     /// Maximum deltas per sync_response batch (default: 50).
     #[serde(default = "default_sync_batch_size")]
     pub batch_size: usize,
+
+    /// Passphrase for E2E encryption key derivation (PBKDF2-HMAC-SHA256).
+    ///
+    /// When set, the sync encryption key is deterministically derived from
+    /// this passphrase. All devices sharing the same passphrase will derive
+    /// the same encryption key, enabling E2E encrypted sync without sharing
+    /// key files.
+    ///
+    /// When not set (None), a random 256-bit key is generated and stored
+    /// in a local `.sync_key` file (legacy behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<String>,
 }
 
 fn default_relay_ttl_secs() -> u64 {
@@ -1831,6 +1843,7 @@ impl Default for SyncConfig {
             relay_ttl_secs: default_relay_ttl_secs(),
             journal_retention_days: default_journal_retention_days(),
             batch_size: default_sync_batch_size(),
+            passphrase: None,
         }
     }
 }
@@ -2599,8 +2612,7 @@ impl Config {
 
         // Require pairing: ZEROCLAW_REQUIRE_PAIRING
         if let Ok(val) = std::env::var("ZEROCLAW_REQUIRE_PAIRING") {
-            self.gateway.require_pairing =
-                val == "1" || val.eq_ignore_ascii_case("true");
+            self.gateway.require_pairing = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
         // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND

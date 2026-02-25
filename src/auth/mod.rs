@@ -15,4 +15,5 @@
 
 pub mod store;
 
+#[allow(unused_imports)]
 pub use store::{AuthStore, DeviceWithStatus, Session};

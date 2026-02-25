@@ -1850,10 +1850,7 @@ async fn handle_auth_device_verify_pairing(
 
     let auth_store = state.auth_store.as_ref().unwrap();
     match auth_store.verify_device_pairing_code(&device_id, &body.pairing_code) {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"verified": true})),
-        ),
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"verified": true}))),
         Ok(false) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"verified": false, "error": "Invalid pairing code"})),
@@ -1899,10 +1896,7 @@ async fn handle_auth_heartbeat(
         );
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "ok"})),
-    )
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
