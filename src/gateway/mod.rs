@@ -2460,11 +2460,34 @@ async fn handle_voice_interpret_ws(
     Query(params): Query<std::collections::HashMap<String, String>>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Authenticate
+    // Authenticate (header first, then query param fallback for WebSocket)
     let session = match require_auth_session(&state, &headers) {
         Ok(s) => s,
-        Err((status, json)) => {
-            return (status, json.0.to_string()).into_response();
+        Err(_) => {
+            // WebSocket clients can't send custom headers, so accept token as query param
+            match params.get("token") {
+                Some(token) => {
+                    let auth_store = match state.auth_store.as_ref() {
+                        Some(s) => s,
+                        None => {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Auth not enabled",
+                            )
+                                .into_response();
+                        }
+                    };
+                    match auth_store.validate_session(token) {
+                        Some(s) => s,
+                        None => {
+                            return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+                        }
+                    }
+                }
+                None => {
+                    return (StatusCode::UNAUTHORIZED, "Missing auth token").into_response();
+                }
+            }
         }
     };
 
