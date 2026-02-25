@@ -2608,6 +2608,23 @@ impl Config {
             self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
+        // Auth enabled: ZEROCLAW_AUTH_ENABLED
+        if let Ok(val) = std::env::var("ZEROCLAW_AUTH_ENABLED") {
+            self.auth.enabled = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
+        // Auth allow registration: ZEROCLAW_AUTH_ALLOW_REGISTRATION
+        if let Ok(val) = std::env::var("ZEROCLAW_AUTH_ALLOW_REGISTRATION") {
+            self.auth.allow_registration = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
+        // Auth max users: ZEROCLAW_AUTH_MAX_USERS
+        if let Ok(val) = std::env::var("ZEROCLAW_AUTH_MAX_USERS") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.auth.max_users = n;
+            }
+        }
+
         // Memory backend: ZEROCLAW_MEMORY_BACKEND
         if let Ok(val) = std::env::var("ZEROCLAW_MEMORY_BACKEND") {
             if !val.is_empty() {
