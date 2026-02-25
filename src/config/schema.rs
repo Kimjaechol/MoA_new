@@ -2970,6 +2970,36 @@ impl Config {
                 }
             }
         }
+
+        // ── Voice overrides ──────────────────────────────────────────
+
+        // Voice enabled: ZEROCLAW_VOICE_ENABLED
+        if let Ok(val) = std::env::var("ZEROCLAW_VOICE_ENABLED") {
+            self.voice.enabled = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
+        // Voice Gemini API key: GEMINI_API_KEY or GOOGLE_API_KEY
+        if self.voice.gemini_api_key.is_none() {
+            if let Ok(key) =
+                std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("GOOGLE_API_KEY"))
+            {
+                if !key.is_empty() {
+                    self.voice.gemini_api_key = Some(key);
+                }
+            }
+        }
+
+        // Voice default languages: ZEROCLAW_VOICE_SOURCE_LANG, ZEROCLAW_VOICE_TARGET_LANG
+        if let Ok(lang) = std::env::var("ZEROCLAW_VOICE_SOURCE_LANG") {
+            if !lang.is_empty() {
+                self.voice.default_source_language = lang;
+            }
+        }
+        if let Ok(lang) = std::env::var("ZEROCLAW_VOICE_TARGET_LANG") {
+            if !lang.is_empty() {
+                self.voice.default_target_language = lang;
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {

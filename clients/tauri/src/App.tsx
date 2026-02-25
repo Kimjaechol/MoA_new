@@ -5,6 +5,7 @@ import { Settings } from "./components/Settings";
 import { Login } from "./components/Login";
 import { SignUp } from "./components/SignUp";
 import { DeviceSelect } from "./components/DeviceSelect";
+import { Interpreter } from "./components/Interpreter";
 import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated } from "./lib/tauri-bridge";
@@ -20,7 +21,7 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "login" | "signup" | "device_select" | "chat" | "settings";
+type Page = "login" | "signup" | "device_select" | "chat" | "settings" | "interpreter";
 
 function App() {
   const [page, setPage] = useState<Page>("login");
@@ -335,6 +336,7 @@ function App() {
         onSelectChat={handleSelectChat}
         onDeleteChat={handleDeleteChat}
         onOpenSettings={() => setPage("settings")}
+        onOpenInterpreter={() => setPage("interpreter")}
         onToggle={() => setSidebarOpen((p) => !p)}
         currentPage={page}
       />
@@ -347,6 +349,13 @@ function App() {
             onSendMessage={handleSendMessage}
             onRetry={handleRetry}
             onOpenSettings={() => setPage("settings")}
+            onToggleSidebar={() => setSidebarOpen((p) => !p)}
+            sidebarOpen={sidebarOpen}
+          />
+        ) : page === "interpreter" ? (
+          <Interpreter
+            locale={locale}
+            onBack={() => setPage("chat")}
             onToggleSidebar={() => setSidebarOpen((p) => !p)}
             sidebarOpen={sidebarOpen}
           />
