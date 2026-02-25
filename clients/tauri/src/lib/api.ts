@@ -14,6 +14,7 @@ const STORAGE_KEY_SERVER = "moa_server_url";
 const STORAGE_KEY_USER = "moa_user";
 const STORAGE_KEY_DEVICE_ID = "moa_device_id";
 const DEFAULT_SERVER_URL = "https://moanew-production.up.railway.app";
+// const DEFAULT_SERVER_URL = "http://localhost:8080";
 
 // ── Types ────────────────────────────────────────────────────────
 
