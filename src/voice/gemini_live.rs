@@ -404,24 +404,73 @@ impl GeminiLiveSession {
             "Connecting to Gemini Live"
         );
 
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(&url)
+        let (mut ws_stream, _response) = tokio_tungstenite::connect_async(&url)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Gemini Live: {e}"))?;
 
-        let (ws_sender, ws_receiver) = ws_stream.split();
-        let ws_sender = Arc::new(Mutex::new(ws_sender));
-
-        // Send setup message
+        // Send setup message on the unsplit stream
         let setup = build_setup_message(config, vad);
         let setup_json = serde_json::to_string(&setup)?;
-        ws_sender
-            .lock()
-            .await
+        tracing::debug!(session_id = %session_id, setup = %setup_json, "Sending Gemini Live setup");
+        ws_stream
             .send(WsMessage::Text(setup_json))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send setup message: {e}"))?;
 
-        let state = Arc::new(Mutex::new(ConnectionState::Connecting));
+        // Wait for setupComplete before splitting the stream.
+        // Gemini Live sends all messages as Binary frames (including JSON),
+        // so we check for Binary containing `{"setupComplete": ...}`.
+        let setup_timeout = std::time::Duration::from_secs(15);
+        let setup_complete = tokio::time::timeout(setup_timeout, async {
+            while let Some(msg_result) = ws_stream.next().await {
+                match msg_result {
+                    Ok(WsMessage::Binary(data)) if data.first() == Some(&b'{') => {
+                        if let Ok(text) = std::str::from_utf8(&data) {
+                            if text.contains("setupComplete") {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    "Gemini Live setup complete — ready to stream"
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Ok(WsMessage::Text(text)) if text.contains("setupComplete") => {
+                        tracing::info!(
+                            session_id = %session_id,
+                            "Gemini Live setup complete (text frame) — ready to stream"
+                        );
+                        return Ok(());
+                    }
+                    Ok(WsMessage::Close(frame)) => {
+                        anyhow::bail!("Connection closed before setupComplete: {frame:?}");
+                    }
+                    Err(e) => {
+                        anyhow::bail!("WebSocket error before setupComplete: {e}");
+                    }
+                    other => {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            msg = ?other,
+                            "Gemini Live setup phase: non-text/binary frame"
+                        );
+                    }
+                }
+            }
+            anyhow::bail!("Stream ended before setupComplete")
+        })
+        .await;
+
+        match setup_complete {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!("Gemini Live setupComplete timeout (15s)"),
+        }
+
+        let (ws_sender, ws_receiver) = ws_stream.split();
+        let ws_sender = Arc::new(Mutex::new(ws_sender));
+
+        let state = Arc::new(Mutex::new(ConnectionState::Ready));
 
         // Channels for bidirectional communication
         let (audio_tx, audio_rx) = mpsc::channel::<OutboundMessage>(256);
@@ -575,6 +624,7 @@ impl GeminiLiveSession {
         while let Some(msg_result) = ws_receiver.next().await {
             match msg_result {
                 Ok(WsMessage::Text(text)) => {
+                    tracing::debug!(session_id = %session_id, msg = %text, "Gemini Live raw message");
                     let events = parse_server_message(&text);
                     for event in events {
                         // Update state on setup completion
@@ -595,19 +645,44 @@ impl GeminiLiveSession {
                     }
                 }
                 Ok(WsMessage::Binary(data)) => {
-                    // Some responses may come as binary frames (raw audio)
-                    if !data.is_empty() {
-                        let event = GeminiLiveEvent::Audio {
-                            data: data.to_vec(),
-                            mime_type: OUTPUT_AUDIO_MIME.to_string(),
-                        };
-                        if event_tx.send(event).await.is_err() {
-                            return;
+                    if data.is_empty() {
+                        continue;
+                    }
+
+                    // Gemini Live sends ALL messages as Binary frames (including JSON).
+                    // Try JSON parse first; if it fails, treat as raw audio.
+                    if data.first() == Some(&b'{') {
+                        if let Ok(text) = std::str::from_utf8(&data) {
+                            tracing::debug!(session_id = %session_id, msg = %text, "Gemini Live binary JSON message");
+                            let events = parse_server_message(text);
+                            for event in events {
+                                if matches!(event, GeminiLiveEvent::SetupComplete) {
+                                    *state.lock().await = ConnectionState::Ready;
+                                    tracing::info!(
+                                        session_id = %session_id,
+                                        "Gemini Live setup complete — ready to stream"
+                                    );
+                                }
+                                if event_tx.send(event).await.is_err() {
+                                    return;
+                                }
+                            }
+                            continue;
                         }
                     }
+
+                    // Raw audio data
+                    tracing::debug!(session_id = %session_id, len = data.len(), "Gemini Live audio frame");
+                    let event = GeminiLiveEvent::Audio {
+                        data: data.to_vec(),
+                        mime_type: OUTPUT_AUDIO_MIME.to_string(),
+                    };
+                    if event_tx.send(event).await.is_err() {
+                        return;
+                    }
                 }
-                Ok(WsMessage::Close(_)) => {
-                    tracing::info!(session_id = %session_id, "Gemini Live connection closed");
+                Ok(WsMessage::Close(frame)) => {
+                    tracing::info!(session_id = %session_id, close_frame = ?frame, "Gemini Live connection closed");
                     *state.lock().await = ConnectionState::Closed;
                     break;
                 }

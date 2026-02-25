@@ -2582,36 +2582,8 @@ async fn handle_voice_ws_connection(
         }
     };
 
-    // Update session status
-    let _ = voice_manager
-        .update_status(&session_id, crate::voice::InterpreterStatus::Connecting)
-        .await;
-
-    // Wait for setup to complete (with timeout)
-    let event_rx = Arc::clone(&gemini_session.event_rx);
-    let setup_ok = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while let Some(event) = event_rx.lock().await.recv().await {
-            if matches!(event, crate::voice::GeminiLiveEvent::SetupComplete) {
-                return true;
-            }
-            if matches!(event, crate::voice::GeminiLiveEvent::Error { .. }) {
-                return false;
-            }
-        }
-        false
-    })
-    .await;
-
-    if !matches!(setup_ok, Ok(true)) {
-        let err = serde_json::json!({
-            "type": "error",
-            "message": "Gemini Live setup timed out or failed"
-        });
-        let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-        gemini_session.close().await;
-        return;
-    }
-
+    // GeminiLiveSession::connect() already waits for setupComplete internally.
+    // If connect() returned Ok, the session is ready to stream.
     let _ = voice_manager
         .update_status(&session_id, crate::voice::InterpreterStatus::Ready)
         .await;
