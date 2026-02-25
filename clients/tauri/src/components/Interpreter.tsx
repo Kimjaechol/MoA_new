@@ -157,8 +157,8 @@ export function Interpreter({
       const session = await res.json();
       const sessionId = session.session_id;
 
-      // 2. Connect WebSocket
-      const wsUrl = serverUrl.replace(/^http/, "ws") + `/api/voice/interpret?session_id=${sessionId}`;
+      // 2. Connect WebSocket (pass token as query param since WS can't use headers)
+      const wsUrl = serverUrl.replace(/^http/, "ws") + `/api/voice/interpret?session_id=${sessionId}&token=${token}`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
