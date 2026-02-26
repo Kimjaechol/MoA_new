@@ -46,7 +46,8 @@
     "macOS": {
       "frameworks": [],
       "minimumSystemVersion": "10.15",
-      "signingIdentity": null
+      "signingIdentity": null,
+      "entitlements": "./Entitlements.plist"
     },
     "linux": {
       "deb": {
