@@ -63,6 +63,35 @@ export interface AgentInfo {
   tools: ToolInfo[];
 }
 
+export interface VoiceLanguage {
+  code: string;
+  name: string;
+  native_name: string;
+  flag: string;
+}
+
+export interface VoiceUiManifest {
+  languages: VoiceLanguage[];
+  default_source: string;
+  default_target: string;
+  domains: string[];
+  formalities: string[];
+}
+
+export interface VoiceSession {
+  session_id: string;
+  ws_url: string;
+  status: string;
+}
+
+export interface VoiceSessionConfig {
+  source_language: string;
+  target_language: string;
+  bidirectional?: boolean;
+  formality?: string;
+  domain?: string;
+}
+
 export type { SyncStatus, PlatformInfo };
 
 // ── Client ──────────────────────────────────────────────────────
@@ -369,6 +398,37 @@ export class MoAClient {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  // ── Voice / Interpreter ────────────────────────────────────────
+
+  async getVoiceUi(): Promise<VoiceUiManifest> {
+    const res = await fetch(`${this.serverUrl}/api/voice/ui`);
+    if (!res.ok) throw new Error(`Failed to fetch voice UI (${res.status})`);
+    return await res.json();
+  }
+
+  async createVoiceSession(config: VoiceSessionConfig): Promise<VoiceSession> {
+    if (!this.token) throw new Error("Not authenticated");
+    const res = await fetch(`${this.serverUrl}/api/voice/sessions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify(config),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Failed" }));
+      throw new Error(data.error || `Failed to create voice session (${res.status})`);
+    }
+    return await res.json();
+  }
+
+  /** Build a full WebSocket URL for voice interpretation. */
+  getVoiceWsUrl(sessionId: string): string {
+    const base = this.serverUrl.replace(/^http/, "ws");
+    return `${base}/api/voice/interpret?session_id=${sessionId}&token=${this.token}`;
   }
 
   // ── Sync commands (Tauri backend only) ──────────────────────────

@@ -119,7 +119,30 @@ type TranslationKey =
   | "sidebar_no_devices"
   | "sidebar_no_channels"
   | "sidebar_no_tools"
-  | "sidebar_chats";
+  | "sidebar_chats"
+  // Interpreter
+  | "sidebar_interpreter"
+  | "interp_title"
+  | "interp_source"
+  | "interp_target"
+  | "interp_bidirectional"
+  | "interp_mode_speaker"
+  | "interp_mode_whisper"
+  | "interp_start"
+  | "interp_stop"
+  | "interp_placeholder"
+  | "interp_listening_hint"
+  | "interp_you_said"
+  | "interp_translation"
+  | "interp_status_idle"
+  | "interp_status_creating"
+  | "interp_status_connecting"
+  | "interp_status_ready"
+  | "interp_status_listening"
+  | "interp_status_error"
+  | "interp_status_closed"
+  | "interp_ws_error"
+  | "interp_start_failed";
 
 const translations: Record<Locale, Record<TranslationKey, string>> = {
   en: {
@@ -228,6 +251,29 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     sidebar_no_channels: "No channels",
     sidebar_no_tools: "No tools",
     sidebar_chats: "Chats",
+    // Interpreter
+    sidebar_interpreter: "Interpreter",
+    interp_title: "Real-time Interpreter",
+    interp_source: "Input Language",
+    interp_target: "Output Language",
+    interp_bidirectional: "Bidirectional",
+    interp_mode_speaker: "Speaker",
+    interp_mode_whisper: "Whisper",
+    interp_start: "Start Interpreting",
+    interp_stop: "Stop",
+    interp_placeholder: "Tap the microphone to start real-time interpretation",
+    interp_listening_hint: "Listening... Speak now",
+    interp_you_said: "You said",
+    interp_translation: "Translation",
+    interp_status_idle: "Ready",
+    interp_status_creating: "Creating session...",
+    interp_status_connecting: "Connecting...",
+    interp_status_ready: "Connected",
+    interp_status_listening: "Listening",
+    interp_status_error: "Error",
+    interp_status_closed: "Session ended",
+    interp_ws_error: "Connection error",
+    interp_start_failed: "Failed to start interpreter",
   },
   ko: {
     app_title: "MoA",
@@ -335,6 +381,29 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     sidebar_no_channels: "\uCC44\uB110 \uC5C6\uC74C",
     sidebar_no_tools: "\uB3C4\uAD6C \uC5C6\uC74C",
     sidebar_chats: "\uB300\uD654",
+    // Interpreter
+    sidebar_interpreter: "\uD1B5\uC5ED",
+    interp_title: "\uC2E4\uC2DC\uAC04 \uD1B5\uC5ED",
+    interp_source: "\uC785\uB825 \uC5B8\uC5B4",
+    interp_target: "\uCD9C\uB825 \uC5B8\uC5B4",
+    interp_bidirectional: "\uC591\uBC29\uD5A5 \uD1B5\uC5ED",
+    interp_mode_speaker: "\uC2A4\uD53C\uCEE4",
+    interp_mode_whisper: "\uADC3\uC18D\uB9D0",
+    interp_start: "\uD1B5\uC5ED \uC2DC\uC791",
+    interp_stop: "\uC815\uC9C0",
+    interp_placeholder: "\uB9C8\uC774\uD06C \uBC84\uD2BC\uC744 \uB20C\uB7EC \uC2E4\uC2DC\uAC04 \uD1B5\uC5ED\uC744 \uC2DC\uC791\uD558\uC138\uC694",
+    interp_listening_hint: "\uB4E3\uB294 \uC911... \uB9D0\uC529\uD558\uC138\uC694",
+    interp_you_said: "\uC6D0\uBB38",
+    interp_translation: "\uD1B5\uC5ED",
+    interp_status_idle: "\uB300\uAE30 \uC911",
+    interp_status_creating: "\uC138\uC158 \uC0DD\uC131 \uC911...",
+    interp_status_connecting: "\uC5F0\uACB0 \uC911...",
+    interp_status_ready: "\uC5F0\uACB0\uB428",
+    interp_status_listening: "\uB4E3\uB294 \uC911",
+    interp_status_error: "\uC624\uB958",
+    interp_status_closed: "\uC138\uC158 \uC885\uB8CC",
+    interp_ws_error: "\uC5F0\uACB0 \uC624\uB958",
+    interp_start_failed: "\uD1B5\uC5ED \uC2DC\uC791 \uC2E4\uD328",
   },
 };
 
