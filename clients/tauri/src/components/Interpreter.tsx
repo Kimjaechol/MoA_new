@@ -201,6 +201,8 @@ export function Interpreter({
       };
 
       ws.onerror = () => {
+        // Ignore errors during intentional close (stop button)
+        if (wsRef.current === null) return;
         setError("WebSocket connection error");
         setStatus("error");
       };
@@ -273,8 +275,15 @@ export function Interpreter({
       streamRef.current = null;
     }
 
-    // Close WebSocket
+    // Close WebSocket gracefully: send stop command, then close after brief delay
     if (wsRef.current) {
+      try {
+        if (wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: "stop" }));
+        }
+      } catch {
+        // ignore send errors on closing socket
+      }
       wsRef.current.close();
       wsRef.current = null;
     }
