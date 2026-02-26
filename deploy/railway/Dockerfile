@@ -52,10 +52,12 @@ FROM debian:bookworm-slim AS runtime
 # - libssl3: OpenSSL runtime library.
 # - gosu: Secure privilege dropping (entrypoint runs as root to fix volume
 #   permissions, then drops to zeroclaw user via gosu).
+# - git: Required by the skills module to clone open-skills repositories.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
         gosu \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user for the runtime process.
