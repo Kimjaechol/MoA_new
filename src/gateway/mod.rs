@@ -2702,6 +2702,15 @@ async fn handle_voice_ws_connection(
                             tracing::info!(session_id = %session_id, "Client requested graceful stop");
                             audio_stopped = true;
                             stop_deadline = Some(Instant::now() + Duration::from_secs(10));
+                            // Signal Gemini that audio stream has ended so it
+                            // processes any remaining buffered input immediately.
+                            if let Err(e) = gemini_session.send_audio_stream_end().await {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    error = %e,
+                                    "Failed to send audioStreamEnd"
+                                );
+                            }
                             // Don't break — keep WS open for remaining translation relay
                         }
                         Some("text") => {
