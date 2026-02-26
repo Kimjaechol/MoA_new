@@ -192,7 +192,10 @@ pub fn build_setup_message(config: &InterpreterConfig, vad: &VadConfig) -> Setup
 
 // ── Audio input message ────────────────────────────────────────────
 
-/// Audio chunk sent to Gemini Live.
+/// Audio input message sent to Gemini Live.
+///
+/// Uses the current `realtimeInput.audio` format (single object).
+/// The older `realtimeInput.mediaChunks` array format is deprecated.
 #[derive(Debug, Serialize)]
 pub struct RealtimeInputMessage {
     #[serde(rename = "realtimeInput")]
@@ -201,15 +204,32 @@ pub struct RealtimeInputMessage {
 
 #[derive(Debug, Serialize)]
 pub struct RealtimeInput {
-    #[serde(rename = "mediaChunks")]
-    pub media_chunks: Vec<MediaChunk>,
+    /// Audio blob — replaces deprecated `mediaChunks` array.
+    pub audio: AudioBlob,
 }
 
+/// Single audio blob with MIME type and base64-encoded data.
 #[derive(Debug, Serialize)]
-pub struct MediaChunk {
+pub struct AudioBlob {
     #[serde(rename = "mimeType")]
     pub mime_type: String,
     pub data: String, // base64-encoded audio
+}
+
+/// Message to signal the end of the audio stream to Gemini Live.
+///
+/// Sent when the microphone is stopped while automatic activity detection
+/// (VAD) is enabled. Tells Gemini to process any remaining buffered input.
+#[derive(Debug, Serialize)]
+pub struct AudioStreamEndMessage {
+    #[serde(rename = "realtimeInput")]
+    pub realtime_input: AudioStreamEndPayload,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AudioStreamEndPayload {
+    #[serde(rename = "audioStreamEnd")]
+    pub audio_stream_end: bool,
 }
 
 /// Build a realtime audio input message from raw PCM bytes.
@@ -217,10 +237,19 @@ pub fn build_audio_message(pcm_data: &[u8]) -> RealtimeInputMessage {
     let b64 = base64::engine::general_purpose::STANDARD.encode(pcm_data);
     RealtimeInputMessage {
         realtime_input: RealtimeInput {
-            media_chunks: vec![MediaChunk {
+            audio: AudioBlob {
                 mime_type: INPUT_AUDIO_MIME.to_string(),
                 data: b64,
-            }],
+            },
+        },
+    }
+}
+
+/// Build an audioStreamEnd message to signal microphone closure.
+pub fn build_audio_stream_end_message() -> AudioStreamEndMessage {
+    AudioStreamEndMessage {
+        realtime_input: AudioStreamEndPayload {
+            audio_stream_end: true,
         },
     }
 }
@@ -372,6 +401,8 @@ pub enum OutboundMessage {
     Audio(Vec<u8>),
     /// Send a text message (for text-based interpretation).
     Text(String),
+    /// Signal end of audio stream (microphone stopped).
+    AudioStreamEnd,
     /// Close the connection.
     Close,
 }
@@ -536,6 +567,17 @@ impl GeminiLiveSession {
         *self.state.lock().await
     }
 
+    /// Signal end of audio stream to Gemini Live.
+    ///
+    /// Call this when the microphone is stopped so Gemini processes
+    /// any remaining buffered input and sends a final response.
+    pub async fn send_audio_stream_end(&self) -> anyhow::Result<()> {
+        self.audio_tx
+            .send(OutboundMessage::AudioStreamEnd)
+            .await
+            .map_err(|_| anyhow::anyhow!("Audio channel closed"))
+    }
+
     /// Close the session gracefully.
     pub async fn close(&self) {
         let _ = self.audio_tx.send(OutboundMessage::Close).await;
@@ -603,6 +645,32 @@ impl GeminiLiveSession {
                         let mut sender = ws_sender.lock().await;
                         if sender.send(WsMessage::Text(json)).await.is_err() {
                             break;
+                        }
+                    }
+                }
+                OutboundMessage::AudioStreamEnd => {
+                    let end_msg = build_audio_stream_end_message();
+                    match serde_json::to_string(&end_msg) {
+                        Ok(json) => {
+                            tracing::info!(
+                                session_id = %session_id,
+                                "Sending audioStreamEnd to Gemini Live"
+                            );
+                            let mut sender = ws_sender.lock().await;
+                            if sender.send(WsMessage::Text(json)).await.is_err() {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    "WebSocket send failed for audioStreamEnd"
+                                );
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "Failed to serialize audioStreamEnd message"
+                            );
                         }
                     }
                 }
@@ -679,15 +747,15 @@ impl GeminiLiveSession {
                         }
                     }
 
-                    // Raw audio data
-                    tracing::debug!(session_id = %session_id, len = data.len(), "Gemini Live audio frame");
-                    let event = GeminiLiveEvent::Audio {
-                        data: data.to_vec(),
-                        mime_type: OUTPUT_AUDIO_MIME.to_string(),
-                    };
-                    if event_tx.send(event).await.is_err() {
-                        return;
-                    }
+                    // Non-JSON binary frame — Gemini Live sends all responses
+                    // as JSON-in-Binary, so a non-JSON binary is unexpected.
+                    // Log a warning and skip rather than misinterpreting as raw PCM.
+                    tracing::warn!(
+                        session_id = %session_id,
+                        len = data.len(),
+                        first_byte = data.first().copied().unwrap_or(0),
+                        "Unexpected non-JSON binary frame from Gemini Live — skipping"
+                    );
                 }
                 Ok(WsMessage::Close(frame)) => {
                     tracing::info!(session_id = %session_id, close_frame = ?frame, "Gemini Live connection closed");
@@ -792,14 +860,28 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
 
         assert!(json.contains("realtimeInput"));
-        assert!(json.contains("mediaChunks"));
+        assert!(json.contains("\"audio\""));
+        assert!(!json.contains("mediaChunks"), "should use audio, not deprecated mediaChunks");
         assert!(json.contains(INPUT_AUDIO_MIME));
         // Verify base64
-        let b64 = &msg.realtime_input.media_chunks[0].data;
+        let b64 = &msg.realtime_input.audio.data;
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .unwrap();
         assert_eq!(decoded, pcm);
+    }
+
+    #[test]
+    fn build_audio_stream_end_message_format() {
+        let msg = build_audio_stream_end_message();
+        let json = serde_json::to_string(&msg).unwrap();
+
+        assert!(json.contains("realtimeInput"));
+        assert!(json.contains("audioStreamEnd"));
+        assert!(json.contains("true"));
+        // Should NOT contain audio data fields
+        assert!(!json.contains("mimeType"));
+        assert!(!json.contains("data"));
     }
 
     #[test]
