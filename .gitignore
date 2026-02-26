@@ -8,6 +8,9 @@ firmware/*/target
 __pycache__/
 *.pyc
 docker-compose.override.yml
+keystore.properties
+*.keystore
+*.jks
 
 # Environment files (may contain secrets)
 .env
