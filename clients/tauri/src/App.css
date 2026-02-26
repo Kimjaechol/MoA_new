@@ -1843,3 +1843,103 @@ html, body {
 .interpreter-stop-btn:hover {
   background: #dc2626;
 }
+
+/* Microphone Permission Modal */
+.mic-permission-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+  padding: 24px;
+  backdrop-filter: blur(4px);
+}
+
+.mic-permission-modal {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  padding: 32px 28px;
+  max-width: 420px;
+  width: 100%;
+  text-align: center;
+  animation: mic-modal-in 0.25s ease-out;
+}
+
+@keyframes mic-modal-in {
+  from { opacity: 0; transform: scale(0.92) translateY(12px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.mic-permission-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+}
+
+.mic-permission-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--color-error);
+  margin-bottom: 8px;
+}
+
+.mic-permission-desc {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+  margin-bottom: 20px;
+}
+
+.mic-permission-steps {
+  text-align: left;
+  margin-bottom: 24px;
+}
+
+.mic-permission-platform {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+
+.mic-permission-platform summary {
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  cursor: pointer;
+  background: var(--color-bg-tertiary);
+  transition: background 0.15s;
+}
+
+.mic-permission-platform summary:hover {
+  background: var(--color-bg-hover);
+}
+
+.mic-permission-platform ol {
+  padding: 12px 14px 12px 32px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  line-height: 1.8;
+  background: var(--color-surface);
+}
+
+.mic-permission-retry {
+  width: 100%;
+  padding: 12px 24px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: var(--color-primary);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.mic-permission-retry:hover {
+  background: var(--color-primary-hover);
+}

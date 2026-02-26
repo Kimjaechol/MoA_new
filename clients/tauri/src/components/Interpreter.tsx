@@ -137,6 +137,7 @@ export function Interpreter({
   const [noiseSuppression, setNoiseSuppression] = useState(true);
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [micPermissionDenied, setMicPermissionDenied] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -478,9 +479,15 @@ export function Interpreter({
       setStatus("listening");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      const name = e instanceof DOMException ? e.name : "";
       console.error("Microphone error:", e);
       addTranscript("system", `Microphone error: ${msg}`);
-      setError(`Microphone error: ${msg}`);
+
+      if (name === "NotAllowedError" || name === "NotFoundError" || msg.includes("Permission denied")) {
+        setMicPermissionDenied(true);
+      } else {
+        setError(`Microphone error: ${msg}`);
+      }
       setStatus("error");
     }
   }, [addTranscript, echoCancellation, autoGainControl, noiseSuppression]);
@@ -726,6 +733,70 @@ export function Interpreter({
       {error && (
         <div className="interpreter-error">
           {error}
+        </div>
+      )}
+
+      {/* Microphone permission denied guide */}
+      {micPermissionDenied && (
+        <div className="mic-permission-overlay" onClick={() => setMicPermissionDenied(false)}>
+          <div className="mic-permission-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="mic-permission-icon">🎙️</div>
+            <h3 className="mic-permission-title">
+              {locale === "ko" ? "마이크 접근이 차단되었습니다" : "Microphone Access Blocked"}
+            </h3>
+            <p className="mic-permission-desc">
+              {locale === "ko"
+                ? "음성 통역을 사용하려면 마이크 권한이 필요합니다. 아래 안내에 따라 설정해주세요."
+                : "Microphone permission is required for voice interpretation. Follow the steps below."}
+            </p>
+
+            <div className="mic-permission-steps">
+              {/* iOS */}
+              <details className="mic-permission-platform">
+                <summary>iPhone / iPad</summary>
+                <ol>
+                  <li>{locale === "ko" ? "설정 앱을 엽니다" : "Open Settings"}</li>
+                  <li>{locale === "ko" ? "MoA (또는 브라우저 앱)를 찾습니다" : "Find MoA (or your browser app)"}</li>
+                  <li>{locale === "ko" ? "마이크를 켭니다" : "Turn on Microphone"}</li>
+                  <li>{locale === "ko" ? "앱을 다시 열어주세요" : "Reopen the app"}</li>
+                </ol>
+              </details>
+
+              {/* Android */}
+              <details className="mic-permission-platform">
+                <summary>Android</summary>
+                <ol>
+                  <li>{locale === "ko" ? "설정 → 앱 → MoA" : "Settings → Apps → MoA"}</li>
+                  <li>{locale === "ko" ? "권한 → 마이크 → 허용" : "Permissions → Microphone → Allow"}</li>
+                  <li>{locale === "ko" ? "앱을 다시 열어주세요" : "Reopen the app"}</li>
+                </ol>
+              </details>
+
+              {/* Desktop */}
+              <details className="mic-permission-platform">
+                <summary>macOS / Windows</summary>
+                <ol>
+                  <li>{locale === "ko"
+                    ? "macOS: 시스템 설정 → 개인정보 보호 → 마이크 → MoA 허용"
+                    : "macOS: System Settings → Privacy → Microphone → Allow MoA"}</li>
+                  <li>{locale === "ko"
+                    ? "Windows: 설정 → 개인정보 → 마이크 → MoA 허용"
+                    : "Windows: Settings → Privacy → Microphone → Allow MoA"}</li>
+                </ol>
+              </details>
+            </div>
+
+            <button
+              className="mic-permission-retry"
+              onClick={() => {
+                setMicPermissionDenied(false);
+                setError(null);
+                setStatus("idle");
+              }}
+            >
+              {locale === "ko" ? "닫기" : "Close"}
+            </button>
+          </div>
         </div>
       )}
 
