@@ -90,6 +90,7 @@ type TranslationKey =
   | "interpreter_ready"
   | "interpreter_listening"
   | "interpreter_error"
+  | "interpreter_stopping"
   | "interpreter_start"
   | "interpreter_stop"
   | "interpreter_bidirectional"
@@ -210,6 +211,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     interpreter_ready: "Connected",
     interpreter_listening: "Listening",
     interpreter_error: "Error",
+    interpreter_stopping: "Translating...",
     interpreter_start: "Start Interpretation",
     interpreter_stop: "Stop",
     interpreter_bidirectional: "Bidirectional",
@@ -329,6 +331,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     interpreter_ready: "연결됨",
     interpreter_listening: "듣는 중",
     interpreter_error: "오류",
+    interpreter_stopping: "번역 중...",
     interpreter_start: "통역 시작",
     interpreter_stop: "중지",
     interpreter_bidirectional: "양방향",

@@ -16,7 +16,7 @@ interface Transcript {
   timestamp: number;
 }
 
-type ConnectionStatus = "idle" | "connecting" | "ready" | "listening" | "error";
+type ConnectionStatus = "idle" | "connecting" | "ready" | "listening" | "stopping" | "error";
 
 const LANGUAGES = [
   { code: "ko", name: "한국어", flag: "🇰🇷" },
@@ -97,7 +97,7 @@ export function Interpreter({
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      stopSession();
+      endSession();
     };
   }, []);
 
@@ -188,7 +188,14 @@ export function Interpreter({
                 if (msg.text) addTranscript("output", msg.text);
                 break;
               case "turn_complete":
-                // Visual indicator could go here
+                setStatus((prev) => {
+                  if (prev === "stopping") {
+                    // Drain complete — schedule full cleanup
+                    setTimeout(() => endSession(), 0);
+                    return prev; // endSession will set idle
+                  }
+                  return prev;
+                });
                 break;
               case "error":
                 setError(msg.message);
@@ -201,10 +208,13 @@ export function Interpreter({
       };
 
       ws.onerror = () => {
-        // Ignore errors during intentional close (stop button)
+        // Ignore errors during intentional close (stop button or draining)
         if (wsRef.current === null) return;
-        setError("WebSocket connection error");
-        setStatus("error");
+        setStatus((prev) => {
+          if (prev === "stopping") return prev; // ignore during drain
+          setError("WebSocket connection error");
+          return "error";
+        });
       };
 
       ws.onclose = () => {
@@ -260,8 +270,8 @@ export function Interpreter({
     }
   }, []);
 
-  const stopSession = useCallback(() => {
-    // Stop microphone
+  // Stop microphone only — keep WS and playback alive for remaining translation
+  const stopMicrophone = useCallback(() => {
     if (workletNodeRef.current) {
       workletNodeRef.current.disconnect();
       workletNodeRef.current = null;
@@ -274,35 +284,56 @@ export function Interpreter({
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
+  }, []);
 
-    // Close WebSocket gracefully: send stop command, then close after brief delay
+  // Full cleanup — close WS, playback, reset state
+  const endSession = useCallback(() => {
+    stopMicrophone();
+
     if (wsRef.current) {
-      try {
-        if (wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: "stop" }));
-        }
-      } catch {
-        // ignore send errors on closing socket
-      }
       wsRef.current.close();
       wsRef.current = null;
     }
 
-    // Close playback
     if (playbackCtxRef.current) {
       playbackCtxRef.current.close();
       playbackCtxRef.current = null;
     }
 
     setStatus("idle");
-  }, []);
+  }, [stopMicrophone]);
+
+  // Graceful stop: mic off → notify server → wait for turn_complete → end
+  const handleStop = useCallback(() => {
+    stopMicrophone();
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(JSON.stringify({ type: "stop" }));
+      } catch {
+        // ignore send errors
+      }
+    }
+
+    setStatus("stopping");
+
+    // Safety timeout: if turn_complete never arrives, force end after 10s
+    setTimeout(() => {
+      setStatus((prev) => {
+        if (prev === "stopping") {
+          endSession();
+        }
+        return prev === "stopping" ? "idle" : prev;
+      });
+    }, 10000);
+  }, [stopMicrophone, endSession]);
 
   const swapLanguages = () => {
     setSourceLang(targetLang);
     setTargetLang(sourceLang);
   };
 
-  const isActive = status === "listening" || status === "ready" || status === "connecting";
+  const isActive = status === "listening" || status === "ready" || status === "connecting" || status === "stopping";
 
   return (
     <div className="interpreter-page">
@@ -319,6 +350,8 @@ export function Interpreter({
             ? t("interpreter_connecting", locale)
             : status === "listening"
             ? t("interpreter_listening", locale)
+            : status === "stopping"
+            ? t("interpreter_stopping", locale)
             : status === "ready"
             ? t("interpreter_ready", locale)
             : t("interpreter_error", locale)}
@@ -414,8 +447,14 @@ export function Interpreter({
             🎙️ {t("interpreter_start", locale)}
           </button>
         ) : (
-          <button className="interpreter-stop-btn" onClick={stopSession}>
-            ⏹ {t("interpreter_stop", locale)}
+          <button
+            className="interpreter-stop-btn"
+            onClick={handleStop}
+            disabled={status === "stopping"}
+          >
+            {status === "stopping"
+              ? `⏳ ${t("interpreter_stopping", locale)}`
+              : `⏹ ${t("interpreter_stop", locale)}`}
           </button>
         )}
       </div>

@@ -2668,9 +2668,22 @@ async fn handle_voice_ws_connection(
     });
 
     // Main loop: browser audio → Gemini Live
+    let mut audio_stopped = false;
+    let mut stop_deadline: Option<Instant> = None;
+
     while let Some(Ok(msg)) = ws_receiver.next().await {
+        // Check stop timeout
+        if let Some(deadline) = stop_deadline {
+            if Instant::now() > deadline {
+                tracing::info!(session_id = %session_id, "Stop timeout reached, ending session");
+                break;
+            }
+        }
         match msg {
             Message::Binary(data) => {
+                if audio_stopped {
+                    continue; // Mic stopped — ignore incoming audio
+                }
                 // Raw PCM audio from browser → Gemini Live
                 if let Err(e) = gemini_session.send_audio(&data).await {
                     tracing::warn!(
@@ -2686,8 +2699,10 @@ async fn handle_voice_ws_connection(
                 if let Ok(ctrl) = serde_json::from_str::<serde_json::Value>(&text) {
                     match ctrl.get("type").and_then(|v| v.as_str()) {
                         Some("stop") => {
-                            tracing::info!(session_id = %session_id, "Client requested stop");
-                            break;
+                            tracing::info!(session_id = %session_id, "Client requested graceful stop");
+                            audio_stopped = true;
+                            stop_deadline = Some(Instant::now() + Duration::from_secs(10));
+                            // Don't break — keep WS open for remaining translation relay
                         }
                         Some("text") => {
                             // Text-based interpretation
