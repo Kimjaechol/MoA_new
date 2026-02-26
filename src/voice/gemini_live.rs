@@ -28,6 +28,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::pipeline::{InterpreterConfig, VoiceProviderKind};
+use super::VoiceEvent;
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -89,11 +90,17 @@ pub struct VadConfig {
 }
 
 impl Default for VadConfig {
+    /// Manual VAD mode: client controls turn boundaries via activityStart/activityEnd.
+    ///
+    /// This prevents Gemini from prematurely splitting long utterances into
+    /// separate turns, which caused partial/missing translations.
+    /// The remaining fields are ignored when `disabled: true` but kept
+    /// as sensible fallbacks in case we toggle back to auto VAD.
     fn default() -> Self {
         Self {
-            disabled: false,
-            start_sensitivity: VadSensitivity::Low,
-            end_sensitivity: EndSensitivity::Low,
+            disabled: true,
+            start_sensitivity: VadSensitivity::High,
+            end_sensitivity: EndSensitivity::High,
             prefix_padding_ms: 100,
             silence_duration_ms: 300,
         }
@@ -125,6 +132,14 @@ pub struct GenerationConfig {
     pub response_modalities: Vec<String>,
     #[serde(rename = "speechConfig", skip_serializing_if = "Option::is_none")]
     pub speech_config: Option<SpeechConfig>,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "thinkingBudget")]
+    pub thinking_budget: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,6 +192,7 @@ pub fn build_setup_message(config: &InterpreterConfig, vad: &VadConfig) -> Setup
                         },
                     },
                 }),
+                thinking_config: Some(ThinkingConfig { thinking_budget: 0 }),
             },
             system_instruction: Some(SystemInstruction {
                 parts: vec![TextPart {
@@ -194,8 +210,9 @@ pub fn build_setup_message(config: &InterpreterConfig, vad: &VadConfig) -> Setup
 
 /// Audio input message sent to Gemini Live.
 ///
-/// Uses the current `realtimeInput.audio` format (single object).
-/// The older `realtimeInput.mediaChunks` array format is deprecated.
+/// Note: API docs mark `mediaChunks` as deprecated in favor of `audio`,
+/// but actual SDKs (Python, Go, JS) still use `mediaChunks` on the wire
+/// and `audio` field is not reliably processed by the server yet.
 #[derive(Debug, Serialize)]
 pub struct RealtimeInputMessage {
     #[serde(rename = "realtimeInput")]
@@ -204,13 +221,13 @@ pub struct RealtimeInputMessage {
 
 #[derive(Debug, Serialize)]
 pub struct RealtimeInput {
-    /// Audio blob — replaces deprecated `mediaChunks` array.
-    pub audio: AudioBlob,
+    #[serde(rename = "mediaChunks")]
+    pub media_chunks: Vec<MediaChunk>,
 }
 
-/// Single audio blob with MIME type and base64-encoded data.
+/// Audio chunk with MIME type and base64-encoded data.
 #[derive(Debug, Serialize)]
-pub struct AudioBlob {
+pub struct MediaChunk {
     #[serde(rename = "mimeType")]
     pub mime_type: String,
     pub data: String, // base64-encoded audio
@@ -233,16 +250,49 @@ pub struct AudioStreamEndPayload {
 }
 
 /// Build a realtime audio input message from raw PCM bytes.
+///
+/// Wire format: `{"realtimeInput": {"mediaChunks": [{"mimeType": "audio/pcm;rate=16000", "data": "<base64>"}]}}`
+///
+/// Note on `mediaChunks` vs `audio`:
+/// Google's API docs (2026-02) mark `mediaChunks` as deprecated and recommend `audio`.
+/// However, all official SDKs (Python googleapis/python-genai, JS @google/genai, Go)
+/// still emit `mediaChunks` on the wire. Testing confirmed `audio` field is silently
+/// ignored by the server — no response at all. Keeping `mediaChunks` until Google
+/// SDKs actually switch. Track: https://ai.google.dev/api/live
 pub fn build_audio_message(pcm_data: &[u8]) -> RealtimeInputMessage {
     let b64 = base64::engine::general_purpose::STANDARD.encode(pcm_data);
     RealtimeInputMessage {
         realtime_input: RealtimeInput {
-            audio: AudioBlob {
+            media_chunks: vec![MediaChunk {
                 mime_type: INPUT_AUDIO_MIME.to_string(),
                 data: b64,
-            },
+            }],
         },
     }
+}
+
+/// Build an activityStart message for manual VAD.
+///
+/// Wire format: `{"realtimeInput": {"activityStart": {}}}`
+/// Only valid when `automaticActivityDetection.disabled` is true.
+pub fn build_activity_start_message() -> serde_json::Value {
+    serde_json::json!({
+        "realtimeInput": {
+            "activityStart": {}
+        }
+    })
+}
+
+/// Build an activityEnd message for manual VAD.
+///
+/// Wire format: `{"realtimeInput": {"activityEnd": {}}}`
+/// Only valid when `automaticActivityDetection.disabled` is true.
+pub fn build_activity_end_message() -> serde_json::Value {
+    serde_json::json!({
+        "realtimeInput": {
+            "activityEnd": {}
+        }
+    })
 }
 
 /// Build an audioStreamEnd message to signal microphone closure.
@@ -256,36 +306,20 @@ pub fn build_audio_stream_end_message() -> AudioStreamEndMessage {
 
 // ── Server response types ──────────────────────────────────────────
 
-/// Parsed response from Gemini Live.
-#[derive(Debug, Clone)]
-pub enum GeminiLiveEvent {
-    /// Setup completed — ready to stream.
-    SetupComplete,
-    /// Translated/interpreted audio chunk from the model.
-    Audio { data: Vec<u8>, mime_type: String },
-    /// Transcription of user's speech (input).
-    InputTranscript { text: String },
-    /// Transcription of model's speech (output / translated).
-    OutputTranscript { text: String },
-    /// Model finished a response turn.
-    TurnComplete,
-    /// The model was interrupted (user started speaking mid-response).
-    Interrupted,
-    /// Error from the server.
-    Error { message: String },
-}
+/// Backward-compatible alias — all Gemini events now use the shared `VoiceEvent`.
+pub type GeminiLiveEvent = VoiceEvent;
 
 /// Parse a JSON text frame from Gemini Live into a list of events.
 ///
 /// A single server message can contain multiple events (e.g., audio
 /// chunks + transcription in the same frame).
-pub fn parse_server_message(json_text: &str) -> Vec<GeminiLiveEvent> {
+pub fn parse_server_message(json_text: &str) -> Vec<VoiceEvent> {
     let mut events = Vec::new();
 
     let value: serde_json::Value = match serde_json::from_str(json_text) {
         Ok(v) => v,
         Err(e) => {
-            events.push(GeminiLiveEvent::Error {
+            events.push(VoiceEvent::Error {
                 message: format!("Failed to parse server message: {e}"),
             });
             return events;
@@ -294,18 +328,18 @@ pub fn parse_server_message(json_text: &str) -> Vec<GeminiLiveEvent> {
 
     // setupComplete
     if value.get("setupComplete").is_some() {
-        events.push(GeminiLiveEvent::SetupComplete);
+        events.push(VoiceEvent::SetupComplete);
     }
 
     // serverContent
     if let Some(content) = value.get("serverContent") {
         // Check turn completion
         if content.get("turnComplete").and_then(|v| v.as_bool()) == Some(true) {
-            events.push(GeminiLiveEvent::TurnComplete);
+            events.push(VoiceEvent::TurnComplete);
         }
         // Check interruption
         if content.get("interrupted").and_then(|v| v.as_bool()) == Some(true) {
-            events.push(GeminiLiveEvent::Interrupted);
+            events.push(VoiceEvent::Interrupted);
         }
         // Extract audio and text from modelTurn.parts
         if let Some(parts) = content
@@ -315,23 +349,20 @@ pub fn parse_server_message(json_text: &str) -> Vec<GeminiLiveEvent> {
             for part in parts {
                 // Audio data
                 if let Some(inline) = part.get("inlineData") {
-                    if let (Some(data_b64), Some(mime)) = (
+                    if let (Some(data_b64), Some(_mime)) = (
                         inline.get("data").and_then(|v| v.as_str()),
                         inline.get("mimeType").and_then(|v| v.as_str()),
                     ) {
                         if let Ok(audio_bytes) =
                             base64::engine::general_purpose::STANDARD.decode(data_b64)
                         {
-                            events.push(GeminiLiveEvent::Audio {
-                                data: audio_bytes,
-                                mime_type: mime.to_string(),
-                            });
+                            events.push(VoiceEvent::Audio { data: audio_bytes });
                         }
                     }
                 }
                 // Text
                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    events.push(GeminiLiveEvent::OutputTranscript {
+                    events.push(VoiceEvent::OutputTranscript {
                         text: text.to_string(),
                     });
                 }
@@ -343,7 +374,7 @@ pub fn parse_server_message(json_text: &str) -> Vec<GeminiLiveEvent> {
     if let Some(transcript) = value.get("inputTranscription") {
         if let Some(text) = transcript.get("text").and_then(|v| v.as_str()) {
             if !text.is_empty() {
-                events.push(GeminiLiveEvent::InputTranscript {
+                events.push(VoiceEvent::InputTranscript {
                     text: text.to_string(),
                 });
             }
@@ -354,7 +385,7 @@ pub fn parse_server_message(json_text: &str) -> Vec<GeminiLiveEvent> {
     if let Some(transcript) = value.get("outputTranscription") {
         if let Some(text) = transcript.get("text").and_then(|v| v.as_str()) {
             if !text.is_empty() {
-                events.push(GeminiLiveEvent::OutputTranscript {
+                events.push(VoiceEvent::OutputTranscript {
                     text: text.to_string(),
                 });
             }
@@ -367,7 +398,7 @@ pub fn parse_server_message(json_text: &str) -> Vec<GeminiLiveEvent> {
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("Unknown server error");
-        events.push(GeminiLiveEvent::Error {
+        events.push(VoiceEvent::Error {
             message: message.to_string(),
         });
     }
@@ -401,6 +432,10 @@ pub enum OutboundMessage {
     Audio(Vec<u8>),
     /// Send a text message (for text-based interpretation).
     Text(String),
+    /// Signal start of user speech (manual VAD).
+    ActivityStart,
+    /// Signal end of user speech (manual VAD).
+    ActivityEnd,
     /// Signal end of audio stream (microphone stopped).
     AudioStreamEnd,
     /// Close the connection.
@@ -415,7 +450,7 @@ pub struct GeminiLiveSession {
     /// Channel to send audio/text to Gemini Live.
     audio_tx: mpsc::Sender<OutboundMessage>,
     /// Channel to receive events from Gemini Live.
-    pub event_rx: Arc<Mutex<mpsc::Receiver<GeminiLiveEvent>>>,
+    pub event_rx: Arc<Mutex<mpsc::Receiver<VoiceEvent>>>,
     /// Current connection state.
     state: Arc<Mutex<ConnectionState>>,
     /// Session ID for logging.
@@ -513,7 +548,7 @@ impl GeminiLiveSession {
 
         // Channels for bidirectional communication
         let (audio_tx, audio_rx) = mpsc::channel::<OutboundMessage>(256);
-        let (event_tx, event_rx) = mpsc::channel::<GeminiLiveEvent>(256);
+        let (event_tx, event_rx) = mpsc::channel::<VoiceEvent>(256);
 
         // Spawn outbound task: reads from audio_rx, sends to WebSocket
         let ws_sender_out = Arc::clone(&ws_sender);
@@ -558,13 +593,29 @@ impl GeminiLiveSession {
     }
 
     /// Receive the next event from Gemini Live.
-    pub async fn recv_event(&self) -> Option<GeminiLiveEvent> {
+    pub async fn recv_event(&self) -> Option<VoiceEvent> {
         self.event_rx.lock().await.recv().await
     }
 
     /// Get the current connection state.
     pub async fn connection_state(&self) -> ConnectionState {
         *self.state.lock().await
+    }
+
+    /// Signal start of user speech (manual VAD).
+    pub async fn send_activity_start(&self) -> anyhow::Result<()> {
+        self.audio_tx
+            .send(OutboundMessage::ActivityStart)
+            .await
+            .map_err(|_| anyhow::anyhow!("Audio channel closed"))
+    }
+
+    /// Signal end of user speech (manual VAD).
+    pub async fn send_activity_end(&self) -> anyhow::Result<()> {
+        self.audio_tx
+            .send(OutboundMessage::ActivityEnd)
+            .await
+            .map_err(|_| anyhow::anyhow!("Audio channel closed"))
     }
 
     /// Signal end of audio stream to Gemini Live.
@@ -606,12 +657,41 @@ impl GeminiLiveSession {
         state: Arc<Mutex<ConnectionState>>,
         session_id: String,
     ) {
+        let mut audio_chunk_count: u64 = 0;
+        let mut total_bytes: u64 = 0;
+
         while let Some(msg) = rx.recv().await {
             match msg {
                 OutboundMessage::Audio(pcm) => {
+                    audio_chunk_count += 1;
+                    total_bytes += pcm.len() as u64;
                     let audio_msg = build_audio_message(&pcm);
                     match serde_json::to_string(&audio_msg) {
                         Ok(json) => {
+                            // Log first chunk and every 50th chunk
+                            if audio_chunk_count == 1 || audio_chunk_count.is_multiple_of(50) {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    chunk = audio_chunk_count,
+                                    pcm_bytes = pcm.len(),
+                                    total_bytes = total_bytes,
+                                    json_len = json.len(),
+                                    "Sending audio chunk to Gemini"
+                                );
+                                if audio_chunk_count == 1 {
+                                    // Log first message structure for debugging
+                                    let preview = if json.len() > 200 {
+                                        &json[..200]
+                                    } else {
+                                        &json
+                                    };
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        preview = %preview,
+                                        "First audio message JSON preview"
+                                    );
+                                }
+                            }
                             let mut sender = ws_sender.lock().await;
                             if sender.send(WsMessage::Text(json)).await.is_err() {
                                 tracing::warn!(
@@ -644,6 +724,28 @@ impl GeminiLiveSession {
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let mut sender = ws_sender.lock().await;
                         if sender.send(WsMessage::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                OutboundMessage::ActivityStart => {
+                    let msg = build_activity_start_message();
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        tracing::info!(session_id = %session_id, "Sending activityStart to Gemini Live");
+                        let mut sender = ws_sender.lock().await;
+                        if sender.send(WsMessage::Text(json)).await.is_err() {
+                            tracing::warn!(session_id = %session_id, "WebSocket send failed for activityStart");
+                            break;
+                        }
+                    }
+                }
+                OutboundMessage::ActivityEnd => {
+                    let msg = build_activity_end_message();
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        tracing::info!(session_id = %session_id, "Sending activityEnd to Gemini Live");
+                        let mut sender = ws_sender.lock().await;
+                        if sender.send(WsMessage::Text(json)).await.is_err() {
+                            tracing::warn!(session_id = %session_id, "WebSocket send failed for activityEnd");
                             break;
                         }
                     }
@@ -693,24 +795,72 @@ impl GeminiLiveSession {
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
             >,
         >,
-        event_tx: mpsc::Sender<GeminiLiveEvent>,
+        event_tx: mpsc::Sender<VoiceEvent>,
         state: Arc<Mutex<ConnectionState>>,
         session_id: String,
     ) {
+        let start_time = std::time::Instant::now();
+        let mut audio_response_count: u64 = 0;
+        let mut turn_count: u64 = 0;
+
         while let Some(msg_result) = ws_receiver.next().await {
             match msg_result {
                 Ok(WsMessage::Text(text)) => {
                     tracing::debug!(session_id = %session_id, msg = %text, "Gemini Live raw message");
                     let events = parse_server_message(&text);
-                    for event in events {
-                        // Update state on setup completion
-                        if matches!(event, GeminiLiveEvent::SetupComplete) {
-                            *state.lock().await = ConnectionState::Ready;
-                            tracing::info!(
-                                session_id = %session_id,
-                                "Gemini Live setup complete — ready to stream"
-                            );
+                    let elapsed = start_time.elapsed().as_secs_f32();
+                    for event in &events {
+                        match event {
+                            VoiceEvent::Audio { data, .. } => {
+                                audio_response_count += 1;
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    t = format!("{elapsed:.1}s"),
+                                    audio_n = audio_response_count,
+                                    bytes = data.len(),
+                                    "⬇ Gemini audio response"
+                                );
+                            }
+                            VoiceEvent::TurnComplete => {
+                                turn_count += 1;
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    t = format!("{elapsed:.1}s"),
+                                    turn = turn_count,
+                                    audio_chunks_this_session = audio_response_count,
+                                    "⬇ Turn complete"
+                                );
+                            }
+                            VoiceEvent::OutputTranscript { text } => {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    t = format!("{elapsed:.1}s"),
+                                    text = %text,
+                                    "⬇ Output transcript"
+                                );
+                            }
+                            VoiceEvent::InputTranscript { text } => {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    t = format!("{elapsed:.1}s"),
+                                    text = %text,
+                                    "⬇ Input transcript"
+                                );
+                            }
+                            VoiceEvent::Interrupted => {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    t = format!("{elapsed:.1}s"),
+                                    "⬇ Interrupted"
+                                );
+                            }
+                            _ => {}
                         }
+                        if matches!(event, VoiceEvent::SetupComplete) {
+                            *state.lock().await = ConnectionState::Ready;
+                        }
+                    }
+                    for event in events {
                         if event_tx.send(event).await.is_err() {
                             tracing::debug!(
                                 session_id = %session_id,
@@ -731,14 +881,59 @@ impl GeminiLiveSession {
                         if let Ok(text) = std::str::from_utf8(&data) {
                             tracing::debug!(session_id = %session_id, msg = %text, "Gemini Live binary JSON message");
                             let events = parse_server_message(text);
-                            for event in events {
-                                if matches!(event, GeminiLiveEvent::SetupComplete) {
-                                    *state.lock().await = ConnectionState::Ready;
-                                    tracing::info!(
-                                        session_id = %session_id,
-                                        "Gemini Live setup complete — ready to stream"
-                                    );
+                            let elapsed = start_time.elapsed().as_secs_f32();
+                            for event in &events {
+                                match event {
+                                    VoiceEvent::Audio { data, .. } => {
+                                        audio_response_count += 1;
+                                        tracing::info!(
+                                            session_id = %session_id,
+                                            t = format!("{elapsed:.1}s"),
+                                            audio_n = audio_response_count,
+                                            bytes = data.len(),
+                                            "⬇ Gemini audio response"
+                                        );
+                                    }
+                                    VoiceEvent::TurnComplete => {
+                                        turn_count += 1;
+                                        tracing::info!(
+                                            session_id = %session_id,
+                                            t = format!("{elapsed:.1}s"),
+                                            turn = turn_count,
+                                            audio_chunks_this_session = audio_response_count,
+                                            "⬇ Turn complete"
+                                        );
+                                    }
+                                    VoiceEvent::OutputTranscript { text } => {
+                                        tracing::info!(
+                                            session_id = %session_id,
+                                            t = format!("{elapsed:.1}s"),
+                                            text = %text,
+                                            "⬇ Output transcript"
+                                        );
+                                    }
+                                    VoiceEvent::InputTranscript { text } => {
+                                        tracing::info!(
+                                            session_id = %session_id,
+                                            t = format!("{elapsed:.1}s"),
+                                            text = %text,
+                                            "⬇ Input transcript"
+                                        );
+                                    }
+                                    VoiceEvent::Interrupted => {
+                                        tracing::info!(
+                                            session_id = %session_id,
+                                            t = format!("{elapsed:.1}s"),
+                                            "⬇ Interrupted"
+                                        );
+                                    }
+                                    _ => {}
                                 }
+                                if matches!(event, VoiceEvent::SetupComplete) {
+                                    *state.lock().await = ConnectionState::Ready;
+                                }
+                            }
+                            for event in events {
                                 if event_tx.send(event).await.is_err() {
                                     return;
                                 }
@@ -773,7 +968,7 @@ impl GeminiLiveSession {
                     );
                     *state.lock().await = ConnectionState::Failed;
                     let _ = event_tx
-                        .send(GeminiLiveEvent::Error {
+                        .send(VoiceEvent::Error {
                             message: format!("WebSocket error: {e}"),
                         })
                         .await;
@@ -795,9 +990,9 @@ mod tests {
     #[test]
     fn vad_config_default() {
         let vad = VadConfig::default();
-        assert!(!vad.disabled);
-        assert_eq!(vad.start_sensitivity, VadSensitivity::Low);
-        assert_eq!(vad.end_sensitivity, EndSensitivity::Low);
+        assert!(vad.disabled); // manual VAD mode by default
+        assert_eq!(vad.start_sensitivity, VadSensitivity::High);
+        assert_eq!(vad.end_sensitivity, EndSensitivity::High);
         assert_eq!(vad.prefix_padding_ms, 100);
         assert_eq!(vad.silence_duration_ms, 300);
     }
@@ -860,11 +1055,10 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
 
         assert!(json.contains("realtimeInput"));
-        assert!(json.contains("\"audio\""));
-        assert!(!json.contains("mediaChunks"), "should use audio, not deprecated mediaChunks");
+        assert!(json.contains("mediaChunks"));
         assert!(json.contains(INPUT_AUDIO_MIME));
         // Verify base64
-        let b64 = &msg.realtime_input.audio.data;
+        let b64 = &msg.realtime_input.media_chunks[0].data;
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .unwrap();
@@ -889,25 +1083,21 @@ mod tests {
         let json = r#"{"setupComplete": {}}"#;
         let events = parse_server_message(json);
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], GeminiLiveEvent::SetupComplete));
+        assert!(matches!(events[0], VoiceEvent::SetupComplete));
     }
 
     #[test]
     fn parse_turn_complete() {
         let json = r#"{"serverContent": {"turnComplete": true}}"#;
         let events = parse_server_message(json);
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, GeminiLiveEvent::TurnComplete)));
+        assert!(events.iter().any(|e| matches!(e, VoiceEvent::TurnComplete)));
     }
 
     #[test]
     fn parse_interrupted() {
         let json = r#"{"serverContent": {"interrupted": true}}"#;
         let events = parse_server_message(json);
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, GeminiLiveEvent::Interrupted)));
+        assert!(events.iter().any(|e| matches!(e, VoiceEvent::Interrupted)));
     }
 
     #[test]
@@ -920,11 +1110,10 @@ mod tests {
 
         let audio = events
             .iter()
-            .find(|e| matches!(e, GeminiLiveEvent::Audio { .. }));
+            .find(|e| matches!(e, VoiceEvent::Audio { .. }));
         assert!(audio.is_some());
-        if let GeminiLiveEvent::Audio { data, mime_type } = audio.unwrap() {
+        if let VoiceEvent::Audio { data } = audio.unwrap() {
             assert_eq!(data, &[10u8, 20, 30]);
-            assert!(mime_type.contains("pcm"));
         }
     }
 
@@ -934,7 +1123,7 @@ mod tests {
         let events = parse_server_message(json);
         assert!(events.iter().any(|e| matches!(
             e,
-            GeminiLiveEvent::OutputTranscript { text } if text == "Hello world"
+            VoiceEvent::OutputTranscript { text } if text == "Hello world"
         )));
     }
 
@@ -944,7 +1133,7 @@ mod tests {
         let events = parse_server_message(json);
         assert!(events.iter().any(|e| matches!(
             e,
-            GeminiLiveEvent::InputTranscript { text } if text == "안녕하세요"
+            VoiceEvent::InputTranscript { text } if text == "안녕하세요"
         )));
     }
 
@@ -954,7 +1143,7 @@ mod tests {
         let events = parse_server_message(json);
         assert!(events.iter().any(|e| matches!(
             e,
-            GeminiLiveEvent::OutputTranscript { text } if text == "Hello"
+            VoiceEvent::OutputTranscript { text } if text == "Hello"
         )));
     }
 
@@ -964,16 +1153,14 @@ mod tests {
         let events = parse_server_message(json);
         assert!(events.iter().any(|e| matches!(
             e,
-            GeminiLiveEvent::Error { message } if message.contains("Rate limit")
+            VoiceEvent::Error { message } if message.contains("Rate limit")
         )));
     }
 
     #[test]
     fn parse_invalid_json() {
         let events = parse_server_message("not json at all");
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, GeminiLiveEvent::Error { .. })));
+        assert!(events.iter().any(|e| matches!(e, VoiceEvent::Error { .. })));
     }
 
     #[test]
@@ -982,7 +1169,7 @@ mod tests {
         let events = parse_server_message(json);
         assert!(!events
             .iter()
-            .any(|e| matches!(e, GeminiLiveEvent::InputTranscript { .. })));
+            .any(|e| matches!(e, VoiceEvent::InputTranscript { .. })));
     }
 
     #[test]

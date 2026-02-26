@@ -116,9 +116,7 @@ impl AuthStore {
             .prepare("SELECT pairing_code_hash FROM devices LIMIT 0")
             .is_ok();
         if !has_pairing_code {
-            let _ = conn.execute_batch(
-                "ALTER TABLE devices ADD COLUMN pairing_code_hash TEXT;",
-            );
+            let _ = conn.execute_batch("ALTER TABLE devices ADD COLUMN pairing_code_hash TEXT;");
         }
 
         Ok(Self {
@@ -391,11 +389,7 @@ impl AuthStore {
     }
 
     /// Verify a pairing code for a device.
-    pub fn verify_device_pairing_code(
-        &self,
-        device_id: &str,
-        code: &str,
-    ) -> Result<bool> {
+    pub fn verify_device_pairing_code(&self, device_id: &str, code: &str) -> Result<bool> {
         let conn = self.conn.lock();
         let stored_hash: Option<String> = conn
             .query_row(

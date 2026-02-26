@@ -28,7 +28,7 @@ function App() {
   const [locale, setLocale] = useState<Locale>(getStoredLocale());
   const [chats, setChats] = useState<ChatSession[]>(() => loadChats());
   const [activeChatId, setActiveChatIdState] = useState<string | null>(() => getActiveChatId());
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 768);
   const [isConnected, setIsConnected] = useState(false);
   const [pendingDevices, setPendingDevices] = useState<DeviceInfo[]>([]);
   const [sidebarDevices, setSidebarDevices] = useState<DeviceInfo[]>([]);
@@ -336,7 +336,10 @@ function App() {
         onSelectChat={handleSelectChat}
         onDeleteChat={handleDeleteChat}
         onOpenSettings={() => setPage("settings")}
-        onOpenInterpreter={() => setPage("interpreter")}
+        onOpenInterpreter={() => {
+          setPage("interpreter");
+          if (window.innerWidth <= 768) setSidebarOpen(false);
+        }}
         onToggle={() => setSidebarOpen((p) => !p)}
         currentPage={page}
       />

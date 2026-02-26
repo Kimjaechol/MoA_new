@@ -568,7 +568,10 @@ mod tests {
 
         // Pairing code should remain unchanged (not consumed)
         let code_after = guard.pairing_code().unwrap();
-        assert_eq!(code_before, code_after, "Code should not be consumed when not provided");
+        assert_eq!(
+            code_before, code_after,
+            "Code should not be consumed when not provided"
+        );
     }
 
     #[test]

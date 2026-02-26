@@ -221,6 +221,8 @@ pub struct AppState {
     pub gateway_base_url: String,
     /// Voice session manager for real-time interpretation.
     pub voice_sessions: Arc<crate::voice::VoiceSessionManager>,
+    /// Voice config for API key resolution and provider defaults.
+    pub voice_config: crate::config::VoiceConfig,
     /// Names of active (configured) channels for sidebar display.
     pub active_channel_names: Vec<String>,
 }
@@ -615,7 +617,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             config.voice.max_sessions_per_user,
             config.voice.default_source_language.clone(),
             config.voice.default_target_language.clone(),
+            config.voice.default_provider.clone(),
         )),
+        voice_config: config.voice.clone(),
         active_channel_names,
     };
 
@@ -1850,10 +1854,7 @@ async fn handle_auth_device_verify_pairing(
 
     let auth_store = state.auth_store.as_ref().unwrap();
     match auth_store.verify_device_pairing_code(&device_id, &body.pairing_code) {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"verified": true})),
-        ),
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"verified": true}))),
         Ok(false) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"verified": false, "error": "Invalid pairing code"})),
@@ -1899,10 +1900,7 @@ async fn handle_auth_heartbeat(
         );
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "ok"})),
-    )
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2299,6 +2297,9 @@ struct VoiceSessionCreateBody {
     /// Domain: "general", "business", "medical", "legal", "technical".
     #[serde(default)]
     domain: Option<String>,
+    /// Voice provider: "gemini" or "openai" (default: config default or "gemini").
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 /// POST /api/voice/sessions — create a voice interpretation session.
@@ -2363,6 +2364,25 @@ async fn handle_voice_session_create(
         _ => crate::voice::Domain::General,
     };
 
+    let provider = match body.provider.as_deref() {
+        Some("openai") => crate::voice::VoiceProviderKind::OpenAiRealtime,
+        Some("gemini") => crate::voice::VoiceProviderKind::GeminiLive,
+        None => {
+            // Fall back to config default
+            match state.voice_sessions.default_provider() {
+                Some("gemini") => crate::voice::VoiceProviderKind::GeminiLive,
+                _ => crate::voice::VoiceProviderKind::OpenAiRealtime,
+            }
+        }
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Unknown provider: {other}. Use 'gemini' or 'openai'")})),
+            )
+                .into_response();
+        }
+    };
+
     let config = crate::voice::InterpreterConfig {
         source_language: source,
         target_language: target,
@@ -2371,7 +2391,7 @@ async fn handle_voice_session_create(
         domain,
         preserve_tone: true,
         api_key: None,
-        provider: crate::voice::VoiceProviderKind::GeminiLive,
+        provider,
     };
 
     match state
@@ -2379,18 +2399,25 @@ async fn handle_voice_session_create(
         .create_session(&session.user_id, config)
         .await
     {
-        Ok(voice_session) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "session_id": voice_session.id,
-                "status": "idle",
-                "source_language": source.as_str(),
-                "target_language": target.as_str(),
-                "bidirectional": body.bidirectional,
-                "ws_url": format!("/api/voice/interpret?session_id={}", voice_session.id),
-            })),
-        )
-            .into_response(),
+        Ok(voice_session) => {
+            let provider_str = match provider {
+                crate::voice::VoiceProviderKind::GeminiLive => "gemini",
+                crate::voice::VoiceProviderKind::OpenAiRealtime => "openai",
+            };
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "session_id": voice_session.id,
+                    "status": "idle",
+                    "provider": provider_str,
+                    "source_language": source.as_str(),
+                    "target_language": target.as_str(),
+                    "bidirectional": body.bidirectional,
+                    "ws_url": format!("/api/voice/interpret?session_id={}", voice_session.id),
+                })),
+            )
+        }
+        .into_response(),
         Err(e) => {
             let msg = e.to_string();
             (
@@ -2474,10 +2501,7 @@ async fn handle_voice_interpret_ws(
                     let auth_store = match state.auth_store.as_ref() {
                         Some(s) => s,
                         None => {
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "Auth not enabled",
-                            )
+                            return (StatusCode::SERVICE_UNAVAILABLE, "Auth not enabled")
                                 .into_response();
                         }
                     };
@@ -2518,80 +2542,141 @@ async fn handle_voice_interpret_ws(
     };
 
     let voice_manager = Arc::clone(&state.voice_sessions);
+    let voice_config = state.voice_config.clone();
 
-    ws.on_upgrade(move |socket| handle_voice_ws_connection(socket, voice_session, voice_manager))
+    ws.on_upgrade(move |socket| {
+        handle_voice_ws_connection(socket, voice_session, voice_manager, voice_config)
+    })
 }
 
 /// Handle a single voice interpretation WebSocket connection.
 ///
-/// This function bridges the browser's audio stream to Gemini Live:
-/// Browser → (binary PCM) → ZeroClaw → (Gemini Live WS) → Gemini API
-///                                                           ↓
-/// Browser ← (binary PCM + text transcripts) ← ZeroClaw ←───┘
+/// Bridges the browser's audio stream to the selected voice provider:
+/// Browser → (binary PCM) → ZeroClaw → (Provider WS) → AI API
+///                                                        ↓
+/// Browser ← (binary PCM + text transcripts) ← ZeroClaw ←┘
 async fn handle_voice_ws_connection(
     socket: axum::extract::ws::WebSocket,
     voice_session: crate::voice::InterpreterSession,
     voice_manager: Arc<crate::voice::VoiceSessionManager>,
+    voice_config: crate::config::VoiceConfig,
 ) {
     use axum::extract::ws::Message;
     use futures_util::{SinkExt, StreamExt};
 
     let session_id = voice_session.id.clone();
+    let provider = voice_session.config.provider;
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Resolve Gemini API key
-    let api_key = voice_session
-        .config
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-        .or_else(|| std::env::var("GOOGLE_API_KEY").ok());
+    // Resolve API key based on provider
+    let (api_key, provider_name, input_sample_rate) = match provider {
+        crate::voice::VoiceProviderKind::GeminiLive => {
+            let key = voice_session
+                .config
+                .api_key
+                .clone()
+                .or(voice_config.gemini_api_key)
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                .or_else(|| std::env::var("GOOGLE_API_KEY").ok());
+            (key, "gemini", 16000u32)
+        }
+        crate::voice::VoiceProviderKind::OpenAiRealtime => {
+            let key = voice_session
+                .config
+                .api_key
+                .clone()
+                .or(voice_config.openai_api_key)
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+            (
+                key,
+                "openai",
+                crate::voice::openai_realtime::INPUT_SAMPLE_RATE,
+            )
+        }
+    };
 
     let api_key = match api_key {
         Some(k) if !k.trim().is_empty() => k,
         _ => {
             let err = serde_json::json!({
                 "type": "error",
-                "message": "Gemini API key not configured. Set GEMINI_API_KEY env var."
+                "message": format!("{provider_name} API key not configured. Set the appropriate env var.")
             });
             let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
             return;
         }
     };
 
-    let vad = crate::voice::VadConfig::default();
+    // Connect to the selected provider and get event_rx + send handles
+    let event_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::voice::VoiceEvent>>>;
 
-    // Connect to Gemini Live
-    let gemini_session = match crate::voice::GeminiLiveSession::connect(
-        session_id.clone(),
-        &api_key,
-        &voice_session.config,
-        &vad,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(session_id = %session_id, error = %e, "Gemini Live connection failed");
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!("Failed to connect to Gemini Live: {e}")
-            });
-            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-            return;
+    // Provider-specific session — we store an enum to avoid Box<dyn> overhead
+    enum ProviderSession {
+        Gemini(crate::voice::GeminiLiveSession),
+        OpenAi(crate::voice::OpenAiRealtimeSession),
+    }
+
+    let provider_session = match provider {
+        crate::voice::VoiceProviderKind::GeminiLive => {
+            let vad = crate::voice::VadConfig::default();
+            match crate::voice::GeminiLiveSession::connect(
+                session_id.clone(),
+                &api_key,
+                &voice_session.config,
+                &vad,
+            )
+            .await
+            {
+                Ok(s) => {
+                    event_rx = Arc::clone(&s.event_rx);
+                    ProviderSession::Gemini(s)
+                }
+                Err(e) => {
+                    tracing::error!(session_id = %session_id, error = %e, "Gemini Live connection failed");
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": format!("Failed to connect to Gemini Live: {e}")
+                    });
+                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                    return;
+                }
+            }
+        }
+        crate::voice::VoiceProviderKind::OpenAiRealtime => {
+            match crate::voice::OpenAiRealtimeSession::connect(
+                session_id.clone(),
+                &api_key,
+                &voice_session.config,
+            )
+            .await
+            {
+                Ok(s) => {
+                    event_rx = Arc::clone(&s.event_rx);
+                    ProviderSession::OpenAi(s)
+                }
+                Err(e) => {
+                    tracing::error!(session_id = %session_id, error = %e, "OpenAI Realtime connection failed");
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": format!("Failed to connect to OpenAI Realtime: {e}")
+                    });
+                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                    return;
+                }
+            }
         }
     };
 
-    // GeminiLiveSession::connect() already waits for setupComplete internally.
-    // If connect() returned Ok, the session is ready to stream.
     let _ = voice_manager
         .update_status(&session_id, crate::voice::InterpreterStatus::Ready)
         .await;
 
-    // Send ready message to browser with full config for UI rendering
+    // Send ready message to browser with full config + provider info
     let ready = serde_json::json!({
         "type": "ready",
         "session_id": session_id,
+        "provider": provider_name,
+        "input_sample_rate": input_sample_rate,
         "source_language": voice_session.config.source_language.as_str(),
         "target_language": voice_session.config.target_language.as_str(),
         "source_language_name": voice_session.config.source_language.display_name(),
@@ -2608,51 +2693,46 @@ async fn handle_voice_ws_connection(
         .update_status(&session_id, crate::voice::InterpreterStatus::Listening)
         .await;
 
-    // Spawn task: Gemini Live events → browser
-    let gemini_event_rx = Arc::clone(&gemini_session.event_rx);
+    // Spawn task: provider events → browser (identical for all providers via VoiceEvent)
     let session_id_events = session_id.clone();
     let voice_manager_events = Arc::clone(&voice_manager);
     let send_task = tokio::spawn(async move {
         let mut sender = ws_sender;
-        while let Some(event) = gemini_event_rx.lock().await.recv().await {
+        while let Some(event) = event_rx.lock().await.recv().await {
             let result = match &event {
-                crate::voice::GeminiLiveEvent::Audio { data, .. } => {
-                    // Send translated audio as binary frame
+                crate::voice::VoiceEvent::Audio { data } => {
                     sender.send(Message::Binary(data.clone().into())).await
                 }
-                crate::voice::GeminiLiveEvent::InputTranscript { text } => {
+                crate::voice::VoiceEvent::InputTranscript { text } => {
                     let msg = serde_json::json!({
                         "type": "input_transcript",
                         "text": text,
                     });
                     sender.send(Message::Text(msg.to_string().into())).await
                 }
-                crate::voice::GeminiLiveEvent::OutputTranscript { text } => {
+                crate::voice::VoiceEvent::OutputTranscript { text } => {
                     let msg = serde_json::json!({
                         "type": "output_transcript",
                         "text": text,
                     });
                     sender.send(Message::Text(msg.to_string().into())).await
                 }
-                crate::voice::GeminiLiveEvent::TurnComplete => {
+                crate::voice::VoiceEvent::TurnComplete => {
                     let msg = serde_json::json!({"type": "turn_complete"});
                     sender.send(Message::Text(msg.to_string().into())).await
                 }
-                crate::voice::GeminiLiveEvent::Interrupted => {
+                crate::voice::VoiceEvent::Interrupted => {
                     let msg = serde_json::json!({"type": "interrupted"});
                     sender.send(Message::Text(msg.to_string().into())).await
                 }
-                crate::voice::GeminiLiveEvent::Error { message } => {
+                crate::voice::VoiceEvent::Error { message } => {
                     let msg = serde_json::json!({
                         "type": "error",
                         "message": message,
                     });
                     sender.send(Message::Text(msg.to_string().into())).await
                 }
-                crate::voice::GeminiLiveEvent::SetupComplete => {
-                    // Already handled above
-                    Ok(())
-                }
+                crate::voice::VoiceEvent::SetupComplete => Ok(()),
             };
             if result.is_err() {
                 break;
@@ -2667,12 +2747,12 @@ async fn handle_voice_ws_connection(
             .await;
     });
 
-    // Main loop: browser audio → Gemini Live
+    // Main loop: browser audio → provider
     let mut audio_stopped = false;
     let mut stop_deadline: Option<Instant> = None;
+    let is_gemini = matches!(provider, crate::voice::VoiceProviderKind::GeminiLive);
 
     while let Some(Ok(msg)) = ws_receiver.next().await {
-        // Check stop timeout
         if let Some(deadline) = stop_deadline {
             if Instant::now() > deadline {
                 tracing::info!(session_id = %session_id, "Stop timeout reached, ending session");
@@ -2682,48 +2762,63 @@ async fn handle_voice_ws_connection(
         match msg {
             Message::Binary(data) => {
                 if audio_stopped {
-                    continue; // Mic stopped — ignore incoming audio
+                    continue;
                 }
-                // Raw PCM audio from browser → Gemini Live
-                if let Err(e) = gemini_session.send_audio(&data).await {
+                let send_result = match &provider_session {
+                    ProviderSession::Gemini(s) => s.send_audio(&data).await,
+                    ProviderSession::OpenAi(s) => s.send_audio(&data).await,
+                };
+                if let Err(e) = send_result {
                     tracing::warn!(
                         session_id = %session_id,
                         error = %e,
-                        "Failed to send audio to Gemini Live"
+                        "Failed to send audio to provider"
                     );
                     break;
                 }
             }
             Message::Text(text) => {
-                // JSON control messages from browser
                 if let Ok(ctrl) = serde_json::from_str::<serde_json::Value>(&text) {
                     match ctrl.get("type").and_then(|v| v.as_str()) {
                         Some("stop") => {
                             tracing::info!(session_id = %session_id, "Client requested graceful stop");
                             audio_stopped = true;
-                            stop_deadline = Some(Instant::now() + Duration::from_secs(10));
-                            // Signal Gemini that audio stream has ended so it
-                            // processes any remaining buffered input immediately.
-                            if let Err(e) = gemini_session.send_audio_stream_end().await {
-                                tracing::warn!(
-                                    session_id = %session_id,
-                                    error = %e,
-                                    "Failed to send audioStreamEnd"
-                                );
+                            stop_deadline = Some(Instant::now() + Duration::from_secs(30));
+                        }
+                        Some("activity_start") if is_gemini => {
+                            if let ProviderSession::Gemini(s) = &provider_session {
+                                tracing::info!(session_id = %session_id, "Client: activityStart");
+                                if let Err(e) = s.send_activity_start().await {
+                                    tracing::warn!(session_id = %session_id, error = %e, "Failed to send activityStart");
+                                }
                             }
-                            // Don't break — keep WS open for remaining translation relay
+                        }
+                        Some("activity_end") if is_gemini => {
+                            if let ProviderSession::Gemini(s) = &provider_session {
+                                tracing::info!(session_id = %session_id, "Client: activityEnd");
+                                if let Err(e) = s.send_activity_end().await {
+                                    tracing::warn!(session_id = %session_id, error = %e, "Failed to send activityEnd");
+                                }
+                            }
+                        }
+                        // OpenAI with semantic VAD: activity_start/end are ignored (server handles it)
+                        Some("activity_start" | "activity_end") => {
+                            tracing::debug!(session_id = %session_id, "Ignoring activity message for non-Gemini provider");
                         }
                         Some("text") => {
-                            // Text-based interpretation
                             if let Some(input) = ctrl.get("text").and_then(|v| v.as_str()) {
-                                let _ = gemini_session.send_text(input).await;
+                                match &provider_session {
+                                    ProviderSession::Gemini(s) => {
+                                        let _ = s.send_text(input).await;
+                                    }
+                                    ProviderSession::OpenAi(s) => {
+                                        let _ = s.send_text(input).await;
+                                    }
+                                }
                             }
                         }
                         _ => {
-                            tracing::debug!(
-                                session_id = %session_id,
-                                "Unknown control message type"
-                            );
+                            tracing::debug!(session_id = %session_id, "Unknown control message type");
                         }
                     }
                 }
@@ -2734,12 +2829,15 @@ async fn handle_voice_ws_connection(
     }
 
     // Cleanup
-    gemini_session.close().await;
+    match &provider_session {
+        ProviderSession::Gemini(s) => s.close().await,
+        ProviderSession::OpenAi(s) => s.close().await,
+    }
     send_task.abort();
 
     let _ = voice_manager.close_session(&session_id).await;
 
-    tracing::info!(session_id = %session_id, "Voice interpretation session ended");
+    tracing::info!(session_id = %session_id, provider = provider_name, "Voice interpretation session ended");
 }
 
 #[cfg(test)]
@@ -3037,6 +3135,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            voice_config: crate::config::VoiceConfig::default(),
             active_channel_names: Vec::new(),
         };
 
@@ -3104,6 +3203,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            voice_config: crate::config::VoiceConfig::default(),
             active_channel_names: Vec::new(),
         };
 
@@ -3180,6 +3280,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            voice_config: crate::config::VoiceConfig::default(),
             active_channel_names: Vec::new(),
         };
 
@@ -3231,6 +3332,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            voice_config: crate::config::VoiceConfig::default(),
             active_channel_names: Vec::new(),
         };
 
@@ -3285,6 +3387,7 @@ mod tests {
             channel_pairing: None,
             gateway_base_url: "http://127.0.0.1:3000".into(),
             voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
+            voice_config: crate::config::VoiceConfig::default(),
             active_channel_names: Vec::new(),
         };
 

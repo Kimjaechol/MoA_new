@@ -1191,6 +1191,37 @@ html, body {
   .message-content {
     max-width: 90%;
   }
+
+  /* Interpreter mobile */
+  .interpreter-page {
+    min-height: 100dvh;
+    height: auto;
+  }
+
+  .interpreter-controls {
+    padding: 12px;
+    gap: 8px;
+  }
+
+  .lang-select,
+  .provider-select {
+    min-width: unset;
+    width: 100%;
+  }
+
+  .interpreter-transcripts {
+    padding: 16px 12px;
+  }
+
+  .interpreter-actions {
+    padding: 16px 12px;
+  }
+
+  .interpreter-start-btn,
+  .interpreter-stop-btn {
+    width: 100%;
+    padding: 12px 24px;
+  }
 }
 
 /* ============================================================
@@ -1613,6 +1644,59 @@ html, body {
   height: 16px;
 }
 
+.provider-select {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text-primary);
+  padding: 6px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  min-width: 100px;
+}
+.provider-select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.audio-mode-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 14px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-secondary);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.audio-mode-btn:hover { background: var(--color-bg-tertiary); }
+.audio-mode-btn.speaker { border-color: var(--color-warning, #f0ad4e); color: var(--color-warning, #f0ad4e); }
+.audio-mode-btn.earphone { border-color: var(--color-primary); color: var(--color-primary); }
+
+.audio-processing-toggles {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  padding: 4px 0;
+}
+.audio-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-secondary);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.audio-toggle:hover { background: var(--color-bg-tertiary); }
+.audio-toggle input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--color-primary); }
+.audio-toggle input[type="checkbox"]:checked + span { color: var(--color-primary); }
+.audio-toggle input[type="checkbox"]:disabled { opacity: 0.5; cursor: not-allowed; }
+
 .interpreter-transcripts {
   flex: 1;
   overflow-y: auto;
@@ -1659,6 +1743,22 @@ html, body {
 .transcript-output {
   background: rgba(99, 102, 241, 0.1);
   border: 1px solid rgba(99, 102, 241, 0.2);
+}
+
+.transcript-system {
+  background: transparent;
+  border: none;
+  padding: 4px 16px;
+}
+
+.transcript-system .transcript-badge {
+  font-size: 12px;
+}
+
+.transcript-system .transcript-text {
+  color: var(--color-text-secondary, #888);
+  font-size: 12px;
+  font-family: monospace;
 }
 
 .transcript-listening {

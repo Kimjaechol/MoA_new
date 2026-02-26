@@ -387,29 +387,24 @@ impl InterpreterConfig {
 
         let direction = if self.bidirectional {
             format!(
-                "You operate in bidirectional mode between {} and {}. \
-                 When the speaker speaks {}, immediately interpret into {}. \
-                 When the speaker speaks {}, immediately interpret into {}. \
-                 Detect the language automatically from each utterance and always \
-                 output in the opposite language. Never repeat the input language.",
+                "Bidirectional: {} ↔ {}. \
+                 Detect input language. Output the OTHER language immediately. \
+                 Never output the same language as input.",
                 self.source_language.display_name(),
                 self.target_language.display_name(),
-                self.source_language.display_name(),
-                self.target_language.display_name(),
-                self.target_language.display_name(),
-                self.source_language.display_name(),
             )
         } else {
             format!(
-                "Interpret from {} to {} only. All output must be in {}.",
+                "{} → {} only.",
                 self.source_language.display_name(),
-                self.target_language.display_name(),
                 self.target_language.display_name(),
             )
         };
 
         format!(
-            "You are a real-time voice interpreter. {direction} {formality_instruction}{domain_instruction}{tone_instruction}"
+            "You are a live interpreter. {direction} {formality_instruction}{domain_instruction}{tone_instruction} \
+             CRITICAL: Speak the translation IMMEDIATELY. Never explain, never describe what you are doing, \
+             never output text like \"Translating...\" — just speak the translated words directly."
         )
     }
 }
@@ -532,6 +527,8 @@ pub struct VoiceSessionManager {
     default_source_language: String,
     /// Default target language code (from config).
     default_target_language: String,
+    /// Default voice provider ("gemini" or "openai").
+    default_provider: Option<String>,
 }
 
 impl VoiceSessionManager {
@@ -543,6 +540,7 @@ impl VoiceSessionManager {
             enabled,
             default_source_language: "ko".to_string(),
             default_target_language: "en".to_string(),
+            default_provider: None,
         }
     }
 
@@ -552,6 +550,7 @@ impl VoiceSessionManager {
         max_sessions_per_user: usize,
         default_source_language: String,
         default_target_language: String,
+        default_provider: Option<String>,
     ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -559,6 +558,7 @@ impl VoiceSessionManager {
             enabled,
             default_source_language,
             default_target_language,
+            default_provider,
         }
     }
 
@@ -570,6 +570,11 @@ impl VoiceSessionManager {
     /// Get the default target language code.
     pub fn default_target_language(&self) -> &str {
         &self.default_target_language
+    }
+
+    /// Get the default voice provider name.
+    pub fn default_provider(&self) -> Option<&str> {
+        self.default_provider.as_deref()
     }
 
     /// Create a new interpretation session.

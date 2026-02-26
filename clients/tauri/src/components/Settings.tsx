@@ -258,34 +258,29 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
             <div className={`settings-message ${message.type}`}>{message.text}</div>
           )}
 
-          {/* Advanced settings (server URL) */}
+          {/* Server URL */}
           <div className="settings-section">
-            <details>
-              <summary className="settings-section-title" style={{ cursor: "pointer" }}>
-                {t("advanced_settings", locale)}
-              </summary>
-              <div className="settings-card" style={{ marginTop: 8 }}>
-                <div className="settings-field">
-                  <label className="settings-label">{t("server_url", locale)}</label>
-                  <div className="settings-input-row">
-                    <input
-                      className="settings-input"
-                      type="url"
-                      value={serverUrl}
-                      onChange={(e) => handleServerUrlChange(e.target.value)}
-                      placeholder="https://moanew-production.up.railway.app"
-                    />
-                    <button
-                      className="settings-btn settings-btn-secondary"
-                      onClick={handleHealthCheck}
-                      disabled={isHealthChecking}
-                    >
-                      {isHealthChecking ? t("checking", locale) : t("health_check", locale)}
-                    </button>
-                  </div>
+            <div className="settings-section-title">{t("server_url", locale)}</div>
+            <div className="settings-card">
+              <div className="settings-field">
+                <div className="settings-input-row">
+                  <input
+                    className="settings-input"
+                    type="url"
+                    value={serverUrl}
+                    onChange={(e) => handleServerUrlChange(e.target.value)}
+                    placeholder="https://moanew-production.up.railway.app"
+                  />
+                  <button
+                    className="settings-btn settings-btn-secondary"
+                    onClick={handleHealthCheck}
+                    disabled={isHealthChecking}
+                  >
+                    {isHealthChecking ? t("checking", locale) : t("health_check", locale)}
+                  </button>
                 </div>
               </div>
-            </details>
+            </div>
           </div>
 
           {/* Language section */}

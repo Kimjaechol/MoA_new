@@ -134,6 +134,12 @@ pub struct VoiceConfig {
     /// Gemini API key override (falls back to GEMINI_API_KEY env var).
     #[serde(default)]
     pub gemini_api_key: Option<String>,
+    /// OpenAI API key override (falls back to OPENAI_API_KEY env var).
+    #[serde(default)]
+    pub openai_api_key: Option<String>,
+    /// Default voice provider: "gemini" or "openai" (default: "gemini").
+    #[serde(default)]
+    pub default_provider: Option<String>,
     /// VAD silence duration in ms (how long silence = end-of-speech).
     #[serde(default = "default_voice_silence_ms")]
     pub silence_duration_ms: u32,
@@ -166,6 +172,8 @@ impl Default for VoiceConfig {
             default_source_language: default_voice_source_language(),
             default_target_language: default_voice_target_language(),
             gemini_api_key: None,
+            openai_api_key: None,
+            default_provider: None,
             silence_duration_ms: default_voice_silence_ms(),
             prefix_padding_ms: default_voice_prefix_padding_ms(),
         }
@@ -2599,8 +2607,7 @@ impl Config {
 
         // Require pairing: ZEROCLAW_REQUIRE_PAIRING
         if let Ok(val) = std::env::var("ZEROCLAW_REQUIRE_PAIRING") {
-            self.gateway.require_pairing =
-                val == "1" || val.eq_ignore_ascii_case("true");
+            self.gateway.require_pairing = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
         // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
@@ -2985,6 +2992,24 @@ impl Config {
             {
                 if !key.is_empty() {
                     self.voice.gemini_api_key = Some(key);
+                }
+            }
+        }
+
+        // Voice OpenAI API key: OPENAI_API_KEY
+        if self.voice.openai_api_key.is_none() {
+            if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                if !key.is_empty() {
+                    self.voice.openai_api_key = Some(key);
+                }
+            }
+        }
+
+        // Voice default provider: ZEROCLAW_VOICE_PROVIDER
+        if self.voice.default_provider.is_none() {
+            if let Ok(provider) = std::env::var("ZEROCLAW_VOICE_PROVIDER") {
+                if !provider.is_empty() {
+                    self.voice.default_provider = Some(provider);
                 }
             }
         }

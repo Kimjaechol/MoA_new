@@ -13,8 +13,8 @@ const STORAGE_KEY_TOKEN = "moa_token";
 const STORAGE_KEY_SERVER = "moa_server_url";
 const STORAGE_KEY_USER = "moa_user";
 const STORAGE_KEY_DEVICE_ID = "moa_device_id";
-const DEFAULT_SERVER_URL = "https://moanew-production.up.railway.app";
-// const DEFAULT_SERVER_URL = "http://localhost:8080";
+// const DEFAULT_SERVER_URL = "https://moanew-production.up.railway.app";
+const DEFAULT_SERVER_URL = "http://localhost:8080";
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -195,6 +195,8 @@ export class MoAClient {
     this.user = null;
     localStorage.removeItem(STORAGE_KEY_TOKEN);
     localStorage.removeItem(STORAGE_KEY_USER);
+    localStorage.removeItem(STORAGE_KEY_SERVER);
+    this.serverUrl = DEFAULT_SERVER_URL;
     this.stopHeartbeat();
     if (isTauri()) {
       disconnectBackend().catch(() => {});

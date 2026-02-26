@@ -11,12 +11,13 @@ interface InterpreterProps {
 
 interface Transcript {
   id: string;
-  type: "input" | "output";
+  type: "input" | "output" | "system";
   text: string;
   timestamp: number;
 }
 
 type ConnectionStatus = "idle" | "connecting" | "ready" | "listening" | "stopping" | "error";
+type VoiceProvider = "gemini" | "openai";
 
 const LANGUAGES = [
   { code: "ko", name: "한국어", flag: "🇰🇷" },
@@ -38,23 +39,73 @@ const LANGUAGES = [
 ];
 
 // AudioWorklet processor code (inline, runs in audio thread)
+// Receives audio at native sample rate (e.g. 48000) and downsamples to 16kHz PCM16.
+// IMPORTANT: AudioContext must be created at native rate, NOT 16000,
+// because forcing sampleRate:16000 kills mic input on macOS WebKit (Tauri).
 const WORKLET_CODE = `
 class PcmCaptureProcessor extends AudioWorkletProcessor {
-  constructor() {
+  constructor(options) {
     super();
     this._buffer = [];
-    this._targetSamples = 1600; // 100ms at 16kHz
+    this._sourceRate = options.processorOptions?.sourceRate || sampleRate;
+    this._targetRate = options.processorOptions?.targetRate || 16000;
+    this._ratio = this._sourceRate / this._targetRate;
+    // 100ms of output at target rate
+    this._targetSamples = Math.round(this._targetRate * 0.1);
+    this._resamplePos = 0;
+
+    // RMS-based VAD state
+    this._rmsThreshold = 0.015;       // silence threshold (tunable)
+    this._silenceChunks = 0;          // consecutive silent chunks
+    this._silenceLimit = 12;          // 12 chunks × 100ms = 1.2s silence → activityEnd
+    this._isSpeaking = false;         // current speech state
+    this._speechStartChunks = 2;      // 2 chunks of speech to confirm start (200ms)
+    this._speechChunks = 0;           // consecutive speech chunks
   }
   process(inputs) {
     const input = inputs[0];
     if (!input || !input[0]) return true;
     const samples = input[0];
-    // Downsample from source rate to 16kHz happens via AudioContext
+
+    // Simple linear-interpolation downsample from native rate to 16kHz
     for (let i = 0; i < samples.length; i++) {
-      this._buffer.push(samples[i]);
+      this._resamplePos += 1;
+      if (this._resamplePos >= this._ratio) {
+        this._resamplePos -= this._ratio;
+        this._buffer.push(samples[i]);
+      }
     }
+
     while (this._buffer.length >= this._targetSamples) {
       const chunk = this._buffer.splice(0, this._targetSamples);
+
+      // Calculate RMS energy for VAD
+      let sumSq = 0;
+      for (let i = 0; i < chunk.length; i++) {
+        sumSq += chunk[i] * chunk[i];
+      }
+      const rms = Math.sqrt(sumSq / chunk.length);
+
+      // VAD state machine
+      if (rms >= this._rmsThreshold) {
+        this._silenceChunks = 0;
+        this._speechChunks++;
+        if (!this._isSpeaking && this._speechChunks >= this._speechStartChunks) {
+          this._isSpeaking = true;
+          this.port.postMessage({ type: 'vad', speaking: true });
+        }
+      } else {
+        this._speechChunks = 0;
+        if (this._isSpeaking) {
+          this._silenceChunks++;
+          if (this._silenceChunks >= this._silenceLimit) {
+            this._isSpeaking = false;
+            this.port.postMessage({ type: 'vad', speaking: false });
+          }
+        }
+      }
+
+      // Convert to PCM16 and send audio
       const pcm16 = new Int16Array(chunk.length);
       for (let i = 0; i < chunk.length; i++) {
         const s = Math.max(-1, Math.min(1, chunk[i]));
@@ -76,9 +127,14 @@ export function Interpreter({
 }: InterpreterProps) {
   void onBack; // available for future navigation
   const [status, setStatus] = useState<ConnectionStatus>("idle");
+  const [provider, setProvider] = useState<VoiceProvider>("openai");
   const [sourceLang, setSourceLang] = useState("ko");
   const [targetLang, setTargetLang] = useState("ja");
   const [bidirectional, setBidirectional] = useState(true);
+  const [speakerMode, setSpeakerMode] = useState(true); // true=speaker(mute mic during playback), false=earphone(simultaneous)
+  const [echoCancellation, setEchoCancellation] = useState(true);
+  const [autoGainControl, setAutoGainControl] = useState(true);
+  const [noiseSuppression, setNoiseSuppression] = useState(true);
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -87,7 +143,14 @@ export function Interpreter({
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const playbackCtxRef = useRef<AudioContext | null>(null);
+  const micMutedRef = useRef(false); // mute mic while audio plays back
+  const speakerModeRef = useRef(true); // ref mirror for use in callbacks
+  const activeProviderRef = useRef<VoiceProvider>("gemini");
+  const inputSampleRateRef = useRef(16000); // from server ready message
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+
+  // Keep ref in sync with state for use inside callbacks
+  useEffect(() => { speakerModeRef.current = speakerMode; }, [speakerMode]);
 
   // Auto-scroll transcripts
   useEffect(() => {
@@ -101,18 +164,50 @@ export function Interpreter({
     };
   }, []);
 
-  const addTranscript = useCallback((type: "input" | "output", text: string) => {
-    setTranscripts((prev) => [
-      ...prev,
-      { id: crypto.randomUUID(), type, text, timestamp: Date.now() },
-    ]);
+  const sessionStartRef = useRef<number>(0);
+
+  const addTranscript = useCallback((type: "input" | "output" | "system", text: string, append = false) => {
+    const now = Date.now();
+    const elapsed = sessionStartRef.current ? `+${((now - sessionStartRef.current) / 1000).toFixed(1)}s` : "0.0s";
+    const prefix = type === "system" ? `[${elapsed}] ` : "";
+    setTranscripts((prev) => {
+      // Append mode: merge with the last transcript of same type
+      if (append && prev.length > 0) {
+        const last = prev[prev.length - 1];
+        if (last.type === type) {
+          return [
+            ...prev.slice(0, -1),
+            { ...last, text: last.text + text, timestamp: now },
+          ];
+        }
+      }
+      return [
+        ...prev,
+        { id: crypto.randomUUID(), type, text: `${prefix}${text}`, timestamp: now },
+      ];
+    });
   }, []);
+
+  const playbackChunkCountRef = useRef(0);
+
+  // Sequential audio playback scheduling.
+  // Each chunk is scheduled to play right after the previous one ends,
+  // preventing overlapping playback that sounds like fast-forward noise.
+  const nextPlayTimeRef = useRef(0);
+  const muteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const playAudioChunk = useCallback(async (pcmData: ArrayBuffer) => {
     if (!playbackCtxRef.current) {
       playbackCtxRef.current = new AudioContext({ sampleRate: 24000 });
+      addTranscript("system", `Playback AudioContext: requested 24000Hz, actual ${playbackCtxRef.current.sampleRate}Hz`);
     }
     const ctx = playbackCtxRef.current;
+
+    // Resume if suspended (browser autoplay policy)
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+
     const int16 = new Int16Array(pcmData);
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) {
@@ -123,13 +218,43 @@ export function Interpreter({
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
-    source.start();
-  }, []);
+
+    // Schedule this chunk to play after the previous one finishes.
+    const now = ctx.currentTime;
+    // Reset schedule if it fell behind (e.g. after a gap between turns)
+    // No max cap — interrupted event handles turn boundaries
+    if (nextPlayTimeRef.current < now) {
+      nextPlayTimeRef.current = now;
+    }
+    const startTime = nextPlayTimeRef.current;
+    const endTime = startTime + buffer.duration;
+    nextPlayTimeRef.current = endTime;
+
+    // Mute mic during playback (Gemini + speaker mode only).
+    // OpenAI semantic VAD handles echo automatically — no muting needed.
+    if (speakerMode && activeProviderRef.current === "gemini") {
+      micMutedRef.current = true;
+      if (muteTimerRef.current) clearTimeout(muteTimerRef.current);
+      const muteMs = (endTime - now) * 1000 + 50; // +50ms safety margin
+      muteTimerRef.current = setTimeout(() => {
+        micMutedRef.current = false;
+        muteTimerRef.current = null;
+      }, muteMs);
+    }
+
+    source.start(startTime);
+    playbackChunkCountRef.current++;
+    if (playbackChunkCountRef.current === 1 || playbackChunkCountRef.current % 20 === 0) {
+      console.log(`[audio] chunk #${playbackChunkCountRef.current}, ctx.state=${ctx.state}, scheduled at ${startTime.toFixed(2)}, now=${now.toFixed(2)}, samples=${int16.length}`);
+    }
+  }, [speakerMode]);
 
   const startSession = useCallback(async () => {
     setError(null);
     setStatus("connecting");
     setTranscripts([]);
+    sessionStartRef.current = Date.now();
+    addTranscript("system", `Connecting to server... (${apiClient.getServerUrl()})`);
 
     try {
       // 1. Create voice session via REST API
@@ -146,6 +271,7 @@ export function Interpreter({
           source_language: sourceLang,
           target_language: targetLang,
           bidirectional,
+          provider,
         }),
       });
 
@@ -156,9 +282,11 @@ export function Interpreter({
 
       const session = await res.json();
       const sessionId = session.session_id;
+      addTranscript("system", `Session created: ${sessionId}`);
 
       // 2. Connect WebSocket (pass token as query param since WS can't use headers)
       const wsUrl = serverUrl.replace(/^http/, "ws") + `/api/voice/interpret?session_id=${sessionId}&token=${token}`;
+      addTranscript("system", "Opening WebSocket...");
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -166,39 +294,83 @@ export function Interpreter({
 
       ws.onopen = () => {
         setStatus("ready");
+        addTranscript("system", "WebSocket connected — waiting for Gemini setup...");
       };
+
+      let audioChunksReceived = 0;
 
       ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
           // Binary: translated audio PCM
+          audioChunksReceived++;
+          if (audioChunksReceived === 1) {
+            addTranscript("system", `First audio response received (${event.data.byteLength} bytes)`);
+          }
           playAudioChunk(event.data);
         } else {
           // Text: JSON event
           try {
             const msg = JSON.parse(event.data);
             switch (msg.type) {
-              case "ready":
+              case "ready": {
+                const serverProvider = msg.provider || "gemini";
+                const sampleRate = msg.input_sample_rate || 16000;
+                activeProviderRef.current = serverProvider;
+                inputSampleRateRef.current = sampleRate;
                 setStatus("listening");
+                const vadMode = serverProvider === "openai" ? "semantic VAD (server)" : "RMS VAD (client)";
+                addTranscript("system", `${serverProvider === "openai" ? "OpenAI Realtime" : "Gemini Live"} ready — ${vadMode}, input ${sampleRate}Hz`);
                 startMicrophone();
                 break;
+              }
               case "input_transcript":
                 if (msg.text) addTranscript("input", msg.text);
                 break;
               case "output_transcript":
-                if (msg.text) addTranscript("output", msg.text);
+                if (msg.text) addTranscript("output", msg.text, true);
                 break;
               case "turn_complete":
+                addTranscript("system", "Turn complete");
                 setStatus((prev) => {
                   if (prev === "stopping") {
-                    // Drain complete — schedule full cleanup
-                    setTimeout(() => endSession(), 0);
-                    return prev; // endSession will set idle
+                    // Wait for ALL scheduled audio to finish before closing.
+                    // Audio chunks arrive in bursts and are scheduled sequentially
+                    // via nextPlayTimeRef, so remaining can be several seconds.
+                    const ctx = playbackCtxRef.current;
+                    const remaining = ctx
+                      ? Math.max(0, (nextPlayTimeRef.current - ctx.currentTime) * 1000)
+                      : 0;
+                    const delayMs = remaining + 1000; // +1s safety margin
+                    addTranscript("system", `Drain: ${(remaining / 1000).toFixed(1)}s audio remaining — closing in ${(delayMs / 1000).toFixed(1)}s`);
+                    setTimeout(() => endSession(), delayMs);
+                    return prev;
                   }
                   return prev;
                 });
                 break;
+              case "interrupted": {
+                addTranscript("system", "Interrupted — new speech detected");
+                // Cancel all scheduled audio by closing current playback context
+                const oldCtx = playbackCtxRef.current;
+                if (oldCtx) {
+                  oldCtx.close();
+                  playbackCtxRef.current = null;
+                }
+                nextPlayTimeRef.current = 0;
+                playbackChunkCountRef.current = 0;
+                micMutedRef.current = false;
+                if (muteTimerRef.current) {
+                  clearTimeout(muteTimerRef.current);
+                  muteTimerRef.current = null;
+                }
+                break;
+              }
               case "error":
+                addTranscript("system", `Error: ${msg.message}`);
                 setError(msg.message);
+                break;
+              default:
+                addTranscript("system", `Event: ${msg.type}`);
                 break;
             }
           } catch {
@@ -212,36 +384,46 @@ export function Interpreter({
         if (wsRef.current === null) return;
         setStatus((prev) => {
           if (prev === "stopping") return prev; // ignore during drain
+          addTranscript("system", "WebSocket error");
           setError("WebSocket connection error");
           return "error";
         });
       };
 
-      ws.onclose = () => {
-        if (status !== "idle") {
-          setStatus("idle");
+      ws.onclose = (event) => {
+        addTranscript("system", `WebSocket closed (code: ${event.code}, reason: "${event.reason || "none"}", clean: ${event.wasClean})`);
+        addTranscript("system", `Stats: ${audioChunksReceived} audio chunks received`);
+        // Only reset if this ws is still the active one (avoid stale closure killing new session)
+        if (wsRef.current === null || wsRef.current === ws) {
+          setStatus((prev) => prev !== "idle" ? "idle" : prev);
         }
       };
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Connection failed");
+      const msg = e instanceof Error ? e.message : "Connection failed";
+      addTranscript("system", `Connection failed: ${msg}`);
+      setError(msg);
       setStatus("error");
     }
-  }, [sourceLang, targetLang, bidirectional, addTranscript, playAudioChunk, status]);
+  }, [sourceLang, targetLang, bidirectional, provider, addTranscript, playAudioChunk, status]);
 
   const startMicrophone = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          sampleRate: 16000,
           channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
+          echoCancellation,
+          autoGainControl,
+          noiseSuppression,
         },
       });
       streamRef.current = stream;
 
-      const ctx = new AudioContext({ sampleRate: 16000 });
+      // Use native sample rate — forcing 16kHz kills mic on macOS WebKit (Tauri).
+      // Downsampling happens inside the AudioWorklet processor.
+      const ctx = new AudioContext();
       audioContextRef.current = ctx;
+      const targetRate = inputSampleRateRef.current;
+      addTranscript("system", `Audio: native ${ctx.sampleRate}Hz → downsample to ${targetRate}Hz`);
 
       // Register worklet
       const blob = new Blob([WORKLET_CODE], { type: "application/javascript" });
@@ -250,25 +432,58 @@ export function Interpreter({
       URL.revokeObjectURL(url);
 
       const source = ctx.createMediaStreamSource(stream);
-      const workletNode = new AudioWorkletNode(ctx, "pcm-capture-processor");
+      const workletNode = new AudioWorkletNode(ctx, "pcm-capture-processor", {
+        processorOptions: { sourceRate: ctx.sampleRate, targetRate },
+      });
       workletNodeRef.current = workletNode;
 
+      let sentChunks = 0;
       workletNode.port.onmessage = (e) => {
         const ws = wsRef.current;
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(e.data);
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        // Distinguish VAD messages from audio data
+        if (e.data && typeof e.data === "object" && !(e.data instanceof ArrayBuffer) && e.data.type === "vad") {
+          // Only send activityStart/End for Gemini (manual/RMS VAD).
+          // OpenAI uses server-side semantic VAD — no client signals needed.
+          if (activeProviderRef.current === "gemini") {
+            if (e.data.speaking) {
+              ws.send(JSON.stringify({ type: "activity_start" }));
+              addTranscript("system", "VAD: speech detected → activityStart");
+            } else {
+              ws.send(JSON.stringify({ type: "activity_end" }));
+              addTranscript("system", "VAD: silence detected → activityEnd");
+            }
+          }
+          return;
+        }
+
+        // Audio data (ArrayBuffer) — always send
+        ws.send(e.data);
+        sentChunks++;
+        if (sentChunks === 1) {
+          addTranscript("system", `First audio chunk sent (${e.data.byteLength} bytes)`);
+        } else if (sentChunks % 50 === 0) {
+          addTranscript("system", `Audio chunks sent: ${sentChunks}`);
         }
       };
 
       source.connect(workletNode);
       workletNode.connect(ctx.destination); // needed to keep processor alive
 
+      // RMS VAD in worklet sends activityStart when speech is detected,
+      // ensuring it arrives before audio chunks (VAD needs 200ms of speech to trigger).
+
+      addTranscript("system", "Microphone active — listening...");
       setStatus("listening");
     } catch (e) {
-      setError("Microphone access denied");
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("Microphone error:", e);
+      addTranscript("system", `Microphone error: ${msg}`);
+      setError(`Microphone error: ${msg}`);
       setStatus("error");
     }
-  }, []);
+  }, [addTranscript, echoCancellation, autoGainControl, noiseSuppression]);
 
   // Stop microphone only — keep WS and playback alive for remaining translation
   const stopMicrophone = useCallback(() => {
@@ -286,7 +501,7 @@ export function Interpreter({
     }
   }, []);
 
-  // Full cleanup — close WS, playback, reset state
+  // Full cleanup — close WS, defer playback ctx close until audio finishes
   const endSession = useCallback(() => {
     stopMicrophone();
 
@@ -295,16 +510,46 @@ export function Interpreter({
       wsRef.current = null;
     }
 
-    if (playbackCtxRef.current) {
-      playbackCtxRef.current.close();
-      playbackCtxRef.current = null;
+    // Don't close playbackCtx immediately — scheduled audio is still playing.
+    // Wait until all scheduled audio finishes, then close.
+    // Capture ref so delayed close won't affect a new session's ctx.
+    const ctx = playbackCtxRef.current;
+    playbackCtxRef.current = null; // detach immediately so new session gets fresh ctx
+    if (ctx) {
+      const remaining = Math.max(0, (nextPlayTimeRef.current - ctx.currentTime) * 1000);
+      const closeDelay = remaining + 500; // +500ms safety
+      setTimeout(() => {
+        ctx.close();
+      }, closeDelay);
+    }
+
+    // Reset all playback state for next session
+    nextPlayTimeRef.current = 0;
+    micMutedRef.current = false;
+    playbackChunkCountRef.current = 0;
+    if (muteTimerRef.current) {
+      clearTimeout(muteTimerRef.current);
+      muteTimerRef.current = null;
     }
 
     setStatus("idle");
   }, [stopMicrophone]);
 
-  // Graceful stop: mic off → notify server → wait for turn_complete → end
+  // Graceful stop: activityEnd (if still speaking) → mic off → notify server → wait for turn_complete → end
   const handleStop = useCallback(() => {
+    addTranscript("system", "Stopping — mic off...");
+
+    // For Gemini: force activityEnd in case VAD hasn't sent it yet (user pressed Stop mid-speech)
+    // For OpenAI: semantic VAD handles this server-side, no signal needed
+    if (activeProviderRef.current === "gemini" && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(JSON.stringify({ type: "activity_end" }));
+        addTranscript("system", "Stop: activityEnd sent (safety)");
+      } catch {
+        // ignore send errors
+      }
+    }
+
     stopMicrophone();
 
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -315,10 +560,14 @@ export function Interpreter({
       }
     }
 
+    addTranscript("system", "Waiting for remaining translation...");
     setStatus("stopping");
 
     // Safety timeout: if turn_complete never arrives, force end after 10s
+    // Capture current ws ref so timeout won't kill a new session
+    const currentWs = wsRef.current;
     setTimeout(() => {
+      if (wsRef.current !== currentWs) return; // new session started, skip
       setStatus((prev) => {
         if (prev === "stopping") {
           endSession();
@@ -406,6 +655,46 @@ export function Interpreter({
           />
           <span>{t("interpreter_bidirectional", locale)}</span>
         </label>
+
+        <select
+          value={provider}
+          onChange={(e) => setProvider(e.target.value as VoiceProvider)}
+          disabled={isActive}
+          className="provider-select"
+          title="Voice AI provider"
+        >
+          <option value="gemini">🤖 Gemini</option>
+          <option value="openai">🧠 GPT</option>
+        </select>
+
+        <button
+          className={`audio-mode-btn ${speakerMode ? "speaker" : "earphone"}`}
+          onClick={() => setSpeakerMode((v) => !v)}
+          title={speakerMode
+            ? (locale === "ko" ? "스피커 모드 (순차 통역)" : "Speaker mode (sequential)")
+            : (locale === "ko" ? "이어폰 모드 (동시 통역)" : "Earphone mode (simultaneous)")}
+        >
+          {speakerMode ? "🔊" : "🎧"}{" "}
+          {speakerMode
+            ? (locale === "ko" ? "스피커" : "Speaker")
+            : (locale === "ko" ? "이어폰" : "Earphone")}
+        </button>
+      </div>
+
+      {/* Audio processing toggles */}
+      <div className="audio-processing-toggles">
+        <label className="audio-toggle" title="Echo Cancellation — removes speaker feedback from mic input">
+          <input type="checkbox" checked={echoCancellation} onChange={(e) => setEchoCancellation(e.target.checked)} disabled={isActive} />
+          <span>AEC</span>
+        </label>
+        <label className="audio-toggle" title="Auto Gain Control — normalizes mic volume automatically">
+          <input type="checkbox" checked={autoGainControl} onChange={(e) => setAutoGainControl(e.target.checked)} disabled={isActive} />
+          <span>AGC</span>
+        </label>
+        <label className="audio-toggle" title="Noise Suppression — filters background noise">
+          <input type="checkbox" checked={noiseSuppression} onChange={(e) => setNoiseSuppression(e.target.checked)} disabled={isActive} />
+          <span>NS</span>
+        </label>
       </div>
 
       {/* Transcript area */}
@@ -419,7 +708,7 @@ export function Interpreter({
         {transcripts.map((tr) => (
           <div key={tr.id} className={`transcript-item transcript-${tr.type}`}>
             <span className="transcript-badge">
-              {tr.type === "input" ? "🗣️" : "🔊"}
+              {tr.type === "input" ? "🗣️" : tr.type === "output" ? "🔊" : "⚙️"}
             </span>
             <span className="transcript-text">{tr.text}</span>
           </div>
