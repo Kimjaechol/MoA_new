@@ -50,9 +50,12 @@ FROM debian:bookworm-slim AS runtime
 # Install only the minimal runtime dependencies.
 # - ca-certificates: TLS root certificates for HTTPS provider/channel calls.
 # - libssl3: OpenSSL runtime library.
+# - gosu: Secure privilege dropping (entrypoint runs as root to fix volume
+#   permissions, then drops to zeroclaw user via gosu).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
+        gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user for the runtime process.
@@ -64,6 +67,9 @@ WORKDIR /app
 # Create workspace and config directories with gateway config.
 # allow_public_bind is required because Railway routes external traffic
 # through its reverse proxy to 0.0.0.0 inside the container.
+# NOTE: These directories are created as a fallback for non-volume deploys.
+# When a Railway volume is mounted at /app/.zeroclaw, the entrypoint script
+# re-creates subdirectories and fixes ownership at runtime.
 RUN mkdir -p /app/.zeroclaw /app/workspace \
     && printf 'default_temperature = 0.7\n\n[gateway]\nallow_public_bind = true\n' > /app/.zeroclaw/config.toml \
     && chmod 600 /app/.zeroclaw/config.toml \
@@ -71,6 +77,10 @@ RUN mkdir -p /app/.zeroclaw /app/workspace \
 
 # Copy the compiled binary from the builder stage.
 COPY --from=builder /build/zeroclaw /usr/local/bin/zeroclaw
+
+# Copy the entrypoint script that fixes volume mount permissions.
+COPY deploy/railway/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Environment variables for Railway.
 # ZEROCLAW_HOST: Bind to all interfaces (required for Railway port forwarding).
@@ -83,10 +93,10 @@ ENV HOME=/app
 # Expose the gateway port.
 EXPOSE 8080
 
-# Run as non-root for security.
-USER zeroclaw
+# Start as root so entrypoint.sh can fix volume permissions.
+# The entrypoint drops to the zeroclaw user via gosu before exec'ing the CMD.
+ENTRYPOINT ["entrypoint.sh"]
 
 # Start the ZeroClaw gateway server.
-# Shell form is required so $PORT is expanded at runtime.
-# Railway injects PORT; falls back to ZEROCLAW_PORT (3000) if unset.
-CMD zeroclaw gateway --host 0.0.0.0 --port ${PORT:-8080}
+# exec form required with ENTRYPOINT; PORT expansion handled via shell wrapper.
+CMD ["sh", "-c", "zeroclaw gateway --host 0.0.0.0 --port ${PORT:-8080}"]
