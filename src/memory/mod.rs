@@ -437,7 +437,6 @@ pub fn create_synced_memory(
         let engine = sync::SyncEngine::new(
             workspace_dir,
             true,
-            sync_config.passphrase.as_deref(),
         )?;
         let engine = Arc::new(parking_lot::Mutex::new(engine));
         let base_arc: Arc<dyn Memory> = Arc::from(base);
