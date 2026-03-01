@@ -132,10 +132,12 @@ impl LineChannel {
                 if let Some(ref store) = self.pairing_store {
                     if store.is_paired("line", user_id) {
                         let uid = user_id.to_string();
-                        std::thread::spawn(move || {
-                            if let Err(e) = pairing::persist_channel_allowlist("line", &uid) {
-                                tracing::error!("LINE: failed to persist pairing: {e}");
-                            }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = pairing::persist_channel_allowlist("line", &uid) {
+                                    tracing::error!("LINE: failed to persist pairing: {e}");
+                                }
+                            }).await.ok();
                         });
                         // Fall through to process message
                     } else {
@@ -262,6 +264,8 @@ fn split_message(text: &str, max_len: usize) -> Vec<&str> {
             .rfind('\n')
             .or_else(|| remaining[..max_len].rfind(' '))
             .unwrap_or(max_len);
+        // Prevent infinite loop when no boundary is found at position 0
+        let boundary = if boundary == 0 { max_len } else { boundary };
         let (chunk, rest) = remaining.split_at(boundary);
         chunks.push(chunk);
         remaining = rest.trim_start_matches('\n');

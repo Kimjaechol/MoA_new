@@ -406,6 +406,7 @@ mod tests {
             content: content.into(),
             channel: channel.into(),
             timestamp: 1000,
+            thread_ts: None,
         }
     }
 

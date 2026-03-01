@@ -9,7 +9,6 @@
 use anyhow::Result;
 use chrono::Local;
 use rusqlite::{params, Connection};
-use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 

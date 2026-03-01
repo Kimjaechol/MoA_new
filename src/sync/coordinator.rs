@@ -526,7 +526,7 @@ mod tests {
 
     fn make_coordinator(tmp: &TempDir) -> Arc<SyncCoordinator> {
         let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-        let engine = Arc::new(Mutex::new(SyncEngine::new(tmp.path(), true, Some("test-passphrase")).unwrap()));
+        let engine = Arc::new(Mutex::new(SyncEngine::new(tmp.path(), true).unwrap()));
         let synced = Arc::new(SyncedMemory::new(mem, engine));
         Arc::new(SyncCoordinator::new(synced, 50))
     }
@@ -622,7 +622,7 @@ mod tests {
         let coord_b = make_coordinator(&tmp_b);
 
         // Create deltas from device A
-        let engine_a = SyncEngine::new(tmp_a.path(), true, Some("test-passphrase")).unwrap();
+        let engine_a = SyncEngine::new(tmp_a.path(), true).unwrap();
         let device_a_id = engine_a.device_id().0.clone();
         drop(engine_a);
 

@@ -1038,10 +1038,10 @@ mod tests {
         };
 
         let prompt = config.build_system_prompt();
-        assert!(prompt.contains("bidirectional mode"));
-        // Should mention both directions explicitly
-        assert!(prompt.contains("speaks Japanese, immediately interpret into Korean"));
-        assert!(prompt.contains("speaks Korean, immediately interpret into Japanese"));
+        assert!(prompt.contains("Bidirectional: Japanese ↔ Korean"));
+        // Should instruct detection and output in the OTHER language
+        assert!(prompt.contains("Detect input language"));
+        assert!(prompt.contains("Output the OTHER language immediately"));
     }
 
     #[test]
