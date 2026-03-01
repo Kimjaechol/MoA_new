@@ -25,6 +25,112 @@ use uuid::Uuid;
 
 const EMPTY_WS_RESPONSE_FALLBACK: &str =
     "Tool execution completed, but the model returned no final text response. Please ask me to summarize the result.";
+
+// ── WebSocket Sync Handler ──────────────────────────────────────────────
+
+/// WebSocket endpoint for real-time cross-device memory sync.
+///
+/// Protocol: Devices exchange `BroadcastMessage` JSON frames.
+/// The coordinator handles message dispatch and responds with
+/// zero or more outbound messages per inbound frame.
+pub async fn handle_ws_sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let query_params = parse_ws_query_params(query.as_deref());
+
+    // Auth
+    if state.pairing.require_pairing() {
+        let token =
+            extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
+        if !state.pairing.is_authenticated(&token) {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+            )
+                .into_response();
+        }
+    }
+
+    let coordinator = match state.sync_coordinator.clone() {
+        Some(c) => c,
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Sync not enabled",
+            )
+                .into_response();
+        }
+    };
+
+    ws.on_upgrade(move |socket| handle_sync_socket(socket, coordinator))
+        .into_response()
+}
+
+/// Process sync WebSocket messages via the SyncCoordinator.
+async fn handle_sync_socket(
+    socket: WebSocket,
+    coordinator: std::sync::Arc<crate::sync::SyncCoordinator>,
+) {
+    let (mut sender, mut receiver) = socket.split();
+    use futures_util::SinkExt;
+
+    tracing::info!(
+        device_id = %coordinator.device_id(),
+        "Sync WebSocket connected"
+    );
+
+    // Send initial SyncRequest to catch up on missed deltas
+    let initial_request = serde_json::json!({
+        "SyncRequest": {
+            "from_device_id": coordinator.device_id(),
+            "version_vector": coordinator.version(),
+        }
+    });
+    let _ = sender
+        .send(Message::Text(initial_request.to_string().into()))
+        .await;
+
+    while let Some(msg) = receiver.next().await {
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!("Sync WS receive error: {e}");
+                break;
+            }
+        };
+
+        let text = match msg {
+            Message::Text(t) => t.to_string(),
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => continue,
+            _ => continue,
+        };
+
+        if text.is_empty() {
+            continue;
+        }
+
+        let responses = coordinator.handle_message(&text).await;
+        for response_json in responses {
+            if sender
+                .send(Message::Text(response_json.into()))
+                .await
+                .is_err()
+            {
+                tracing::debug!("Sync WS send error, closing");
+                return;
+            }
+        }
+    }
+
+    tracing::info!(
+        device_id = %coordinator.device_id(),
+        "Sync WebSocket disconnected"
+    );
+}
 const WS_HISTORY_MEMORY_KEY_PREFIX: &str = "gateway_ws_history";
 const MAX_WS_PERSISTED_TURNS: usize = 128;
 const MAX_WS_SESSION_ID_LEN: usize = 128;

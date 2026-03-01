@@ -6,6 +6,7 @@ import { Login } from "./components/Login";
 import { SignUp } from "./components/SignUp";
 import { DeviceSelect } from "./components/DeviceSelect";
 import { Interpreter } from "./components/Interpreter";
+import { SetupWizard } from "./components/SetupWizard";
 import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated } from "./lib/tauri-bridge";
@@ -21,7 +22,7 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "login" | "signup" | "device_select" | "chat" | "settings" | "interpreter";
+type Page = "setup" | "login" | "signup" | "device_select" | "chat" | "settings" | "interpreter";
 
 function App() {
   const [page, setPage] = useState<Page>("login");
@@ -46,8 +47,14 @@ function App() {
     setActiveChatId(activeChatId);
   }, [activeChatId]);
 
-  // Check auth on startup
+  // Check auth on startup — show setup wizard for first-time users
   useEffect(() => {
+    const setupComplete = localStorage.getItem("moa_setup_complete");
+    if (!setupComplete) {
+      setPage("setup");
+      return;
+    }
+
     if (apiClient.isLoggedIn()) {
       // Already have a token → go to chat
       setIsConnected(true);
@@ -281,6 +288,18 @@ function App() {
   }, []);
 
   // ── Render ─────────────────────────────────────────────────────
+
+  // First-time setup wizard (no sidebar)
+  if (page === "setup") {
+    return (
+      <div className="app">
+        <SetupWizard
+          locale={locale}
+          onComplete={() => setPage("login")}
+        />
+      </div>
+    );
+  }
 
   // Auth screens (no sidebar)
   if (page === "login") {

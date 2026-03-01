@@ -67,8 +67,16 @@ class ZeroClawApp : Application(), Configuration.Provider {
                 }
         }
 
-        // TODO: Initialize native library
-        // System.loadLibrary("zeroclaw_android")
+        // Initialize ZeroClaw native bridge
+        applicationScope.launch(Dispatchers.IO) {
+            try {
+                val dataDir = filesDir.absolutePath
+                ai.zeroclaw.android.bridge.ZeroClawBridge.initialize(dataDir)
+                android.util.Log.i("ZeroClawApp", "Native bridge initialized: $dataDir")
+            } catch (e: Exception) {
+                android.util.Log.w("ZeroClawApp", "Native bridge init failed (expected if .so not bundled): ${e.message}")
+            }
+        }
     }
 
     private fun createNotificationChannels() {

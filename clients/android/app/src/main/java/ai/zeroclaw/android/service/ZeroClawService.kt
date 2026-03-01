@@ -9,6 +9,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import ai.zeroclaw.android.MainActivity
 import ai.zeroclaw.android.ZeroClawApp
+import ai.zeroclaw.android.bridge.ZeroClawBridge
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -65,16 +66,17 @@ class ZeroClawService : Service() {
 
         scope.launch {
             try {
-                // TODO: Initialize and start ZeroClaw native library
-                // ZeroClawBridge.start(configPath)
+                // Initialize bridge if not already done
+                if (!ZeroClawBridge.isLoaded()) {
+                    val dataDir = applicationContext.filesDir.absolutePath
+                    ZeroClawBridge.initialize(dataDir).getOrThrow()
+                }
+
+                // Start the local ZeroClaw gateway
+                val configPath = applicationContext.filesDir.absolutePath + "/config.toml"
+                ZeroClawBridge.start(configPath).getOrThrow()
 
                 _status.value = Status.Running
-
-                // TODO: Start message loop
-                // while (isActive) {
-                //     val message = ZeroClawBridge.pollMessage()
-                //     message?.let { _lastMessage.value = it }
-                // }
             } catch (e: Exception) {
                 _status.value = Status.Error(e.message ?: "Unknown error")
             }
@@ -83,14 +85,19 @@ class ZeroClawService : Service() {
 
     private fun stopAgent() {
         scope.launch {
-            // TODO: ZeroClawBridge.stop()
+            ZeroClawBridge.stop()
             _status.value = Status.Stopped
         }
     }
 
     private fun sendMessage(message: String) {
         scope.launch {
-            // TODO: ZeroClawBridge.sendMessage(message)
+            try {
+                val response = ZeroClawBridge.sendMessage(message).getOrThrow()
+                _lastMessage.value = response
+            } catch (e: Exception) {
+                _lastMessage.value = "Error: ${e.message}"
+            }
         }
     }
 

@@ -1019,6 +1019,127 @@ fn hydrate_config_for_save(
     incoming
 }
 
+// ── Sync endpoints (cross-device memory sync) ────────────────────
+
+/// Push local deltas to the sync coordinator for relay to other devices.
+///
+/// Request body:
+/// ```json
+/// { "version_vector": { "clocks": { "device_a": 5 } } }
+/// ```
+///
+/// Response: encrypted sync payload with deltas the requester hasn't seen.
+pub async fn handle_sync_push(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let coordinator = match &state.sync_coordinator {
+        Some(c) => c.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "Sync not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Parse the incoming message and delegate to coordinator
+    let json_str = body.to_string();
+    let responses = coordinator.handle_message(&json_str).await;
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "device_id": coordinator.device_id(),
+        "responses": responses,
+    }))
+    .into_response()
+}
+
+/// Pull missing deltas from this device's sync coordinator.
+///
+/// Request body:
+/// ```json
+/// { "version_vector": { "clocks": { "device_b": 3 } } }
+/// ```
+///
+/// Response: deltas the requester hasn't seen.
+pub async fn handle_sync_pull(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let coordinator = match &state.sync_coordinator {
+        Some(c) => c.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "Sync not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Build a SyncRequest message from the body and process it
+    let from_device = body
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let version_vector = body.get("version_vector").cloned().unwrap_or_default();
+
+    let sync_request = serde_json::json!({
+        "SyncRequest": {
+            "from_device_id": from_device,
+            "version_vector": version_vector,
+        }
+    });
+
+    let responses = coordinator.handle_message(&sync_request.to_string()).await;
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "device_id": coordinator.device_id(),
+        "version": coordinator.version(),
+        "responses": responses,
+    }))
+    .into_response()
+}
+
+/// Get current sync status (device ID, version vector, journal size).
+pub async fn handle_sync_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match &state.sync_coordinator {
+        Some(coordinator) => Json(serde_json::json!({
+            "enabled": true,
+            "device_id": coordinator.device_id(),
+            "version": coordinator.version(),
+        }))
+        .into_response(),
+        None => Json(serde_json::json!({
+            "enabled": false,
+            "device_id": null,
+            "version": null,
+        }))
+        .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
