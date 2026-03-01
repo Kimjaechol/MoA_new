@@ -6,7 +6,7 @@
 //! ## Design
 //! - **Version Vectors**: Causal ordering via Lamport-like version vectors per device
 //! - **Delta Journals**: Compact change records (store/forget) with timestamps
-//! - **E2E Encryption**: All sync payloads encrypted with ChaCha20-Poly1305 before transit
+//! - **E2E Encryption**: AES-256-GCM with PBKDF2-derived keys (patent-specified)
 //! - **Conflict Resolution**: Last-writer-wins with device priority tiebreaker
 //! - **Journal Retention**: 30-day rolling window for delta entries
 //!
@@ -15,8 +15,8 @@
 //! - **Pull**: On startup, request missing deltas from peers
 //! - **Full Sync**: Periodic full reconciliation for consistency
 
-use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,8 +26,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Maximum age for delta journal entries before pruning (30 days).
 const JOURNAL_RETENTION_SECS: u64 = 30 * 24 * 3600;
 
-/// Nonce size for ChaCha20-Poly1305 (12 bytes).
+/// Nonce size for AES-256-GCM (12 bytes / 96 bits).
 const NONCE_SIZE: usize = 12;
+
+/// PBKDF2 iteration count (600,000 per OWASP 2023 recommendation for HMAC-SHA256).
+const PBKDF2_ITERATIONS: u32 = 600_000;
+
+/// Salt size for PBKDF2 (16 bytes).
+const PBKDF2_SALT_SIZE: usize = 16;
 
 /// Unique identifier for a device in the sync mesh.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -133,8 +139,10 @@ pub struct SyncEngine {
     version: VersionVector,
     /// Delta journal (in-memory cache, persisted to SQLite on write).
     journal: Vec<DeltaEntry>,
-    /// Encryption key for sync payloads (32 bytes).
+    /// AES-256-GCM encryption key for sync payloads (32 bytes).
     encryption_key: [u8; 32],
+    /// PBKDF2 salt used for key derivation (persisted alongside key).
+    pbkdf2_salt: [u8; PBKDF2_SALT_SIZE],
     /// Path to the sync state SQLite database.
     db_path: PathBuf,
     /// Whether sync is enabled.
@@ -247,8 +255,28 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// Derive a 256-bit AES key from a passphrase using PBKDF2-HMAC-SHA256.
+    fn derive_key(passphrase: &str, salt: &[u8; PBKDF2_SALT_SIZE]) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
+            passphrase.as_bytes(),
+            salt,
+            PBKDF2_ITERATIONS,
+            &mut key,
+        );
+        key
+    }
+
     /// Create a new sync engine for the given workspace.
-    pub fn new(workspace_dir: &Path, enabled: bool) -> anyhow::Result<Self> {
+    ///
+    /// If `passphrase` is provided, the encryption key is derived via
+    /// PBKDF2-HMAC-SHA256 (patent-specified). Otherwise, falls back to a
+    /// random key file for backward compatibility.
+    pub fn new(
+        workspace_dir: &Path,
+        enabled: bool,
+        passphrase: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("sync_state.db");
 
         // Load or generate device ID
@@ -262,21 +290,47 @@ impl SyncEngine {
             id
         };
 
-        // Load or generate encryption key
-        let key_path = workspace_dir.join(".sync_key");
-        let encryption_key = if key_path.exists() {
-            let key_bytes = std::fs::read(&key_path)?;
-            if key_bytes.len() != 32 {
-                anyhow::bail!("Invalid sync key length (expected 32 bytes)");
+        // Load or generate PBKDF2 salt
+        let salt_path = workspace_dir.join(".sync_salt");
+        let pbkdf2_salt = if salt_path.exists() {
+            let salt_bytes = std::fs::read(&salt_path)?;
+            if salt_bytes.len() != PBKDF2_SALT_SIZE {
+                anyhow::bail!(
+                    "Invalid sync salt length (expected {} bytes, got {})",
+                    PBKDF2_SALT_SIZE,
+                    salt_bytes.len()
+                );
             }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&key_bytes);
-            key
+            let mut salt = [0u8; PBKDF2_SALT_SIZE];
+            salt.copy_from_slice(&salt_bytes);
+            salt
         } else {
-            let mut key = [0u8; 32];
-            OsRng.fill_bytes(&mut key);
-            std::fs::write(&key_path, key)?;
-            key
+            let mut salt = [0u8; PBKDF2_SALT_SIZE];
+            OsRng.fill_bytes(&mut salt);
+            std::fs::write(&salt_path, salt)?;
+            salt
+        };
+
+        // Derive encryption key via PBKDF2 if passphrase provided,
+        // otherwise fall back to random key file (backward compat).
+        let encryption_key = if let Some(phrase) = passphrase {
+            Self::derive_key(phrase, &pbkdf2_salt)
+        } else {
+            let key_path = workspace_dir.join(".sync_key");
+            if key_path.exists() {
+                let key_bytes = std::fs::read(&key_path)?;
+                if key_bytes.len() != 32 {
+                    anyhow::bail!("Invalid sync key length (expected 32 bytes)");
+                }
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&key_bytes);
+                key
+            } else {
+                let mut key = [0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                std::fs::write(&key_path, key)?;
+                key
+            }
         };
 
         if enabled {
@@ -288,6 +342,7 @@ impl SyncEngine {
             version: VersionVector::default(),
             journal: Vec::new(),
             encryption_key,
+            pbkdf2_salt,
             db_path,
             enabled,
         };
@@ -440,12 +495,12 @@ impl SyncEngine {
         applied
     }
 
-    /// Encrypt delta entries for transit.
+    /// Encrypt delta entries for transit using AES-256-GCM.
     pub fn encrypt_deltas(&self, deltas: &[DeltaEntry]) -> anyhow::Result<SyncPayload> {
         let plaintext = serde_json::to_vec(deltas)?;
 
-        let cipher = ChaCha20Poly1305::new_from_slice(&self.encryption_key)
-            .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
+        let cipher = Aes256Gcm::new_from_slice(&self.encryption_key)
+            .map_err(|e| anyhow::anyhow!("Failed to create AES-256-GCM cipher: {e}"))?;
 
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         OsRng.fill_bytes(&mut nonce_bytes);
@@ -453,7 +508,7 @@ impl SyncEngine {
 
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_ref())
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("AES-256-GCM encryption failed: {e}"))?;
 
         use base64::Engine;
         Ok(SyncPayload {
@@ -464,7 +519,7 @@ impl SyncEngine {
         })
     }
 
-    /// Decrypt a sync payload from a remote device.
+    /// Decrypt a sync payload from a remote device using AES-256-GCM.
     pub fn decrypt_payload(&self, payload: &SyncPayload) -> anyhow::Result<Vec<DeltaEntry>> {
         use base64::Engine;
 
@@ -475,13 +530,13 @@ impl SyncEngine {
 
         let ciphertext = base64::engine::general_purpose::STANDARD.decode(&payload.ciphertext)?;
 
-        let cipher = ChaCha20Poly1305::new_from_slice(&self.encryption_key)
-            .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
+        let cipher = Aes256Gcm::new_from_slice(&self.encryption_key)
+            .map_err(|e| anyhow::anyhow!("Failed to create AES-256-GCM cipher: {e}"))?;
 
         let nonce = Nonce::from_slice(&nonce_bytes);
         let plaintext = cipher
             .decrypt(nonce, ciphertext.as_ref())
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("AES-256-GCM decryption failed: {e}"))?;
 
         let deltas: Vec<DeltaEntry> = serde_json::from_slice(&plaintext)?;
         Ok(deltas)
@@ -590,7 +645,7 @@ mod tests {
     #[test]
     fn sync_engine_record_and_get_deltas() {
         let tmp = TempDir::new().unwrap();
-        let mut engine = SyncEngine::new(tmp.path(), true).unwrap();
+        let mut engine = SyncEngine::new(tmp.path(), true, Some("test-passphrase")).unwrap();
 
         engine.record_store("key1", "value1", "general");
         engine.record_store("key2", "value2", "conversation");
@@ -608,8 +663,8 @@ mod tests {
         let tmp1 = TempDir::new().unwrap();
         let tmp2 = TempDir::new().unwrap();
 
-        let mut engine1 = SyncEngine::new(tmp1.path(), true).unwrap();
-        let mut engine2 = SyncEngine::new(tmp2.path(), true).unwrap();
+        let mut engine1 = SyncEngine::new(tmp1.path(), true, Some("test-passphrase")).unwrap();
+        let mut engine2 = SyncEngine::new(tmp2.path(), true, Some("test-passphrase")).unwrap();
 
         engine1.record_store("shared_key", "from_device_1", "general");
 
@@ -632,7 +687,7 @@ mod tests {
     #[test]
     fn sync_engine_encrypt_decrypt_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        let mut engine = SyncEngine::new(tmp.path(), true).unwrap();
+        let mut engine = SyncEngine::new(tmp.path(), true, Some("test-passphrase")).unwrap();
 
         engine.record_store("secret_key", "secret_value", "general");
 
@@ -656,7 +711,7 @@ mod tests {
     #[test]
     fn sync_engine_prune_journal() {
         let tmp = TempDir::new().unwrap();
-        let mut engine = SyncEngine::new(tmp.path(), true).unwrap();
+        let mut engine = SyncEngine::new(tmp.path(), true, Some("test-passphrase")).unwrap();
 
         // Add an entry with a very old timestamp
         engine.journal.push(DeltaEntry {
@@ -681,7 +736,7 @@ mod tests {
     #[test]
     fn sync_engine_disabled_skips_recording() {
         let tmp = TempDir::new().unwrap();
-        let mut engine = SyncEngine::new(tmp.path(), false).unwrap();
+        let mut engine = SyncEngine::new(tmp.path(), false, None).unwrap();
 
         engine.record_store("key", "value", "general");
         assert_eq!(engine.journal_len(), 0);
@@ -691,10 +746,10 @@ mod tests {
     fn device_id_persists_across_instances() {
         let tmp = TempDir::new().unwrap();
 
-        let engine1 = SyncEngine::new(tmp.path(), true).unwrap();
+        let engine1 = SyncEngine::new(tmp.path(), true, Some("test-passphrase")).unwrap();
         let id1 = engine1.device_id().0.clone();
 
-        let engine2 = SyncEngine::new(tmp.path(), true).unwrap();
+        let engine2 = SyncEngine::new(tmp.path(), true, Some("test-passphrase")).unwrap();
         let id2 = engine2.device_id().0.clone();
 
         assert_eq!(id1, id2);
@@ -706,7 +761,7 @@ mod tests {
 
         // Create engine and record some entries
         {
-            let mut engine = SyncEngine::new(tmp.path(), true).unwrap();
+            let mut engine = SyncEngine::new(tmp.path(), true, Some("test-passphrase")).unwrap();
             engine.record_store("persistent_key", "persistent_value", "general");
             engine.record_forget("old_key");
             assert_eq!(engine.journal_len(), 2);
@@ -714,7 +769,7 @@ mod tests {
 
         // Create new engine from same directory — should load persisted journal
         {
-            let engine = SyncEngine::new(tmp.path(), true).unwrap();
+            let engine = SyncEngine::new(tmp.path(), true, Some("test-passphrase")).unwrap();
             assert_eq!(engine.journal_len(), 2);
 
             // Verify the operations were preserved
@@ -735,8 +790,8 @@ mod tests {
         let tmp1 = TempDir::new().unwrap();
         let tmp2 = TempDir::new().unwrap();
 
-        let mut engine1 = SyncEngine::new(tmp1.path(), true).unwrap();
-        let mut engine2 = SyncEngine::new(tmp2.path(), true).unwrap();
+        let mut engine1 = SyncEngine::new(tmp1.path(), true, Some("test-passphrase")).unwrap();
+        let mut engine2 = SyncEngine::new(tmp2.path(), true, Some("test-passphrase")).unwrap();
 
         engine1.record_store("key", "value", "general");
 
@@ -753,5 +808,91 @@ mod tests {
         // Apply same deltas again — should be idempotent
         let applied2 = engine2.apply_deltas(deltas);
         assert_eq!(applied2.len(), 0);
+    }
+
+    #[test]
+    fn pbkdf2_key_derivation_is_deterministic() {
+        let salt = [42u8; PBKDF2_SALT_SIZE];
+        let key1 = SyncEngine::derive_key("my-passphrase", &salt);
+        let key2 = SyncEngine::derive_key("my-passphrase", &salt);
+        assert_eq!(key1, key2);
+
+        // Different passphrase → different key
+        let key3 = SyncEngine::derive_key("other-passphrase", &salt);
+        assert_ne!(key1, key3);
+
+        // Different salt → different key
+        let salt2 = [99u8; PBKDF2_SALT_SIZE];
+        let key4 = SyncEngine::derive_key("my-passphrase", &salt2);
+        assert_ne!(key1, key4);
+    }
+
+    #[test]
+    fn passphrase_engines_share_encryption() {
+        // Two engines with the same passphrase and same salt should
+        // be able to decrypt each other's payloads.
+        let tmp = TempDir::new().unwrap();
+
+        let mut engine1 = SyncEngine::new(tmp.path(), true, Some("shared-secret")).unwrap();
+        engine1.record_store("cross_device", "shared_data", "general");
+
+        let deltas: Vec<DeltaEntry> = engine1
+            .get_deltas_since(&VersionVector::default())
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let payload = engine1.encrypt_deltas(&deltas).unwrap();
+
+        // Second engine from same dir inherits same salt → derives same key
+        let engine2 = SyncEngine::new(tmp.path(), true, Some("shared-secret")).unwrap();
+        let decrypted = engine2.decrypt_payload(&payload).unwrap();
+        assert_eq!(decrypted.len(), 1);
+        assert!(matches!(
+            &decrypted[0].operation,
+            DeltaOperation::Store { key, content, .. }
+            if key == "cross_device" && content == "shared_data"
+        ));
+    }
+
+    #[test]
+    fn wrong_passphrase_fails_decryption() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut engine1 = SyncEngine::new(tmp.path(), true, Some("correct-passphrase")).unwrap();
+        engine1.record_store("secret", "data", "general");
+
+        let deltas: Vec<DeltaEntry> = engine1
+            .get_deltas_since(&VersionVector::default())
+            .into_iter()
+            .cloned()
+            .collect();
+        let payload = engine1.encrypt_deltas(&deltas).unwrap();
+
+        // New engine with wrong passphrase (same salt since same dir)
+        let engine2 = SyncEngine::new(tmp.path(), true, Some("wrong-passphrase")).unwrap();
+        assert!(engine2.decrypt_payload(&payload).is_err());
+    }
+
+    #[test]
+    fn fallback_random_key_without_passphrase() {
+        // Without passphrase, engine should use random key file
+        let tmp = TempDir::new().unwrap();
+        let mut engine = SyncEngine::new(tmp.path(), true, None).unwrap();
+        engine.record_store("key", "value", "general");
+
+        let deltas: Vec<DeltaEntry> = engine
+            .get_deltas_since(&VersionVector::default())
+            .into_iter()
+            .cloned()
+            .collect();
+
+        // Encrypt/decrypt with same engine should work
+        let payload = engine.encrypt_deltas(&deltas).unwrap();
+        let decrypted = engine.decrypt_payload(&payload).unwrap();
+        assert_eq!(decrypted.len(), 1);
+
+        // Verify .sync_key file was created
+        assert!(tmp.path().join(".sync_key").exists());
     }
 }

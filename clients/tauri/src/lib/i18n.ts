@@ -125,6 +125,24 @@ type TranslationKey =
   | "new_pairing_code"
   | "save_pairing_code"
   | "account_info"
+  // API Keys & Credits
+  | "api_keys"
+  | "api_key_claude"
+  | "api_key_openai"
+  | "api_key_gemini"
+  | "api_key_placeholder"
+  | "api_key_saved"
+  | "api_key_cleared"
+  | "api_key_hint"
+  | "credits"
+  | "credit_balance"
+  | "credit_buy"
+  | "credit_history"
+  | "credit_package_basic"
+  | "credit_package_standard"
+  | "credit_package_premium"
+  | "credit_package_pro"
+  | "credit_operator_hint"
   // Sidebar sections
   | "sidebar_devices"
   | "sidebar_channels"
@@ -246,6 +264,24 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     new_pairing_code: "New pairing code",
     save_pairing_code: "Save",
     account_info: "Account",
+    // API Keys & Credits
+    api_keys: "API Keys",
+    api_key_claude: "Claude (Anthropic)",
+    api_key_openai: "OpenAI",
+    api_key_gemini: "Gemini (Google)",
+    api_key_placeholder: "sk-... or AIza...",
+    api_key_saved: "API key saved",
+    api_key_cleared: "API key removed",
+    api_key_hint: "Use your own key for free. Without a key, operator credits are used (2x cost).",
+    credits: "Credits",
+    credit_balance: "Balance",
+    credit_buy: "Buy Credits",
+    credit_history: "History",
+    credit_package_basic: "Basic",
+    credit_package_standard: "Standard",
+    credit_package_premium: "Premium",
+    credit_package_pro: "Pro",
+    credit_operator_hint: "Credits are used when you don't have your own API key (2x actual cost).",
     // Sidebar sections
     sidebar_devices: "Devices",
     sidebar_channels: "Channels",
@@ -366,6 +402,24 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     new_pairing_code: "\uC0C8 \uD398\uC5B4\uB9C1 \uCF54\uB4DC",
     save_pairing_code: "\uC800\uC7A5",
     account_info: "\uACC4\uC815 \uC815\uBCF4",
+    // API Keys & Credits
+    api_keys: "API \uD0A4",
+    api_key_claude: "Claude (Anthropic)",
+    api_key_openai: "OpenAI",
+    api_key_gemini: "Gemini (Google)",
+    api_key_placeholder: "sk-... \uB610\uB294 AIza...",
+    api_key_saved: "API \uD0A4\uAC00 \uC800\uC7A5\uB418\uC5C8\uC2B5\uB2C8\uB2E4",
+    api_key_cleared: "API \uD0A4\uAC00 \uC81C\uAC70\uB418\uC5C8\uC2B5\uB2C8\uB2E4",
+    api_key_hint: "\uC790\uC2E0\uC758 \uD0A4\uB97C \uC0AC\uC6A9\uD558\uBA74 \uBB34\uB8CC\uC785\uB2C8\uB2E4. \uD0A4 \uC5C6\uC774 \uC0AC\uC6A9 \uC2DC \uC6B4\uC601\uC790 \uD06C\uB808\uB527 \uCC28\uAC10 (2\uBC30).",
+    credits: "\uD06C\uB808\uB527",
+    credit_balance: "\uC794\uC561",
+    credit_buy: "\uD06C\uB808\uB527 \uCDA9\uC804",
+    credit_history: "\uC774\uC6A9 \uB0B4\uC5ED",
+    credit_package_basic: "\uBCA0\uC774\uC9C1",
+    credit_package_standard: "\uC2A4\uD0E0\uB2E4\uB4DC",
+    credit_package_premium: "\uD504\uB9AC\uBBF8\uC5C4",
+    credit_package_pro: "\uD504\uB85C",
+    credit_operator_hint: "\uC790\uC2E0\uC758 API \uD0A4\uAC00 \uC5C6\uC744 \uB54C \uD06C\uB808\uB527\uC774 \uC0AC\uC6A9\uB429\uB2C8\uB2E4 (\uC2E4\uC81C \uBE44\uC6A9\uC758 2\uBC30).",
     // Sidebar sections
     sidebar_devices: "\uB514\uBC14\uC774\uC2A4",
     sidebar_channels: "\uCC44\uB110",

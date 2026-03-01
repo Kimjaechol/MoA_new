@@ -62,6 +62,9 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 
+# PBKDF2 for passphrase-based key derivation (patent-specified sync encryption)
+pbkdf2 = { version = "0.12", features = ["simple"] }
+
 # CSPRNG for secure token generation
 rand = "0.8"
 

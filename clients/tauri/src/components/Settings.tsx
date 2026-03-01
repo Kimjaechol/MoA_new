@@ -10,6 +10,20 @@ interface SettingsProps {
   onLogout: () => void;
 }
 
+const API_KEY_STORAGE_PREFIX = "moa_api_key_";
+
+function getStoredApiKey(provider: string): string {
+  return localStorage.getItem(`${API_KEY_STORAGE_PREFIX}${provider}`) || "";
+}
+
+function setStoredApiKey(provider: string, key: string): void {
+  if (key) {
+    localStorage.setItem(`${API_KEY_STORAGE_PREFIX}${provider}`, key);
+  } else {
+    localStorage.removeItem(`${API_KEY_STORAGE_PREFIX}${provider}`);
+  }
+}
+
 export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsProps) {
   const [serverUrl, setServerUrl] = useState(apiClient.getServerUrl());
   const [isHealthChecking, setIsHealthChecking] = useState(false);
@@ -20,6 +34,10 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [editingPairingDevice, setEditingPairingDevice] = useState<string | null>(null);
   const [newPairingCode, setNewPairingCode] = useState("");
+  const [claudeKey, setClaudeKey] = useState(() => getStoredApiKey("anthropic"));
+  const [openaiKey, setOpenaiKey] = useState(() => getStoredApiKey("openai"));
+  const [geminiKey, setGeminiKey] = useState(() => getStoredApiKey("gemini"));
+  const [creditBalance, setCreditBalance] = useState<number | null>(null);
   const inTauri = isTauri();
   const user = apiClient.getUser();
   const isLoggedIn = apiClient.isLoggedIn();
@@ -32,8 +50,21 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     }
     if (isLoggedIn) {
       apiClient.getDevices().then(setDevices).catch(() => {});
+      // Load credit balance
+      apiClient.getCreditBalance?.()
+        .then((b: number) => setCreditBalance(b))
+        .catch(() => setCreditBalance(null));
     }
   }, [inTauri, isLoggedIn]);
+
+  const handleSaveApiKey = useCallback((provider: string, key: string) => {
+    setStoredApiKey(provider, key);
+    setMessage({
+      type: "success",
+      text: key ? t("api_key_saved", locale) : t("api_key_cleared", locale),
+    });
+    clearMessage();
+  }, [locale, clearMessage]);
 
   const clearMessage = useCallback(() => {
     setTimeout(() => setMessage(null), 5000);
@@ -250,6 +281,112 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
                     </div>
                   );
                 })}
+              </div>
+            </div>
+          )}
+
+          {/* API Keys section */}
+          {isLoggedIn && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("api_keys", locale)}</div>
+              <div className="settings-card">
+                <p style={{ fontSize: 12, color: "var(--color-text-muted)", marginBottom: 12 }}>
+                  {t("api_key_hint", locale)}
+                </p>
+                <div className="settings-field">
+                  <label className="settings-label">{t("api_key_claude", locale)}</label>
+                  <div className="settings-input-row">
+                    <input
+                      className="settings-input"
+                      type="password"
+                      value={claudeKey}
+                      onChange={(e) => setClaudeKey(e.target.value)}
+                      placeholder={t("api_key_placeholder", locale)}
+                    />
+                    <button
+                      className="settings-btn settings-btn-secondary settings-btn-sm"
+                      onClick={() => handleSaveApiKey("anthropic", claudeKey)}
+                    >
+                      {locale === "ko" ? "\uC800\uC7A5" : "Save"}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-field" style={{ marginTop: 8 }}>
+                  <label className="settings-label">{t("api_key_openai", locale)}</label>
+                  <div className="settings-input-row">
+                    <input
+                      className="settings-input"
+                      type="password"
+                      value={openaiKey}
+                      onChange={(e) => setOpenaiKey(e.target.value)}
+                      placeholder={t("api_key_placeholder", locale)}
+                    />
+                    <button
+                      className="settings-btn settings-btn-secondary settings-btn-sm"
+                      onClick={() => handleSaveApiKey("openai", openaiKey)}
+                    >
+                      {locale === "ko" ? "\uC800\uC7A5" : "Save"}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-field" style={{ marginTop: 8 }}>
+                  <label className="settings-label">{t("api_key_gemini", locale)}</label>
+                  <div className="settings-input-row">
+                    <input
+                      className="settings-input"
+                      type="password"
+                      value={geminiKey}
+                      onChange={(e) => setGeminiKey(e.target.value)}
+                      placeholder={t("api_key_placeholder", locale)}
+                    />
+                    <button
+                      className="settings-btn settings-btn-secondary settings-btn-sm"
+                      onClick={() => handleSaveApiKey("gemini", geminiKey)}
+                    >
+                      {locale === "ko" ? "\uC800\uC7A5" : "Save"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Credits section */}
+          {isLoggedIn && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("credits", locale)}</div>
+              <div className="settings-card">
+                <p style={{ fontSize: 12, color: "var(--color-text-muted)", marginBottom: 12 }}>
+                  {t("credit_operator_hint", locale)}
+                </p>
+                <div className="settings-field">
+                  <label className="settings-label">{t("credit_balance", locale)}</label>
+                  <div className="settings-token-display" style={{ fontSize: 18, fontWeight: 600 }}>
+                    {creditBalance !== null ? `${creditBalance.toLocaleString()} C` : "---"}
+                  </div>
+                </div>
+                <div className="settings-credit-packages" style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  {[
+                    { id: "basic_1000", name: t("credit_package_basic", locale), price: "\u20A91,000", credits: "100C" },
+                    { id: "standard_3000", name: t("credit_package_standard", locale), price: "\u20A93,000", credits: "350C" },
+                    { id: "premium_5000", name: t("credit_package_premium", locale), price: "\u20A95,000", credits: "650C" },
+                    { id: "pro_10000", name: t("credit_package_pro", locale), price: "\u20A910,000", credits: "1,500C" },
+                  ].map((pkg) => (
+                    <button
+                      key={pkg.id}
+                      className="settings-btn settings-btn-secondary"
+                      style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "8px 4px", fontSize: 12 }}
+                      onClick={() => {
+                        // TODO: Wire to Kakao Pay payment flow
+                        setMessage({ type: "success", text: `${pkg.name} - ${locale === "ko" ? "\uACB0\uC81C \uAE30\uB2A5 \uC900\uBE44 \uC911" : "Payment coming soon"}` });
+                        clearMessage();
+                      }}
+                    >
+                      <span style={{ fontWeight: 600 }}>{pkg.name}</span>
+                      <span style={{ color: "var(--color-text-muted)" }}>{pkg.price} = {pkg.credits}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
           )}

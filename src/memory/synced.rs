@@ -289,7 +289,7 @@ mod tests {
     fn setup() -> (TempDir, Arc<dyn Memory>, Arc<Mutex<SyncEngine>>) {
         let tmp = TempDir::new().unwrap();
         let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-        let sync = Arc::new(Mutex::new(SyncEngine::new(tmp.path(), true).unwrap()));
+        let sync = Arc::new(Mutex::new(SyncEngine::new(tmp.path(), true, Some("test-passphrase")).unwrap()));
         (tmp, mem, sync)
     }
 
@@ -442,11 +442,11 @@ mod tests {
         let tmp_b = TempDir::new().unwrap();
 
         let mem_a: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp_a.path()).unwrap());
-        let sync_a = Arc::new(Mutex::new(SyncEngine::new(tmp_a.path(), true).unwrap()));
+        let sync_a = Arc::new(Mutex::new(SyncEngine::new(tmp_a.path(), true, Some("test-passphrase")).unwrap()));
         let synced_a = SyncedMemory::new(mem_a, sync_a.clone());
 
         let mem_b: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp_b.path()).unwrap());
-        let sync_b = Arc::new(Mutex::new(SyncEngine::new(tmp_b.path(), true).unwrap()));
+        let sync_b = Arc::new(Mutex::new(SyncEngine::new(tmp_b.path(), true, Some("test-passphrase")).unwrap()));
         let synced_b = SyncedMemory::new(mem_b.clone(), sync_b);
 
         // Device A stores a memory
