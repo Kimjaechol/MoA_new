@@ -7,41 +7,56 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-pub mod pair;
+pub mod api;
+mod openai_compat;
+mod openclaw_compat;
+pub mod sse;
+pub mod static_files;
+pub mod ws;
 
-use crate::agent::agent::Agent;
-use crate::channels::{Channel, SendMessage, WhatsAppChannel};
+use crate::channels::{
+    BlueBubblesChannel, Channel, GitHubChannel, LinqChannel, NextcloudTalkChannel, QQChannel,
+    SendMessage, WatiChannel, WhatsAppChannel,
+};
 use crate::config::Config;
+use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::providers::{self, ChatMessage, Provider};
+use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
+use crate::security::SecurityPolicy;
+use crate::tools::traits::ToolSpec;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
-    body::Bytes,
-    extract::{Query, State},
+    body::{Body, Bytes},
+    extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
-    routing::{get, post},
+    response::{IntoResponse, Json, Response},
+    routing::{delete, get, post, put},
     Router,
 };
+use futures_util::StreamExt;
 use parking_lot::Mutex;
-use serde::Deserialize as GatewayDeserialize;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (120s) — allows agentic tool execution while preventing abuse
-pub const REQUEST_TIMEOUT_SECS: u64 = 120;
+/// Request timeout (30s) — prevents slow-loris attacks
+pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+/// Fallback max distinct client keys tracked in gateway rate limiter.
+pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
+/// Fallback max distinct idempotency keys retained in gateway memory.
+pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
@@ -49,6 +64,41 @@ fn webhook_memory_key() -> String {
 
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
+
+fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("linq_{}_{}", msg.sender, msg.id)
+}
+
+fn github_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("github_{}_{}", msg.sender, msg.id)
+}
+
+fn bluebubbles_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("bluebubbles_{}_{}", msg.sender, msg.id)
+}
+
+fn wati_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("wati_{}_{}", msg.sender, msg.id)
+}
+
+fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
+}
+
+fn qq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("qq_{}_{}", msg.sender, msg.id)
+}
+
+fn gateway_message_session_id(msg: &crate::channels::traits::ChannelMessage) -> String {
+    if msg.channel == "qq" || msg.channel == "napcat" {
+        return format!("{}_{}", msg.channel, msg.sender);
+    }
+
+    match &msg.thread_ts {
+        Some(thread_id) => format!("{}_{}_{}", msg.channel, thread_id, msg.sender),
+        None => format!("{}_{}", msg.channel, msg.sender),
+    }
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -65,16 +115,25 @@ const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 struct SlidingWindowRateLimiter {
     limit_per_window: u32,
     window: Duration,
+    max_keys: usize,
     requests: Mutex<(HashMap<String, Vec<Instant>>, Instant)>,
 }
 
 impl SlidingWindowRateLimiter {
-    fn new(limit_per_window: u32, window: Duration) -> Self {
+    fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
         Self {
             limit_per_window,
             window,
+            max_keys: max_keys.max(1),
             requests: Mutex::new((HashMap::new(), Instant::now())),
         }
+    }
+
+    fn prune_stale(requests: &mut HashMap<String, Vec<Instant>>, cutoff: Instant) {
+        requests.retain(|_, timestamps| {
+            timestamps.retain(|t| *t > cutoff);
+            !timestamps.is_empty()
+        });
     }
 
     fn allow(&self, key: &str) -> bool {
@@ -88,13 +147,26 @@ impl SlidingWindowRateLimiter {
         let mut guard = self.requests.lock();
         let (requests, last_sweep) = &mut *guard;
 
-        // Periodic sweep: remove IPs with no recent requests
+        // Periodic sweep: remove keys with no recent requests
         if last_sweep.elapsed() >= Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS) {
-            requests.retain(|_, timestamps| {
-                timestamps.retain(|t| *t > cutoff);
-                !timestamps.is_empty()
-            });
+            Self::prune_stale(requests, cutoff);
             *last_sweep = now;
+        }
+
+        if !requests.contains_key(key) && requests.len() >= self.max_keys {
+            // Opportunistic stale cleanup before eviction under cardinality pressure.
+            Self::prune_stale(requests, cutoff);
+            *last_sweep = now;
+
+            if requests.len() >= self.max_keys {
+                let evict_key = requests
+                    .iter()
+                    .min_by_key(|(_, timestamps)| timestamps.last().copied().unwrap_or(cutoff))
+                    .map(|(k, _)| k.clone());
+                if let Some(evict_key) = evict_key {
+                    requests.remove(&evict_key);
+                }
+            }
         }
 
         let entry = requests.entry(key.to_owned()).or_default();
@@ -116,11 +188,11 @@ pub struct GatewayRateLimiter {
 }
 
 impl GatewayRateLimiter {
-    fn new(pair_per_minute: u32, webhook_per_minute: u32) -> Self {
+    fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
-            pair: SlidingWindowRateLimiter::new(pair_per_minute, window),
-            webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window),
+            pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
+            webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
         }
     }
 
@@ -136,13 +208,15 @@ impl GatewayRateLimiter {
 #[derive(Debug)]
 pub struct IdempotencyStore {
     ttl: Duration,
+    max_keys: usize,
     keys: Mutex<HashMap<String, Instant>>,
 }
 
 impl IdempotencyStore {
-    fn new(ttl: Duration) -> Self {
+    fn new(ttl: Duration, max_keys: usize) -> Self {
         Self {
             ttl,
+            max_keys: max_keys.max(1),
             keys: Mutex::new(HashMap::new()),
         }
     }
@@ -158,26 +232,82 @@ impl IdempotencyStore {
             return false;
         }
 
+        if keys.len() >= self.max_keys {
+            let evict_key = keys
+                .iter()
+                .min_by_key(|(_, seen_at)| *seen_at)
+                .map(|(k, _)| k.clone());
+            if let Some(evict_key) = evict_key {
+                keys.remove(&evict_key);
+            }
+        }
+
         keys.insert(key.to_owned(), now);
         true
     }
 }
 
-fn client_key_from_headers(headers: &HeaderMap) -> String {
-    for header_name in ["X-Forwarded-For", "X-Real-IP"] {
-        if let Some(value) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
-            let first = value.split(',').next().unwrap_or("").trim();
-            if !first.is_empty() {
-                return first.to_owned();
+fn parse_client_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim().trim_matches('"').trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip);
+    }
+
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Some(addr.ip());
+    }
+
+    let value = value.trim_matches(['[', ']']);
+    value.parse::<IpAddr>().ok()
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
+        for candidate in xff.split(',') {
+            if let Some(ip) = parse_client_ip(candidate) {
+                return Some(ip);
             }
         }
     }
-    "unknown".into()
+
+    headers
+        .get("X-Real-IP")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_client_ip)
+}
+
+pub(crate) fn client_key_from_request(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_forwarded_headers: bool,
+) -> String {
+    if trust_forwarded_headers {
+        if let Some(ip) = forwarded_client_ip(headers) {
+            return ip.to_string();
+        }
+    }
+
+    peer_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
+    if configured == 0 {
+        fallback.max(1)
+    } else {
+        configured
+    }
 }
 
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
+    pub config: Arc<Mutex<Config>>,
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub temperature: f64,
@@ -186,50 +316,47 @@ pub struct AppState {
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
+    pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
-    /// LINE channel (if configured) for webhook-based message handling.
-    pub line: Option<Arc<crate::channels::line::LineChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
-    /// SLM gatekeeper for local intent classification + simple response.
-    pub gatekeeper: Option<Arc<tokio::sync::Mutex<crate::gatekeeper::GatekeeperRouter>>>,
-    /// Agent with tools for agentic webhook handling.
-    /// When `Some`, `/webhook` uses `agent.turn()` (tools enabled).
-    /// When `None`, falls back to `provider.simple_chat()` (no tools).
-    pub agent: Option<Arc<tokio::sync::Mutex<Agent>>>,
-    /// Admin telemetry store for usage analytics.
-    pub telemetry: Option<Arc<crate::telemetry::TelemetryStore>>,
-    /// Admin token hash for telemetry API authentication.
-    pub telemetry_admin_token_hash: Option<Arc<str>>,
-    /// Multi-user auth store (when auth.enabled = true).
-    pub auth_store: Option<Arc<crate::auth::AuthStore>>,
-    /// Whether new user registration is allowed.
-    pub auth_allow_registration: bool,
-    /// Maximum registered users (0 = unlimited).
-    pub auth_max_users: u64,
-    /// Maximum devices per user.
-    pub auth_max_devices_per_user: u32,
-    /// Temporary relay for sync Layer 1 (TTL-based in-memory storage).
-    pub sync_relay: Option<Arc<crate::sync::SyncRelay>>,
-    /// Broadcast channel for sync WebSocket messages.
-    pub sync_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
-    /// Shared pairing store for channel connect flow.
-    pub channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>>,
-    /// Base URL for this gateway (e.g. "http://127.0.0.1:3000").
-    pub gateway_base_url: String,
-    /// Voice session manager for real-time interpretation.
-    pub voice_sessions: Arc<crate::voice::VoiceSessionManager>,
-    /// Voice config for API key resolution and provider defaults.
-    pub voice_config: crate::config::VoiceConfig,
-    /// Names of active (configured) channels for sidebar display.
-    pub active_channel_names: Vec<String>,
+    pub linq: Option<Arc<LinqChannel>>,
+    /// Linq webhook signing secret for signature verification
+    pub linq_signing_secret: Option<Arc<str>>,
+    pub bluebubbles: Option<Arc<BlueBubblesChannel>>,
+    /// BlueBubbles inbound webhook secret for Bearer auth verification
+    pub bluebubbles_webhook_secret: Option<Arc<str>>,
+    pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+    /// Nextcloud Talk webhook secret for signature verification
+    pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    pub wati: Option<Arc<WatiChannel>>,
+    pub qq: Option<Arc<QQChannel>>,
+    pub qq_webhook_enabled: bool,
+    /// Observability backend for metrics scraping
+    pub observer: Arc<dyn crate::observability::Observer>,
+    /// Registered tool specs (for web dashboard tools page)
+    pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Executable tools for agent loop (web chat)
+    pub tools_registry_exec: Arc<Vec<Box<dyn Tool>>>,
+    /// Multimodal config for image handling in web chat
+    pub multimodal: crate::config::MultimodalConfig,
+    /// Max tool iterations for agent loop
+    pub max_tool_iterations: usize,
+    /// Cost tracker (optional, for web dashboard cost page)
+    pub cost_tracker: Option<Arc<CostTracker>>,
+    /// SSE broadcast channel for real-time events
+    pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
+    if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+        tracing::warn!("plugin registry initialization skipped: {error}");
+    }
+
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
@@ -239,30 +366,96 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
     }
+    let config_state = Arc::new(Mutex::new(config.clone()));
+
+    // ── Hooks ──────────────────────────────────────────────────────
+    let hooks = crate::hooks::HookRunner::from_config(&config.hooks).map(std::sync::Arc::new);
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
+        &providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: config.api_url.clone(),
+            provider_transport: config.effective_provider_transport(),
+            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            secrets_encrypt: config.secrets.encrypt,
+            reasoning_enabled: config.runtime.reasoning_enabled,
+            reasoning_level: config.effective_provider_reasoning_level(),
+            custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+            max_tokens_override: None,
+            model_support_vision: config.model_support_vision,
+        },
     )?);
     let model = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "google/gemini-3.1-pro-preview".into());
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
+        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    // Note: runtime, security, tools, and composio are created internally
-    // by Agent::from_config() — no need to create them here.
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let tools_registry_exec: Arc<Vec<Box<dyn Tool>>> = Arc::new(tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        Arc::clone(&mem),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    ));
+    let tools_registry: Arc<Vec<ToolSpec>> =
+        Arc::new(tools_registry_exec.iter().map(|t| t.spec()).collect());
+    let max_tool_iterations = config.agent.max_tool_iterations;
+    let multimodal_config = config.multimodal.clone();
+
+    // Cost tracker (optional)
+    let cost_tracker = if config.cost.enabled {
+        match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+            Ok(ct) => Some(Arc::new(ct)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize cost tracker: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // SSE broadcast channel for real-time events
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -273,51 +466,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             })
         });
 
-    // ── Channel pairing store (shared SQLite for gateway+channels) ──
-    let pairing_db_path = config.workspace_dir.join("pairing.db");
-    let channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>> =
-        match crate::channels::pairing::ChannelPairingStore::open(&pairing_db_path) {
-            Ok(store) => {
-                tracing::info!(
-                    "Channel pairing store initialized at {}",
-                    pairing_db_path.display()
-                );
-                Some(Arc::new(store))
-            }
-            Err(e) => {
-                tracing::warn!("Failed to open channel pairing store: {e} — pairing disabled");
-                None
-            }
-        };
-
-    // LINE channel (if configured)
-    let line_channel: Option<Arc<crate::channels::line::LineChannel>> =
-        config.channels_config.line.as_ref().map(|line| {
-            Arc::new(crate::channels::line::LineChannel::new(
-                line.channel_access_token.clone(),
-                line.channel_secret.clone(),
-                line.allowed_users.clone(),
-                channel_pairing.clone(),
-                Some(format!(
-                    "http://{}:{}",
-                    config.gateway.host, config.gateway.port
-                )),
-            ))
-        });
-
     // WhatsApp channel (if configured)
-    let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
-        config.channels_config.whatsapp.as_ref().map(|wa| {
+    let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
+        .channels_config
+        .whatsapp
+        .as_ref()
+        .filter(|wa| wa.is_cloud_config())
+        .map(|wa| {
             Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone(),
-                wa.phone_number_id.clone(),
-                wa.verify_token.clone(),
+                wa.access_token.clone().unwrap_or_default(),
+                wa.phone_number_id.clone().unwrap_or_default(),
+                wa.verify_token.clone().unwrap_or_default(),
                 wa.allowed_numbers.clone(),
-                channel_pairing.clone(),
-                Some(format!(
-                    "http://{}:{}",
-                    config.gateway.host, config.gateway.port
-                )),
             ))
         });
 
@@ -340,108 +500,133 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         })
         .map(Arc::from);
 
-    // ── SLM Gatekeeper ────────────────────────────────────
-    let gatekeeper = if config.gatekeeper.enabled {
-        let mut router = crate::gatekeeper::GatekeeperRouter::from_config(&config.gatekeeper);
-        let healthy = router.check_slm_health().await;
-        if healthy {
-            tracing::info!(
-                model = config.gatekeeper.model,
-                "SLM gatekeeper active — local routing enabled"
-            );
-        } else {
-            tracing::warn!(
-                "SLM gatekeeper enabled but Ollama not reachable — will fall back to cloud"
-            );
-        }
-        Some(Arc::new(tokio::sync::Mutex::new(router)))
-    } else {
-        None
-    };
+    // Linq channel (if configured)
+    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
+        Arc::new(LinqChannel::new(
+            lq.api_token.clone(),
+            lq.from_phone.clone(),
+            lq.allowed_senders.clone(),
+        ))
+    });
 
-    // ── Telemetry ─────────────────────────────────────────
-    let (telemetry, telemetry_admin_token_hash) = if config.telemetry.enabled {
-        match crate::telemetry::TelemetryStore::new(&config.workspace_dir, config.telemetry.clone())
-        {
-            Ok(store) => {
-                tracing::info!("Telemetry store initialized");
-                let hash = config.telemetry.admin_token.as_deref().map(|token| {
-                    use sha2::{Digest, Sha256};
-                    let h = format!("{:x}", Sha256::digest(token.as_bytes()));
-                    Arc::from(h.as_str())
-                });
-                (Some(Arc::new(store)), hash)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize telemetry store: {e}");
-                (None, None)
-            }
-        }
-    } else {
-        (None, None)
-    };
+    // Linq signing secret for webhook signature verification
+    // Priority: environment variable > config file
+    let linq_signing_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINQ_SIGNING_SECRET")
+        .ok()
+        .and_then(|secret| {
+            let secret = secret.trim();
+            (!secret.is_empty()).then(|| secret.to_owned())
+        })
+        .or_else(|| {
+            config.channels_config.linq.as_ref().and_then(|lq| {
+                lq.signing_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|secret| !secret.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .map(Arc::from);
 
-    // ── Auth store (multi-user) ─────────────────────────────
-    let auth_store = if config.auth.enabled {
-        let auth_db = config.workspace_dir.join("auth.db");
-        match crate::auth::AuthStore::new(&auth_db, Some(config.auth.session_ttl_secs)) {
-            Ok(store) => {
-                tracing::info!("Multi-user auth store initialized");
-                Some(Arc::new(store))
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize auth store: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let auth_allow_registration = config.auth.allow_registration;
-    let auth_max_users = config.auth.max_users;
-    let auth_max_devices_per_user = config.auth.max_devices_per_user;
+    // BlueBubbles channel (if configured)
+    let bluebubbles_channel: Option<Arc<BlueBubblesChannel>> =
+        config.channels_config.bluebubbles.as_ref().map(|bb| {
+            Arc::new(BlueBubblesChannel::new(
+                bb.server_url.clone(),
+                bb.password.clone(),
+                bb.allowed_senders.clone(),
+                bb.ignore_senders.clone(),
+            ))
+        });
+    let bluebubbles_webhook_secret: Option<Arc<str>> = config
+        .channels_config
+        .bluebubbles
+        .as_ref()
+        .and_then(|bb| bb.webhook_secret.as_deref())
+        .map(Arc::from);
 
-    // ── Sync relay + broadcast ───────────────────────────────
-    let (sync_relay, sync_broadcast) = if config.sync.enabled {
-        let relay = Arc::new(crate::sync::SyncRelay::with_ttl(config.sync.relay_ttl_secs));
-        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(256);
-        tracing::info!(
-            ttl = config.sync.relay_ttl_secs,
-            "Sync relay + broadcast channel initialized"
-        );
-
-        // Periodic relay sweep (every 60 seconds)
-        let relay_for_sweep = Arc::clone(&relay);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                let removed = relay_for_sweep.sweep_expired();
-                if removed > 0 {
-                    tracing::debug!(removed, "Swept expired relay entries");
-                }
-            }
+    // WATI channel (if configured)
+    let wati_channel: Option<Arc<WatiChannel>> =
+        config.channels_config.wati.as_ref().map(|wati_cfg| {
+            Arc::new(WatiChannel::new(
+                wati_cfg.api_token.clone(),
+                wati_cfg.api_url.clone(),
+                wati_cfg.tenant_id.clone(),
+                wati_cfg.allowed_numbers.clone(),
+            ))
         });
 
-        (Some(relay), Some(tx))
-    } else {
-        (None, None)
-    };
+    // QQ channel (if configured)
+    let qq_channel: Option<Arc<QQChannel>> = config.channels_config.qq.as_ref().map(|qq_cfg| {
+        Arc::new(QQChannel::new_with_environment(
+            qq_cfg.app_id.clone(),
+            qq_cfg.app_secret.clone(),
+            qq_cfg.allowed_users.clone(),
+            qq_cfg.environment.clone(),
+        ))
+    });
+    let qq_webhook_enabled = config
+        .channels_config
+        .qq
+        .as_ref()
+        .is_some_and(|qq| qq.receive_mode == crate::config::schema::QQReceiveMode::Webhook);
+
+    // Nextcloud Talk channel (if configured)
+    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
+        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
+            Arc::new(NextcloudTalkChannel::new(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nc.allowed_users.clone(),
+            ))
+        });
+
+    // Nextcloud Talk webhook secret for signature verification
+    // Priority: environment variable > config file
+    let nextcloud_talk_webhook_secret: Option<Arc<str>> =
+        std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
+            .ok()
+            .and_then(|secret| {
+                let secret = secret.trim();
+                (!secret.is_empty()).then(|| secret.to_owned())
+            })
+            .or_else(|| {
+                config
+                    .channels_config
+                    .nextcloud_talk
+                    .as_ref()
+                    .and_then(|nc| {
+                        nc.webhook_secret
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|secret| !secret.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
+            })
+            .map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
-        config.gateway.owner_username.as_deref(),
-        config.gateway.owner_password.as_deref(),
     ));
+    let rate_limit_max_keys = normalize_max_keys(
+        config.gateway.rate_limit_max_keys,
+        RATE_LIMIT_MAX_KEYS_DEFAULT,
+    );
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
         config.gateway.webhook_rate_limit_per_minute,
+        rate_limit_max_keys,
     ));
-    let idempotency_store = Arc::new(IdempotencyStore::new(Duration::from_secs(
-        config.gateway.idempotency_ttl_secs.max(1),
-    )));
+    let idempotency_max_keys = normalize_max_keys(
+        config.gateway.idempotency_max_keys,
+        IDEMPOTENCY_MAX_KEYS_DEFAULT,
+    );
+    let idempotency_store = Arc::new(IdempotencyStore::new(
+        Duration::from_secs(config.gateway.idempotency_ttl_secs.max(1)),
+        idempotency_max_keys,
+    ));
 
     // ── Tunnel ────────────────────────────────────────────────
     let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
@@ -465,55 +650,49 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
+    println!("  🌐 Web Dashboard: http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
+    println!("  POST /api/chat  — {{\"message\": \"...\", \"context\": [...]}} (tools-enabled, OpenClaw compat)");
     if whatsapp_channel.is_some() {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
-    if line_channel.is_some() {
-        println!("  POST /line      — LINE message webhook");
+    if linq_channel.is_some() {
+        println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
-    println!("  GET  /pair/connect/{{channel}} — channel pairing login page");
-    println!("  GET  /pair/signup            — channel pairing signup page");
+    if config.channels_config.github.is_some() {
+        println!("  POST /github    — GitHub issue/PR comment webhook");
+    }
+    if bluebubbles_channel.is_some() {
+        println!("  POST /bluebubbles — BlueBubbles iMessage webhook");
+    }
+    if wati_channel.is_some() {
+        println!("  GET  /wati      — WATI webhook verification");
+        println!("  POST /wati      — WATI message webhook");
+    }
+    if nextcloud_talk_channel.is_some() {
+        println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
+    }
+    if qq_webhook_enabled {
+        println!("  POST /qq        — QQ Bot webhook (validation + events)");
+    }
+    if config.gateway.node_control.enabled {
+        println!("  POST /api/node-control — experimental node-control RPC scaffold");
+    }
+    println!("  POST /v1/chat/completions — OpenAI-compatible (full agent loop)");
+    println!("  GET  /v1/models — list available models");
+    println!("  GET  /api/*     — REST API (bearer token required)");
+    println!("  GET  /ws/chat   — WebSocket agent chat");
     println!("  GET  /health    — health check");
-    if config.sync.enabled {
-        println!("  WS   /sync      — WebSocket sync broadcast channel");
-        println!("  POST /api/sync/relay  — upload encrypted data to relay");
-        println!("  GET  /api/sync/relay  — pickup pending relay entries");
-    }
-    if config.auth.enabled {
-        println!("  POST /api/auth/register            — create new user account");
-        println!("  POST /api/auth/login               — authenticate and get session token");
-        println!("  POST /api/auth/logout              — revoke current session");
-        println!("  GET  /api/auth/me                  — current user info");
-        println!("  GET  /api/auth/devices             — list user devices");
-        println!("  POST /api/auth/devices             — register a device");
-        println!("  DELETE /api/auth/devices/:id       — remove a device");
-    }
-    if config.telemetry.enabled {
-        println!("  POST /api/telemetry/events        — ingest telemetry events");
-        println!("  GET  /api/admin/telemetry/events   — query events (admin)");
-        println!("  GET  /api/admin/telemetry/summary  — usage summary (admin)");
-        println!("  GET  /api/admin/telemetry/alerts   — suspicious alerts (admin)");
-    }
+    println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
         println!();
-        if pairing.requires_credentials() {
-            println!("  🔐 PAIRING REQUIRED — credentials + code:");
-        } else {
-            println!("  🔐 PAIRING REQUIRED — use this code:");
-        }
+        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
         println!("     ┌──────────────┐");
         println!("     │  {code}  │");
         println!("     └──────────────┘");
-        if pairing.requires_credentials() {
-            println!(
-                "     Send: POST /pair with X-Pairing-Code header + {{username, password}} body"
-            );
-        } else {
-            println!("     Send: POST /pair with header X-Pairing-Code: {code}");
-        }
+        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
     } else {
@@ -523,71 +702,23 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     crate::health::mark_component_ok("gateway");
 
-    // ── Agent with tools ─────────────────────────────────────
-    let agent = match Agent::from_config(&config) {
-        Ok(a) => {
-            tracing::info!("Gateway agent initialized with tools");
-            Some(Arc::new(tokio::sync::Mutex::new(a)))
-        }
-        Err(e) => {
-            tracing::warn!("Failed to create gateway agent: {e} — falling back to simple chat");
-            None
-        }
-    };
-
-    // Collect active channel names for sidebar display
-    let mut active_channel_names: Vec<String> = Vec::new();
-    if config.channels_config.cli {
-        active_channel_names.push("CLI".into());
-    }
-    if config.channels_config.webhook.is_some() {
-        active_channel_names.push("Webhook".into());
-    }
-    if config.channels_config.telegram.is_some() {
-        active_channel_names.push("Telegram".into());
-    }
-    if config.channels_config.discord.is_some() {
-        active_channel_names.push("Discord".into());
-    }
-    if config.channels_config.slack.is_some() {
-        active_channel_names.push("Slack".into());
-    }
-    if config.channels_config.whatsapp.is_some() {
-        active_channel_names.push("WhatsApp".into());
-    }
-    if config.channels_config.line.is_some() {
-        active_channel_names.push("LINE".into());
-    }
-    if config.channels_config.signal.is_some() {
-        active_channel_names.push("Signal".into());
-    }
-    if config.channels_config.matrix.is_some() {
-        active_channel_names.push("Matrix".into());
-    }
-    if config.channels_config.irc.is_some() {
-        active_channel_names.push("IRC".into());
-    }
-    if config.channels_config.imessage.is_some() {
-        active_channel_names.push("iMessage".into());
-    }
-    if config.channels_config.email.is_some() {
-        active_channel_names.push("Email".into());
-    }
-    if config.channels_config.lark.is_some() {
-        active_channel_names.push("Lark".into());
-    }
-    if config.channels_config.dingtalk.is_some() {
-        active_channel_names.push("DingTalk".into());
-    }
-    if config.channels_config.qq.is_some() {
-        active_channel_names.push("QQ".into());
-    }
-    if config.channels_config.kakao.is_some() {
-        active_channel_names.push("KakaoTalk".into());
+    // Fire gateway start hook
+    if let Some(ref hooks) = hooks {
+        hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Build shared state
+    // Wrap observer with broadcast capability for SSE
+    // Use cost-tracking observer when cost tracking is enabled
+    let base_observer = crate::observability::create_observer_with_cost_tracking(
+        &config.observability,
+        cost_tracker.clone(),
+        &config.cost,
+    );
+    let broadcast_observer: Arc<dyn crate::observability::Observer> =
+        Arc::new(sse::BroadcastObserver::new(base_observer, event_tx.clone()));
+
     let state = AppState {
+        config: config_state,
         provider,
         model,
         temperature,
@@ -595,128 +726,125 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         auto_save: config.memory.auto_save,
         webhook_secret_hash,
         pairing,
+        trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
         idempotency_store,
         whatsapp: whatsapp_channel,
-        line: line_channel,
         whatsapp_app_secret,
-        gatekeeper,
-        agent,
-        telemetry,
-        telemetry_admin_token_hash,
-        auth_store,
-        auth_allow_registration,
-        auth_max_users,
-        auth_max_devices_per_user,
-        sync_relay,
-        sync_broadcast,
-        channel_pairing,
-        gateway_base_url: format!("http://{}:{}", config.gateway.host, config.gateway.port),
-        voice_sessions: Arc::new(crate::voice::VoiceSessionManager::with_defaults(
-            config.voice.enabled,
-            config.voice.max_sessions_per_user,
-            config.voice.default_source_language.clone(),
-            config.voice.default_target_language.clone(),
-            config.voice.default_provider.clone(),
-        )),
-        voice_config: config.voice.clone(),
-        active_channel_names,
+        linq: linq_channel,
+        linq_signing_secret,
+        bluebubbles: bluebubbles_channel,
+        bluebubbles_webhook_secret,
+        nextcloud_talk: nextcloud_talk_channel,
+        nextcloud_talk_webhook_secret,
+        wati: wati_channel,
+        qq: qq_channel,
+        qq_webhook_enabled,
+        observer: broadcast_observer,
+        tools_registry,
+        tools_registry_exec,
+        multimodal: multimodal_config,
+        max_tool_iterations,
+        cost_tracker,
+        event_tx,
     };
 
-    // Ensure channel_links table exists if auth is enabled
-    if let Some(ref auth) = state.auth_store {
-        if let Err(e) = auth.ensure_channel_links_table() {
-            tracing::warn!("Failed to create channel_links table: {e}");
-        }
-    }
+    // Config PUT needs larger body limit (1MB)
+    let config_put_router = Router::new()
+        .route("/api/config", put(api::handle_api_config_put))
+        .layer(RequestBodyLimitLayer::new(1_048_576));
 
-    // ── CORS — allow web/Tauri clients to connect from any origin ──
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::PUT,
-            axum::http::Method::DELETE,
-            axum::http::Method::OPTIONS,
-        ])
-        .allow_headers([
-            header::AUTHORIZATION,
-            header::CONTENT_TYPE,
-            header::HeaderName::from_static("x-webhook-secret"),
-            header::HeaderName::from_static("x-pairing-code"),
-            header::HeaderName::from_static("x-idempotency-key"),
-        ])
-        .max_age(Duration::from_secs(3600));
+    // The OpenAI-compatible endpoints use a larger body limit (512KB) because
+    // chat histories can be much bigger than the default 64KB webhook limit.
+    // They get their own nested router with a separate body limit layer.
+    //
+    // NOTE: The /v1/chat/completions handler routes through the full agent loop
+    // (run_gateway_chat_with_tools) via openclaw_compat, giving OpenClaw callers
+    // tools + memory support. The original simple-chat handler is preserved in
+    // openai_compat.rs for reference.
+    let openai_compat_routes = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(openclaw_compat::handle_v1_chat_completions_with_tools),
+        )
+        .layer(RequestBodyLimitLayer::new(
+            openai_compat::CHAT_COMPLETIONS_MAX_BODY_SIZE,
+        ));
 
     // Build router with middleware
     let app = Router::new()
+        // ── Existing routes ──
         .route("/health", get(handle_health))
-        .route("/api/navigation", get(handle_navigation))
-        .route("/api/coding/layout", get(handle_coding_layout))
-        .route(
-            "/api/coding/layout/mobile",
-            get(handle_coding_layout_mobile),
-        )
+        .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
-        .route("/webhook", post(handle_webhook))
+        .route("/webhook", get(handle_webhook_usage).post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
-        .route("/line", post(handle_line_message))
-        .route("/api/auth/register", post(handle_auth_register))
-        .route("/api/auth/login", post(handle_auth_login))
-        .route("/api/auth/logout", post(handle_auth_logout))
-        .route("/api/auth/me", get(handle_auth_me))
-        .route("/api/auth/devices", get(handle_auth_devices_list))
-        .route("/api/auth/devices", post(handle_auth_device_register))
+        .route("/linq", post(handle_linq_webhook))
+        .route("/github", post(handle_github_webhook))
+        .route("/bluebubbles", post(handle_bluebubbles_webhook))
+        .route("/wati", get(handle_wati_verify))
+        .route("/wati", post(handle_wati_webhook))
+        .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        .route("/qq", post(handle_qq_webhook))
+        // ── OpenClaw migration: tools-enabled chat endpoint ──
+        .route("/api/chat", post(openclaw_compat::handle_api_chat))
+        // ── OpenAI-compatible endpoints ──
+        .route("/v1/models", get(openai_compat::handle_v1_models))
+        .merge(openai_compat_routes)
+        // ── Web Dashboard API routes ──
+        .route("/api/status", get(api::handle_api_status))
+        .route("/api/config", get(api::handle_api_config_get))
+        .route("/api/tools", get(api::handle_api_tools))
+        .route("/api/cron", get(api::handle_api_cron_list))
+        .route("/api/cron", post(api::handle_api_cron_add))
+        .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
+        .route("/api/integrations", get(api::handle_api_integrations))
         .route(
-            "/api/auth/devices/{device_id}",
-            axum::routing::delete(handle_auth_device_remove),
+            "/api/doctor",
+            get(api::handle_api_doctor).post(api::handle_api_doctor),
         )
+        .route("/api/memory", get(api::handle_api_memory_list))
+        .route("/api/memory", post(api::handle_api_memory_store))
+        .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
+        .route("/api/pairing/devices", get(api::handle_api_pairing_devices))
         .route(
-            "/api/auth/devices/{device_id}/pairing-code",
-            axum::routing::put(handle_auth_device_set_pairing_code),
+            "/api/pairing/devices/{id}",
+            delete(api::handle_api_pairing_device_revoke),
         )
-        .route(
-            "/api/auth/devices/{device_id}/verify-pairing",
-            post(handle_auth_device_verify_pairing),
-        )
-        .route("/api/auth/heartbeat", post(handle_auth_heartbeat))
-        .route("/sync", get(handle_sync_ws))
-        .route("/api/sync/relay", post(handle_sync_relay_upload))
-        .route("/api/sync/relay", get(handle_sync_relay_pickup))
-        .route("/pair/auto/{token}", get(pair::handle_auto_pair_page))
-        .route("/pair/auto/{token}", post(pair::handle_auto_pair_login))
-        .route("/pair/signup", get(pair::handle_pair_signup_page))
-        .route("/pair/signup", post(pair::handle_pair_signup_submit))
-        .route("/api/telemetry/events", post(handle_telemetry_ingest))
-        .route(
-            "/api/admin/telemetry/events",
-            get(handle_admin_telemetry_events),
-        )
-        .route(
-            "/api/admin/telemetry/summary",
-            get(handle_admin_telemetry_summary),
-        )
-        .route(
-            "/api/admin/telemetry/alerts",
-            get(handle_admin_telemetry_alerts),
-        )
-        .route("/api/agent/info", get(handle_agent_info))
-        .route("/api/voice/ui", get(handle_voice_ui))
-        .route("/api/voice/interpret", get(handle_voice_interpret_ws))
-        .route("/api/voice/sessions", get(handle_voice_sessions_list))
-        .route("/api/voice/sessions", post(handle_voice_session_create))
+        .route("/api/cost", get(api::handle_api_cost))
+        .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/health", get(api::handle_api_health))
+        .route("/api/node-control", post(handle_node_control))
+        // ── SSE event stream ──
+        .route("/api/events", get(sse::handle_sse_events))
+        // ── WebSocket agent chat ──
+        .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── Static assets (web dashboard) ──
+        .route("/_app/{*path}", get(static_files::handle_static))
+        // ── Config PUT with larger body limit ──
+        .merge(config_put_router)
         .with_state(state)
-        .layer(cors)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        ));
+        ))
+        // ── SPA fallback: non-API GET requests serve index.html ──
+        .fallback(get(static_files::handle_spa_fallback));
 
     // Run the server
-    axum::serve(listener, app).await?;
+    let serve_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await;
+
+    if let Some(ref hooks) = hooks {
+        hooks.fire_gateway_stop().await;
+    }
+
+    serve_result?;
 
     Ok(())
 }
@@ -730,72 +858,75 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
         "paired": state.pairing.is_paired(),
+        "require_pairing": state.pairing.require_pairing(),
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
 }
 
-/// GET /api/navigation — returns the navigation manifest for the web chat UI.
-async fn handle_navigation() -> Json<crate::task_category::NavigationManifest> {
-    Json(crate::task_category::NavigationManifest::build())
-}
+/// Prometheus content type for text exposition format.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// GET /api/coding/layout — returns the default split-screen coding layout.
-async fn handle_coding_layout() -> Json<crate::sandbox::layout::CodingLayout> {
-    Json(crate::sandbox::layout::CodingLayout::default())
-}
+/// GET /metrics — Prometheus text exposition format
+async fn handle_metrics(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("").trim();
+        if !state.pairing.is_authenticated(token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+                String::from(
+                    "# unauthorized: provide Authorization: Bearer <token> for /metrics\n",
+                ),
+            );
+        }
+    } else if !peer_addr.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+            String::from(
+                "# metrics disabled for non-loopback clients when pairing is not required\n",
+            ),
+        );
+    }
 
-/// GET /api/coding/layout/mobile — returns the mobile-optimized coding layout.
-async fn handle_coding_layout_mobile() -> Json<crate::sandbox::layout::CodingLayout> {
-    Json(crate::sandbox::layout::CodingLayout::mobile())
-}
-
-/// GET /api/agent/info — returns available tools and active channels for sidebar display.
-async fn handle_agent_info(State(state): State<AppState>) -> impl IntoResponse {
-    let tools: Vec<serde_json::Value> = if let Some(ref agent) = state.agent {
-        let agent = agent.lock().await;
-        agent
-            .tool_specs()
-            .iter()
-            .map(|spec| {
-                serde_json::json!({
-                    "name": spec.name,
-                    "description": spec.description,
-                })
-            })
-            .collect()
+    let body = if let Some(prom) = state
+        .observer
+        .as_ref()
+        .as_any()
+        .downcast_ref::<crate::observability::PrometheusObserver>()
+    {
+        prom.encode()
     } else {
-        Vec::new()
+        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
     };
 
-    Json(serde_json::json!({
-        "channels": state.active_channel_names,
-        "tools": tools,
-    }))
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        body,
+    )
 }
 
-/// Optional JSON body for pairing with credentials.
-#[derive(Debug, Default, GatewayDeserialize)]
-struct PairBody {
-    #[serde(default)]
-    username: Option<String>,
-    #[serde(default)]
-    password: Option<String>,
-}
-
-/// POST /pair — exchange pairing code (+ optional credentials) for bearer token.
-///
-/// The pairing code is read from the `X-Pairing-Code` header.
-/// If owner credentials are configured on the server, `username` and `password`
-/// must also be provided in the JSON request body.
+/// POST /pair — exchange one-time code for bearer token
+#[axum::debug_handler]
 async fn handle_pair(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: Result<Json<PairBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let client_key = client_key_from_headers(&headers);
-    if !state.rate_limiter.allow_pair(&client_key) {
-        tracing::warn!("/pair rate limit exceeded for key: {client_key}");
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_pair(&rate_key) {
+        tracing::warn!("/pair rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many pairing requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -808,34 +939,31 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let pair_body = body.map(|Json(b)| b).unwrap_or_default();
-    let username = pair_body.username;
-    let password = pair_body.password;
-
-    let request = crate::security::pairing::PairRequest {
-        code,
-        username: username.as_deref(),
-        password: password.as_deref(),
-    };
-
-    match state.pairing.try_pair(&request) {
+    match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
-            tracing::info!("🔐 New device paired successfully");
+            tracing::info!("🔐 New client paired successfully");
+            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+                tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
+                let body = serde_json::json!({
+                    "paired": true,
+                    "persisted": false,
+                    "token": token,
+                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
+                });
+                return (StatusCode::OK, Json(body));
+            }
+
             let body = serde_json::json!({
                 "paired": true,
+                "persisted": true,
                 "token": token,
-                "message": "Device paired. Save this token — use it as Authorization: Bearer <token>"
+                "message": "Save this token — use it as Authorization: Bearer <token>"
             });
             (StatusCode::OK, Json(body))
         }
         Ok(None) => {
-            let msg = if state.pairing.requires_credentials() {
-                "Invalid credentials or pairing code"
-            } else {
-                "Invalid pairing code"
-            };
-            tracing::warn!("🔐 Pairing attempt failed");
-            let err = serde_json::json!({"error": msg});
+            tracing::warn!("🔐 Pairing attempt with invalid code");
+            let err = serde_json::json!({"error": "Invalid pairing code"});
             (StatusCode::FORBIDDEN, Json(err))
         }
         Err(lockout_secs) => {
@@ -851,54 +979,574 @@ async fn handle_pair(
     }
 }
 
+async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
+    let paired_tokens = pairing.tokens();
+    // This is needed because parking_lot's guard is not Send so we clone the inner
+    // this should be removed once async mutexes are used everywhere
+    let mut updated_cfg = { config.lock().clone() };
+    updated_cfg.gateway.paired_tokens = paired_tokens;
+    updated_cfg
+        .save()
+        .await
+        .context("Failed to persist paired tokens to config.toml")?;
+
+    // Keep shared runtime config in sync with persisted tokens.
+    *config.lock() = updated_cfg;
+    Ok(())
+}
+
+/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
+async fn prepare_gateway_messages_for_provider(
+    state: &AppState,
+    message: &str,
+) -> anyhow::Result<Vec<ChatMessage>> {
+    let user_messages = vec![ChatMessage::user(message)];
+
+    // Keep webhook/gateway prompts aligned with channel behavior by injecting
+    // workspace-aware system context before model invocation.
+    let system_prompt = {
+        let config_guard = state.config.lock();
+        crate::channels::build_system_prompt(
+            &config_guard.workspace_dir,
+            &state.model,
+            &[], // tools - empty for simple chat
+            &[], // skills
+            Some(&config_guard.identity),
+            None, // bootstrap_max_chars - use default
+        )
+    };
+
+    let mut messages = Vec::with_capacity(1 + user_messages.len());
+    messages.push(ChatMessage::system(system_prompt));
+    messages.extend(user_messages);
+
+    let multimodal_config = state.config.lock().multimodal.clone();
+    let prepared =
+        crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
+
+    Ok(prepared.messages)
+}
+
+/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
+async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let prepared_messages = prepare_gateway_messages_for_provider(state, message).await?;
+
+    state
+        .provider
+        .chat_with_history(&prepared_messages, &state.model, state.temperature)
+        .await
+}
+
+/// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+pub(super) async fn run_gateway_chat_with_tools(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+    crate::agent::process_message_with_session(config, message, session_id).await
+}
+
+fn gateway_outbound_leak_guard_snapshot(
+    state: &AppState,
+) -> crate::config::OutboundLeakGuardConfig {
+    state.config.lock().security.outbound_leak_guard.clone()
+}
+
+fn sanitize_gateway_response(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_guard: &crate::config::OutboundLeakGuardConfig,
+) -> String {
+    match crate::channels::sanitize_channel_response(response, tools, leak_guard) {
+        crate::channels::ChannelSanitizationResult::Sanitized(sanitized) => {
+            if sanitized.is_empty() && !response.trim().is_empty() {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
+                    .to_string()
+            } else {
+                sanitized
+            }
+        }
+        crate::channels::ChannelSanitizationResult::Blocked { .. } => {
+            "I blocked a draft response because it appeared to contain credential material. Please ask for a redacted summary."
+                .to_string()
+        }
+    }
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
-    /// Optional task category — when set, the agent selects tools for this mode.
-    /// Values: "web_general", "document", "coding", "image", "music", "video", "translation".
-    pub task_category: Option<String>,
-    /// Optional model override — when set, uses this model instead of the server default.
-    /// Format: "provider/model-name" (e.g. "google/gemini-3.1-pro-preview").
-    pub model: Option<String>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
-/// POST /webhook — main webhook endpoint
-async fn handle_webhook(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    let client_key = client_key_from_headers(&headers);
-    if !state.rate_limiter.allow_webhook(&client_key) {
-        tracing::warn!("/webhook rate limit exceeded for key: {client_key}");
-        let err = serde_json::json!({
-            "error": "Too many webhook requests. Please retry later.",
-            "retry_after": RATE_LIMIT_WINDOW_SECS,
-        });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NodeControlRequest {
+    pub method: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+fn node_id_allowed(node_id: &str, allowed_node_ids: &[String]) -> bool {
+    if allowed_node_ids.is_empty() {
+        return true;
     }
 
-    // ── Bearer token auth (pairing OR multi-user session) ──
+    allowed_node_ids
+        .iter()
+        .any(|candidate| candidate == "*" || candidate == node_id)
+}
+
+/// POST /api/node-control — experimental node-control protocol scaffold.
+///
+/// Supported methods:
+/// - `node.list`
+/// - `node.describe`
+/// - `node.invoke` (stubbed as not implemented)
+async fn handle_node_control(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<NodeControlRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    // ── Bearer auth (pairing) ──
     if state.pairing.require_pairing() {
         let auth = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        let pairing_ok = state.pairing.is_authenticated(token);
-        let session_ok = !pairing_ok
-            && state
-                .auth_store
-                .as_ref()
-                .and_then(|store| store.validate_session(token))
-                .is_some();
-        if !pairing_ok && !session_ok {
-            tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
+        if !state.pairing.is_authenticated(token) {
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
             });
             return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!("Node-control JSON parse error: {e}");
+            let err = serde_json::json!({
+                "error": "Invalid JSON body for node-control request"
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let node_control = { state.config.lock().gateway.node_control.clone() };
+    if !node_control.enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Node-control API is disabled"})),
+        );
+    }
+
+    // Optional second-factor shared token for node-control endpoints.
+    if let Some(expected_token) = node_control
+        .auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let provided_token = headers
+            .get("X-Node-Control-Token")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .unwrap_or("");
+        if !constant_time_eq(expected_token, provided_token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid X-Node-Control-Token"})),
+            );
+        }
+    }
+
+    let method = request.method.trim();
+    match method {
+        "node.list" => {
+            let nodes = node_control
+                .allowed_node_ids
+                .iter()
+                .map(|node_id| {
+                    serde_json::json!({
+                        "node_id": node_id,
+                        "status": "unpaired",
+                        "capabilities": []
+                    })
+                })
+                .collect::<Vec<_>>();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "method": "node.list",
+                    "nodes": nodes
+                })),
+            )
+        }
+        "node.describe" => {
+            let Some(node_id) = request
+                .node_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "node_id is required for node.describe"})),
+                );
+            };
+            if !node_id_allowed(node_id, &node_control.allowed_node_ids) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "node_id is not allowed"})),
+                );
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "method": "node.describe",
+                    "node_id": node_id,
+                    "description": {
+                        "status": "stub",
+                        "capabilities": [],
+                        "message": "Node descriptor scaffold is enabled; runtime backend is not wired yet."
+                    }
+                })),
+            )
+        }
+        "node.invoke" => {
+            let Some(node_id) = request
+                .node_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "node_id is required for node.invoke"})),
+                );
+            };
+            if !node_id_allowed(node_id, &node_control.allowed_node_ids) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "node_id is not allowed"})),
+                );
+            }
+
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "method": "node.invoke",
+                    "node_id": node_id,
+                    "capability": request.capability,
+                    "arguments": request.arguments,
+                    "error": "node.invoke backend is not implemented yet in this scaffold"
+                })),
+            )
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Unsupported method",
+                "supported_methods": ["node.list", "node.describe", "node.invoke"]
+            })),
+        ),
+    }
+}
+
+/// POST /webhook — main webhook endpoint
+async fn handle_webhook_usage() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(serde_json::json!({
+            "error": "Use POST /webhook with a JSON body: {\"message\":\"...\"}",
+            "method": "POST",
+            "path": "/webhook",
+            "example": {
+                "message": "Hello from webhook"
+            }
+        })),
+    )
+}
+
+fn handle_webhook_streaming(
+    state: AppState,
+    prepared_messages: Vec<ChatMessage>,
+    provider_label: String,
+    model_label: String,
+    started_at: Instant,
+) -> Response {
+    if !state.provider.supports_streaming() {
+        let model_for_call = state.model.clone();
+        let provider_label_for_call = provider_label.clone();
+        let model_label_for_call = model_label.clone();
+        let state_for_call = state.clone();
+        let messages_for_call = prepared_messages.clone();
+
+        let stream = futures_util::stream::once(async move {
+            match state_for_call
+                .provider
+                .chat_with_history(
+                    &messages_for_call,
+                    &model_for_call,
+                    state_for_call.temperature,
+                )
+                .await
+            {
+                Ok(response) => {
+                    let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state_for_call);
+                    let safe_response = sanitize_gateway_response(
+                        &response,
+                        state_for_call.tools_registry_exec.as_ref(),
+                        &leak_guard_cfg,
+                    );
+                    let duration = started_at.elapsed();
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::LlmResponse {
+                            provider: provider_label_for_call.clone(),
+                            model: model_label_for_call.clone(),
+                            duration,
+                            success: true,
+                            error_message: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                        },
+                    );
+                    state_for_call.observer.record_metric(
+                        &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+                    );
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::AgentEnd {
+                            provider: provider_label_for_call,
+                            model: model_label_for_call,
+                            duration,
+                            tokens_used: None,
+                            cost_usd: None,
+                        },
+                    );
+
+                    let payload = serde_json::json!({"response": safe_response, "model": state_for_call.model});
+                    let mut output = format!("data: {payload}\n\n");
+                    output.push_str("data: [DONE]\n\n");
+                    Ok::<_, std::io::Error>(Bytes::from(output))
+                }
+                Err(e) => {
+                    let duration = started_at.elapsed();
+                    let sanitized = providers::sanitize_api_error(&e.to_string());
+
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::LlmResponse {
+                            provider: provider_label_for_call.clone(),
+                            model: model_label_for_call.clone(),
+                            duration,
+                            success: false,
+                            error_message: Some(sanitized.clone()),
+                            input_tokens: None,
+                            output_tokens: None,
+                        },
+                    );
+                    state_for_call.observer.record_metric(
+                        &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+                    );
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::Error {
+                            component: "gateway".to_string(),
+                            message: sanitized.clone(),
+                        },
+                    );
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::AgentEnd {
+                            provider: provider_label_for_call,
+                            model: model_label_for_call,
+                            duration,
+                            tokens_used: None,
+                            cost_usd: None,
+                        },
+                    );
+
+                    tracing::error!("Webhook provider error: {}", sanitized);
+                    let mut output = format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"error": "LLM request failed"})
+                    );
+                    output.push_str("data: [DONE]\n\n");
+                    Ok(Bytes::from(output))
+                }
+            }
+        });
+
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let provider_stream = state.provider.stream_chat_with_history(
+        &prepared_messages,
+        &state.model,
+        state.temperature,
+        crate::providers::traits::StreamOptions::new(true),
+    );
+
+    let state_for_stream = state.clone();
+    let provider_label_for_stream = provider_label.clone();
+    let model_label_for_stream = model_label.clone();
+    let mut stream_failed = false;
+
+    let sse_stream = provider_stream.map(move |result| match result {
+        Ok(chunk) if chunk.is_final => {
+            if !stream_failed {
+                let duration = started_at.elapsed();
+                state_for_stream.observer.record_event(
+                    &crate::observability::ObserverEvent::LlmResponse {
+                        provider: provider_label_for_stream.clone(),
+                        model: model_label_for_stream.clone(),
+                        duration,
+                        success: true,
+                        error_message: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                    },
+                );
+                state_for_stream.observer.record_metric(
+                    &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+                );
+                state_for_stream.observer.record_event(
+                    &crate::observability::ObserverEvent::AgentEnd {
+                        provider: provider_label_for_stream.clone(),
+                        model: model_label_for_stream.clone(),
+                        duration,
+                        tokens_used: None,
+                        cost_usd: None,
+                    },
+                );
+            }
+            Ok::<_, std::io::Error>(Bytes::from("data: [DONE]\n\n"))
+        }
+        Ok(chunk) => {
+            if chunk.delta.is_empty() {
+                return Ok(Bytes::new());
+            }
+            let payload = serde_json::json!({
+                "delta": chunk.delta,
+                "model": model_label_for_stream
+            });
+            Ok(Bytes::from(format!("data: {payload}\n\n")))
+        }
+        Err(e) => {
+            stream_failed = true;
+            let duration = started_at.elapsed();
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+
+            state_for_stream.observer.record_event(
+                &crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label_for_stream.clone(),
+                    model: model_label_for_stream.clone(),
+                    duration,
+                    success: false,
+                    error_message: Some(sanitized.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            );
+            state_for_stream.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state_for_stream
+                .observer
+                .record_event(&crate::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            state_for_stream.observer.record_event(
+                &crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label_for_stream.clone(),
+                    model: model_label_for_stream.clone(),
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                },
+            );
+
+            tracing::error!("Webhook streaming provider error: {}", sanitized);
+            let output = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"error": "LLM request failed"})
+            );
+            Ok(Bytes::from(output))
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(sse_stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// POST /webhook — main webhook endpoint
+async fn handle_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/webhook rate limit exceeded");
+        let err = serde_json::json!({
+            "error": "Too many webhook requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err)).into_response();
+    }
+
+    // Require at least one auth layer for non-loopback traffic.
+    if !state.pairing.require_pairing()
+        && state.webhook_secret_hash.is_none()
+        && !peer_addr.ip().is_loopback()
+    {
+        tracing::warn!(
+            "Webhook: rejected unauthenticated non-loopback request (pairing disabled and no webhook secret configured)"
+        );
+        let err = serde_json::json!({
+            "error": "Unauthorized — configure pairing or X-Webhook-Secret for non-local webhook access"
+        });
+        return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
+    }
+
+    // ── Bearer token auth (pairing) ──
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
         }
     }
 
@@ -915,7 +1563,7 @@ async fn handle_webhook(
             _ => {
                 tracing::warn!("Webhook: rejected request — invalid or missing X-Webhook-Secret");
                 let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
-                return (StatusCode::UNAUTHORIZED, Json(err));
+                return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
             }
         }
     }
@@ -928,7 +1576,7 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     };
 
@@ -946,112 +1594,183 @@ async fn handle_webhook(
                 "idempotent": true,
                 "message": "Request already processed for this idempotency key"
             });
-            return (StatusCode::OK, Json(body));
+            return (StatusCode::OK, Json(body)).into_response();
         }
     }
 
-    let message = &webhook_body.message;
-
-    // Use client-specified model if provided, otherwise fall back to server default.
-    let effective_model = webhook_body
-        .model
+    let message = webhook_body.message.trim();
+    let webhook_session_id = webhook_body
+        .session_id
         .as_deref()
-        .filter(|m| !m.is_empty())
-        .unwrap_or(&state.model)
-        .to_string();
-
-    // ── Telemetry: record webhook interaction ──
-    if let Some(ref store) = state.telemetry {
-        let event = crate::telemetry::TelemetryEvent {
-            id: 0,
-            user_id: client_key.clone(),
-            country: String::new(),
-            ip_address: headers
-                .get("x-forwarded-for")
-                .or_else(|| headers.get("x-real-ip"))
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown")
-                .to_string(),
-            channel: "webhook".into(),
-            action: "message".into(),
-            target_url: String::new(),
-            details: crate::util::truncate_with_ellipsis(message, 200),
-            tool_name: String::new(),
-            alert_level: crate::telemetry::AlertLevel::None,
-            alert_reason: String::new(),
-            timestamp: chrono::Utc::now(),
-        };
-        if let Err(e) = store.record(event) {
-            tracing::debug!("Telemetry record failed: {e}");
-        }
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if message.is_empty() {
+        let err = serde_json::json!({
+            "error": "The `message` field is required and must be a non-empty string."
+        });
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
     }
 
     if state.auto_save {
         let key = webhook_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
+            .store(
+                &key,
+                message,
+                MemoryCategory::Conversation,
+                webhook_session_id,
+            )
             .await;
     }
 
-    // ── SLM gatekeeper: try local handling first ──
-    if let Some(ref gatekeeper) = state.gatekeeper {
-        let gk: tokio::sync::MutexGuard<'_, crate::gatekeeper::GatekeeperRouter> =
-            gatekeeper.lock().await;
-        let result = gk.process_message(message).await;
-        if let Some(local_response) = result.local_response {
-            let body = serde_json::json!({
-                "response": local_response,
-                "model": gk.model(),
-                "routed": "local",
-                "category": format!("{:?}", result.decision.category),
-            });
-            return (StatusCode::OK, Json(body));
-        }
-        // Fall through to cloud LLM if gatekeeper didn't handle it.
-        tracing::debug!(
-            category = ?result.decision.category,
-            reason = result.decision.reason,
-            "Gatekeeper routed to cloud"
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let model_label = state.model.clone();
+    let started_at = Instant::now();
+
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentStart {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+        });
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::LlmRequest {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+            messages_count: 1,
+        });
+
+    if webhook_body.stream.unwrap_or(false) {
+        let prepared_messages = match prepare_gateway_messages_for_provider(&state, message).await {
+            Ok(messages) => messages,
+            Err(e) => {
+                let duration = started_at.elapsed();
+                let sanitized = providers::sanitize_api_error(&e.to_string());
+                state
+                    .observer
+                    .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                        provider: provider_label.clone(),
+                        model: model_label.clone(),
+                        duration,
+                        success: false,
+                        error_message: Some(sanitized.clone()),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                state.observer.record_metric(
+                    &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+                );
+                state
+                    .observer
+                    .record_event(&crate::observability::ObserverEvent::Error {
+                        component: "gateway".to_string(),
+                        message: sanitized.clone(),
+                    });
+                state
+                    .observer
+                    .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                        provider: provider_label,
+                        model: model_label,
+                        duration,
+                        tokens_used: None,
+                        cost_usd: None,
+                    });
+
+                tracing::error!("Webhook streaming setup failed: {}", sanitized);
+                let err = serde_json::json!({"error": "LLM request failed"});
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+            }
+        };
+
+        return handle_webhook_streaming(
+            state,
+            prepared_messages,
+            provider_label,
+            model_label,
+            started_at,
         );
     }
 
-    // ── Agentic handling: use Agent with tools when available ──
-    if let Some(ref agent) = state.agent {
-        let mut agent = agent.lock().await;
-        match agent.turn(message).await {
-            Ok(response) => {
-                let body = serde_json::json!({"response": response, "model": effective_model});
-                return (StatusCode::OK, Json(body));
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Webhook agent error: {}",
-                    providers::sanitize_api_error(&e.to_string())
-                );
-                let err = serde_json::json!({"error": "LLM request failed"});
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
-            }
-        }
-    }
-
-    // Fallback: simple chat without tools
-    match state
-        .provider
-        .simple_chat(message, &effective_model, state.temperature)
-        .await
-    {
+    match run_gateway_chat_simple(&state, message).await {
         Ok(response) => {
-            let body = serde_json::json!({"response": response, "model": effective_model});
-            (StatusCode::OK, Json(body))
+            let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+            let safe_response = sanitize_gateway_response(
+                &response,
+                state.tools_registry_exec.as_ref(),
+                &leak_guard_cfg,
+            );
+            let duration = started_at.elapsed();
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: true,
+                    error_message: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            let body = serde_json::json!({"response": safe_response, "model": state.model});
+            (StatusCode::OK, Json(body)).into_response()
         }
         Err(e) => {
-            tracing::error!(
-                "Webhook provider error: {}",
-                providers::sanitize_api_error(&e.to_string())
+            let duration = started_at.elapsed();
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: false,
+                    error_message: Some(sanitized.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
             );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response()
         }
     }
 }
@@ -1097,8 +1816,7 @@ async fn handle_whatsapp_verify(
 /// Returns true if the signature is valid, false otherwise.
 /// See: <https://developers.facebook.com/docs/graph-api/webhooks/getting-started#verification-requests>
 pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header: &str) -> bool {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    use ring::hmac;
 
     // Signature format: "sha256=<hex_signature>"
     let Some(hex_sig) = signature_header.strip_prefix("sha256=") else {
@@ -1110,14 +1828,8 @@ pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header
         return false;
     };
 
-    // Compute HMAC-SHA256
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(app_secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(body);
-
-    // Constant-time comparison
-    mac.verify_slice(&expected).is_ok()
+    let key = hmac::Key::new(hmac::HMAC_SHA256, app_secret.as_bytes());
+    hmac::verify(&key, body, &expected).is_ok()
 }
 
 /// POST /whatsapp — incoming message webhook
@@ -1164,26 +1876,6 @@ async fn handle_whatsapp_message(
         );
     };
 
-    // Send one-click connect links to unauthorized, unpaired senders
-    let unpaired = wa.extract_unpaired_senders(&payload);
-    if let Some(ref cp) = state.channel_pairing {
-        for sender in &unpaired {
-            let token = cp.create_token("whatsapp", sender);
-            let auto_url = crate::channels::pairing::ChannelPairingStore::auto_pair_url(
-                &state.gateway_base_url,
-                &token,
-            );
-            let _ = wa
-                .send(&SendMessage::new(
-                    format!(
-                        "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
-                    ),
-                    sender,
-                ))
-                .await;
-        }
-    }
-
     // Parse messages from the webhook payload
     let messages = wa.parse_webhook_payload(&payload);
 
@@ -1199,26 +1891,33 @@ async fn handle_whatsapp_message(
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
+        let session_id = gateway_message_session_id(msg);
 
         // Auto-save to memory
         if state.auto_save {
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
                 .await;
         }
 
-        // Call the LLM
-        match state
-            .provider
-            .simple_chat(&msg.content, &state.model, state.temperature)
-            .await
-        {
+        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
             Ok(response) => {
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
                 // Send reply via WhatsApp
                 if let Err(e) = wa
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
@@ -1240,39 +1939,52 @@ async fn handle_whatsapp_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-/// POST /line — incoming LINE webhook
-async fn handle_line_message(
+/// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
+async fn handle_linq_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let Some(ref line) = state.line else {
+    let Some(ref linq) = state.linq else {
         return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "LINE not configured"})),
+            Json(serde_json::json!({"error": "Linq not configured"})),
         );
     };
 
-    // Verify X-Line-Signature
-    let signature = headers
-        .get("X-Line-Signature")
-        .or_else(|| headers.get("x-line-signature"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let body_str = String::from_utf8_lossy(&body);
 
-    if !line.verify_signature(&body, signature) {
-        tracing::warn!(
-            "LINE webhook signature verification failed (signature: {})",
-            if signature.is_empty() {
-                "missing"
-            } else {
-                "invalid"
-            }
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Invalid signature"})),
-        );
+    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
+    if let Some(ref signing_secret) = state.linq_signing_secret {
+        let timestamp = headers
+            .get("X-Webhook-Timestamp")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let signature = headers
+            .get("X-Webhook-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::linq::verify_linq_signature(
+            signing_secret,
+            &body_str,
+            timestamp,
+            signature,
+        ) {
+            tracing::warn!(
+                "Linq webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
     }
 
     // Parse JSON body
@@ -1283,66 +1995,331 @@ async fn handle_line_message(
         );
     };
 
-    // Parse messages and unpaired senders
-    let (messages, unpaired) = line.parse_webhook_payload(&payload);
-
-    // Send one-click connect links to unpaired senders
-    if let Some(ref cp) = state.channel_pairing {
-        for sender in &unpaired {
-            let token = cp.create_token("line", sender);
-            let auto_url = crate::channels::pairing::ChannelPairingStore::auto_pair_url(
-                &state.gateway_base_url,
-                &token,
-            );
-            let _ = line
-                .send(&SendMessage::new(
-                    format!(
-                        "🔗 MoA에 연결하려면 아래 링크를 클릭하세요.\nTap the link below to connect to MoA.\n\n{auto_url}"
-                    ),
-                    sender,
-                ))
-                .await;
-        }
-    }
+    // Parse messages from the webhook payload
+    let messages = linq.parse_webhook_payload(&payload);
 
     if messages.is_empty() {
+        if payload
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|event| event == "message.received")
+        {
+            tracing::warn!(
+                "Linq webhook message.received produced no actionable messages (possible unsupported payload shape)"
+            );
+        }
+        // Acknowledge the webhook even if no messages (could be status/delivery events)
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
     // Process each message
     for msg in &messages {
         tracing::info!(
-            "LINE message from {}: {}",
+            "Linq message from {}: {}",
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
+        let session_id = gateway_message_session_id(msg);
 
         // Auto-save to memory
         if state.auto_save {
-            let key = format!("line_msg_{}_{}", msg.sender, msg.timestamp);
+            let key = linq_memory_key(msg);
+            let _ = state
+                .mem
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
+                .await;
+        }
+
+        // Call the LLM
+        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+            Ok(response) => {
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
+                // Send reply via Linq
+                if let Err(e) = linq
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send Linq reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for Linq message: {e:#}");
+                let _ = linq
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /github — incoming GitHub webhook (issue/PR comments)
+#[allow(clippy::large_futures)]
+async fn handle_github_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let github_cfg = {
+        let guard = state.config.lock();
+        guard.channels_config.github.clone()
+    };
+
+    let Some(github_cfg) = github_cfg else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "GitHub channel not configured"})),
+        );
+    };
+
+    let access_token = std::env::var("ZEROCLAW_GITHUB_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| github_cfg.access_token.trim().to_string());
+    if access_token.is_empty() {
+        tracing::error!(
+            "GitHub webhook received but no access token is configured. \
+             Set channels_config.github.access_token or ZEROCLAW_GITHUB_TOKEN."
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "GitHub access token is not configured"})),
+        );
+    }
+
+    let webhook_secret = std::env::var("ZEROCLAW_GITHUB_WEBHOOK_SECRET")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            github_cfg
+                .webhook_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned)
+        });
+
+    let event_name = headers
+        .get("X-GitHub-Event")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let Some(event_name) = event_name else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing X-GitHub-Event header"})),
+        );
+    };
+
+    if let Some(secret) = webhook_secret.as_deref() {
+        let signature = headers
+            .get("X-Hub-Signature-256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::github::verify_github_signature(secret, &body, signature) {
+            tracing::warn!(
+                "GitHub webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    if let Some(delivery_id) = headers
+        .get("X-GitHub-Delivery")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let key = format!("github:{delivery_id}");
+        if !state.idempotency_store.record_if_new(&key) {
+            tracing::info!("GitHub webhook duplicate ignored (delivery: {delivery_id})");
+            return (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"status":"duplicate","idempotent":true,"delivery_id":delivery_id}),
+                ),
+            );
+        }
+    }
+
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    let github = GitHubChannel::new(
+        access_token,
+        github_cfg.api_base_url.clone(),
+        github_cfg.allowed_repos.clone(),
+    );
+    let messages = github.parse_webhook_payload(event_name, &payload);
+    if messages.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "handled": false})),
+        );
+    }
+
+    for msg in &messages {
+        tracing::info!(
+            "GitHub webhook message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 80)
+        );
+
+        if state.auto_save {
+            let key = github_memory_key(msg);
             let _ = state
                 .mem
                 .store(&key, &msg.content, MemoryCategory::Conversation, None)
                 .await;
         }
 
-        // Call the LLM
-        match state
-            .provider
-            .simple_chat(&msg.content, &state.model, state.temperature)
-            .await
-        {
+        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
             Ok(response) => {
-                if let Err(e) = line
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
+                if let Err(e) = github
+                    .send(
+                        &SendMessage::new(safe_response, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
                     .await
                 {
-                    tracing::error!("Failed to send LINE reply: {e}");
+                    tracing::error!("Failed to send GitHub reply: {e}");
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for LINE message: {e:#}");
-                let _ = line
+                tracing::error!("LLM error for GitHub webhook message: {e:#}");
+                let _ = github
+                    .send(
+                        &SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        )
+                        .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "ok", "handled": true})),
+    )
+}
+
+/// POST /bluebubbles — incoming BlueBubbles iMessage webhook
+async fn handle_bluebubbles_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref bluebubbles) = state.bluebubbles else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "BlueBubbles not configured"})),
+        );
+    };
+
+    // Verify Authorization: Bearer <webhook_secret> if configured
+    if let Some(ref expected) = state.bluebubbles_webhook_secret {
+        let provided = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if !provided.is_some_and(|t| constant_time_eq(t, expected.as_ref())) {
+            tracing::warn!("BlueBubbles webhook auth failed (missing or invalid Bearer token)");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            );
+        }
+    }
+
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    let messages = bluebubbles.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    for msg in &messages {
+        tracing::info!(
+            "BlueBubbles iMessage from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        if state.auto_save {
+            let key = bluebubbles_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        let _ = bluebubbles.start_typing(&msg.reply_target).await;
+        let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+
+        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
+            Ok(response) => {
+                let _ = bluebubbles.stop_typing(&msg.reply_target).await;
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
+                if let Err(e) = bluebubbles
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send BlueBubbles reply: {e}");
+                }
+            }
+            Err(e) => {
+                let _ = bluebubbles.stop_typing(&msg.reply_target).await;
+                tracing::error!("LLM error for BlueBubbles message: {e:#}");
+                let _ = bluebubbles
                     .send(&SendMessage::new(
                         "Sorry, I couldn't process your message right now.",
                         &msg.reply_target,
@@ -1355,1489 +2332,329 @@ async fn handle_line_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// TELEMETRY HANDLERS (admin-only)
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Authenticate admin requests by checking the `Authorization: Bearer <token>` header
-/// against the SHA-256-hashed admin token stored in state.
-fn authenticate_admin(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(ref expected_hash) = state.telemetry_admin_token_hash else {
-        return false;
-    };
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .strip_prefix("Bearer ")
-        .unwrap_or("");
-
-    if token.is_empty() {
-        return false;
-    }
-
-    use sha2::{Digest, Sha256};
-    let provided_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-    crate::security::pairing::constant_time_eq(&provided_hash, expected_hash.as_ref())
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// AUTH HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Concrete return type for auth handlers (avoids `impl IntoResponse` inference issues).
-type AuthResponse = (StatusCode, Json<serde_json::Value>);
-
-/// Request body for user registration.
-#[derive(GatewayDeserialize)]
-struct AuthRegisterBody {
-    username: String,
-    password: String,
-}
-
-/// Request body for login.
-#[derive(GatewayDeserialize)]
-struct AuthLoginBody {
-    username: String,
-    password: String,
-    device_id: Option<String>,
-    device_name: Option<String>,
-}
-
-/// Request body for device registration.
-#[derive(GatewayDeserialize)]
-struct AuthDeviceRegisterBody {
-    device_id: String,
-    device_name: String,
-    platform: Option<String>,
-}
-
-/// Extract bearer token from Authorization header.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-}
-
-/// Validate a session token and return the session. Returns error response if invalid.
-fn require_auth_session(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<crate::auth::Session, (StatusCode, Json<serde_json::Value>)> {
-    let auth_store = state.auth_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Auth not enabled"})),
-        )
-    })?;
-
-    let token = extract_bearer_token(headers).ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Missing Authorization header"})),
-        )
-    })?;
-
-    auth_store.validate_session(token).ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Invalid or expired session token"})),
-        )
-    })
-}
-
-/// POST /api/auth/register — create a new user account.
-async fn handle_auth_register(
+/// GET /wati — WATI webhook verification (echoes hub.challenge)
+async fn handle_wati_verify(
     State(state): State<AppState>,
-    body: Result<Json<AuthRegisterBody>, axum::extract::rejection::JsonRejection>,
-) -> AuthResponse {
-    let auth_store = match state.auth_store.as_ref() {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Auth not enabled"})),
-            );
-        }
-    };
-
-    if !state.auth_allow_registration {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "Registration is disabled"})),
-        );
+    Query(params): Query<WatiVerifyQuery>,
+) -> impl IntoResponse {
+    if state.wati.is_none() {
+        return (StatusCode::NOT_FOUND, "WATI not configured".to_string());
     }
 
-    // Enforce max_users limit (0 = unlimited)
-    if state.auth_max_users > 0 {
-        if let Ok(count) = auth_store.user_count() {
-            if count >= state.auth_max_users {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({"error": "Maximum user limit reached"})),
+    // WATI may use Meta-style webhook verification; echo the challenge
+    if let Some(challenge) = params.challenge {
+        tracing::info!("WATI webhook verified successfully");
+        return (StatusCode::OK, challenge);
+    }
+
+    (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string())
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct WatiVerifyQuery {
+    #[serde(rename = "hub.challenge")]
+    pub challenge: Option<String>,
+}
+
+/// POST /wati — incoming WATI WhatsApp message webhook
+async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+    let Some(ref wati) = state.wati else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "WATI not configured"})),
+        );
+    };
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from the webhook payload
+    let messages = wati.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Process each message
+    for msg in &messages {
+        tracing::info!(
+            "WATI message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+        let session_id = gateway_message_session_id(msg);
+
+        // Auto-save to memory
+        if state.auto_save {
+            let key = wati_memory_key(msg);
+            let _ = state
+                .mem
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
+                .await;
+        }
+
+        // Call the LLM
+        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+            Ok(response) => {
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
                 );
+                // Send reply via WATI
+                if let Err(e) = wati
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send WATI reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for WATI message: {e:#}");
+                let _ = wati
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
             }
         }
     }
 
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
-            );
-        }
-    };
-
-    match auth_store.register(&body.username, &body.password) {
-        Ok(user_id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "status": "registered",
-                "user_id": user_id,
-            })),
-        ),
-        Err(e) => {
-            let msg = e.to_string();
-            let status = if msg.contains("already taken") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (status, Json(serde_json::json!({"error": msg})))
-        }
-    }
+    // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-/// POST /api/auth/login — authenticate and get a session token.
-async fn handle_auth_login(
+/// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
+async fn handle_nextcloud_talk_webhook(
     State(state): State<AppState>,
-    body: Result<Json<AuthLoginBody>, axum::extract::rejection::JsonRejection>,
-) -> AuthResponse {
-    let auth_store = match state.auth_store.as_ref() {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Auth not enabled"})),
-            );
-        }
-    };
-
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
-            );
-        }
-    };
-
-    let user = match auth_store.authenticate(&body.username, &body.password) {
-        Ok(u) => u,
-        Err(_) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid username or password"})),
-            );
-        }
-    };
-
-    match auth_store.create_session(
-        &user.id,
-        body.device_id.as_deref(),
-        body.device_name.as_deref(),
-    ) {
-        Ok(token) => {
-            // Include device list in login response
-            let devices = auth_store
-                .list_devices_with_status(&user.id, DEVICE_ONLINE_THRESHOLD_SECS)
-                .unwrap_or_default();
-            let device_list: Vec<_> = devices
-                .iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "device_id": d.device_id,
-                        "device_name": d.device_name,
-                        "platform": d.platform,
-                        "last_seen": d.last_seen,
-                        "is_online": d.is_online,
-                        "has_pairing_code": d.has_pairing_code,
-                    })
-                })
-                .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "authenticated",
-                    "token": token,
-                    "user_id": user.id,
-                    "username": user.username,
-                    "devices": device_list,
-                })),
-            )
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Session creation failed: {e}")})),
-        ),
-    }
-}
-
-/// POST /api/auth/logout — revoke current session.
-async fn handle_auth_logout(State(state): State<AppState>, headers: HeaderMap) -> AuthResponse {
-    let auth_store = match state.auth_store.as_ref() {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Auth not enabled"})),
-            );
-        }
-    };
-
-    let token = match extract_bearer_token(&headers) {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Missing Authorization header"})),
-            );
-        }
-    };
-
-    match auth_store.revoke_session(token) {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "logged_out"})),
-        ),
-        Ok(false) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Invalid session"})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Logout failed: {e}")})),
-        ),
-    }
-}
-
-/// GET /api/auth/me — get current user info from session token.
-async fn handle_auth_me(State(state): State<AppState>, headers: HeaderMap) -> AuthResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let auth_store = state.auth_store.as_ref().unwrap();
-    match auth_store.get_user(&session.user_id) {
-        Ok(Some(user)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "user_id": user.id,
-                "username": user.username,
-                "device_id": session.device_id,
-                "device_name": session.device_name,
-            })),
-        ),
-        _ => (
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref nextcloud_talk) = state.nextcloud_talk else {
+        return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "User not found"})),
-        ),
-    }
-}
-
-/// GET /api/auth/devices — list devices for authenticated user.
-async fn handle_auth_devices_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AuthResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let auth_store = state.auth_store.as_ref().unwrap();
-    match auth_store.list_devices_with_status(&session.user_id, DEVICE_ONLINE_THRESHOLD_SECS) {
-        Ok(devices) => {
-            let list: Vec<_> = devices
-                .iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "device_id": d.device_id,
-                        "device_name": d.device_name,
-                        "platform": d.platform,
-                        "last_seen": d.last_seen,
-                        "is_online": d.is_online,
-                        "has_pairing_code": d.has_pairing_code,
-                    })
-                })
-                .collect();
-            (StatusCode::OK, Json(serde_json::json!({"devices": list})))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to list devices: {e}")})),
-        ),
-    }
-}
-
-/// POST /api/auth/devices — register a device for authenticated user.
-async fn handle_auth_device_register(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<AuthDeviceRegisterBody>, axum::extract::rejection::JsonRejection>,
-) -> AuthResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
-            );
-        }
-    };
-
-    let auth_store = state.auth_store.as_ref().unwrap();
-
-    // Enforce max_devices_per_user limit
-    if let Ok(devices) = auth_store.list_devices(&session.user_id) {
-        // Only enforce if this is a new device (not an update of an existing one)
-        let is_existing = devices.iter().any(|d| d.device_id == body.device_id);
-        if !is_existing && devices.len() >= state.auth_max_devices_per_user as usize {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": format!("Maximum devices per user ({}) reached", state.auth_max_devices_per_user),
-                })),
-            );
-        }
-    }
-
-    match auth_store.register_device(
-        &session.user_id,
-        &body.device_id,
-        &body.device_name,
-        body.platform.as_deref(),
-    ) {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "status": "device_registered",
-                "device_id": body.device_id,
-            })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Device registration failed: {e}")})),
-        ),
-    }
-}
-
-/// DELETE /api/auth/devices/:device_id — remove a device.
-async fn handle_auth_device_remove(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(device_id): axum::extract::Path<String>,
-) -> AuthResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let auth_store = state.auth_store.as_ref().unwrap();
-    match auth_store.remove_device(&session.user_id, &device_id) {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "device_removed"})),
-        ),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Device not found"})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Device removal failed: {e}")})),
-        ),
-    }
-}
-
-/// Device online threshold — devices seen within this window are "online".
-const DEVICE_ONLINE_THRESHOLD_SECS: u64 = 120;
-
-/// Request body for setting device pairing code.
-#[derive(GatewayDeserialize)]
-struct DevicePairingCodeBody {
-    pairing_code: Option<String>,
-}
-
-/// Request body for verifying device pairing code.
-#[derive(GatewayDeserialize)]
-struct DeviceVerifyPairingBody {
-    pairing_code: String,
-}
-
-/// Request body for heartbeat.
-#[derive(GatewayDeserialize)]
-struct HeartbeatBody {
-    device_id: String,
-}
-
-/// PUT /api/auth/devices/:device_id/pairing-code — set or clear device pairing code.
-async fn handle_auth_device_set_pairing_code(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(device_id): axum::extract::Path<String>,
-    body: Result<Json<DevicePairingCodeBody>, axum::extract::rejection::JsonRejection>,
-) -> AuthResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
-            );
-        }
-    };
-
-    let auth_store = state.auth_store.as_ref().unwrap();
-    match auth_store.set_device_pairing_code(
-        &session.user_id,
-        &device_id,
-        body.pairing_code.as_deref(),
-    ) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "pairing_code_updated"})),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
-    }
-}
-
-/// POST /api/auth/devices/:device_id/verify-pairing — verify pairing code for a device.
-async fn handle_auth_device_verify_pairing(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Path(device_id): axum::extract::Path<String>,
-    body: Result<Json<DeviceVerifyPairingBody>, axum::extract::rejection::JsonRejection>,
-) -> AuthResponse {
-    let _session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
-            );
-        }
-    };
-
-    let auth_store = state.auth_store.as_ref().unwrap();
-    match auth_store.verify_device_pairing_code(&device_id, &body.pairing_code) {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"verified": true}))),
-        Ok(false) => (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"verified": false, "error": "Invalid pairing code"})),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
-    }
-}
-
-/// POST /api/auth/heartbeat — update device last_seen and register if needed.
-async fn handle_auth_heartbeat(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<HeartbeatBody>, axum::extract::rejection::JsonRejection>,
-) -> AuthResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
-            );
-        }
-    };
-
-    let auth_store = state.auth_store.as_ref().unwrap();
-    // Touch the device (update last_seen), register it if not yet registered
-    if auth_store.touch_device(&body.device_id).is_err() {
-        // Device not found — auto-register it
-        let platform = format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH);
-        let _ = auth_store.register_device(
-            &session.user_id,
-            &body.device_id,
-            "MoA Device",
-            Some(&platform),
+            Json(serde_json::json!({"error": "Nextcloud Talk not configured"})),
         );
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+
+    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
+    if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
+        let random = headers
+            .get("X-Nextcloud-Talk-Random")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let signature = headers
+            .get("X-Nextcloud-Talk-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
+            webhook_secret,
+            random,
+            &body_str,
+            signature,
+        ) {
+            tracing::warn!(
+                "Nextcloud Talk webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from webhook payload
+    let messages = nextcloud_talk.parse_webhook_payload(&payload);
+    if messages.is_empty() {
+        // Acknowledge webhook even if payload does not contain actionable user messages.
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    for msg in &messages {
+        tracing::info!(
+            "Nextcloud Talk message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+        let session_id = gateway_message_session_id(msg);
+
+        if state.auto_save {
+            let key = nextcloud_talk_memory_key(msg);
+            let _ = state
+                .mem
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
+                .await;
+        }
+
+        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+            Ok(response) => {
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
+                if let Err(e) = nextcloud_talk
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                let _ = nextcloud_talk
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// SYNC HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Request body for relay upload.
-#[derive(GatewayDeserialize)]
-struct SyncRelayUploadBody {
-    encrypted_payload: String,
-    nonce: String,
-}
-
-/// Query params for relay pickup.
-#[derive(GatewayDeserialize)]
-struct SyncRelayPickupQuery {
-    device_id: Option<String>,
-}
-
-/// GET /sync — WebSocket upgrade for sync broadcast channel.
-///
-/// Once connected, clients receive all broadcast messages from peers.
-/// Clients can also send messages that get broadcast to all other
-/// connected WebSocket clients. The server does NOT store any messages.
-async fn handle_sync_ws(
+/// POST /qq — incoming QQ Bot webhook (validation + events)
+async fn handle_qq_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ws: axum::extract::WebSocketUpgrade,
+    body: Bytes,
 ) -> impl IntoResponse {
-    // Authenticate via session token (query param or header)
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err((status, json)) => {
-            return (status, json.0.to_string()).into_response();
-        }
-    };
-
-    let broadcast_tx = match state.sync_broadcast.as_ref() {
-        Some(tx) => tx.clone(),
-        None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Sync not enabled").into_response();
-        }
-    };
-
-    let device_id = session.device_id.clone().unwrap_or_default();
-    let user_id = session.user_id.clone();
-
-    ws.on_upgrade(move |socket| handle_sync_ws_connection(socket, broadcast_tx, device_id, user_id))
-}
-
-/// Handle a single WebSocket sync connection.
-async fn handle_sync_ws_connection(
-    socket: axum::extract::ws::WebSocket,
-    broadcast_tx: tokio::sync::broadcast::Sender<String>,
-    device_id: String,
-    _user_id: String,
-) {
-    use axum::extract::ws::Message;
-    use futures_util::{SinkExt, StreamExt};
-
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-    let mut broadcast_rx = broadcast_tx.subscribe();
-
-    // Spawn task to forward broadcast messages to this client
-    let device_id_clone = device_id.clone();
-    let send_task = tokio::spawn(async move {
-        while let Ok(msg) = broadcast_rx.recv().await {
-            // Don't echo messages back to the sender.
-            // Parse JSON to reliably check from_device_id regardless of field order.
-            let is_own_message = serde_json::from_str::<serde_json::Value>(&msg)
-                .ok()
-                .and_then(|v| v.get("from_device_id")?.as_str().map(String::from))
-                .is_some_and(|id| id == device_id_clone);
-            if is_own_message {
-                continue;
-            }
-            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Receive messages from this client and broadcast to all peers
-    while let Some(Ok(msg)) = ws_receiver.next().await {
-        match msg {
-            Message::Text(text) => {
-                let _ = broadcast_tx.send(text.to_string());
-            }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-
-    send_task.abort();
-    tracing::debug!(device_id, "Sync WebSocket disconnected");
-}
-
-/// POST /api/sync/relay — upload encrypted data to the temporary relay.
-async fn handle_sync_relay_upload(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<SyncRelayUploadBody>, axum::extract::rejection::JsonRejection>,
-) -> AuthResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let relay = match state.sync_relay.as_ref() {
-        Some(r) => r,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Sync not enabled"})),
-            );
-        }
-    };
-
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
-            );
-        }
-    };
-
-    let entry_id = uuid::Uuid::new_v4().to_string();
-    let device_id = session.device_id.clone().unwrap_or_default();
-
-    let entry = crate::sync::relay::RelayEntry {
-        id: entry_id.clone(),
-        sender_device_id: device_id.clone(),
-        user_id: session.user_id.clone(),
-        encrypted_payload: body.encrypted_payload,
-        nonce: body.nonce,
-        created_at_epoch: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    };
-
-    relay.store(entry);
-
-    // Notify connected peers via broadcast
-    if let Some(ref tx) = state.sync_broadcast {
-        let notify = serde_json::json!({
-            "type": "relay_notify",
-            "from_device_id": device_id,
-            "relay_ids": [entry_id],
-        });
-        let _ = tx.send(notify.to_string());
-    }
-
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "status": "stored",
-            "relay_id": entry_id,
-        })),
-    )
-}
-
-/// GET /api/sync/relay — pick up pending relay entries.
-async fn handle_sync_relay_pickup(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    query: Query<SyncRelayPickupQuery>,
-) -> AuthResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let relay = match state.sync_relay.as_ref() {
-        Some(r) => r,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Sync not enabled"})),
-            );
-        }
-    };
-
-    let exclude_device = query.device_id.as_deref().or(session.device_id.as_deref());
-    let entries = relay.pickup(&session.user_id, exclude_device);
-
-    let list: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "id": e.id,
-                "sender_device_id": e.sender_device_id,
-                "encrypted_payload": e.encrypted_payload,
-                "nonce": e.nonce,
-                "created_at_epoch": e.created_at_epoch,
-            })
-        })
-        .collect();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "entries": list,
-            "count": list.len(),
-        })),
-    )
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// TELEMETRY HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// POST /api/telemetry/events — ingest telemetry events from app clients.
-/// Requires bearer token auth (pairing or admin token).
-async fn handle_telemetry_ingest(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(event): Json<crate::telemetry::TelemetryEvent>,
-) -> impl IntoResponse {
-    let Some(ref store) = state.telemetry else {
+    let Some(ref qq) = state.qq else {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "telemetry not enabled"})),
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "QQ not configured"})),
         );
     };
 
-    // Accept events from paired clients, multi-user session, or admin
-    let token_str = {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        auth.strip_prefix("Bearer ").unwrap_or("").to_string()
-    };
-    let is_paired = state.pairing.is_authenticated(&token_str);
-    let is_session = !is_paired
-        && state
-            .auth_store
-            .as_ref()
-            .and_then(|s| s.validate_session(&token_str))
-            .is_some();
-    let is_admin = authenticate_admin(&state, &headers);
+    if !state.qq_webhook_enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "QQ webhook mode not enabled"})),
+        );
+    }
 
-    if !is_paired && !is_session && !is_admin {
+    let app_id_header = headers
+        .get("X-Bot-Appid")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if !app_id_header.is_empty() && !constant_time_eq(app_id_header, qq.app_id()) {
+        tracing::warn!("QQ webhook rejected due to mismatched X-Bot-Appid");
         return (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized"})),
+            Json(serde_json::json!({"error": "Invalid X-Bot-Appid"})),
         );
     }
 
-    // Enrich event with IP-derived country if not already set
-    let mut enriched = event;
-    if enriched.ip_address.is_empty() {
-        enriched.ip_address = headers
-            .get("x-forwarded-for")
-            .or_else(|| headers.get("x-real-ip"))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
-    }
-
-    match store.record(enriched) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "recorded"})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to record: {e}")})),
-        ),
-    }
-}
-
-/// GET /api/admin/telemetry/events — query telemetry events (admin only).
-/// Query params: user_id, country, channel, action, alert_level, since, until, search, limit, offset
-async fn handle_admin_telemetry_events(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<crate::telemetry::TelemetryQuery>,
-) -> impl IntoResponse {
-    if !authenticate_admin(&state, &headers) {
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "admin authentication required"})),
-        );
-    }
-
-    let Some(ref store) = state.telemetry else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "telemetry not enabled"})),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
         );
     };
 
-    match store.query(&query) {
-        Ok(events) => (StatusCode::OK, Json(serde_json::json!({"events": events}))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("query failed: {e}")})),
-        ),
+    if let Some(validation_response) = qq.build_webhook_validation_response(&payload) {
+        tracing::info!("QQ webhook validation challenge accepted");
+        return (StatusCode::OK, Json(validation_response));
     }
-}
 
-/// GET /api/admin/telemetry/summary — dashboard summary (admin only).
-async fn handle_admin_telemetry_summary(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if !authenticate_admin(&state, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "admin authentication required"})),
+    let messages = qq.parse_webhook_payload(&payload).await;
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    for msg in &messages {
+        tracing::info!(
+            "QQ webhook message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
         );
-    }
+        let session_id = gateway_message_session_id(msg);
 
-    let Some(ref store) = state.telemetry else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "telemetry not enabled"})),
-        );
-    };
-
-    match store.summary() {
-        Ok(summary) => (StatusCode::OK, Json(serde_json::json!(summary))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("summary failed: {e}")})),
-        ),
-    }
-}
-
-/// GET /api/admin/telemetry/alerts — recent suspicious activity alerts (admin only).
-async fn handle_admin_telemetry_alerts(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if !authenticate_admin(&state, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "admin authentication required"})),
-        );
-    }
-
-    let Some(ref store) = state.telemetry else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "telemetry not enabled"})),
-        );
-    };
-
-    match store.pending_alerts() {
-        Ok(alerts) => (StatusCode::OK, Json(serde_json::json!({"alerts": alerts}))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("alerts query failed: {e}")})),
-        ),
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// VOICE / INTERPRETATION HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// GET /api/voice/ui — returns the translation UI manifest.
-///
-/// Provides the frontend with everything needed to render the translation
-/// panel: language list (25 languages with native labels and flags),
-/// direction modes (bidirectional/unidirectional), domain options,
-/// formality levels, and default values from server config.
-async fn handle_voice_ui(
-    State(state): State<AppState>,
-) -> Json<crate::task_category::TranslationUiManifest> {
-    Json(crate::task_category::TranslationUiManifest::build(
-        state.voice_sessions.default_source_language(),
-        state.voice_sessions.default_target_language(),
-    ))
-}
-
-/// Request body for creating a voice interpretation session.
-#[derive(Debug, GatewayDeserialize)]
-struct VoiceSessionCreateBody {
-    /// Source language code (e.g. "ko", "en").
-    source_language: String,
-    /// Target language code (e.g. "en", "ko").
-    target_language: String,
-    /// Enable bidirectional auto-switching.
-    #[serde(default)]
-    bidirectional: bool,
-    /// Formality level: "formal", "neutral", "casual".
-    #[serde(default)]
-    formality: Option<String>,
-    /// Domain: "general", "business", "medical", "legal", "technical".
-    #[serde(default)]
-    domain: Option<String>,
-    /// Voice provider: "gemini" or "openai" (default: config default or "gemini").
-    #[serde(default)]
-    provider: Option<String>,
-}
-
-/// POST /api/voice/sessions — create a voice interpretation session.
-async fn handle_voice_session_create(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<VoiceSessionCreateBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err((status, json)) => return (status, json).into_response(),
-    };
-
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid request: {e}")})),
-            )
-                .into_response();
+        if state.auto_save {
+            let key = qq_memory_key(msg);
+            let _ = state
+                .mem
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
+                .await;
         }
-    };
 
-    let source: crate::voice::LanguageCode = match crate::voice::LanguageCode::from_str_code(
-        &body.source_language,
-    ) {
-        Some(l) => l,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Unknown source language: {}", body.source_language)})),
-            )
-                .into_response();
-        }
-    };
-
-    let target: crate::voice::LanguageCode = match crate::voice::LanguageCode::from_str_code(
-        &body.target_language,
-    ) {
-        Some(l) => l,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Unknown target language: {}", body.target_language)})),
-            )
-                .into_response();
-        }
-    };
-
-    let formality = match body.formality.as_deref() {
-        Some("formal") => crate::voice::Formality::Formal,
-        Some("casual") => crate::voice::Formality::Casual,
-        _ => crate::voice::Formality::Neutral,
-    };
-
-    let domain = match body.domain.as_deref() {
-        Some("business") => crate::voice::Domain::Business,
-        Some("medical") => crate::voice::Domain::Medical,
-        Some("legal") => crate::voice::Domain::Legal,
-        Some("technical") => crate::voice::Domain::Technical,
-        _ => crate::voice::Domain::General,
-    };
-
-    let provider = match body.provider.as_deref() {
-        Some("openai") => crate::voice::VoiceProviderKind::OpenAiRealtime,
-        Some("gemini") => crate::voice::VoiceProviderKind::GeminiLive,
-        None => {
-            // Fall back to config default
-            match state.voice_sessions.default_provider() {
-                Some("gemini") => crate::voice::VoiceProviderKind::GeminiLive,
-                _ => crate::voice::VoiceProviderKind::OpenAiRealtime,
-            }
-        }
-        Some(other) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Unknown provider: {other}. Use 'gemini' or 'openai'")})),
-            )
-                .into_response();
-        }
-    };
-
-    let config = crate::voice::InterpreterConfig {
-        source_language: source,
-        target_language: target,
-        bidirectional: body.bidirectional,
-        formality,
-        domain,
-        preserve_tone: true,
-        api_key: None,
-        provider,
-    };
-
-    match state
-        .voice_sessions
-        .create_session(&session.user_id, config)
-        .await
-    {
-        Ok(voice_session) => {
-            let provider_str = match provider {
-                crate::voice::VoiceProviderKind::GeminiLive => "gemini",
-                crate::voice::VoiceProviderKind::OpenAiRealtime => "openai",
-            };
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({
-                    "session_id": voice_session.id,
-                    "status": "idle",
-                    "provider": provider_str,
-                    "source_language": source.as_str(),
-                    "target_language": target.as_str(),
-                    "bidirectional": body.bidirectional,
-                    "ws_url": format!("/api/voice/interpret?session_id={}", voice_session.id),
-                })),
-            )
-        }
-        .into_response(),
-        Err(e) => {
-            let msg = e.to_string();
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": msg})),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// GET /api/voice/sessions — list active voice sessions for the authenticated user.
-async fn handle_voice_sessions_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err((status, json)) => return (status, json).into_response(),
-    };
-
-    let sessions = state
-        .voice_sessions
-        .list_user_sessions(&session.user_id)
-        .await;
-
-    let sessions_json: Vec<serde_json::Value> = sessions
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "session_id": s.id,
-                "status": format!("{:?}", s.status),
-                "source_language": s.config.source_language.as_str(),
-                "target_language": s.config.target_language.as_str(),
-                "bidirectional": s.config.bidirectional,
-                "utterance_count": s.stats.utterance_count,
-            })
-        })
-        .collect();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"sessions": sessions_json})),
-    )
-        .into_response()
-}
-
-/// GET /api/voice/interpret — WebSocket upgrade for real-time voice interpretation.
-///
-/// ## Protocol
-///
-/// 1. Client connects with `?session_id=<id>` query parameter
-/// 2. Server sends JSON text frame: `{"type": "ready", "session_id": "..."}`
-/// 3. Client sends binary frames: raw PCM audio (16kHz, mono, 16-bit LE)
-/// 4. Client sends text frames: JSON control messages
-///    - `{"type": "config", "vad": {...}}` — update VAD settings
-///    - `{"type": "stop"}` — graceful close
-/// 5. Server sends binary frames: translated audio (24kHz PCM)
-/// 6. Server sends text frames: JSON events
-///    - `{"type": "input_transcript", "text": "..."}`
-///    - `{"type": "output_transcript", "text": "..."}`
-///    - `{"type": "turn_complete"}`
-///    - `{"type": "error", "message": "..."}`
-async fn handle_voice_interpret_ws(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-    ws: axum::extract::WebSocketUpgrade,
-) -> impl IntoResponse {
-    // TODO: migrate to first-message auth pattern instead of query param token.
-    // Query param exposes token in URLs/logs. First-message auth: client connects,
-    // sends {"type":"auth","token":"..."} as first WS frame, server validates before
-    // accepting further messages. Update Interpreter.tsx client accordingly.
-    // Authenticate (header first, then query param fallback for WebSocket)
-    let session = match require_auth_session(&state, &headers) {
-        Ok(s) => s,
-        Err(_) => {
-            // WebSocket clients can't send custom headers, so accept token as query param
-            match params.get("token") {
-                Some(token) => {
-                    let auth_store = match state.auth_store.as_ref() {
-                        Some(s) => s,
-                        None => {
-                            return (StatusCode::SERVICE_UNAVAILABLE, "Auth not enabled")
-                                .into_response();
-                        }
-                    };
-                    match auth_store.validate_session(token) {
-                        Some(s) => s,
-                        None => {
-                            return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
-                        }
-                    }
-                }
-                None => {
-                    return (StatusCode::UNAUTHORIZED, "Missing auth token").into_response();
+        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+            Ok(response) => {
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
+                if let Err(e) = qq
+                    .send(
+                        &SendMessage::new(safe_response, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await
+                {
+                    tracing::error!("Failed to send QQ reply: {e}");
                 }
             }
-        }
-    };
-
-    let session_id = match params.get("session_id") {
-        Some(id) => id.clone(),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Missing session_id query parameter",
-            )
-                .into_response();
-        }
-    };
-
-    // Verify the session exists and belongs to this user
-    let voice_session = match state.voice_sessions.get_session(&session_id).await {
-        Some(vs) if vs.user_id == session.user_id => vs,
-        Some(_) => {
-            return (StatusCode::FORBIDDEN, "Session does not belong to you").into_response();
-        }
-        None => {
-            return (StatusCode::NOT_FOUND, "Voice session not found").into_response();
-        }
-    };
-
-    let voice_manager = Arc::clone(&state.voice_sessions);
-    let voice_config = state.voice_config.clone();
-
-    ws.on_upgrade(move |socket| {
-        handle_voice_ws_connection(socket, voice_session, voice_manager, voice_config)
-    })
-}
-
-/// Handle a single voice interpretation WebSocket connection.
-///
-/// Bridges the browser's audio stream to the selected voice provider:
-/// Browser → (binary PCM) → ZeroClaw → (Provider WS) → AI API
-///                                                        ↓
-/// Browser ← (binary PCM + text transcripts) ← ZeroClaw ←┘
-async fn handle_voice_ws_connection(
-    socket: axum::extract::ws::WebSocket,
-    voice_session: crate::voice::InterpreterSession,
-    voice_manager: Arc<crate::voice::VoiceSessionManager>,
-    voice_config: crate::config::VoiceConfig,
-) {
-    use axum::extract::ws::Message;
-    use futures_util::{SinkExt, StreamExt};
-
-    let session_id = voice_session.id.clone();
-    let provider = voice_session.config.provider;
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-
-    // Resolve API key based on provider
-    let (api_key, provider_name, input_sample_rate) = match provider {
-        crate::voice::VoiceProviderKind::GeminiLive => {
-            let key = voice_session
-                .config
-                .api_key
-                .clone()
-                .or(voice_config.gemini_api_key)
-                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-                .or_else(|| std::env::var("GOOGLE_API_KEY").ok());
-            (key, "gemini", 16000u32)
-        }
-        crate::voice::VoiceProviderKind::OpenAiRealtime => {
-            let key = voice_session
-                .config
-                .api_key
-                .clone()
-                .or(voice_config.openai_api_key)
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-            (
-                key,
-                "openai",
-                crate::voice::openai_realtime::INPUT_SAMPLE_RATE,
-            )
-        }
-    };
-
-    let api_key = match api_key {
-        Some(k) if !k.trim().is_empty() => k,
-        _ => {
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!("{provider_name} API key not configured. Set the appropriate env var.")
-            });
-            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-            return;
-        }
-    };
-
-    // Connect to the selected provider and get event_rx + send handles
-    let event_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::voice::VoiceEvent>>>;
-
-    // Provider-specific session — we store an enum to avoid Box<dyn> overhead
-    enum ProviderSession {
-        Gemini(crate::voice::GeminiLiveSession),
-        OpenAi(crate::voice::OpenAiRealtimeSession),
-    }
-
-    let provider_session = match provider {
-        crate::voice::VoiceProviderKind::GeminiLive => {
-            let vad = crate::voice::VadConfig::default();
-            match crate::voice::GeminiLiveSession::connect(
-                session_id.clone(),
-                &api_key,
-                &voice_session.config,
-                &vad,
-            )
-            .await
-            {
-                Ok(s) => {
-                    event_rx = Arc::clone(&s.event_rx);
-                    ProviderSession::Gemini(s)
-                }
-                Err(e) => {
-                    tracing::error!(session_id = %session_id, error = %e, "Gemini Live connection failed");
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!("Failed to connect to Gemini Live: {e}")
-                    });
-                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                    return;
-                }
+            Err(e) => {
+                tracing::error!("LLM error for QQ webhook message: {e:#}");
+                let _ = qq
+                    .send(
+                        &SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        )
+                        .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
             }
-        }
-        crate::voice::VoiceProviderKind::OpenAiRealtime => {
-            match crate::voice::OpenAiRealtimeSession::connect(
-                session_id.clone(),
-                &api_key,
-                &voice_session.config,
-            )
-            .await
-            {
-                Ok(s) => {
-                    event_rx = Arc::clone(&s.event_rx);
-                    ProviderSession::OpenAi(s)
-                }
-                Err(e) => {
-                    tracing::error!(session_id = %session_id, error = %e, "OpenAI Realtime connection failed");
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!("Failed to connect to OpenAI Realtime: {e}")
-                    });
-                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                    return;
-                }
-            }
-        }
-    };
-
-    let _ = voice_manager
-        .update_status(&session_id, crate::voice::InterpreterStatus::Ready)
-        .await;
-
-    // Send ready message to browser with full config + provider info
-    let ready = serde_json::json!({
-        "type": "ready",
-        "session_id": session_id,
-        "provider": provider_name,
-        "input_sample_rate": input_sample_rate,
-        "source_language": voice_session.config.source_language.as_str(),
-        "target_language": voice_session.config.target_language.as_str(),
-        "source_language_name": voice_session.config.source_language.display_name(),
-        "target_language_name": voice_session.config.target_language.display_name(),
-        "bidirectional": voice_session.config.bidirectional,
-        "domain": format!("{:?}", voice_session.config.domain),
-        "formality": format!("{:?}", voice_session.config.formality),
-    });
-    let _ = ws_sender
-        .send(Message::Text(ready.to_string().into()))
-        .await;
-
-    let _ = voice_manager
-        .update_status(&session_id, crate::voice::InterpreterStatus::Listening)
-        .await;
-
-    // Spawn task: provider events → browser (identical for all providers via VoiceEvent)
-    let session_id_events = session_id.clone();
-    let voice_manager_events = Arc::clone(&voice_manager);
-    let send_task = tokio::spawn(async move {
-        let mut sender = ws_sender;
-        while let Some(event) = event_rx.lock().await.recv().await {
-            let result = match &event {
-                crate::voice::VoiceEvent::Audio { data } => {
-                    sender.send(Message::Binary(data.clone().into())).await
-                }
-                crate::voice::VoiceEvent::InputTranscript { text } => {
-                    let msg = serde_json::json!({
-                        "type": "input_transcript",
-                        "text": text,
-                    });
-                    sender.send(Message::Text(msg.to_string().into())).await
-                }
-                crate::voice::VoiceEvent::OutputTranscript { text } => {
-                    let msg = serde_json::json!({
-                        "type": "output_transcript",
-                        "text": text,
-                    });
-                    sender.send(Message::Text(msg.to_string().into())).await
-                }
-                crate::voice::VoiceEvent::TurnComplete => {
-                    let msg = serde_json::json!({"type": "turn_complete"});
-                    sender.send(Message::Text(msg.to_string().into())).await
-                }
-                crate::voice::VoiceEvent::Interrupted => {
-                    let msg = serde_json::json!({"type": "interrupted"});
-                    sender.send(Message::Text(msg.to_string().into())).await
-                }
-                crate::voice::VoiceEvent::Error { message } => {
-                    let msg = serde_json::json!({
-                        "type": "error",
-                        "message": message,
-                    });
-                    sender.send(Message::Text(msg.to_string().into())).await
-                }
-                crate::voice::VoiceEvent::SetupComplete => Ok(()),
-            };
-            if result.is_err() {
-                break;
-            }
-        }
-        tracing::debug!(
-            session_id = %session_id_events,
-            "Voice event relay task ended"
-        );
-        let _ = voice_manager_events
-            .update_status(&session_id_events, crate::voice::InterpreterStatus::Closed)
-            .await;
-    });
-
-    // Main loop: browser audio → provider
-    let mut audio_stopped = false;
-    let mut stop_deadline: Option<Instant> = None;
-    let is_gemini = matches!(provider, crate::voice::VoiceProviderKind::GeminiLive);
-
-    while let Some(Ok(msg)) = ws_receiver.next().await {
-        if let Some(deadline) = stop_deadline {
-            if Instant::now() > deadline {
-                tracing::info!(session_id = %session_id, "Stop timeout reached, ending session");
-                break;
-            }
-        }
-        match msg {
-            Message::Binary(data) => {
-                if audio_stopped {
-                    continue;
-                }
-                let send_result = match &provider_session {
-                    ProviderSession::Gemini(s) => s.send_audio(&data).await,
-                    ProviderSession::OpenAi(s) => s.send_audio(&data).await,
-                };
-                if let Err(e) = send_result {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        error = %e,
-                        "Failed to send audio to provider"
-                    );
-                    break;
-                }
-            }
-            Message::Text(text) => {
-                if let Ok(ctrl) = serde_json::from_str::<serde_json::Value>(&text) {
-                    match ctrl.get("type").and_then(|v| v.as_str()) {
-                        Some("stop") => {
-                            tracing::info!(session_id = %session_id, "Client requested graceful stop");
-                            audio_stopped = true;
-                            stop_deadline = Some(Instant::now() + Duration::from_secs(30));
-                        }
-                        Some("activity_start") if is_gemini => {
-                            if let ProviderSession::Gemini(s) = &provider_session {
-                                tracing::info!(session_id = %session_id, "Client: activityStart");
-                                if let Err(e) = s.send_activity_start().await {
-                                    tracing::warn!(session_id = %session_id, error = %e, "Failed to send activityStart");
-                                }
-                            }
-                        }
-                        Some("activity_end") if is_gemini => {
-                            if let ProviderSession::Gemini(s) = &provider_session {
-                                tracing::info!(session_id = %session_id, "Client: activityEnd");
-                                if let Err(e) = s.send_activity_end().await {
-                                    tracing::warn!(session_id = %session_id, error = %e, "Failed to send activityEnd");
-                                }
-                            }
-                        }
-                        // OpenAI with semantic VAD: activity_start/end are ignored (server handles it)
-                        Some("activity_start" | "activity_end") => {
-                            tracing::debug!(session_id = %session_id, "Ignoring activity message for non-Gemini provider");
-                        }
-                        Some("text") => {
-                            if let Some(input) = ctrl.get("text").and_then(|v| v.as_str()) {
-                                match &provider_session {
-                                    ProviderSession::Gemini(s) => {
-                                        let _ = s.send_text(input).await;
-                                    }
-                                    ProviderSession::OpenAi(s) => {
-                                        let _ = s.send_text(input).await;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::debug!(session_id = %session_id, "Unknown control message type");
-                        }
-                    }
-                }
-            }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 
-    // Cleanup
-    match &provider_session {
-        ProviderSession::Gemini(s) => s.close().await,
-        ProviderSession::OpenAi(s) => s.close().await,
-    }
-    send_task.abort();
-
-    let _ = voice_manager.close_session(&session_id).await;
-
-    tracing::info!(session_id = %session_id, provider = provider_name, "Voice interpretation session ended");
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
 #[cfg(test)]
@@ -2853,14 +2670,20 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
+    fn generate_test_secret() -> String {
+        let bytes: [u8; 32] = rand::random();
+        hex::encode(bytes)
+    }
+
     #[test]
     fn security_body_limit_is_64kb() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
     }
 
     #[test]
-    fn security_timeout_is_120_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 120);
+    fn security_timeout_is_30_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
     }
 
     #[test]
@@ -2868,11 +2691,30 @@ mod tests {
         let valid = r#"{"message": "hello"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(valid);
         assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap().message, "hello");
+        let parsed = parsed.unwrap();
+        assert_eq!(parsed.message, "hello");
+        assert_eq!(parsed.stream, None);
+
+        let stream_enabled = r#"{"message": "hello", "stream": true}"#;
+        let parsed: Result<WebhookBody, _> = serde_json::from_str(stream_enabled);
+        assert!(parsed.is_ok());
+        assert_eq!(parsed.unwrap().stream, Some(true));
 
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
         assert!(parsed.is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_get_usage_returns_explicit_method_hint() {
+        let response = handle_webhook_usage().await.into_response();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["method"], "POST");
+        assert_eq!(parsed["path"], "/webhook");
+        assert_eq!(parsed["example"]["message"], "Hello from webhook");
     }
 
     #[test]
@@ -2886,14 +2728,227 @@ mod tests {
     }
 
     #[test]
+    fn node_id_allowed_with_empty_allowlist_accepts_any() {
+        assert!(node_id_allowed("node-a", &[]));
+    }
+
+    #[test]
+    fn node_id_allowed_respects_allowlist() {
+        let allow = vec!["node-1".to_string(), "node-2".to_string()];
+        assert!(node_id_allowed("node-1", &allow));
+        assert!(!node_id_allowed("node-9", &allow));
+    }
+
+    #[test]
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
     }
 
+    #[tokio::test]
+    async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROMETHEUS_CONTENT_TYPE)
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Prometheus backend not enabled"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_renders_prometheus_output() {
+        let prom = Arc::new(
+            crate::observability::PrometheusObserver::new()
+                .expect("prometheus observer should initialize in tests"),
+        );
+        crate::observability::Observer::record_event(
+            prom.as_ref(),
+            &crate::observability::ObserverEvent::HeartbeatTick,
+        );
+
+        let observer: Arc<dyn crate::observability::Observer> = prom;
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer,
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_rejects_public_clients_when_pairing_is_disabled() {
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("non-loopback"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_requires_bearer_token_when_pairing_is_enabled() {
+        let paired_token = "zc_test_token".to_string();
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(true, std::slice::from_ref(&paired_token))),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let unauthorized =
+            handle_metrics(State(state.clone()), test_connect_info(), HeaderMap::new())
+                .await
+                .into_response();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {paired_token}")).unwrap(),
+        );
+        let authorized = handle_metrics(State(state), test_connect_info(), headers)
+            .await
+            .into_response();
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
     #[test]
     fn gateway_rate_limiter_blocks_after_limit() {
-        let limiter = GatewayRateLimiter::new(2, 2);
+        let limiter = GatewayRateLimiter::new(2, 2, 100);
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(!limiter.allow_pair("127.0.0.1"));
@@ -2901,7 +2956,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_sweep_removes_stale_entries() {
-        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60));
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 100);
         // Add entries for multiple IPs
         assert!(limiter.allow("ip-1"));
         assert!(limiter.allow("ip-2"));
@@ -2935,7 +2990,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_zero_limit_always_allows() {
-        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_secs(60));
+        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_secs(60), 10);
         for _ in 0..100 {
             assert!(limiter.allow("any-key"));
         }
@@ -2943,10 +2998,123 @@ mod tests {
 
     #[test]
     fn idempotency_store_rejects_duplicate_key() {
-        let store = IdempotencyStore::new(Duration::from_secs(30));
+        let store = IdempotencyStore::new(Duration::from_secs(30), 10);
         assert!(store.record_if_new("req-1"));
         assert!(!store.record_if_new("req-1"));
         assert!(store.record_if_new("req-2"));
+    }
+
+    #[test]
+    fn rate_limiter_bounded_cardinality_evicts_oldest_key() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 2);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-3"));
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 2);
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(guard.0.contains_key("ip-3"));
+    }
+
+    #[test]
+    fn idempotency_store_bounded_cardinality_evicts_oldest_key() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 2);
+        assert!(store.record_if_new("k1"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("k2"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("k3"));
+
+        let keys = store.keys.lock();
+        assert_eq!(keys.len(), 2);
+        assert!(!keys.contains_key("k1"));
+        assert!(keys.contains_key("k2"));
+        assert!(keys.contains_key("k3"));
+    }
+
+    #[test]
+    fn client_key_defaults_to_peer_addr_when_untrusted_proxy_mode() {
+        let peer = SocketAddr::from(([10, 0, 0, 5], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
+        );
+
+        let key = client_key_from_request(Some(peer), &headers, false);
+        assert_eq!(key, "10.0.0.5");
+    }
+
+    #[test]
+    fn client_key_uses_forwarded_ip_only_in_trusted_proxy_mode() {
+        let peer = SocketAddr::from(([10, 0, 0, 5], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
+        );
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "198.51.100.10");
+    }
+
+    #[test]
+    fn client_key_falls_back_to_peer_when_forwarded_header_invalid() {
+        let peer = SocketAddr::from(([10, 0, 0, 5], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("garbage-value"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "10.0.0.5");
+    }
+
+    #[test]
+    fn normalize_max_keys_uses_fallback_for_zero() {
+        assert_eq!(normalize_max_keys(0, 10_000), 10_000);
+        assert_eq!(normalize_max_keys(0, 0), 1);
+    }
+
+    #[test]
+    fn normalize_max_keys_preserves_nonzero_values() {
+        assert_eq!(normalize_max_keys(2_048, 10_000), 2_048);
+        assert_eq!(normalize_max_keys(1, 10_000), 1);
+    }
+
+    #[tokio::test]
+    async fn persist_pairing_tokens_writes_config_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let workspace_path = temp.path().join("workspace");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = workspace_path;
+        config.save().await.unwrap();
+
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        assert!(guard.is_authenticated(&token));
+
+        let shared_config = Arc::new(Mutex::new(config));
+        persist_pairing_tokens(shared_config.clone(), &guard)
+            .await
+            .unwrap();
+
+        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
+        let parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(parsed.gateway.paired_tokens.len(), 1);
+        let persisted = &parsed.gateway.paired_tokens[0];
+        assert!(crate::security::SecretStore::is_encrypted(persisted));
+        let store = crate::security::SecretStore::new(temp.path(), true);
+        let decrypted = store.decrypt(persisted).unwrap();
+        assert_eq!(decrypted.len(), 64);
+        assert!(decrypted.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let in_memory = shared_config.lock();
+        assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
+        assert_eq!(&in_memory.gateway.paired_tokens[0], &decrypted);
     }
 
     #[test]
@@ -2968,10 +3136,109 @@ mod tests {
             content: "hello".into(),
             channel: "whatsapp".into(),
             timestamp: 1,
+            thread_ts: None,
         };
 
         let key = whatsapp_memory_key(&msg);
         assert_eq!(key, "whatsapp_+1234567890_wamid-123");
+    }
+
+    #[test]
+    fn qq_memory_key_includes_sender_and_message_id() {
+        let msg = ChannelMessage {
+            id: "msg-123".into(),
+            sender: "user_openid".into(),
+            reply_target: "user:user_openid".into(),
+            content: "hello".into(),
+            channel: "qq".into(),
+            timestamp: 1,
+            thread_ts: Some("msg-123".into()),
+        };
+
+        let key = qq_memory_key(&msg);
+        assert_eq!(key, "qq_user_openid_msg-123");
+    }
+
+    struct MockScheduleTool;
+
+    #[async_trait]
+    impl Tool for MockScheduleTool {
+        fn name(&self) -> &str {
+            "schedule"
+        }
+
+        fn description(&self) -> &str {
+            "Mock schedule tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" }
+                },
+                "required": ["action"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn sanitize_gateway_response_removes_tool_call_tags() {
+        let input = r#"Before
+<tool_call>
+{"name":"schedule","arguments":{"action":"create"}}
+</tool_call>
+After"#;
+
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = sanitize_gateway_response(input, &[], &leak_guard);
+        let normalized = result
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(normalized, "Before\nAfter");
+        assert!(!result.contains("<tool_call>"));
+        assert!(!result.contains("\"name\":\"schedule\""));
+    }
+
+    #[test]
+    fn sanitize_gateway_response_removes_isolated_tool_json_artifacts() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+        let input = r#"{"name":"schedule","parameters":{"action":"create"}}
+{"result":{"status":"scheduled"}}
+Reminder set successfully."#;
+
+        let leak_guard = crate::config::OutboundLeakGuardConfig::default();
+        let result = sanitize_gateway_response(input, &tools, &leak_guard);
+        assert_eq!(result, "Reminder set successfully.");
+        assert!(!result.contains("\"name\":\"schedule\""));
+        assert!(!result.contains("\"result\""));
+    }
+
+    #[test]
+    fn sanitize_gateway_response_blocks_detected_credentials_when_configured() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leak_guard = crate::config::OutboundLeakGuardConfig {
+            enabled: true,
+            action: crate::config::OutboundLeakGuardAction::Block,
+            sensitivity: 0.7,
+        };
+
+        let result =
+            sanitize_gateway_response("Temporary key: AKIAABCDEFGHIJKLMNOP", &tools, &leak_guard);
+        assert!(result.contains("blocked a draft response"));
     }
 
     #[derive(Default)]
@@ -3103,6 +3370,14 @@ mod tests {
         }
     }
 
+    fn test_connect_info() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
+    }
+
+    fn test_public_connect_info() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([203, 0, 113, 10], 30_300)))
+    }
+
     #[tokio::test]
     async fn webhook_idempotency_skips_duplicate_provider_calls() {
         let provider_impl = Arc::new(MockProvider::default());
@@ -3110,54 +3385,61 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
-            line: None,
             whatsapp_app_secret: None,
-            gatekeeper: None,
-            agent: None,
-            telemetry: None,
-            telemetry_admin_token_hash: None,
-            auth_store: None,
-            auth_allow_registration: false,
-            auth_max_users: 0,
-            auth_max_devices_per_user: 10,
-            sync_relay: None,
-            sync_broadcast: None,
-            channel_pairing: None,
-            gateway_base_url: "http://127.0.0.1:3000".into(),
-            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
-            voice_config: crate::config::VoiceConfig::default(),
-            active_channel_names: Vec::new(),
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
 
         let body = Ok(Json(WebhookBody {
-            task_category: None,
             message: "hello".into(),
-            model: None,
+            stream: None,
+            session_id: None,
         }));
-        let first = handle_webhook(State(state.clone()), headers.clone(), body)
-            .await
-            .into_response();
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            headers.clone(),
+            body,
+        )
+        .await
+        .into_response();
         assert_eq!(first.status(), StatusCode::OK);
 
         let body = Ok(Json(WebhookBody {
-            task_category: None,
             message: "hello".into(),
-            model: None,
+            stream: None,
+            session_id: None,
         }));
-        let second = handle_webhook(State(state), headers, body)
+        let second = handle_webhook(State(state), test_connect_info(), headers, body)
             .await
             .into_response();
         assert_eq!(second.status(), StatusCode::OK);
@@ -3170,6 +3452,294 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhook_rejects_public_traffic_without_auth_layers() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl;
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_public_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: None,
+                session_id: None,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_empty_message() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "   ".into(),
+                stream: None,
+                session_id: None,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_stream_response_uses_sse_content_type() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "stream me".into(),
+                stream: Some(true),
+                session_id: None,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.starts_with("text/event-stream"));
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&payload);
+        assert!(text.contains("data: [DONE]"));
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn node_control_returns_not_found_when_disabled() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_node_control(
+            State(state),
+            HeaderMap::new(),
+            Ok(Json(NodeControlRequest {
+                method: "node.list".into(),
+                node_id: None,
+                capability: None,
+                arguments: serde_json::Value::Null,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn node_control_list_returns_stub_nodes_when_enabled() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let mut config = Config::default();
+        config.gateway.node_control.enabled = true;
+        config.gateway.node_control.allowed_node_ids = vec!["node-1".into(), "node-2".into()];
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_node_control(
+            State(state),
+            HeaderMap::new(),
+            Ok(Json(NodeControlRequest {
+                method: "node.list".into(),
+                node_id: None,
+                capability: None,
+                arguments: serde_json::Value::Null,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["method"], "node.list");
+        assert_eq!(parsed["nodes"].as_array().map(|v| v.len()), Some(2));
+    }
+
+    #[tokio::test]
     async fn webhook_autosave_stores_distinct_keys_per_request() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
@@ -3178,53 +3748,60 @@ mod tests {
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
             auto_save: true,
             webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
-            line: None,
             whatsapp_app_secret: None,
-            gatekeeper: None,
-            agent: None,
-            telemetry: None,
-            telemetry_admin_token_hash: None,
-            auth_store: None,
-            auth_allow_registration: false,
-            auth_max_users: 0,
-            auth_max_devices_per_user: 10,
-            sync_relay: None,
-            sync_broadcast: None,
-            channel_pairing: None,
-            gateway_base_url: "http://127.0.0.1:3000".into(),
-            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
-            voice_config: crate::config::VoiceConfig::default(),
-            active_channel_names: Vec::new(),
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let headers = HeaderMap::new();
 
         let body1 = Ok(Json(WebhookBody {
-            task_category: None,
             message: "hello one".into(),
-            model: None,
+            stream: None,
+            session_id: None,
         }));
-        let first = handle_webhook(State(state.clone()), headers.clone(), body1)
-            .await
-            .into_response();
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            headers.clone(),
+            body1,
+        )
+        .await
+        .into_response();
         assert_eq!(first.status(), StatusCode::OK);
 
         let body2 = Ok(Json(WebhookBody {
-            task_category: None,
             message: "hello two".into(),
-            model: None,
+            stream: None,
+            session_id: None,
         }));
-        let second = handle_webhook(State(state), headers, body2)
+        let second = handle_webhook(State(state), test_connect_info(), headers, body2)
             .await
             .into_response();
         assert_eq!(second.status(), StatusCode::OK);
@@ -3239,9 +3816,11 @@ mod tests {
 
     #[test]
     fn webhook_secret_hash_is_deterministic_and_nonempty() {
-        let one = hash_webhook_secret("secret-value");
-        let two = hash_webhook_secret("secret-value");
-        let other = hash_webhook_secret("other-value");
+        let secret_a = generate_test_secret();
+        let secret_b = generate_test_secret();
+        let one = hash_webhook_secret(&secret_a);
+        let two = hash_webhook_secret(&secret_a);
+        let other = hash_webhook_secret(&secret_b);
 
         assert_eq!(one, two);
         assert_ne!(one, other);
@@ -3253,44 +3832,48 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
-            line: None,
             whatsapp_app_secret: None,
-            gatekeeper: None,
-            agent: None,
-            telemetry: None,
-            telemetry_admin_token_hash: None,
-            auth_store: None,
-            auth_allow_registration: false,
-            auth_max_users: 0,
-            auth_max_devices_per_user: 10,
-            sync_relay: None,
-            sync_broadcast: None,
-            channel_pairing: None,
-            gateway_base_url: "http://127.0.0.1:3000".into(),
-            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
-            voice_config: crate::config::VoiceConfig::default(),
-            active_channel_names: Vec::new(),
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let response = handle_webhook(
             State(state),
+            test_connect_info(),
             HeaderMap::new(),
             Ok(Json(WebhookBody {
-                task_category: None,
                 message: "hello".into(),
-                model: None,
+                stream: None,
+                session_id: None,
             })),
         )
         .await
@@ -3305,47 +3888,55 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let valid_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
-            line: None,
             whatsapp_app_secret: None,
-            gatekeeper: None,
-            agent: None,
-            telemetry: None,
-            telemetry_admin_token_hash: None,
-            auth_store: None,
-            auth_allow_registration: false,
-            auth_max_users: 0,
-            auth_max_devices_per_user: 10,
-            sync_relay: None,
-            sync_broadcast: None,
-            channel_pairing: None,
-            gateway_base_url: "http://127.0.0.1:3000".into(),
-            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
-            voice_config: crate::config::VoiceConfig::default(),
-            active_channel_names: Vec::new(),
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("wrong-secret"));
+        headers.insert(
+            "X-Webhook-Secret",
+            HeaderValue::from_str(&wrong_secret).unwrap(),
+        );
 
         let response = handle_webhook(
             State(state),
+            test_connect_info(),
             headers,
             Ok(Json(WebhookBody {
-                task_category: None,
                 message: "hello".into(),
-                model: None,
+                stream: None,
+                session_id: None,
             })),
         )
         .await
@@ -3360,47 +3951,51 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[], None, None)),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
-            line: None,
             whatsapp_app_secret: None,
-            gatekeeper: None,
-            agent: None,
-            telemetry: None,
-            telemetry_admin_token_hash: None,
-            auth_store: None,
-            auth_allow_registration: false,
-            auth_max_users: 0,
-            auth_max_devices_per_user: 10,
-            sync_relay: None,
-            sync_broadcast: None,
-            channel_pairing: None,
-            gateway_base_url: "http://127.0.0.1:3000".into(),
-            voice_sessions: Arc::new(crate::voice::VoiceSessionManager::new(true, 5)),
-            voice_config: crate::config::VoiceConfig::default(),
-            active_channel_names: Vec::new(),
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("super-secret"));
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
 
         let response = handle_webhook(
             State(state),
+            test_connect_info(),
             headers,
             Ok(Json(WebhookBody {
-                task_category: None,
                 message: "hello".into(),
-                model: None,
+                stream: None,
+                session_id: None,
             })),
         )
         .await
@@ -3408,6 +4003,446 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let payload = format!("{random}{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    fn compute_github_signature_header(secret: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body.as_bytes());
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[tokio::test]
+    async fn github_webhook_returns_not_found_when_not_configured() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_github_webhook(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"action":"created"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn github_webhook_rejects_invalid_signature() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let mut config = Config::default();
+        config.channels_config.github = Some(crate::config::schema::GitHubConfig {
+            access_token: "ghp_test_token".into(),
+            webhook_secret: Some("github-secret".into()),
+            api_base_url: None,
+            allowed_repos: vec!["zeroclaw-labs/zeroclaw".into()],
+        });
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let body = r#"{
+            "action":"created",
+            "repository":{"full_name":"zeroclaw-labs/zeroclaw"},
+            "issue":{"number":2079,"title":"x"},
+            "comment":{"id":1,"body":"hello","user":{"login":"alice","type":"User"}}
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-GitHub-Event", HeaderValue::from_static("issue_comment"));
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_static("sha256=deadbeef"),
+        );
+
+        let response = handle_github_webhook(State(state), headers, Bytes::from(body))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn github_webhook_duplicate_delivery_returns_duplicate_status() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = "github-secret";
+        let mut config = Config::default();
+        config.channels_config.github = Some(crate::config::schema::GitHubConfig {
+            access_token: "ghp_test_token".into(),
+            webhook_secret: Some(secret.into()),
+            api_base_url: None,
+            allowed_repos: vec!["zeroclaw-labs/zeroclaw".into()],
+        });
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let body = r#"{
+            "action":"created",
+            "repository":{"full_name":"zeroclaw-labs/zeroclaw"},
+            "issue":{"number":2079,"title":"x"},
+            "comment":{"id":1,"body":"hello","user":{"login":"alice","type":"User"}}
+        }"#;
+        let signature = compute_github_signature_header(secret, body);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-GitHub-Event", HeaderValue::from_static("issue_comment"));
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+        headers.insert("X-GitHub-Delivery", HeaderValue::from_static("delivery-1"));
+
+        let first = handle_github_webhook(
+            State(state.clone()),
+            headers.clone(),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = handle_github_webhook(State(state), headers, Bytes::from(body.to_string()))
+            .await
+            .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+        let payload = second.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "duplicate");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_nextcloud_talk_webhook(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"type":"message"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_invalid_signature() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            vec!["*".into()],
+        ));
+
+        let secret = "nextcloud-test-secret";
+        let random = "seed-value";
+        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
+        let invalid_signature = "deadbeef";
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: Some(channel),
+            nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(invalid_signature).unwrap(),
+        );
+
+        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn qq_webhook_returns_not_found_when_not_configured() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_qq_webhook(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"op":13,"d":{"plain_token":"p","event_ts":"1"}}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn qq_webhook_validation_returns_signed_challenge() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let qq = Arc::new(QQChannel::new(
+            "11111111".into(),
+            "DG5g3B4j9X2KOErG".into(),
+            vec!["*".into()],
+        ));
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            bluebubbles: None,
+            bluebubbles_webhook_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: Some(qq),
+            qq_webhook_enabled: true,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Bot-Appid", HeaderValue::from_static("11111111"));
+
+        let response = handle_qq_webhook(
+            State(state),
+            headers,
+            Bytes::from_static(
+                br#"{"op":13,"d":{"plain_token":"Arq0D5A61EgUu4OxUvOp","event_ts":"1725442341"}}"#,
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["plain_token"], "Arq0D5A61EgUu4OxUvOp");
+        assert_eq!(
+            parsed["signature"],
+            "87befc99c42c651b3aac0278e71ada338433ae26fcb24307bdc5ad38c1adc2d01bcfcadc0842edac85e85205028a1132afe09280305f13aa6909ffc2d652c706"
+        );
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
     // ══════════════════════════════════════════════════════════
@@ -3429,14 +4464,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_valid() {
-        // Test with known values
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3444,14 +4478,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_secret() {
-        let app_secret = "correct_secret_key_abc";
-        let wrong_secret = "wrong_secret_key_xyz";
+        let app_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(wrong_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3459,15 +4493,15 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let original_body = b"original body";
         let tampered_body = b"tampered body";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, original_body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, original_body);
 
         // Verify with tampered body should fail
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             tampered_body,
             &signature_header
         ));
@@ -3475,14 +4509,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_missing_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Signature without "sha256=" prefix
         let signature_header = "abc123def456";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -3490,22 +4524,22 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_header() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        assert!(!verify_whatsapp_signature(app_secret, body, ""));
+        assert!(!verify_whatsapp_signature(&app_secret, body, ""));
     }
 
     #[test]
     fn whatsapp_signature_invalid_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Invalid hex characters
         let signature_header = "sha256=not_valid_hex_zzz";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -3513,13 +4547,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3527,13 +4561,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_unicode_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = "Hello 🦀 World".as_bytes();
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3541,13 +4575,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_json_payload() {
-        let app_secret = "test_app_secret_key_xyz";
+        let app_secret = generate_test_secret();
         let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3555,31 +4589,35 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_case_sensitive_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
 
         // Wrong case prefix should fail
         let wrong_prefix = format!("SHA256={hex_sig}");
-        assert!(!verify_whatsapp_signature(app_secret, body, &wrong_prefix));
+        assert!(!verify_whatsapp_signature(&app_secret, body, &wrong_prefix));
 
         // Correct prefix should pass
         let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(app_secret, body, &correct_prefix));
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &correct_prefix
+        ));
     }
 
     #[test]
     fn whatsapp_signature_truncated_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let truncated = &hex_sig[..32]; // Only half the signature
         let signature_header = format!("sha256={truncated}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -3587,17 +4625,211 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_extra_bytes() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let extended = format!("{hex_sig}deadbeef");
         let signature_header = format!("sha256={extended}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // IdempotencyStore Edge-Case Tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn idempotency_store_allows_different_keys() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 100);
+        assert!(store.record_if_new("key-a"));
+        assert!(store.record_if_new("key-b"));
+        assert!(store.record_if_new("key-c"));
+        assert!(store.record_if_new("key-d"));
+    }
+
+    #[test]
+    fn idempotency_store_max_keys_clamped_to_one() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 0);
+        assert!(store.record_if_new("only-key"));
+        assert!(!store.record_if_new("only-key"));
+    }
+
+    #[test]
+    fn idempotency_store_rapid_duplicate_rejected() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 100);
+        assert!(store.record_if_new("rapid"));
+        assert!(!store.record_if_new("rapid"));
+    }
+
+    #[test]
+    fn idempotency_store_accepts_after_ttl_expires() {
+        let store = IdempotencyStore::new(Duration::from_millis(1), 100);
+        assert!(store.record_if_new("ttl-key"));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.record_if_new("ttl-key"));
+    }
+
+    #[test]
+    fn idempotency_store_eviction_preserves_newest() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 1);
+        assert!(store.record_if_new("old-key"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("new-key"));
+
+        let keys = store.keys.lock();
+        assert_eq!(keys.len(), 1);
+        assert!(!keys.contains_key("old-key"));
+        assert!(keys.contains_key("new-key"));
+    }
+
+    #[test]
+    fn rate_limiter_allows_after_window_expires() {
+        let window = Duration::from_millis(50);
+        let limiter = SlidingWindowRateLimiter::new(2, window, 100);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-1"));
+        assert!(!limiter.allow("ip-1")); // blocked
+
+        // Wait for window to expire
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Should be allowed again
+        assert!(limiter.allow("ip-1"));
+    }
+
+    #[test]
+    fn rate_limiter_independent_keys_tracked_separately() {
+        let limiter = SlidingWindowRateLimiter::new(2, Duration::from_secs(60), 100);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-1"));
+        assert!(!limiter.allow("ip-1")); // ip-1 blocked
+
+        // ip-2 should still work
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-2"));
+        assert!(!limiter.allow("ip-2")); // ip-2 now blocked
+    }
+
+    #[test]
+    fn rate_limiter_exact_boundary_at_max_keys() {
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 3);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-3"));
+        // At capacity now
+        assert!(limiter.allow("ip-4")); // should evict ip-1
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 3);
+        assert!(
+            !guard.0.contains_key("ip-1"),
+            "ip-1 should have been evicted"
+        );
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(guard.0.contains_key("ip-3"));
+        assert!(guard.0.contains_key("ip-4"));
+    }
+
+    #[test]
+    fn gateway_rate_limiter_pair_and_webhook_are_independent() {
+        let limiter = GatewayRateLimiter::new(2, 3, 100);
+
+        // Exhaust pair limit
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(!limiter.allow_pair("ip-1")); // pair blocked
+
+        // Webhook should still work
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(!limiter.allow_webhook("ip-1")); // webhook now blocked
+    }
+
+    #[test]
+    fn rate_limiter_single_key_max_allows_one_request() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 1);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2")); // evicts ip-1
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 1);
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(!guard.0.contains_key("ip-1"));
+    }
+
+    #[test]
+    fn rate_limiter_concurrent_access_safe() {
+        use std::sync::Arc;
+
+        let limiter = Arc::new(SlidingWindowRateLimiter::new(
+            1000,
+            Duration::from_secs(60),
+            1000,
+        ));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let limiter = limiter.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..100 {
+                    limiter.allow(&format!("thread-{i}-req-{j}"));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should not panic or deadlock
+        let guard = limiter.requests.lock();
+        assert!(guard.0.len() <= 1000, "should respect max_keys");
+    }
+
+    #[test]
+    fn idempotency_store_concurrent_access_safe() {
+        use std::sync::Arc;
+
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..100 {
+                    store.record_if_new(&format!("thread-{i}-key-{j}"));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let keys = store.keys.lock();
+        assert!(keys.len() <= 1000, "should respect max_keys");
+    }
+
+    #[test]
+    fn rate_limiter_rapid_burst_then_cooldown() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_millis(50), 100);
+
+        // Burst: use all 5 requests
+        for _ in 0..5 {
+            assert!(limiter.allow("burst-ip"));
+        }
+        assert!(!limiter.allow("burst-ip")); // 6th should fail
+
+        // Cooldown
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Should be allowed again
+        assert!(limiter.allow("burst-ip"));
     }
 }

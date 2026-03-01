@@ -112,7 +112,7 @@ impl OpenAiRealtimeSession {
         {
             let mut sender = ws_sender.lock().await;
             sender
-                .send(WsMessage::Text(update_json))
+                .send(WsMessage::Text(update_json.into()))
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to send session.update: {e}"))?;
         }
@@ -204,7 +204,7 @@ impl OpenAiRealtimeSession {
                             );
                         }
                         let mut sender = ws_sender.lock().await;
-                        if sender.send(WsMessage::Text(json)).await.is_err() {
+                        if sender.send(WsMessage::Text(json.into())).await.is_err() {
                             tracing::warn!(
                                 session_id = %session_id,
                                 "WebSocket send failed, closing outbound loop"
@@ -227,13 +227,13 @@ impl OpenAiRealtimeSession {
                     });
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let mut sender = ws_sender.lock().await;
-                        if sender.send(WsMessage::Text(json)).await.is_err() {
+                        if sender.send(WsMessage::Text(json.into())).await.is_err() {
                             break;
                         }
                         // Trigger response after text input
                         let response_create = serde_json::json!({"type": "response.create"});
                         if let Ok(json) = serde_json::to_string(&response_create) {
-                            if sender.send(WsMessage::Text(json)).await.is_err() {
+                            if sender.send(WsMessage::Text(json.into())).await.is_err() {
                                 break;
                             }
                         }

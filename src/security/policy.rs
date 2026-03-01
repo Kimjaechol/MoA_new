@@ -1,11 +1,11 @@
 use parking_lot::Mutex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// How much autonomy the agent has
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AutonomyLevel {
     /// Read-only: can observe but not act
@@ -17,6 +17,21 @@ pub enum AutonomyLevel {
     Full,
 }
 
+impl std::str::FromStr for AutonomyLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "read_only" | "readonly" => Ok(Self::ReadOnly),
+            "supervised" => Ok(Self::Supervised),
+            "full" => Ok(Self::Full),
+            _ => Err(format!(
+                "invalid autonomy level '{s}': expected read_only, supervised, or full"
+            )),
+        }
+    }
+}
+
 /// Risk score for shell command execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandRiskLevel {
@@ -25,330 +40,54 @@ pub enum CommandRiskLevel {
     High,
 }
 
-/// Strike level applied when burst rate limit is exceeded.
+/// Classifies whether a tool operation is read-only or side-effecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StrikeLevel {
-    /// No strikes — normal operation.
-    None,
-    /// Strike 1: 30-second cooldown.
-    First,
-    /// Strike 2: 2-minute cooldown.
-    Second,
-    /// Strike 3: 10-minute cooldown (admin reset required to clear).
-    Third,
+pub enum ToolOperation {
+    Read,
+    Act,
 }
 
-/// Result of a rate-limit check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RateLimitResult {
-    /// Action is allowed.
-    Allowed,
-    /// Action is blocked due to burst rate limit.
-    BurstLimited {
-        strike: StrikeLevel,
-        cooldown_remaining_secs: u64,
-    },
-    /// Action is blocked due to hourly total limit.
-    HourlyLimited { count: usize, limit: usize },
-}
-
-/// Dual-window action tracker: per-minute burst + per-hour total.
-///
-/// Burst limiting prevents DDoS-like rapid-fire requests.
-/// Hourly limiting provides a global action budget.
-/// Progressive penalties (strikes) escalate cooldowns on repeated violations.
+/// Sliding-window action tracker for rate limiting.
 #[derive(Debug)]
 pub struct ActionTracker {
     /// Timestamps of recent actions (kept within the last hour).
     actions: Mutex<Vec<Instant>>,
-    /// Per-minute burst limit (default: 20).
-    burst_limit_per_minute: usize,
-    /// Per-hour total limit (default: 600).
-    max_actions_per_hour: usize,
-    /// Strike state for progressive penalties.
-    strike_state: Mutex<StrikeState>,
-}
-
-#[derive(Debug, Clone)]
-struct StrikeState {
-    level: StrikeLevel,
-    /// When the current cooldown expires (if any).
-    cooldown_until: Option<Instant>,
 }
 
 impl ActionTracker {
     pub fn new() -> Self {
         Self {
             actions: Mutex::new(Vec::new()),
-            burst_limit_per_minute: 20,
-            max_actions_per_hour: 600,
-            strike_state: Mutex::new(StrikeState {
-                level: StrikeLevel::None,
-                cooldown_until: None,
-            }),
         }
     }
 
-    /// Create a tracker with custom limits.
-    pub fn with_limits(burst_per_minute: u32, max_per_hour: u32) -> Self {
-        Self {
-            actions: Mutex::new(Vec::new()),
-            burst_limit_per_minute: burst_per_minute as usize,
-            max_actions_per_hour: max_per_hour as usize,
-            strike_state: Mutex::new(StrikeState {
-                level: StrikeLevel::None,
-                cooldown_until: None,
-            }),
-        }
-    }
-
-    /// Record an action and return the current hourly count.
+    /// Record an action and return the current count within the window.
     pub fn record(&self) -> usize {
         let mut actions = self.actions.lock();
         let cutoff = Instant::now()
-            .checked_sub(Duration::from_secs(3600))
+            .checked_sub(std::time::Duration::from_secs(3600))
             .unwrap_or_else(Instant::now);
         actions.retain(|t| *t > cutoff);
         actions.push(Instant::now());
         actions.len()
     }
 
-    /// Count of actions in the current hour without recording.
+    /// Count of actions in the current window without recording.
     pub fn count(&self) -> usize {
         let mut actions = self.actions.lock();
         let cutoff = Instant::now()
-            .checked_sub(Duration::from_secs(3600))
+            .checked_sub(std::time::Duration::from_secs(3600))
             .unwrap_or_else(Instant::now);
         actions.retain(|t| *t > cutoff);
         actions.len()
-    }
-
-    /// Count of actions in the last 60 seconds (burst window).
-    pub fn count_last_minute(&self) -> usize {
-        let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(Duration::from_secs(60))
-            .unwrap_or_else(Instant::now);
-        // Prune old entries beyond 1 hour for memory hygiene.
-        let hour_cutoff = Instant::now()
-            .checked_sub(Duration::from_secs(3600))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > hour_cutoff);
-        actions.iter().filter(|t| **t > cutoff).count()
-    }
-
-    /// Check rate limits and apply progressive penalties.
-    /// Returns `RateLimitResult` indicating whether the action is allowed.
-    pub fn check_and_record(&self) -> RateLimitResult {
-        // Check cooldown first.
-        {
-            let state = self.strike_state.lock();
-            if let Some(until) = state.cooldown_until {
-                if Instant::now() < until {
-                    let remaining = until.duration_since(Instant::now()).as_secs();
-                    return RateLimitResult::BurstLimited {
-                        strike: state.level,
-                        cooldown_remaining_secs: remaining,
-                    };
-                }
-            }
-        }
-
-        // Check burst limit (per-minute).
-        let minute_count = self.count_last_minute();
-        if minute_count >= self.burst_limit_per_minute {
-            let mut state = self.strike_state.lock();
-            state.level = match state.level {
-                StrikeLevel::None => StrikeLevel::First,
-                StrikeLevel::First => StrikeLevel::Second,
-                StrikeLevel::Second | StrikeLevel::Third => StrikeLevel::Third,
-            };
-            let cooldown = match state.level {
-                StrikeLevel::None => Duration::from_secs(0),
-                StrikeLevel::First => Duration::from_secs(30),
-                StrikeLevel::Second => Duration::from_secs(120),
-                StrikeLevel::Third => Duration::from_secs(600),
-            };
-            state.cooldown_until = Some(Instant::now() + cooldown);
-            let remaining = cooldown.as_secs();
-            return RateLimitResult::BurstLimited {
-                strike: state.level,
-                cooldown_remaining_secs: remaining,
-            };
-        }
-
-        // Check hourly total.
-        let hourly_count = self.record();
-        if hourly_count > self.max_actions_per_hour {
-            return RateLimitResult::HourlyLimited {
-                count: hourly_count,
-                limit: self.max_actions_per_hour,
-            };
-        }
-
-        // Clear strikes when operating normally (no burst violations).
-        {
-            let mut state = self.strike_state.lock();
-            if state.cooldown_until.is_some_and(|u| Instant::now() >= u) {
-                // Cooldown expired; don't reset level (it persists as a warning).
-                state.cooldown_until = None;
-            }
-        }
-
-        RateLimitResult::Allowed
-    }
-
-    /// Current strike level.
-    pub fn strike_level(&self) -> StrikeLevel {
-        self.strike_state.lock().level
-    }
-
-    /// Reset strikes (admin action).
-    pub fn reset_strikes(&self) {
-        let mut state = self.strike_state.lock();
-        state.level = StrikeLevel::None;
-        state.cooldown_until = None;
     }
 }
 
 impl Clone for ActionTracker {
     fn clone(&self) -> Self {
         let actions = self.actions.lock();
-        let strike = self.strike_state.lock().clone();
         Self {
             actions: Mutex::new(actions.clone()),
-            burst_limit_per_minute: self.burst_limit_per_minute,
-            max_actions_per_hour: self.max_actions_per_hour,
-            strike_state: Mutex::new(strike),
-        }
-    }
-}
-
-/// Detects repeated identical action patterns (infinite loops).
-///
-/// An infinite loop is defined as the same action signature being executed
-/// `max_identical_repeats` times consecutively without producing a new result.
-/// The signature is computed from the action name + key parameters (URL, selector, etc.).
-#[derive(Debug)]
-pub struct LoopDetector {
-    /// Recent action signatures with their result hashes.
-    history: Mutex<VecDeque<ActionEntry>>,
-    /// Maximum number of consecutive identical actions before triggering.
-    max_identical_repeats: usize,
-    /// Maximum history size to keep.
-    max_history: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ActionEntry {
-    /// Opaque signature identifying the action (e.g. "browser:open:https://example.com").
-    signature: String,
-    /// Whether the action produced a meaningful (non-empty, non-error) result.
-    produced_result: bool,
-    /// Timestamp for expiry.
-    timestamp: Instant,
-}
-
-/// Result of a loop detection check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoopCheckResult {
-    /// No loop detected — proceed.
-    Ok,
-    /// Loop detected — the same action has been repeated too many times without effect.
-    LoopDetected {
-        signature: String,
-        repeat_count: usize,
-        max_allowed: usize,
-    },
-}
-
-impl LoopDetector {
-    /// Create a new detector. `max_identical_repeats` is how many consecutive
-    /// identical fruitless actions trigger a block (default: 5).
-    pub fn new(max_identical_repeats: u32) -> Self {
-        Self {
-            history: Mutex::new(VecDeque::new()),
-            max_identical_repeats: max_identical_repeats as usize,
-            max_history: 100,
-        }
-    }
-
-    /// Build an action signature from tool name and key parameters.
-    /// Callers should pass a stable, deterministic representation.
-    pub fn make_signature(tool: &str, action: &str, target: &str) -> String {
-        format!("{tool}:{action}:{target}")
-    }
-
-    /// Record an action and check for loops.
-    ///
-    /// `signature`: action identity (from `make_signature`).
-    /// `produced_result`: true if the action returned a non-empty, non-error result.
-    ///
-    /// Returns `LoopCheckResult::LoopDetected` if the same signature has been
-    /// repeated `max_identical_repeats` times in a row without producing a result.
-    pub fn record_and_check(&self, signature: &str, produced_result: bool) -> LoopCheckResult {
-        let mut history = self.history.lock();
-
-        // Prune entries older than 10 minutes.
-        let cutoff = Instant::now()
-            .checked_sub(Duration::from_secs(600))
-            .unwrap_or_else(Instant::now);
-        while history.front().is_some_and(|e| e.timestamp < cutoff) {
-            history.pop_front();
-        }
-
-        // Trim to max_history.
-        while history.len() >= self.max_history {
-            history.pop_front();
-        }
-
-        history.push_back(ActionEntry {
-            signature: signature.to_string(),
-            produced_result,
-            timestamp: Instant::now(),
-        });
-
-        // Count consecutive identical fruitless actions from the tail.
-        let consecutive_fruitless = history
-            .iter()
-            .rev()
-            .take_while(|e| e.signature == signature && !e.produced_result)
-            .count();
-
-        if consecutive_fruitless >= self.max_identical_repeats {
-            LoopCheckResult::LoopDetected {
-                signature: signature.to_string(),
-                repeat_count: consecutive_fruitless,
-                max_allowed: self.max_identical_repeats,
-            }
-        } else {
-            LoopCheckResult::Ok
-        }
-    }
-
-    /// Reset all history (e.g. when a new task starts).
-    pub fn reset(&self) {
-        self.history.lock().clear();
-    }
-
-    /// Current consecutive count for a given signature (for diagnostics).
-    pub fn consecutive_count(&self, signature: &str) -> usize {
-        let history = self.history.lock();
-        history
-            .iter()
-            .rev()
-            .take_while(|e| e.signature == signature && !e.produced_result)
-            .count()
-    }
-}
-
-impl Clone for LoopDetector {
-    fn clone(&self) -> Self {
-        let history = self.history.lock();
-        Self {
-            history: Mutex::new(history.clone()),
-            max_identical_repeats: self.max_identical_repeats,
-            max_history: self.max_history,
         }
     }
 }
@@ -361,26 +100,19 @@ pub struct SecurityPolicy {
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
-    /// Legacy field — kept for backward compatibility with configs that set it.
-    /// Actual enforcement now uses `tracker.max_actions_per_hour`.
+    pub allowed_roots: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
-    /// Burst rate limit: max actions per minute before progressive penalties.
-    pub max_actions_per_minute: u32,
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
+    pub shell_env_passthrough: Vec<String>,
+    pub allow_sensitive_file_reads: bool,
+    pub allow_sensitive_file_writes: bool,
     pub tracker: ActionTracker,
-    /// Detects repeated identical actions that indicate an infinite loop.
-    pub loop_detector: LoopDetector,
-    /// Maximum consecutive identical fruitless actions before blocking.
-    pub max_loop_repeats: u32,
 }
 
 impl Default for SecurityPolicy {
     fn default() -> Self {
-        let burst_per_min: u32 = 20;
-        let max_per_hour: u32 = 600;
-        let max_loop: u32 = 5;
         Self {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
@@ -398,6 +130,7 @@ impl Default for SecurityPolicy {
                 "wc".into(),
                 "head".into(),
                 "tail".into(),
+                "date".into(),
             ],
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
@@ -415,24 +148,52 @@ impl Default for SecurityPolicy {
                 "/sys".into(),
                 "/var".into(),
                 "/tmp".into(),
+                "/mnt".into(),
                 // Sensitive dotfiles
                 "~/.ssh".into(),
                 "~/.gnupg".into(),
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: max_per_hour,
-            max_actions_per_minute: burst_per_min,
+            allowed_roots: Vec::new(),
+            max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
-            tracker: ActionTracker::with_limits(burst_per_min, max_per_hour),
-            loop_detector: LoopDetector::new(max_loop),
-            max_loop_repeats: max_loop,
+            shell_env_passthrough: vec![],
+            allow_sensitive_file_reads: false,
+            allow_sensitive_file_writes: false,
+            tracker: ActionTracker::new(),
         }
     }
 }
 
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    }
+
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(stripped);
+        }
+    }
+
+    PathBuf::from(path)
+}
+
+// ── Shell Command Parsing Utilities ───────────────────────────────────────
+// These helpers implement a minimal quote-aware shell lexer. They exist
+// because security validation must reason about the *structure* of a
+// command (separators, operators, quoting) rather than treating it as a
+// flat string — otherwise an attacker could hide dangerous sub-commands
+// inside quoted arguments or chained operators.
 /// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
 /// Returns the remainder starting at the first non-assignment word.
 fn skip_env_assignments(s: &str) -> &str {
@@ -456,45 +217,366 @@ fn skip_env_assignments(s: &str) -> &str {
     }
 }
 
-/// Detect a single `&` operator (background/chain). `&&` is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteState {
+    None,
+    Single,
+    Double,
+}
+
+/// Split a shell command into sub-commands by unquoted separators.
+///
+/// Separators:
+/// - `;` and newline
+/// - `|`
+/// - `&&`, `||`
+///
+/// Characters inside single or double quotes are treated as literals, so
+/// `sqlite3 db "SELECT 1; SELECT 2;"` remains a single segment.
+fn split_unquoted_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+
+    let push_segment = |segments: &mut Vec<String>, current: &mut String| {
+        let trimmed = current.trim();
+        if !trimmed.is_empty() {
+            segments.push(trimmed.to_string());
+        }
+        current.clear();
+    };
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+                current.push(ch);
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                current.push(ch);
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    current.push(ch);
+                    continue;
+                }
+
+                match ch {
+                    '\'' => {
+                        quote = QuoteState::Single;
+                        current.push(ch);
+                    }
+                    '"' => {
+                        quote = QuoteState::Double;
+                        current.push(ch);
+                    }
+                    ';' | '\n' => push_segment(&mut segments, &mut current),
+                    '|' => {
+                        if chars.next_if_eq(&'|').is_some() {
+                            // Consume full `||`; both characters are separators.
+                        }
+                        push_segment(&mut segments, &mut current);
+                    }
+                    '&' => {
+                        if chars.next_if_eq(&'&').is_some() {
+                            // `&&` is a separator; single `&` is handled separately.
+                            push_segment(&mut segments, &mut current);
+                        } else {
+                            current.push(ch);
+                        }
+                    }
+                    _ => current.push(ch),
+                }
+            }
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+
+    segments
+}
+
+/// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
 ///
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
-fn contains_single_ampersand(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    for (i, b) in bytes.iter().enumerate() {
-        if *b != b'&' {
-            continue;
-        }
-        let prev_is_amp = i > 0 && bytes[i - 1] == b'&';
-        let next_is_amp = i + 1 < bytes.len() && bytes[i + 1] == b'&';
-        if !prev_is_amp && !next_is_amp {
-            return true;
+fn contains_unquoted_single_ampersand(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                match ch {
+                    '\'' => quote = QuoteState::Single,
+                    '"' => quote = QuoteState::Double,
+                    '&' => {
+                        if chars.next_if_eq(&'&').is_none() {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
+
     false
 }
 
-impl SecurityPolicy {
-    /// Classify command risk. Any high-risk segment marks the whole command high.
-    pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
-        let mut normalized = command.to_string();
-        for sep in ["&&", "||"] {
-            normalized = normalized.replace(sep, "\x00");
-        }
-        for sep in ['\n', ';', '|', '&'] {
-            normalized = normalized.replace(sep, "\x00");
-        }
+/// Detect an unquoted character in a shell command.
+fn contains_unquoted_char(command: &str, target: char) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
 
-        let mut saw_medium = false;
+    for ch in command.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                match ch {
+                    '\'' => quote = QuoteState::Single,
+                    '"' => quote = QuoteState::Double,
+                    _ if ch == target => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
 
-        for segment in normalized.split('\x00') {
-            let segment = segment.trim();
-            if segment.is_empty() {
+    false
+}
+
+/// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
+///
+/// Escaped dollars (`\$`) are ignored. Variables inside single quotes are
+/// treated as literals and therefore ignored.
+fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let chars: Vec<char> = command.chars().collect();
+
+    for i in 0..chars.len() {
+        let ch = chars[i];
+
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
                 continue;
             }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                    continue;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '\'' {
+                    quote = QuoteState::Single;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::Double;
+                    continue;
+                }
+            }
+        }
 
-            let cmd_part = skip_env_assignments(segment);
+        if ch != '$' {
+            continue;
+        }
+
+        let Some(next) = chars.get(i + 1).copied() else {
+            continue;
+        };
+        if next.is_ascii_alphanumeric()
+            || matches!(
+                next,
+                '_' | '{' | '(' | '#' | '?' | '!' | '$' | '*' | '@' | '-'
+            )
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn strip_wrapping_quotes(token: &str) -> &str {
+    token.trim_matches(|c| c == '"' || c == '\'')
+}
+
+fn looks_like_path(candidate: &str) -> bool {
+    candidate.starts_with('/')
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+        || candidate.starts_with('~')
+        || candidate == "."
+        || candidate == ".."
+        || candidate.contains('/')
+}
+
+fn attached_short_option_value(token: &str) -> Option<&str> {
+    // Examples:
+    // -f/etc/passwd   -> /etc/passwd
+    // -C../outside    -> ../outside
+    // -I./include     -> ./include
+    let body = token.strip_prefix('-')?;
+    if body.starts_with('-') || body.len() < 2 {
+        return None;
+    }
+    let value = body[1..].trim_start_matches('=').trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn redirection_target(token: &str) -> Option<&str> {
+    let marker_idx = token.find(['<', '>'])?;
+    let mut rest = &token[marker_idx + 1..];
+    rest = rest.trim_start_matches(['<', '>']);
+    rest = rest.trim_start_matches('&');
+    rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
+    let allowed = strip_wrapping_quotes(allowed).trim();
+    if allowed.is_empty() {
+        return false;
+    }
+
+    // Explicit wildcard support for "allow any command name/path".
+    if allowed == "*" {
+        return true;
+    }
+
+    // Path-like allowlist entries must match the executable token exactly
+    // after "~" expansion.
+    if looks_like_path(allowed) {
+        let allowed_path = expand_user_path(allowed);
+        let executable_path = expand_user_path(executable);
+        return executable_path == allowed_path;
+    }
+
+    // Command-name entries continue to match by basename.
+    allowed == executable_base
+}
+
+impl SecurityPolicy {
+    // ── Risk Classification ──────────────────────────────────────────────
+    // Risk is assessed per-segment (split on shell operators), and the
+    // highest risk across all segments wins. This prevents bypasses like
+    // `ls && rm -rf /` from being classified as Low just because `ls` is safe.
+
+    /// Classify command risk. Any high-risk segment marks the whole command high.
+    pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
+        let mut saw_medium = false;
+
+        for segment in split_unquoted_segments(command) {
+            let cmd_part = skip_env_assignments(&segment);
             let mut words = cmd_part.split_whitespace();
             let Some(base_raw) = words.next() else {
                 continue;
@@ -596,6 +678,15 @@ impl SecurityPolicy {
         }
     }
 
+    // ── Command Execution Policy Gate ──────────────────────────────────────
+    // Validation follows a strict precedence order:
+    //   1. Allowlist check (is the base command permitted at all?)
+    //   2. Risk classification (high / medium / low)
+    //   3. Policy flags (block_high_risk_commands, require_approval_for_medium_risk)
+    //   4. Autonomy level × approval status (supervised requires explicit approval)
+    // This ordering ensures deny-by-default: unknown commands are rejected
+    // before any risk or autonomy logic runs.
+
     /// Validate full command execution policy (allowlist + risk gate).
     pub fn validate_command_execution(
         &self,
@@ -606,10 +697,21 @@ impl SecurityPolicy {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
+        if let Some(path) = self.forbidden_path_argument(command) {
+            return Err(format!("Path blocked by security policy: {path}"));
+        }
+
         let risk = self.command_risk_level(command);
 
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands {
+                let lower = command.to_ascii_lowercase();
+                if lower.contains("curl") || lower.contains("wget") {
+                    return Err(
+                        "Command blocked: high-risk command is disallowed by policy. Shell curl/wget are blocked; use `http_request` or `web_fetch` with configured allowed_domains."
+                            .into(),
+                    );
+                }
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
@@ -633,6 +735,11 @@ impl SecurityPolicy {
         Ok(risk)
     }
 
+    // ── Layered Command Allowlist ──────────────────────────────────────────
+    // Defence-in-depth: five independent gates run in order before the
+    // per-segment allowlist check. Each gate targets a specific bypass
+    // technique. If any gate rejects, the whole command is blocked.
+
     /// Check if a shell command is allowed.
     ///
     /// Validates the **entire** command string, not just the first word:
@@ -640,7 +747,7 @@ impl SecurityPolicy {
     /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines) and
     ///   validates each sub-command against the allowlist
     /// - Blocks single `&` background chaining (`&&` remains supported)
-    /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
+    /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path policy
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
@@ -648,18 +755,22 @@ impl SecurityPolicy {
         }
 
         // Block subshell/expansion operators — these allow hiding arbitrary
-        // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
+        // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
+        // bypassing path checks through variable indirection. The helper below
+        // ignores escapes and literals inside single quotes, so `$(` or `${`
+        // literals are permitted there.
         if command.contains('`')
-            || command.contains("$(")
-            || command.contains("${")
+            || contains_unquoted_shell_variable_expansion(command)
             || command.contains("<(")
             || command.contains(">(")
         {
             return false;
         }
 
-        // Block output redirections — they can write to arbitrary paths
-        if command.contains('>') {
+        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
+        // arbitrary paths and bypass path checks.
+        // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
+        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
             return false;
         }
 
@@ -674,32 +785,19 @@ impl SecurityPolicy {
 
         // Block background command chaining (`&`), which can hide extra
         // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_single_ampersand(command) {
+        if contains_unquoted_single_ampersand(command) {
             return false;
         }
 
-        // Split on command separators and validate each sub-command.
-        // We collect segments by scanning for separator characters.
-        let mut normalized = command.to_string();
-        for sep in ["&&", "||"] {
-            normalized = normalized.replace(sep, "\x00");
-        }
-        for sep in ['\n', ';', '|'] {
-            normalized = normalized.replace(sep, "\x00");
-        }
-
-        for segment in normalized.split('\x00') {
-            let segment = segment.trim();
-            if segment.is_empty() {
-                continue;
-            }
-
+        // Split on unquoted command separators and validate each sub-command.
+        let segments = split_unquoted_segments(command);
+        for segment in &segments {
             // Strip leading env var assignments (e.g. FOO=bar cmd)
             let cmd_part = skip_env_assignments(segment);
 
             let mut words = cmd_part.split_whitespace();
-            let base_raw = words.next().unwrap_or("");
-            let base_cmd = base_raw.rsplit('/').next().unwrap_or("");
+            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let base_cmd = executable.rsplit('/').next().unwrap_or("");
 
             if base_cmd.is_empty() {
                 continue;
@@ -708,7 +806,7 @@ impl SecurityPolicy {
             if !self
                 .allowed_commands
                 .iter()
-                .any(|allowed| allowed == base_cmd)
+                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
             {
                 return false;
             }
@@ -721,7 +819,7 @@ impl SecurityPolicy {
         }
 
         // At least one command must be present
-        let has_cmd = normalized.split('\x00').any(|s| {
+        let has_cmd = segments.iter().any(|s| {
             let s = skip_env_assignments(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
         });
@@ -738,19 +836,186 @@ impl SecurityPolicy {
                 !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
             }
             "git" => {
-                // git config, alias, and -c can be used to set dangerous options
-                // (e.g. git config core.editor "rm -rf /")
-                !args.iter().any(|arg| {
-                    arg == "config"
-                        || arg.starts_with("config.")
-                        || arg == "alias"
-                        || arg.starts_with("alias.")
-                        || arg == "-c"
-                })
+                // Global git config injection can be used to set dangerous options
+                // (e.g., pager/editor/credential helpers) even without `git config`.
+                if args.iter().any(|arg| {
+                    arg == "-c"
+                        || arg == "--config"
+                        || arg.starts_with("--config=")
+                        || arg == "--config-env"
+                        || arg.starts_with("--config-env=")
+                }) {
+                    return false;
+                }
+
+                // Determine subcommand by first non-option token.
+                let Some(subcommand_index) = args.iter().position(|arg| !arg.starts_with('-'))
+                else {
+                    return true;
+                };
+                let subcommand = args[subcommand_index].as_str();
+
+                // `git alias` can create executable aliases.
+                if subcommand == "alias" || subcommand.starts_with("alias.") {
+                    return false;
+                }
+
+                // Only `git config` needs special handling. Other git subcommands are
+                // allowed after the global option checks above.
+                if subcommand != "config" {
+                    return true;
+                }
+
+                let config_args = &args[subcommand_index + 1..];
+
+                // Allow ONLY read-only operations.
+                let has_readonly_flag = config_args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--get" | "--list" | "-l" | "--get-all" | "--get-regexp" | "--get-urlmatch"
+                    )
+                });
+                if !has_readonly_flag {
+                    return false;
+                }
+
+                // Explicit write/edit operations must never be mixed with reads.
+                let has_write_flag = config_args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--add"
+                            | "--replace-all"
+                            | "--unset"
+                            | "--unset-all"
+                            | "--edit"
+                            | "-e"
+                            | "--rename-section"
+                            | "--remove-section"
+                    )
+                });
+                if has_write_flag {
+                    return false;
+                }
+
+                // Reject unknown config flags to avoid option-based bypasses.
+                let has_unknown_flag = config_args.iter().any(|arg| {
+                    if !arg.starts_with('-') {
+                        return false;
+                    }
+
+                    let is_known_flag = matches!(
+                        arg.as_str(),
+                        "--get"
+                            | "--list"
+                            | "-l"
+                            | "--get-all"
+                            | "--get-regexp"
+                            | "--get-urlmatch"
+                            | "--global"
+                            | "--system"
+                            | "--local"
+                            | "--worktree"
+                            | "--show-origin"
+                            | "--show-scope"
+                            | "--null"
+                            | "-z"
+                            | "--name-only"
+                            | "--includes"
+                            | "--no-includes"
+                    ) || arg == "--file"
+                        || arg == "-f"
+                        || arg.starts_with("--file=")
+                        || arg == "--blob"
+                        || arg.starts_with("--blob=")
+                        || arg == "--default"
+                        || arg.starts_with("--default=")
+                        || arg == "--type"
+                        || arg.starts_with("--type=");
+
+                    !is_known_flag
+                });
+                if has_unknown_flag {
+                    return false;
+                }
+
+                true
             }
             _ => true,
         }
     }
+
+    /// Return the first path-like argument blocked by path policy.
+    ///
+    /// This is best-effort token parsing for shell commands and is intended
+    /// as a safety gate before command execution.
+    pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        let forbidden_candidate = |raw: &str| {
+            let candidate = strip_wrapping_quotes(raw).trim();
+            if candidate.is_empty() || candidate.contains("://") {
+                return None;
+            }
+            if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
+                Some(candidate.to_string())
+            } else {
+                None
+            }
+        };
+
+        for segment in split_unquoted_segments(command) {
+            let cmd_part = skip_env_assignments(&segment);
+            let mut words = cmd_part.split_whitespace();
+            let Some(executable) = words.next() else {
+                continue;
+            };
+
+            // Cover inline forms like `cat</etc/passwd`.
+            if let Some(target) = redirection_target(strip_wrapping_quotes(executable)) {
+                if let Some(blocked) = forbidden_candidate(target) {
+                    return Some(blocked);
+                }
+            }
+
+            for token in words {
+                let candidate = strip_wrapping_quotes(token).trim();
+                if candidate.is_empty() || candidate.contains("://") {
+                    continue;
+                }
+
+                if let Some(target) = redirection_target(candidate) {
+                    if let Some(blocked) = forbidden_candidate(target) {
+                        return Some(blocked);
+                    }
+                }
+
+                // Handle option assignment forms like `--file=/etc/passwd`.
+                if candidate.starts_with('-') {
+                    if let Some((_, value)) = candidate.split_once('=') {
+                        if let Some(blocked) = forbidden_candidate(value) {
+                            return Some(blocked);
+                        }
+                    }
+                    if let Some(value) = attached_short_option_value(candidate) {
+                        if let Some(blocked) = forbidden_candidate(value) {
+                            return Some(blocked);
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(blocked) = forbidden_candidate(candidate) {
+                    return Some(blocked);
+                }
+            }
+        }
+
+        None
+    }
+
+    // ── Path Validation ────────────────────────────────────────────────
+    // Layered checks: null-byte injection → component-level traversal →
+    // URL-encoded traversal → tilde expansion → absolute-path block →
+    // forbidden-prefix match. Each layer addresses a distinct escape
+    // technique; together they enforce workspace confinement.
 
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
@@ -773,35 +1038,23 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Expand tilde for comparison
-        let expanded = if let Some(stripped) = path.strip_prefix("~/") {
-            if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-                home.join(stripped).to_string_lossy().to_string()
-            } else {
-                path.to_string()
-            }
-        } else {
-            path.to_string()
-        };
+        // Reject "~user" forms because the shell expands them at runtime and
+        // they can escape workspace policy.
+        if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+            return false;
+        }
+
+        // Expand "~" for consistent matching with forbidden paths and allowlists.
+        let expanded_path = expand_user_path(path);
 
         // Block absolute paths when workspace_only is set
-        if self.workspace_only && Path::new(&expanded).is_absolute() {
+        if self.workspace_only && expanded_path.is_absolute() {
             return false;
         }
 
         // Block forbidden paths using path-component-aware matching
-        let expanded_path = Path::new(&expanded);
         for forbidden in &self.forbidden_paths {
-            let forbidden_expanded = if let Some(stripped) = forbidden.strip_prefix("~/") {
-                if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-                    home.join(stripped).to_string_lossy().to_string()
-                } else {
-                    forbidden.clone()
-                }
-            } else {
-                forbidden.clone()
-            };
-            let forbidden_path = Path::new(&forbidden_expanded);
+            let forbidden_path = expand_user_path(forbidden);
             if expanded_path.starts_with(forbidden_path) {
                 return false;
             }
@@ -810,17 +1063,59 @@ impl SecurityPolicy {
         true
     }
 
-    /// Validate that a resolved path is still inside the workspace.
+    /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
-        // Must be under workspace_dir (prevents symlink escapes).
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
         let workspace_root = self
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
-        resolved.starts_with(workspace_root)
+        if resolved.starts_with(&workspace_root) {
+            return true;
+        }
+
+        // Check extra allowed roots (e.g. shared skills directories) before
+        // forbidden checks so explicit allowlists can coexist with broad
+        // default forbidden roots such as `/home` and `/tmp`.
+        for root in &self.allowed_roots {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if resolved.starts_with(&canonical) {
+                return true;
+            }
+        }
+
+        // For paths outside workspace/allowlist, block forbidden roots to
+        // prevent symlink escapes and sensitive directory access.
+        for forbidden in &self.forbidden_paths {
+            let forbidden_path = expand_user_path(forbidden);
+            if resolved.starts_with(&forbidden_path) {
+                return false;
+            }
+        }
+
+        // When workspace_only is disabled the user explicitly opted out of
+        // workspace confinement after forbidden-path checks are applied.
+        if !self.workspace_only {
+            return true;
+        }
+
+        false
+    }
+
+    pub fn resolved_path_violation_message(&self, resolved: &Path) -> String {
+        let guidance = if self.allowed_roots.is_empty() {
+            "Add the directory to [autonomy].allowed_roots (for example: allowed_roots = [\"/absolute/path\"]), or move the file into the workspace."
+        } else {
+            "Add a matching parent directory to [autonomy].allowed_roots, or move the file into the workspace."
+        };
+
+        format!(
+            "Resolved path escapes workspace allowlist: {}. {}",
+            resolved.display(),
+            guidance
+        )
     }
 
     /// Check if autonomy level permits any action at all
@@ -828,89 +1123,144 @@ impl SecurityPolicy {
         self.autonomy != AutonomyLevel::ReadOnly
     }
 
-    /// Record an action and check rate limits (burst + hourly).
-    /// Returns `true` if the action is allowed, `false` if rate-limited.
+    // ── Tool Operation Gating ──────────────────────────────────────────────
+    // Read operations bypass autonomy and rate checks because they have
+    // no side effects. Act operations must pass both the autonomy gate
+    // (not read-only) and the sliding-window rate limiter.
+
+    /// Enforce policy for a tool operation.
     ///
-    /// Checks both the tracker's internal limits and the policy-level
-    /// `max_actions_per_hour` field (whichever is stricter wins).
-    pub fn record_action(&self) -> bool {
-        matches!(self.record_action_detailed(), RateLimitResult::Allowed)
+    /// Read operations are always allowed by autonomy/rate gates.
+    /// Act operations require non-readonly autonomy and available action budget.
+    pub fn enforce_tool_operation(
+        &self,
+        operation: ToolOperation,
+        operation_name: &str,
+    ) -> Result<(), String> {
+        match operation {
+            ToolOperation::Read => Ok(()),
+            ToolOperation::Act => {
+                if !self.can_act() {
+                    return Err(format!(
+                        "Security policy: read-only mode, cannot perform '{operation_name}'"
+                    ));
+                }
+
+                if !self.record_action() {
+                    return Err("Rate limit exceeded: action budget exhausted".to_string());
+                }
+
+                Ok(())
+            }
+        }
     }
 
-    /// Record an action with detailed result information.
-    /// Returns `RateLimitResult` for callers that need specific error messages.
-    pub fn record_action_detailed(&self) -> RateLimitResult {
-        // Check policy-level hourly cap (may differ from tracker if overridden).
-        let hourly_count = self.tracker.count();
-        if hourly_count >= self.max_actions_per_hour as usize {
-            return RateLimitResult::HourlyLimited {
-                count: hourly_count,
-                limit: self.max_actions_per_hour as usize,
-            };
-        }
-        self.tracker.check_and_record()
+    /// Record an action and check if the rate limit has been exceeded.
+    /// Returns `true` if the action is allowed, `false` if rate-limited.
+    pub fn record_action(&self) -> bool {
+        let count = self.tracker.record();
+        count <= self.max_actions_per_hour as usize
     }
 
     /// Check if the rate limit would be exceeded without recording.
     pub fn is_rate_limited(&self) -> bool {
-        self.tracker.count_last_minute() >= self.max_actions_per_minute as usize
-            || self.tracker.count() >= self.max_actions_per_hour as usize
-    }
-
-    /// Record a tool action for loop detection and check for infinite loops.
-    ///
-    /// `tool`: tool name (e.g. "browser", "shell").
-    /// `action`: action name (e.g. "open", "click").
-    /// `target`: key parameter (e.g. URL, selector).
-    /// `produced_result`: whether the action returned a non-empty, non-error result.
-    pub fn check_loop(
-        &self,
-        tool: &str,
-        action: &str,
-        target: &str,
-        produced_result: bool,
-    ) -> LoopCheckResult {
-        let sig = LoopDetector::make_signature(tool, action, target);
-        self.loop_detector.record_and_check(&sig, produced_result)
-    }
-
-    /// Current strike level from burst rate limiting.
-    pub fn strike_level(&self) -> StrikeLevel {
-        self.tracker.strike_level()
-    }
-
-    /// Reset rate limit strikes (admin action).
-    pub fn reset_strikes(&self) {
-        self.tracker.reset_strikes();
-    }
-
-    /// Reset loop detector history (e.g. when a new task starts).
-    pub fn reset_loop_detector(&self) {
-        self.loop_detector.reset();
+        self.tracker.count() >= self.max_actions_per_hour as usize
     }
 
     /// Build from config sections
+    /// Produce a concise security-constraint summary suitable for periodic
+    /// re-injection into the conversation (safety heartbeat).
+    ///
+    /// The output is intentionally short (~100-150 tokens) so the token
+    /// overhead per heartbeat is negligible.
+    pub fn summary_for_heartbeat(&self) -> String {
+        let autonomy_label = match self.autonomy {
+            AutonomyLevel::ReadOnly => "read_only — side-effecting actions are blocked",
+            AutonomyLevel::Supervised => "supervised — destructive actions require approval",
+            AutonomyLevel::Full => "full — autonomous execution within policy bounds",
+        };
+
+        let workspace = self.workspace_dir.display();
+        let ws_only = self.workspace_only;
+
+        let forbidden_preview: String = {
+            let shown: Vec<&str> = self
+                .forbidden_paths
+                .iter()
+                .take(8)
+                .map(String::as_str)
+                .collect();
+            let remaining = self.forbidden_paths.len().saturating_sub(8);
+            if remaining > 0 {
+                format!("{} (+ {} more)", shown.join(", "), remaining)
+            } else {
+                shown.join(", ")
+            }
+        };
+
+        let commands_preview: String = {
+            let shown: Vec<&str> = self
+                .allowed_commands
+                .iter()
+                .take(8)
+                .map(String::as_str)
+                .collect();
+            let remaining = self.allowed_commands.len().saturating_sub(8);
+            if remaining > 0 {
+                format!("{} (+ {} more rejected)", shown.join(", "), remaining)
+            } else if shown.is_empty() {
+                "none (all rejected)".to_string()
+            } else {
+                format!("{} (others rejected)", shown.join(", "))
+            }
+        };
+
+        let high_risk = if self.block_high_risk_commands {
+            "blocked"
+        } else {
+            "allowed (caution)"
+        };
+
+        format!(
+            "- Autonomy: {autonomy_label}\n\
+             - Workspace: {workspace} (workspace_only: {ws_only})\n\
+             - Forbidden paths: {forbidden_preview}\n\
+             - Allowed commands: {commands_preview}\n\
+             - High-risk commands: {high_risk}\n\
+             - Do not exfiltrate data, bypass approval, or run destructive commands without asking."
+        )
+    }
+
     pub fn from_config(
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
     ) -> Self {
-        let burst = autonomy_config.max_actions_per_minute;
-        let hourly = autonomy_config.max_actions_per_hour;
-        let max_loop = autonomy_config.max_loop_repeats;
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
-            max_actions_per_hour: hourly,
-            max_actions_per_minute: burst,
+            allowed_roots: autonomy_config
+                .allowed_roots
+                .iter()
+                .map(|root| {
+                    let expanded = expand_user_path(root);
+                    if expanded.is_absolute() {
+                        expanded
+                    } else {
+                        workspace_dir.join(expanded)
+                    }
+                })
+                .collect(),
+            max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
-            tracker: ActionTracker::with_limits(burst, hourly),
-            loop_detector: LoopDetector::new(max_loop),
-            max_loop_repeats: max_loop,
+            shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
+            allow_sensitive_file_reads: autonomy_config.allow_sensitive_file_reads,
+            allow_sensitive_file_writes: autonomy_config.allow_sensitive_file_writes,
+            tracker: ActionTracker::new(),
         }
     }
 }
@@ -969,6 +1319,35 @@ mod tests {
         assert!(full_policy().can_act());
     }
 
+    #[test]
+    fn enforce_tool_operation_read_allowed_in_readonly_mode() {
+        let p = readonly_policy();
+        assert!(p
+            .enforce_tool_operation(ToolOperation::Read, "memory_recall")
+            .is_ok());
+    }
+
+    #[test]
+    fn enforce_tool_operation_act_blocked_in_readonly_mode() {
+        let p = readonly_policy();
+        let err = p
+            .enforce_tool_operation(ToolOperation::Act, "memory_store")
+            .unwrap_err();
+        assert!(err.contains("read-only mode"));
+    }
+
+    #[test]
+    fn enforce_tool_operation_act_uses_rate_budget() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 0,
+            ..default_policy()
+        };
+        let err = p
+            .enforce_tool_operation(ToolOperation::Act, "memory_store")
+            .unwrap_err();
+        assert!(err.contains("Rate limit exceeded"));
+    }
+
     // ── is_command_allowed ───────────────────────────────────
 
     #[test]
@@ -979,6 +1358,7 @@ mod tests {
         assert!(p.is_command_allowed("cargo build --release"));
         assert!(p.is_command_allowed("cat file.txt"));
         assert!(p.is_command_allowed("grep -r pattern ."));
+        assert!(p.is_command_allowed("date"));
     }
 
     #[test]
@@ -1012,6 +1392,33 @@ mod tests {
         let p = default_policy();
         assert!(p.is_command_allowed("/usr/bin/git status"));
         assert!(p.is_command_allowed("/bin/ls -la"));
+    }
+
+    #[test]
+    fn allowlist_supports_explicit_executable_paths() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/antigravity".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed("/usr/bin/antigravity"));
+        assert!(!p.is_command_allowed("antigravity"));
+    }
+
+    #[test]
+    fn allowlist_supports_wildcard_entry() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed("python3 --version"));
+        assert!(p.is_command_allowed("/usr/bin/antigravity"));
+
+        // Wildcard still respects risk gates in validate_command_execution.
+        let blocked = p.validate_command_execution("rm -rf tmp_test_dir", true);
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().contains("high-risk"));
     }
 
     #[test]
@@ -1114,9 +1521,22 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        let result = p.validate_command_execution("rm -rf tmp_test_dir", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    #[test]
+    fn validate_command_full_mode_skips_medium_risk_approval_gate() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["touch".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let result = p.validate_command_execution("touch test.txt", false);
+        assert_eq!(result.unwrap(), CommandRiskLevel::Medium);
     }
 
     #[test]
@@ -1199,11 +1619,12 @@ mod tests {
             allowed_commands: vec!["docker".into()],
             forbidden_paths: vec!["/secret".into()],
             max_actions_per_hour: 100,
-            max_actions_per_minute: 15,
-            max_loop_repeats: 8,
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
+            shell_env_passthrough: vec!["DATABASE_URL".into()],
+            allow_sensitive_file_reads: true,
+            allow_sensitive_file_writes: true,
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
@@ -1214,12 +1635,40 @@ mod tests {
         assert_eq!(policy.allowed_commands, vec!["docker"]);
         assert_eq!(policy.forbidden_paths, vec!["/secret"]);
         assert_eq!(policy.max_actions_per_hour, 100);
-        assert_eq!(policy.max_actions_per_minute, 15);
-        assert_eq!(policy.max_loop_repeats, 8);
         assert_eq!(policy.max_cost_per_day_cents, 1000);
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
+        assert_eq!(policy.shell_env_passthrough, vec!["DATABASE_URL"]);
+        assert!(policy.allow_sensitive_file_reads);
+        assert!(policy.allow_sensitive_file_writes);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
+    }
+
+    #[test]
+    fn from_config_normalizes_allowed_roots() {
+        let autonomy_config = crate::config::AutonomyConfig {
+            allowed_roots: vec!["~/Desktop".into(), "shared-data".into()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        let expected_home_root = if let Some(home) = std::env::var_os("HOME") {
+            PathBuf::from(home).join("Desktop")
+        } else {
+            PathBuf::from("~/Desktop")
+        };
+
+        assert_eq!(policy.allowed_roots[0], expected_home_root);
+        assert_eq!(policy.allowed_roots[1], workspace.join("shared-data"));
+    }
+
+    #[test]
+    fn resolved_path_violation_message_includes_allowed_roots_guidance() {
+        let p = default_policy();
+        let msg = p.resolved_path_violation_message(Path::new("/tmp/outside.txt"));
+        assert!(msg.contains("escapes workspace"));
+        assert!(msg.contains("allowed_roots"));
     }
 
     // ── Default policy ──────────────────────────────────────
@@ -1232,11 +1681,10 @@ mod tests {
         assert!(!p.allowed_commands.is_empty());
         assert!(!p.forbidden_paths.is_empty());
         assert!(p.max_actions_per_hour > 0);
-        assert!(p.max_actions_per_minute > 0);
-        assert!(p.max_loop_repeats > 0);
         assert!(p.max_cost_per_day_cents > 0);
         assert!(p.require_approval_for_medium_risk);
         assert!(p.block_high_risk_commands);
+        assert!(p.shell_env_passthrough.is_empty());
     }
 
     // ── ActionTracker / rate limiting ───────────────────────
@@ -1321,6 +1769,32 @@ mod tests {
     }
 
     #[test]
+    fn quoted_semicolons_do_not_split_sqlite_command() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["sqlite3".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed(
+            "sqlite3 /tmp/test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
+        ));
+        assert_eq!(
+            p.command_risk_level(
+                "sqlite3 /tmp/test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
+            ),
+            CommandRiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn unquoted_semicolon_after_quoted_sql_still_splits_commands() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["sqlite3".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("sqlite3 /tmp/test.db \"SELECT 1;\"; rm -rf /"));
+    }
+
+    #[test]
     fn command_injection_backtick_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo `whoami`"));
@@ -1332,6 +1806,24 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo $(cat /etc/passwd)"));
         assert!(!p.is_command_allowed("echo $(rm -rf /)"));
+    }
+
+    #[test]
+    fn command_injection_dollar_paren_literal_inside_single_quotes_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo '$(cat /etc/passwd)'"));
+    }
+
+    #[test]
+    fn command_injection_dollar_brace_literal_inside_single_quotes_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo '${HOME}'"));
+    }
+
+    #[test]
+    fn command_injection_dollar_brace_unquoted_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo ${HOME}"));
     }
 
     #[test]
@@ -1380,6 +1872,16 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo secret > /etc/crontab"));
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
+        assert!(!p.is_command_allowed("cat </etc/passwd"));
+        assert!(!p.is_command_allowed("cat</etc/passwd"));
+    }
+
+    #[test]
+    fn quoted_ampersand_and_redirect_literals_are_not_treated_as_operators() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo \"A&B\""));
+        assert!(p.is_command_allowed("echo \"A>B\""));
+        assert!(p.is_command_allowed("echo \"A<B\""));
     }
 
     #[test]
@@ -1388,10 +1890,13 @@ mod tests {
         // find -exec is a common bypass
         assert!(!p.is_command_allowed("find . -exec rm -rf {} +"));
         assert!(!p.is_command_allowed("find / -ok cat {} \\;"));
-        // git config/alias can execute commands
+        // git config write operations can execute commands
         assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
         assert!(!p.is_command_allowed("git alias.st status"));
         assert!(!p.is_command_allowed("git -c core.editor=calc.exe commit"));
+        // git config without readonly flag is blocked
+        assert!(!p.is_command_allowed("git config user.name \"test\""));
+        assert!(!p.is_command_allowed("git config user.email test@example.com"));
         // Legitimate commands should still work
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
@@ -1399,9 +1904,77 @@ mod tests {
     }
 
     #[test]
+    fn git_config_readonly_operations_allowed() {
+        let p = default_policy();
+        // git config --get is read-only and safe
+        assert!(p.is_command_allowed("git config --get user.name"));
+        assert!(p.is_command_allowed("git config --get user.email"));
+        assert!(p.is_command_allowed("git config --get core.editor"));
+        // git config --list is read-only and safe
+        assert!(p.is_command_allowed("git config --list"));
+        assert!(p.is_command_allowed("git config -l"));
+        // git config --get-all is read-only
+        assert!(p.is_command_allowed("git config --get-all user.name"));
+        // git config --get-regexp is read-only
+        assert!(p.is_command_allowed("git config --get-regexp user.*"));
+        // git config --get-urlmatch is read-only
+        assert!(p.is_command_allowed("git config --get-urlmatch http.example.com"));
+        // scoped read operations are allowed
+        assert!(p.is_command_allowed("git config --global --get user.name"));
+        assert!(p.is_command_allowed("git config --local --list"));
+        assert!(p.is_command_allowed("git config --global --get user.name --show-origin"));
+        assert!(p.is_command_allowed("git config --default=unknown --get user.name"));
+    }
+
+    #[test]
+    fn git_config_write_operations_blocked() {
+        let p = default_policy();
+        // Plain git config (write) is blocked
+        assert!(!p.is_command_allowed("git config user.name test"));
+        assert!(!p.is_command_allowed("git config user.email test@example.com"));
+        // git config --unset is a write operation
+        assert!(!p.is_command_allowed("git config --unset user.name"));
+        // git config --add is a write operation
+        assert!(!p.is_command_allowed("git config --add user.name test"));
+        // git config --global without readonly flag is blocked
+        assert!(!p.is_command_allowed("git config --global user.name test"));
+        // git config --replace-all is a write operation
+        assert!(!p.is_command_allowed("git config --replace-all user.name test"));
+        // git config --edit is blocked (opens editor)
+        assert!(!p.is_command_allowed("git config -e"));
+        assert!(!p.is_command_allowed("git config --edit"));
+    }
+
+    #[test]
+    fn git_config_mixed_read_write_flags_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("git config --get --unset user.name"));
+        assert!(!p.is_command_allowed("git config --list --add user.name test"));
+        assert!(!p.is_command_allowed("git config --get-all --replace-all user.name test"));
+    }
+
+    #[test]
+    fn git_config_global_injection_flags_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("git --config-env=core.editor=EVIL_EDITOR status"));
+        assert!(!p.is_command_allowed("git --config=core.pager=cat status"));
+        assert!(
+            !p.is_command_allowed("git --config-env=credential.helper=EVIL config --get user.name")
+        );
+        assert!(!p.is_command_allowed("git --config=core.editor=vim config --get user.name"));
+    }
+
+    #[test]
     fn command_injection_dollar_brace_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo ${IFS}cat${IFS}/etc/passwd"));
+    }
+
+    #[test]
+    fn command_injection_plain_dollar_var_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("cat $HOME/.ssh/id_rsa"));
+        assert!(!p.is_command_allowed("cat $SECRET_FILE"));
     }
 
     #[test]
@@ -1427,6 +2000,115 @@ mod tests {
         assert!(p.is_command_allowed("LANG=C grep pattern file"));
         // env assignment + disallowed command — blocked
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_absolute_path() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn validate_command_execution_rejects_forbidden_paths() {
+        let p = default_policy();
+        let err = p
+            .validate_command_execution("cat /etc/shadow", false)
+            .unwrap_err();
+        assert!(err.contains("Path blocked by security policy"));
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_parent_dir_reference() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat ../secret.txt"),
+            Some("../secret.txt".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("find .. -name '*.rs'"),
+            Some("..".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_workspace_relative_paths() {
+        let p = default_policy();
+        assert_eq!(p.forbidden_path_argument("cat src/main.rs"), None);
+        assert_eq!(p.forbidden_path_argument("grep -r todo ./src"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_option_assignment_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep --file=/etc/passwd root ./src"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat --input=../secret.txt"),
+            Some("../secret.txt".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_safe_option_assignment_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep --file=./patterns.txt root ./src"),
+            None
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_short_option_attached_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep -f/etc/passwd root ./src"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("git -C../outside status"),
+            Some("../outside".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_safe_short_option_attached_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep -f./patterns.txt root ./src"),
+            None
+        );
+        assert_eq!(p.forbidden_path_argument("git -C./repo status"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_tilde_user_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat ~root/.ssh/id_rsa"),
+            Some("~root/.ssh/id_rsa".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("ls ~nobody"),
+            Some("~nobody".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_input_redirection_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat </etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat</etc/passwd"),
+            Some("/etc/passwd".into())
+        );
     }
 
     // ── Edge cases: path traversal ──────────────────────────
@@ -1468,6 +2150,8 @@ mod tests {
         };
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("~/.gnupg/secring.gpg"));
+        assert!(!p.is_path_allowed("~root/.ssh/id_rsa"));
+        assert!(!p.is_path_allowed("~nobody"));
     }
 
     #[test]
@@ -1505,8 +2189,6 @@ mod tests {
     fn rate_limit_high_allows_many() {
         let p = SecurityPolicy {
             max_actions_per_hour: 10000,
-            max_actions_per_minute: 10000,
-            tracker: ActionTracker::with_limits(10000, 10000),
             ..SecurityPolicy::default()
         };
         for _ in 0..100 {
@@ -1550,6 +2232,78 @@ mod tests {
         assert!(!p.is_path_allowed("/root/.bashrc"));
     }
 
+    #[test]
+    fn workspace_only_false_allows_resolved_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_false");
+        let _ = std::fs::create_dir_all(&workspace);
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: false,
+            forbidden_paths: vec!["/etc".into(), "/var".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Path outside workspace should be allowed when workspace_only=false
+        let outside = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/home"))
+            .join("zeroclaw_outside_ws");
+        assert!(
+            p.is_resolved_path_allowed(&outside),
+            "workspace_only=false must allow resolved paths outside workspace"
+        );
+
+        // Forbidden paths must still be blocked even with workspace_only=false
+        assert!(
+            !p.is_resolved_path_allowed(Path::new("/etc/passwd")),
+            "forbidden paths must be blocked even when workspace_only=false"
+        );
+        assert!(
+            !p.is_resolved_path_allowed(Path::new("/var/run/docker.sock")),
+            "forbidden /var must be blocked even when workspace_only=false"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn workspace_only_true_blocks_resolved_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_true");
+        let _ = std::fs::create_dir_all(&workspace);
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Path inside workspace — allowed
+        let inside = canonical_workspace.join("subdir");
+        assert!(
+            p.is_resolved_path_allowed(&inside),
+            "path inside workspace must be allowed"
+        );
+
+        // Path outside workspace — blocked
+        let outside = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("zeroclaw_outside_ws_true");
+        assert!(
+            !p.is_resolved_path_allowed(&outside),
+            "workspace_only=true must block resolved paths outside workspace"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     // ── Edge cases: from_config preserves tracker ────────────
 
     #[test]
@@ -1569,6 +2323,53 @@ mod tests {
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
         assert_eq!(policy.tracker.count(), 0);
         assert!(!policy.is_rate_limited());
+    }
+
+    // ── summary_for_heartbeat ──────────────────────────────
+
+    #[test]
+    fn summary_for_heartbeat_contains_key_fields() {
+        let policy = default_policy();
+        let summary = policy.summary_for_heartbeat();
+        assert!(summary.contains("Autonomy:"));
+        assert!(summary.contains("supervised"));
+        assert!(summary.contains("Workspace:"));
+        assert!(summary.contains("workspace_only: true"));
+        assert!(summary.contains("Forbidden paths:"));
+        assert!(summary.contains("/etc"));
+        assert!(summary.contains("Allowed commands:"));
+        assert!(summary.contains("git"));
+        assert!(summary.contains("High-risk commands: blocked"));
+        assert!(summary.contains("Do not exfiltrate data"));
+    }
+
+    #[test]
+    fn summary_for_heartbeat_truncates_long_lists() {
+        let policy = SecurityPolicy {
+            forbidden_paths: (0..15).map(|i| format!("/path_{i}")).collect(),
+            allowed_commands: (0..12).map(|i| format!("cmd_{i}")).collect(),
+            ..SecurityPolicy::default()
+        };
+        let summary = policy.summary_for_heartbeat();
+        // Only first 8 shown, remainder counted
+        assert!(summary.contains("+ 7 more"));
+        assert!(summary.contains("+ 4 more rejected"));
+    }
+
+    #[test]
+    fn summary_for_heartbeat_full_autonomy() {
+        let policy = full_policy();
+        let summary = policy.summary_for_heartbeat();
+        assert!(summary.contains("full"));
+        assert!(summary.contains("autonomous execution"));
+    }
+
+    #[test]
+    fn summary_for_heartbeat_readonly_autonomy() {
+        let policy = readonly_policy();
+        let summary = policy.summary_for_heartbeat();
+        assert!(summary.contains("read_only"));
+        assert!(summary.contains("side-effecting actions are blocked"));
     }
 
     // ══════════════════════════════════════════════════════════
@@ -1594,7 +2395,7 @@ mod tests {
         };
         for dir in [
             "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev",
-            "/proc", "/sys", "/var", "/tmp",
+            "/proc", "/sys", "/var", "/tmp", "/mnt",
         ] {
             assert!(
                 !p.is_path_allowed(dir),
@@ -1672,7 +2473,9 @@ mod tests {
     fn checklist_default_forbidden_paths_comprehensive() {
         let p = SecurityPolicy::default();
         // Must contain all critical system dirs
-        for dir in ["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"] {
+        for dir in [
+            "/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp", "/mnt",
+        ] {
             assert!(
                 p.forbidden_paths.iter().any(|f| f == dir),
                 "Default forbidden_paths must include {dir}"
@@ -1687,310 +2490,165 @@ mod tests {
         }
     }
 
-    // ══════════════════════════════════════════════════════════
-    // BURST RATE LIMITER TESTS
-    // ══════════════════════════════════════════════════════════
+    // ── §1.2 Path resolution / symlink bypass tests ──────────
 
     #[test]
-    fn burst_limiter_allows_under_limit() {
-        let tracker = ActionTracker::with_limits(5, 1000);
-        for _ in 0..5 {
-            assert!(matches!(
-                tracker.check_and_record(),
-                RateLimitResult::Allowed
-            ));
-        }
-    }
+    fn resolved_path_blocks_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_resolved_path");
+        let _ = std::fs::create_dir_all(&workspace);
 
-    #[test]
-    fn burst_limiter_blocks_at_limit() {
-        let tracker = ActionTracker::with_limits(3, 1000);
-        // Use up burst budget.
-        for _ in 0..3 {
-            assert!(matches!(
-                tracker.check_and_record(),
-                RateLimitResult::Allowed
-            ));
-        }
-        // 4th should trigger burst limit.
-        let result = tracker.check_and_record();
-        assert!(
-            matches!(result, RateLimitResult::BurstLimited { .. }),
-            "Expected BurstLimited, got {result:?}"
-        );
-    }
+        // Use the canonicalized workspace so starts_with checks match
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
 
-    #[test]
-    fn burst_limiter_progressive_strikes() {
-        let tracker = ActionTracker::with_limits(1, 1000);
-
-        // First action allowed.
-        assert!(matches!(
-            tracker.check_and_record(),
-            RateLimitResult::Allowed
-        ));
-
-        // Second triggers strike 1.
-        let r1 = tracker.check_and_record();
-        match r1 {
-            RateLimitResult::BurstLimited { strike, .. } => {
-                assert_eq!(strike, StrikeLevel::First);
-            }
-            other => panic!("Expected BurstLimited strike 1, got {other:?}"),
-        }
-        assert_eq!(tracker.strike_level(), StrikeLevel::First);
-    }
-
-    #[test]
-    fn burst_limiter_strike_escalation() {
-        // With burst_limit=0 every action triggers burst.
-        let tracker = ActionTracker::with_limits(0, 1000);
-
-        let r1 = tracker.check_and_record();
-        match &r1 {
-            RateLimitResult::BurstLimited { strike, .. } => {
-                assert_eq!(*strike, StrikeLevel::First);
-            }
-            other => panic!("Expected strike 1, got {other:?}"),
-        }
-
-        // During cooldown, further attempts also blocked.
-        let r2 = tracker.check_and_record();
-        match &r2 {
-            RateLimitResult::BurstLimited { strike, .. } => {
-                // Still in first strike cooldown.
-                assert_eq!(*strike, StrikeLevel::First);
-            }
-            other => panic!("Expected cooldown block, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn burst_limiter_reset_clears_strikes() {
-        let tracker = ActionTracker::with_limits(0, 1000);
-        // Trigger a strike.
-        tracker.check_and_record();
-        assert_eq!(tracker.strike_level(), StrikeLevel::First);
-        // Reset.
-        tracker.reset_strikes();
-        assert_eq!(tracker.strike_level(), StrikeLevel::None);
-    }
-
-    #[test]
-    fn hourly_limit_blocks_after_budget() {
-        let tracker = ActionTracker::with_limits(1000, 3);
-        for _ in 0..3 {
-            assert!(matches!(
-                tracker.check_and_record(),
-                RateLimitResult::Allowed
-            ));
-        }
-        let result = tracker.check_and_record();
-        assert!(
-            matches!(result, RateLimitResult::HourlyLimited { .. }),
-            "Expected HourlyLimited, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn policy_detailed_rate_limit_burst_message() {
-        let p = SecurityPolicy {
-            max_actions_per_minute: 1,
-            max_actions_per_hour: 1000,
-            tracker: ActionTracker::with_limits(1, 1000),
+        let policy = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
             ..SecurityPolicy::default()
         };
 
-        // First: allowed.
-        assert!(matches!(
-            p.record_action_detailed(),
-            RateLimitResult::Allowed
-        ));
-
-        // Second: burst limited.
-        let result = p.record_action_detailed();
+        // A resolved path inside the workspace should be allowed
+        let inside = canonical_workspace.join("subdir").join("file.txt");
         assert!(
-            matches!(result, RateLimitResult::BurstLimited { .. }),
-            "Expected BurstLimited, got {result:?}"
+            policy.is_resolved_path_allowed(&inside),
+            "path inside workspace should be allowed"
         );
-    }
 
-    #[test]
-    fn policy_detailed_rate_limit_hourly_message() {
-        let p = SecurityPolicy {
-            max_actions_per_minute: 1000,
-            max_actions_per_hour: 2,
-            tracker: ActionTracker::with_limits(1000, 1000),
-            ..SecurityPolicy::default()
-        };
-
-        assert!(matches!(
-            p.record_action_detailed(),
-            RateLimitResult::Allowed
-        ));
-        assert!(matches!(
-            p.record_action_detailed(),
-            RateLimitResult::Allowed
-        ));
-        let result = p.record_action_detailed();
+        // A resolved path outside the workspace should be blocked
+        let canonical_temp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let outside = canonical_temp.join("outside_workspace_zeroclaw");
         assert!(
-            matches!(result, RateLimitResult::HourlyLimited { .. }),
-            "Expected HourlyLimited, got {result:?}"
+            !policy.is_resolved_path_allowed(&outside),
+            "path outside workspace must be blocked"
         );
-    }
 
-    // ══════════════════════════════════════════════════════════
-    // LOOP DETECTOR TESTS
-    // ══════════════════════════════════════════════════════════
-
-    #[test]
-    fn loop_detector_allows_varied_actions() {
-        let det = LoopDetector::new(3);
-        for i in 0..10 {
-            let sig = format!("browser:click:button_{i}");
-            assert_eq!(det.record_and_check(&sig, false), LoopCheckResult::Ok);
-        }
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]
-    fn loop_detector_allows_fruitful_repeats() {
-        let det = LoopDetector::new(3);
-        // Same action but always produces a result — never triggers.
-        for _ in 0..10 {
-            assert_eq!(
-                det.record_and_check("browser:open:https://example.com", true),
-                LoopCheckResult::Ok
-            );
-        }
-    }
-
-    #[test]
-    fn loop_detector_triggers_on_fruitless_repeats() {
-        let det = LoopDetector::new(3);
-        let sig = "browser:click:#submit";
-
-        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
-        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
-        // 3rd fruitless repeat triggers.
-        match det.record_and_check(sig, false) {
-            LoopCheckResult::LoopDetected {
-                repeat_count,
-                max_allowed,
-                ..
-            } => {
-                assert_eq!(repeat_count, 3);
-                assert_eq!(max_allowed, 3);
-            }
-            other @ LoopCheckResult::Ok => panic!("Expected LoopDetected, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn loop_detector_resets_on_success() {
-        let det = LoopDetector::new(3);
-        let sig = "browser:click:#submit";
-
-        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
-        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
-        // Successful result breaks the chain.
-        assert_eq!(det.record_and_check(sig, true), LoopCheckResult::Ok);
-        // Counter resets — can do 2 more fruitless.
-        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
-        assert_eq!(det.record_and_check(sig, false), LoopCheckResult::Ok);
-    }
-
-    #[test]
-    fn loop_detector_different_actions_dont_interfere() {
-        let det = LoopDetector::new(3);
-
-        assert_eq!(
-            det.record_and_check("browser:click:#a", false),
-            LoopCheckResult::Ok
-        );
-        assert_eq!(
-            det.record_and_check("browser:click:#a", false),
-            LoopCheckResult::Ok
-        );
-        // Different action breaks the chain for #a.
-        assert_eq!(
-            det.record_and_check("browser:click:#b", false),
-            LoopCheckResult::Ok
-        );
-        // Back to #a — chain restarts from 1.
-        assert_eq!(
-            det.record_and_check("browser:click:#a", false),
-            LoopCheckResult::Ok
-        );
-    }
-
-    #[test]
-    fn loop_detector_make_signature() {
-        assert_eq!(
-            LoopDetector::make_signature("browser", "open", "https://example.com"),
-            "browser:open:https://example.com"
-        );
-    }
-
-    #[test]
-    fn loop_detector_consecutive_count() {
-        let det = LoopDetector::new(5);
-        let sig = "shell:exec:ls";
-
-        det.record_and_check(sig, false);
-        det.record_and_check(sig, false);
-        assert_eq!(det.consecutive_count(sig), 2);
-
-        det.record_and_check(sig, true); // produces result
-        assert_eq!(det.consecutive_count(sig), 0);
-    }
-
-    #[test]
-    fn loop_detector_reset_clears_history() {
-        let det = LoopDetector::new(3);
-        let sig = "browser:click:#submit";
-
-        det.record_and_check(sig, false);
-        det.record_and_check(sig, false);
-        assert_eq!(det.consecutive_count(sig), 2);
-
-        det.reset();
-        assert_eq!(det.consecutive_count(sig), 0);
-    }
-
-    #[test]
-    fn policy_check_loop_integration() {
-        let p = SecurityPolicy {
-            max_loop_repeats: 2,
-            loop_detector: LoopDetector::new(2),
+    fn resolved_path_blocks_root_escape() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/home/zeroclaw_user/project"),
             ..SecurityPolicy::default()
         };
 
-        assert_eq!(
-            p.check_loop("browser", "click", "#btn", false),
-            LoopCheckResult::Ok
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/etc/passwd")),
+            "resolved path to /etc/passwd must be blocked"
         );
-        match p.check_loop("browser", "click", "#btn", false) {
-            LoopCheckResult::LoopDetected { repeat_count, .. } => {
-                assert_eq!(repeat_count, 2);
-            }
-            other @ LoopCheckResult::Ok => panic!("Expected LoopDetected, got {other:?}"),
-        }
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/root/.bashrc")),
+            "resolved path to /root/.bashrc must be blocked"
+        );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn policy_reset_loop_detector() {
-        let p = SecurityPolicy {
-            max_loop_repeats: 2,
-            loop_detector: LoopDetector::new(2),
+    fn resolved_path_blocks_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_symlink_escape");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside_target");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Create a symlink inside workspace pointing outside
+        let link_path = workspace.join("escape_link");
+        symlink(&outside, &link_path).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
             ..SecurityPolicy::default()
         };
 
-        p.check_loop("browser", "click", "#btn", false);
-        p.reset_loop_detector();
-        // After reset, counter should be back to 0.
-        assert_eq!(
-            p.check_loop("browser", "click", "#btn", false),
-            LoopCheckResult::Ok
+        // The resolved symlink target should be outside workspace
+        let resolved = link_path.canonicalize().unwrap();
+        assert!(
+            !policy.is_resolved_path_allowed(&resolved),
+            "symlink-resolved path outside workspace must be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allowed_roots_permits_paths_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_allowed_roots");
+        let workspace = root.join("workspace");
+        let extra = root.join("extra_root");
+        let extra_file = extra.join("data.txt");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(&extra_file, "test").unwrap();
+
+        // Symlink inside workspace pointing to extra root
+        let link_path = workspace.join("link_to_extra");
+        symlink(&extra, &link_path).unwrap();
+
+        let resolved = link_path.join("data.txt").canonicalize().unwrap();
+
+        // Without allowed_roots — blocked (symlink escape)
+        let policy_without = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots: vec![],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            !policy_without.is_resolved_path_allowed(&resolved),
+            "without allowed_roots, symlink target must be blocked"
+        );
+
+        // With allowed_roots — permitted
+        let policy_with = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots: vec![extra.clone()],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            policy_with.is_resolved_path_allowed(&resolved),
+            "with allowed_roots containing the target, symlink must be allowed"
+        );
+
+        // Unrelated path still blocked
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        assert!(
+            !policy_with.is_resolved_path_allowed(&unrelated.canonicalize().unwrap()),
+            "paths outside workspace and allowed_roots must still be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_path_allowed_blocks_null_bytes() {
+        let policy = default_policy();
+        assert!(
+            !policy.is_path_allowed("file\0.txt"),
+            "paths with null bytes must be blocked"
+        );
+    }
+
+    #[test]
+    fn is_path_allowed_blocks_url_encoded_traversal() {
+        let policy = default_policy();
+        assert!(
+            !policy.is_path_allowed("..%2fetc%2fpasswd"),
+            "URL-encoded path traversal must be blocked"
+        );
+        assert!(
+            !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
+            "URL-encoded parent dir traversal must be blocked"
         );
     }
 }

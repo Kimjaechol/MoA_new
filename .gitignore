@@ -1,9 +1,12 @@
 /target
 **/target/
+/target_ci
+/target_review*
 firmware/*/target
 *.db
 *.db-journal
 .DS_Store
+._*
 .wt-pr37/
 __pycache__/
 *.pyc
@@ -11,6 +14,12 @@ docker-compose.override.yml
 keystore.properties
 *.keystore
 *.jks
+site/node_modules/
+site/.vite/
+site/public/docs-content/
+gh-pages/
+
+.idea
 
 # Environment files (may contain secrets)
 .env
@@ -34,6 +43,12 @@ dist/
 
 # Secret keys and credentials
 .secret_key
+otp-secret
 *.key
 *.pem
 credentials.json
+/config.toml
+.worktrees/
+
+# Nix
+result

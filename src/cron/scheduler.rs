@@ -1,7 +1,10 @@
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
+#[cfg(feature = "channel-matrix")]
+use crate::channels::MatrixChannel;
 use crate::channels::{
-    Channel, DingTalkChannel, DiscordChannel, EmailChannel, IMessageChannel, IrcChannel,
-    KakaoTalkChannel, LarkChannel, LineChannel, MatrixChannel, QQChannel, SendMessage,
-    SignalChannel, SlackChannel, TelegramChannel, WhatsAppChannel,
+    Channel, DingTalkChannel, DiscordChannel, EmailChannel, MattermostChannel, NapcatChannel,
+    QQChannel, SendMessage, SlackChannel, TelegramChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -11,50 +14,52 @@ use crate::cron::{
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use futures_util::{stream, StreamExt};
+use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
 
 const MIN_POLL_SECONDS: u64 = 5;
+const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+const SCHEDULER_COMPONENT: &str = "scheduler";
+
+pub(crate) fn is_no_reply_sentinel(output: &str) -> bool {
+    output.trim().eq_ignore_ascii_case("NO_REPLY")
+}
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
-    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
 
-    crate::health::mark_component_ok("scheduler");
+    crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
     loop {
         interval.tick().await;
+        // Keep scheduler liveness fresh even when there are no due jobs.
+        crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
         let jobs = match due_jobs(&config, Utc::now()) {
             Ok(jobs) => jobs,
             Err(e) => {
-                crate::health::mark_component_error("scheduler", e.to_string());
+                crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
                 tracing::warn!("Scheduler query failed: {e}");
                 continue;
             }
         };
 
-        for job in jobs {
-            crate::health::mark_component_ok("scheduler");
-            warn_if_high_frequency_agent_job(&job);
-
-            let started_at = Utc::now();
-            let (success, output) = execute_job_with_retry(&config, &security, &job).await;
-            let finished_at = Utc::now();
-            let success =
-                persist_job_result(&config, &job, success, &output, started_at, finished_at).await;
-
-            if !success {
-                crate::health::mark_component_error("scheduler", format!("job {} failed", job.id));
-            }
-        }
+        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
     }
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    execute_job_with_retry(config, &security, job).await
+    Box::pin(execute_job_with_retry(config, &security, job)).await
 }
 
 async fn execute_job_with_retry(
@@ -69,7 +74,7 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, job).await,
+            JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
         };
         last_output = output;
 
@@ -92,7 +97,81 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
+async fn process_due_jobs(
+    config: &Config,
+    security: &Arc<SecurityPolicy>,
+    jobs: Vec<CronJob>,
+    component: &str,
+) {
+    // Refresh scheduler health on every successful poll cycle, including idle cycles.
+    crate::health::mark_component_ok(component);
+
+    let max_concurrent = config.scheduler.max_concurrent.max(1);
+    let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
+        let config = config.clone();
+        let security = Arc::clone(security);
+        let component = component.to_owned();
+        async move {
+            Box::pin(execute_and_persist_job(
+                &config,
+                security.as_ref(),
+                &job,
+                &component,
+            ))
+            .await
+        }
+    }))
+    .buffer_unordered(max_concurrent);
+
+    while let Some((job_id, success, output)) = in_flight.next().await {
+        if !success {
+            tracing::warn!("Scheduler job '{job_id}' failed: {output}");
+        }
+    }
+}
+
+async fn execute_and_persist_job(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    component: &str,
+) -> (String, bool, String) {
+    crate::health::mark_component_ok(component);
+    warn_if_high_frequency_agent_job(job);
+
+    let started_at = Utc::now();
+    let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
+    let finished_at = Utc::now();
+    let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
+
+    (job.id.clone(), success, output)
+}
+
+async fn run_agent_job(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
+    if !security.can_act() {
+        return (
+            false,
+            "blocked by security policy: autonomy is read-only".to_string(),
+        );
+    }
+
+    if security.is_rate_limited() {
+        return (
+            false,
+            "blocked by security policy: rate limit exceeded".to_string(),
+        );
+    }
+
+    if !security.record_action() {
+        return (
+            false,
+            "blocked by security policy: action budget exhausted".to_string(),
+        );
+    }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
@@ -100,14 +179,16 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            crate::agent::run(
+            Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prefixed_prompt),
                 None,
                 model_override,
                 config.default_temperature,
                 vec![],
-            )
+                false,
+                None,
+            ))
             .await
         }
     };
@@ -218,6 +299,13 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
     }
+    if is_no_reply_sentinel(output) {
+        tracing::debug!(
+            "Cron job '{}' returned NO_REPLY sentinel; skipping announce delivery",
+            job.id
+        );
+        return Ok(());
+    }
 
     let channel = delivery
         .channel
@@ -228,16 +316,31 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
-    match channel.to_ascii_lowercase().as_str() {
+    deliver_announcement(config, channel, target, output).await
+}
+
+pub(crate) async fn deliver_announcement(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    output: &str,
+) -> Result<()> {
+    let normalized = channel.to_ascii_lowercase();
+    match normalized.as_str() {
         "telegram" => {
             let tg = config
                 .channels_config
                 .telegram
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let ch =
-                TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone(), None, None);
-            ch.send(&SendMessage::new(output, target)).await?;
+            let channel = TelegramChannel::new(
+                tg.bot_token.clone(),
+                tg.allowed_users.clone(),
+                tg.mention_only,
+                tg.ack_enabled,
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
+            channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
             let dc = config
@@ -245,16 +348,15 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .discord
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
-            let ch = DiscordChannel::new(
+            let channel = DiscordChannel::new(
                 dc.bot_token.clone(),
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
-                None,
-                None,
-            );
-            ch.send(&SendMessage::new(output, target)).await?;
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
+            channel.send(&SendMessage::new(output, target)).await?;
         }
         "slack" => {
             let sl = config
@@ -262,110 +364,30 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .slack
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
-            let ch = SlackChannel::new(
+            let channel = SlackChannel::new(
                 sl.bot_token.clone(),
+                sl.app_token.clone(),
                 sl.channel_id.clone(),
+                sl.channel_ids.clone(),
                 sl.allowed_users.clone(),
-                None,
-                None,
             );
-            ch.send(&SendMessage::new(output, target)).await?;
+            channel.send(&SendMessage::new(output, target)).await?;
         }
-        "kakao" | "kakaotalk" => {
-            let kk = config
+        "mattermost" => {
+            let mm = config
                 .channels_config
-                .kakao
+                .mattermost
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("kakao channel not configured"))?;
-            let ch = KakaoTalkChannel::new(
-                kk.rest_api_key.clone(),
-                kk.admin_key.clone(),
-                kk.webhook_secret.clone(),
-                kk.allowed_users.clone(),
-                kk.port,
-                None,
-                None,
+                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
+            let channel = MattermostChannel::new(
+                mm.url.clone(),
+                mm.bot_token.clone(),
+                mm.channel_id.clone(),
+                mm.allowed_users.clone(),
+                mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
             );
-            ch.send(&SendMessage::new(output, target)).await?;
-        }
-        "matrix" => {
-            let mx = config
-                .channels_config
-                .matrix
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
-            let ch = MatrixChannel::new(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-            );
-            ch.send(&SendMessage::new(output, target)).await?;
-        }
-        "signal" => {
-            let sg = config
-                .channels_config
-                .signal
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("signal channel not configured"))?;
-            let ch = SignalChannel::new(
-                sg.http_url.clone(),
-                sg.account.clone(),
-                sg.group_id.clone(),
-                sg.allowed_from.clone(),
-                sg.ignore_attachments,
-                sg.ignore_stories,
-            );
-            ch.send(&SendMessage::new(output, target)).await?;
-        }
-        "whatsapp" => {
-            let wa = config
-                .channels_config
-                .whatsapp
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
-            let ch = WhatsAppChannel::new(
-                wa.access_token.clone(),
-                wa.phone_number_id.clone(),
-                wa.verify_token.clone(),
-                wa.allowed_numbers.clone(),
-                None,
-                None,
-            );
-            ch.send(&SendMessage::new(output, target)).await?;
-        }
-        "line" => {
-            let ln = config
-                .channels_config
-                .line
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("line channel not configured"))?;
-            let ch = LineChannel::new(
-                ln.channel_access_token.clone(),
-                ln.channel_secret.clone(),
-                ln.allowed_users.clone(),
-                None,
-                None,
-            );
-            ch.send(&SendMessage::new(output, target)).await?;
-        }
-        "email" => {
-            let em = config
-                .channels_config
-                .email
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("email channel not configured"))?;
-            let ch = EmailChannel::new(em.clone());
-            ch.send(&SendMessage::new(output, target)).await?;
-        }
-        "lark" | "feishu" => {
-            let lk = config
-                .channels_config
-                .lark
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
-            let ch = LarkChannel::from_config(lk);
-            ch.send(&SendMessage::new(output, target)).await?;
+            channel.send(&SendMessage::new(output, target)).await?;
         }
         "dingtalk" => {
             let dt = config
@@ -373,12 +395,12 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .dingtalk
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("dingtalk channel not configured"))?;
-            let ch = DingTalkChannel::new(
+            let channel = DingTalkChannel::new(
                 dt.client_id.clone(),
                 dt.client_secret.clone(),
                 dt.allowed_users.clone(),
             );
-            ch.send(&SendMessage::new(output, target)).await?;
+            channel.send(&SendMessage::new(output, target)).await?;
         }
         "qq" => {
             let qq = config
@@ -386,41 +408,112 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .qq
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
-            let ch = QQChannel::new(
+            let channel = QQChannel::new_with_environment(
                 qq.app_id.clone(),
                 qq.app_secret.clone(),
                 qq.allowed_users.clone(),
+                qq.environment.clone(),
             );
-            ch.send(&SendMessage::new(output, target)).await?;
+            channel.send(&SendMessage::new(output, target)).await?;
         }
-        "irc" => {
-            let ir = config
+        "napcat" => {
+            let napcat_cfg = config
                 .channels_config
-                .irc
+                .napcat
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("irc channel not configured"))?;
-            let ch = IrcChannel::new(crate::channels::irc::IrcChannelConfig {
-                server: ir.server.clone(),
-                port: ir.port,
-                nickname: ir.nickname.clone(),
-                username: ir.username.clone(),
-                channels: ir.channels.clone(),
-                allowed_users: ir.allowed_users.clone(),
-                server_password: ir.server_password.clone(),
-                nickserv_password: ir.nickserv_password.clone(),
-                sasl_password: ir.sasl_password.clone(),
-                verify_tls: ir.verify_tls.unwrap_or(true),
-            });
-            ch.send(&SendMessage::new(output, target)).await?;
+                .ok_or_else(|| anyhow::anyhow!("napcat channel not configured"))?;
+            let channel = NapcatChannel::from_config(napcat_cfg.clone())?;
+            channel.send(&SendMessage::new(output, target)).await?;
         }
-        "imessage" => {
-            let im = config
+        "whatsapp_web" | "whatsapp" => {
+            let wa = config
                 .channels_config
-                .imessage
+                .whatsapp
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("imessage channel not configured"))?;
-            let ch = IMessageChannel::new(im.allowed_contacts.clone(), None, None);
-            ch.send(&SendMessage::new(output, target)).await?;
+                .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
+
+            // WhatsApp Web requires the connected channel instance from the
+            // channel runtime. Fall back to cloud mode if configured.
+            if let Some(live_channel) = crate::channels::get_live_channel("whatsapp") {
+                live_channel.send(&SendMessage::new(output, target)).await?;
+            } else if wa.is_cloud_config() {
+                let channel = WhatsAppChannel::new(
+                    wa.access_token.clone().unwrap_or_default(),
+                    wa.phone_number_id.clone().unwrap_or_default(),
+                    wa.verify_token.clone().unwrap_or_default(),
+                    wa.allowed_numbers.clone(),
+                );
+                channel.send(&SendMessage::new(output, target)).await?;
+            } else {
+                anyhow::bail!(
+                    "whatsapp_web delivery requires an active channels runtime session; start daemon/channels with whatsapp web enabled"
+                );
+            }
+        }
+        "lark" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lark = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = LarkChannel::from_lark_config(lark);
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("lark delivery channel requires `channel-lark` feature");
+            }
+        }
+        "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let feishu = config
+                    .channels_config
+                    .feishu
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("feishu channel not configured"))?;
+                let channel = LarkChannel::from_feishu_config(feishu);
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("feishu delivery channel requires `channel-lark` feature");
+            }
+        }
+        "email" => {
+            let email = config
+                .channels_config
+                .email
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("email channel not configured"))?;
+            let channel = EmailChannel::new(email.clone());
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "matrix" => {
+            #[cfg(feature = "channel-matrix")]
+            {
+                // NOTE: uses the basic constructor without session hints (user_id/device_id).
+                // Plain (non-E2EE) Matrix rooms work fine. Encrypted-room delivery is not
+                // supported in cron mode; use start_channels for full E2EE listener sessions.
+                let mx = config
+                    .channels_config
+                    .matrix
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
+                let channel = MatrixChannel::new(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                );
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-matrix"))]
+            {
+                anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -428,68 +521,25 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     Ok(())
 }
 
-fn is_env_assignment(word: &str) -> bool {
-    word.contains('=')
-        && word
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-}
-
-fn strip_wrapping_quotes(token: &str) -> &str {
-    token.trim_matches(|c| c == '"' || c == '\'')
-}
-
-fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<String> {
-    let mut normalized = command.to_string();
-    for sep in ["&&", "||"] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-    for sep in ['\n', ';', '|'] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-
-    for segment in normalized.split('\x00') {
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-
-        // Skip leading env assignments and executable token.
-        let mut idx = 0;
-        while idx < tokens.len() && is_env_assignment(tokens[idx]) {
-            idx += 1;
-        }
-        if idx >= tokens.len() {
-            continue;
-        }
-        idx += 1;
-
-        for token in &tokens[idx..] {
-            let candidate = strip_wrapping_quotes(token);
-            if candidate.is_empty() || candidate.starts_with('-') || candidate.contains("://") {
-                continue;
-            }
-
-            let looks_like_path = candidate.starts_with('/')
-                || candidate.starts_with("./")
-                || candidate.starts_with("../")
-                || candidate.starts_with("~/")
-                || candidate.contains('/');
-
-            if looks_like_path && !security.is_path_allowed(candidate) {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-
-    None
-}
-
 async fn run_job_command(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
+) -> (bool, String) {
+    run_job_command_with_timeout(
+        config,
+        security,
+        job,
+        Duration::from_secs(SHELL_JOB_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn run_job_command_with_timeout(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    timeout: Duration,
 ) -> (bool, String) {
     if !security.can_act() {
         return (
@@ -515,7 +565,7 @@ async fn run_job_command(
         );
     }
 
-    if let Some(path) = forbidden_path_argument(security, &job.command) {
+    if let Some(path) = security.forbidden_path_argument(&job.command) {
         return (
             false,
             format!("blocked by security policy: forbidden path argument: {path}"),
@@ -529,15 +579,22 @@ async fn run_job_command(
         );
     }
 
-    let output = Command::new("sh")
+    let child = match Command::new("sh")
         .arg("-lc")
         .arg(&job.command)
         .current_dir(&config.workspace_dir)
-        .output()
-        .await;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return (false, format!("spawn error: {e}")),
+    };
 
-    match output {
-        Ok(output) => {
+    match time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = format!(
@@ -548,7 +605,11 @@ async fn run_job_command(
             );
             (output.status.success(), combined)
         }
-        Err(e) => (false, format!("spawn error: {e}")),
+        Ok(Err(e)) => (false, format!("spawn error: {e}")),
+        Err(_) => (
+            false,
+            format!("job timed out after {}s", timeout.as_secs_f64()),
+        ),
     }
 }
 
@@ -559,15 +620,47 @@ mod tests {
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::sync::OnceLock;
     use tempfile::TempDir;
 
-    fn test_config(tmp: &TempDir) -> Config {
+    async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    async fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         config
     }
 
@@ -596,10 +689,14 @@ mod tests {
         }
     }
 
+    fn unique_component(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
     #[tokio::test]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let job = test_job("echo scheduler-ok");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -612,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_scheduler_test");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -623,9 +720,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_command_times_out() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["sleep".into()];
+        let job = test_job("sleep 1");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) =
+            run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
+        assert!(!success);
+        assert!(output.contains("job timed out after"));
+    }
+
+    #[tokio::test]
     async fn run_job_command_blocks_disallowed_command() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.autonomy.allowed_commands = vec!["echo".into()];
         let job = test_job("curl https://evil.example");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -639,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_blocks_forbidden_path_argument() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.autonomy.allowed_commands = vec!["cat".into()];
         let job = test_job("cat /etc/passwd");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -652,9 +763,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_command_blocks_forbidden_option_assignment_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["grep".into()];
+        let job = test_job("grep --file=/etc/passwd root ./src");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_forbidden_short_option_attached_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["grep".into()];
+        let job = test_job("grep -f/etc/passwd root ./src");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_tilde_user_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat ~root/.ssh/id_rsa");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("~root/.ssh/id_rsa"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_input_redirection_path_bypass() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat </etc/passwd");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("command not allowed"));
+    }
+
+    #[tokio::test]
     async fn run_job_command_blocks_readonly_mode() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
         let job = test_job("echo should-not-run");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -668,7 +838,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_blocks_rate_limited() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.autonomy.max_actions_per_hour = 0;
         let job = test_job("echo should-not-run");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -682,16 +852,17 @@ mod tests {
     #[tokio::test]
     async fn execute_job_with_retry_recovers_after_first_failure() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
         config.autonomy.allowed_commands = vec!["sh".into()];
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        std::fs::write(
+        tokio::fs::write(
             config.workspace_dir.join("retry-once.sh"),
             "#!/bin/sh\nif [ -f retry-ok.flag ]; then\n  echo recovered\n  exit 0\nfi\ntouch retry-ok.flag\nexit 1\n",
         )
+        .await
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
@@ -703,7 +874,7 @@ mod tests {
     #[tokio::test]
     async fn execute_job_with_retry_exhausts_attempts() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
+        let mut config = test_config(&tmp).await;
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -718,20 +889,96 @@ mod tests {
     #[tokio::test]
     async fn run_agent_job_returns_error_without_provider_key() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
+        let _env = env_lock().await;
+        let _generic = EnvGuard::unset("ZEROCLAW_API_KEY");
+        let _fallback = EnvGuard::unset("API_KEY");
+        let _openrouter = EnvGuard::unset("OPENROUTER_API_KEY");
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &job).await;
+        let (success, output) = run_agent_job(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
 
     #[tokio::test]
+    async fn run_agent_job_blocks_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_blocks_rate_limited() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.max_actions_per_hour = 0;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_marks_component_ok_even_when_idle() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let component = unique_component("scheduler-idle");
+
+        crate::health::mark_component_error(&component, "pre-existing error");
+        process_due_jobs(&config, &security, Vec::new(), &component).await;
+
+        let snapshot = crate::health::snapshot_json();
+        let entry = &snapshot["components"][component.as_str()];
+        assert_eq!(entry["status"], "ok");
+        assert!(entry["last_ok"].as_str().is_some());
+        assert!(entry["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_failure_does_not_mark_component_unhealthy() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let component = unique_component("scheduler-fail");
+
+        crate::health::mark_component_ok(&component);
+        process_due_jobs(&config, &security, vec![job], &component).await;
+
+        let snapshot = crate::health::snapshot_json();
+        let entry = &snapshot["components"][component.as_str()];
+        assert_eq!(entry["status"], "ok");
+    }
+
+    #[tokio::test]
     async fn persist_job_result_records_run_and_reschedules_shell_job() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -748,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_success_deletes_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_agent_job(
             &config,
@@ -773,7 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn persist_job_result_failure_disables_one_shot() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_agent_job(
             &config,
@@ -797,9 +1044,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_job_result_success_deletes_one_shot_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        assert!(job.delete_after_run);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+        let lookup = cron::get_job(&config, &job.id);
+        assert!(lookup.is_err());
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_failure_disables_one_shot_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        assert!(job.delete_after_run);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        assert!(!success);
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_delivery_failure_non_best_effort_marks_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &config,
+            Some("announce-job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "deliver this",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("123456".into()),
+                best_effort: false,
+            }),
+            false,
+        )
+        .unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(!success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("error"));
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "error");
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_delivery_failure_best_effort_keeps_success() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &config,
+            Some("announce-job-best-effort".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "deliver this",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("123456".into()),
+                best_effort: true,
+            }),
+            false,
+        )
+        .unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_at_schedule_without_delete_after_run_is_not_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_agent_job(
+            &config,
+            Some("at-no-autodelete".into()),
+            crate::cron::Schedule::At { at },
+            "Hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!job.delete_after_run);
+
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
     async fn deliver_if_configured_handles_none_and_invalid_channel() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp).await;
         let mut job = test_job("echo ok");
 
         assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
@@ -812,5 +1196,59 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_skips_no_reply_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("invalid".into()),
+            to: Some("target".into()),
+            best_effort: true,
+        };
+
+        assert!(deliver_if_configured(&config, &job, "  no_reply  ")
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn no_reply_sentinel_matching_is_trimmed_and_case_insensitive() {
+        assert!(is_no_reply_sentinel("NO_REPLY"));
+        assert!(is_no_reply_sentinel("  no_reply  "));
+        assert!(!is_no_reply_sentinel("NO_REPLY please"));
+        assert!(!is_no_reply_sentinel(""));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_whatsapp_web_requires_live_session_in_web_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("whatsapp_web".into()),
+            to: Some("+15551234567".into()),
+            best_effort: true,
+        };
+
+        let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires an active channels runtime session"));
     }
 }

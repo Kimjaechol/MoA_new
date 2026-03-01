@@ -15,9 +15,8 @@
 //! - **Pull**: On startup, request missing deltas from peers
 //! - **Full Sync**: Periodic full reconciliation for consistency
 
-use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -274,7 +273,7 @@ impl SyncEngine {
             key
         } else {
             let mut key = [0u8; 32];
-            OsRng.fill_bytes(&mut key);
+            rand::fill(&mut key);
             std::fs::write(&key_path, key)?;
             key
         };
@@ -448,7 +447,7 @@ impl SyncEngine {
             .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
 
         let mut nonce_bytes = [0u8; NONCE_SIZE];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        rand::fill(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher

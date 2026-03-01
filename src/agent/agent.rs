@@ -1,20 +1,24 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::agent::loop_::detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::config::Config;
+use crate::agent::research;
+use crate::config::{Config, ResearchPhaseConfig};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
-use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
+
+const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -31,8 +35,13 @@ pub struct Agent {
     workspace_dir: std::path::PathBuf,
     identity_config: crate::config::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
     history: Vec<ConversationMessage>,
+    classification_config: crate::config::QueryClassificationConfig,
+    available_hints: Vec<String>,
+    route_model_by_hint: HashMap<String, String>,
+    research_config: ResearchPhaseConfig,
 }
 
 pub struct AgentBuilder {
@@ -49,7 +58,12 @@ pub struct AgentBuilder {
     workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<crate::config::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
+    skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
+    classification_config: Option<crate::config::QueryClassificationConfig>,
+    available_hints: Option<Vec<String>>,
+    route_model_by_hint: Option<HashMap<String, String>>,
+    research_config: Option<ResearchPhaseConfig>,
 }
 
 impl AgentBuilder {
@@ -68,7 +82,12 @@ impl AgentBuilder {
             workspace_dir: None,
             identity_config: None,
             skills: None,
+            skills_prompt_mode: None,
             auto_save: None,
+            classification_config: None,
+            available_hints: None,
+            route_model_by_hint: None,
+            research_config: None,
         }
     }
 
@@ -137,8 +156,39 @@ impl AgentBuilder {
         self
     }
 
+    pub fn skills_prompt_mode(
+        mut self,
+        skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    ) -> Self {
+        self.skills_prompt_mode = Some(skills_prompt_mode);
+        self
+    }
+
     pub fn auto_save(mut self, auto_save: bool) -> Self {
         self.auto_save = Some(auto_save);
+        self
+    }
+
+    pub fn classification_config(
+        mut self,
+        classification_config: crate::config::QueryClassificationConfig,
+    ) -> Self {
+        self.classification_config = Some(classification_config);
+        self
+    }
+
+    pub fn available_hints(mut self, available_hints: Vec<String>) -> Self {
+        self.available_hints = Some(available_hints);
+        self
+    }
+
+    pub fn route_model_by_hint(mut self, route_model_by_hint: HashMap<String, String>) -> Self {
+        self.route_model_by_hint = Some(route_model_by_hint);
+        self
+    }
+
+    pub fn research_config(mut self, research_config: ResearchPhaseConfig) -> Self {
+        self.research_config = Some(research_config);
         self
     }
 
@@ -170,17 +220,20 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
-            model_name: self
-                .model_name
-                .unwrap_or_else(|| "google/gemini-3.1-pro-preview".into()),
+            model_name: crate::config::resolve_default_model_id(self.model_name.as_deref(), None),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
+            skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
+            classification_config: self.classification_config.unwrap_or_default(),
+            available_hints: self.available_hints.unwrap_or_default(),
+            route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
+            research_config: self.research_config.unwrap_or_default(),
         })
     }
 }
@@ -198,12 +251,11 @@ impl Agent {
         self.history.clear();
     }
 
-    /// Returns the tool specifications (name + description) for all loaded tools.
-    pub fn tool_specs(&self) -> &[ToolSpec] {
-        &self.tool_specs
-    }
-
     pub fn from_config(config: &Config) -> Result<Self> {
+        if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+            tracing::warn!("plugin registry initialization skipped: {error}");
+        }
+
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -213,14 +265,13 @@ impl Agent {
             &config.workspace_dir,
         ));
 
-        // Create memory with sync wrapping when sync is enabled.
-        let (memory, _sync_engine) = memory::create_synced_memory(
+        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
             &config.memory,
-            &config.sync,
+            &config.embedding_routes,
+            Some(&config.storage.provider.config),
             &config.workspace_dir,
             config.api_key.as_deref(),
-        )?;
-        let memory: Arc<dyn Memory> = memory;
+        )?);
 
         let composio_key = if config.composio.enabled {
             config.composio.api_key.as_deref()
@@ -242,6 +293,7 @@ impl Agent {
             composio_entity_id,
             &config.browser,
             &config.http_request,
+            &config.web_fetch,
             &config.workspace_dir,
             &config.agents,
             config.api_key.as_deref(),
@@ -250,11 +302,10 @@ impl Agent {
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
-        let model_name = config
-            .default_model
-            .as_deref()
-            .unwrap_or("google/gemini-3.1-pro-preview")
-            .to_string();
+        let model_name = crate::config::resolve_default_model_id(
+            config.default_model.as_deref(),
+            Some(provider_name),
+        );
 
         let provider: Box<dyn Provider> = providers::create_routed_provider(
             provider_name,
@@ -273,21 +324,39 @@ impl Agent {
             _ => Box::new(XmlToolDispatcher),
         };
 
+        let route_model_by_hint: HashMap<String, String> = config
+            .model_routes
+            .iter()
+            .map(|route| (route.hint.clone(), route.model.clone()))
+            .collect();
+        let available_hints: Vec<String> = route_model_by_hint.keys().cloned().collect();
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
             .observer(observer)
             .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::default()))
+            .memory_loader(Box::new(DefaultMemoryLoader::new(
+                5,
+                config.memory.min_relevance_score,
+            )))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
+            .classification_config(config.query_classification.clone())
+            .available_hints(available_hints)
+            .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills(&config.workspace_dir))
+            .skills(crate::skills::load_skills_with_config(
+                &config.workspace_dir,
+                config,
+            ))
+            .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
+            .research_config(config.research.clone())
             .build()
     }
 
@@ -325,6 +394,7 @@ impl Agent {
             model_name: &self.model_name,
             tools: &self.tools,
             skills: &self.skills,
+            skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
         };
@@ -378,11 +448,35 @@ impl Agent {
             return results;
         }
 
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            results.push(self.execute_tool_call(call).await);
+        let futs: Vec<_> = calls
+            .iter()
+            .map(|call| self.execute_tool_call(call))
+            .collect();
+        futures_util::future::join_all(futs).await
+    }
+
+    fn classify_model(&self, user_message: &str) -> String {
+        if let Some(decision) =
+            super::classifier::classify_with_decision(&self.classification_config, user_message)
+        {
+            if self.available_hints.contains(&decision.hint) {
+                let resolved_model = self
+                    .route_model_by_hint
+                    .get(&decision.hint)
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
+                tracing::info!(
+                    target: "query_classification",
+                    hint = decision.hint.as_str(),
+                    model = resolved_model,
+                    rule_priority = decision.priority,
+                    message_length = user_message.len(),
+                    "Classified message route"
+                );
+                return format!("hint:{}", decision.hint);
+            }
         }
-        results
+        self.model_name.clone()
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
@@ -407,16 +501,73 @@ impl Agent {
             .await
             .unwrap_or_default();
 
-        let enriched = if context.is_empty() {
-            user_message.to_string()
+        // ── Research Phase ──────────────────────────────────────────────
+        // If enabled and triggered, run a focused research turn to gather
+        // information before the main response.
+        let research_context = if research::should_trigger(&self.research_config, user_message) {
+            if self.research_config.show_progress {
+                println!("[Research] Gathering information...");
+            }
+
+            match research::run_research_phase(
+                &self.research_config,
+                self.provider.as_ref(),
+                &self.tools,
+                user_message,
+                &self.model_name,
+                self.temperature,
+                self.observer.clone(),
+            )
+            .await
+            {
+                Ok(result) => {
+                    if self.research_config.show_progress {
+                        println!(
+                            "[Research] Complete: {} tool calls, {} chars context",
+                            result.tool_call_count,
+                            result.context.len()
+                        );
+                        for summary in &result.tool_summaries {
+                            println!("  - {}: {}", summary.tool_name, summary.result_preview);
+                        }
+                    }
+                    if result.context.is_empty() {
+                        None
+                    } else {
+                        Some(result.context)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Research phase failed: {}", e);
+                    None
+                }
+            }
         } else {
-            format!("{context}{user_message}")
+            None
+        };
+
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let stamped_user_message = format!("[{now}] {user_message}");
+        let enriched = match (&context, &research_context) {
+            (c, Some(r)) if !c.is_empty() => {
+                format!("{c}\n\n{r}\n\n{stamped_user_message}")
+            }
+            (_, Some(r)) => format!("{r}\n\n{stamped_user_message}"),
+            (c, None) if !c.is_empty() => format!("{c}{stamped_user_message}"),
+            _ => stamped_user_message,
         };
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        for _ in 0..self.config.max_tool_iterations {
+        let effective_model = self.classify_model(user_message);
+        let mut loop_detector = LoopDetector::new(LoopDetectionConfig {
+            no_progress_threshold: self.config.loop_detection_no_progress_threshold,
+            ping_pong_cycles: self.config.loop_detection_ping_pong_cycles,
+            failure_streak_threshold: self.config.loop_detection_failure_streak,
+        });
+
+        for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let response = match self
                 .provider
@@ -429,7 +580,7 @@ impl Agent {
                             None
                         },
                     },
-                    &self.model_name,
+                    &effective_model,
                     self.temperature,
                 )
                 .await
@@ -450,15 +601,18 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
-                self.trim_history();
-
-                if self.auto_save {
-                    let summary = truncate_with_ellipsis(&final_text, 100);
+                if self.auto_save && final_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                     let _ = self
                         .memory
-                        .store("assistant_resp", &summary, MemoryCategory::Daily, None)
+                        .store(
+                            "assistant_resp",
+                            &final_text,
+                            MemoryCategory::Conversation,
+                            None,
+                        )
                         .await;
                 }
+                self.trim_history();
 
                 return Ok(final_text);
             }
@@ -475,12 +629,38 @@ impl Agent {
             self.history.push(ConversationMessage::AssistantToolCalls {
                 text: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
+                reasoning_content: response.reasoning_content.clone(),
             });
 
             let results = self.execute_tools(&calls).await;
+
+            // ── Loop detection: record calls ─────────────────────
+            for (call, result) in calls.iter().zip(results.iter()) {
+                let args_sig =
+                    serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
+                loop_detector.record_call(&call.name, &args_sig, &result.output, result.success);
+            }
+
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
+
+            // ── Loop detection: check verdict ────────────────────
+            match loop_detector.check() {
+                DetectionVerdict::Continue => {}
+                DetectionVerdict::InjectWarning(warning) => {
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::user(warning)));
+                }
+                DetectionVerdict::HardStop(reason) => {
+                    anyhow::bail!(
+                        "Agent stopped early due to detected loop pattern (iteration {}/{}): {}",
+                        iteration + 1,
+                        self.config.max_tool_iterations,
+                        reason
+                    );
+                }
+            }
         }
 
         anyhow::bail!(
@@ -548,12 +728,16 @@ pub async fn run(
     let model_name = effective_config
         .default_model
         .as_deref()
-        .unwrap_or("google/gemini-3.1-pro-preview")
-        .to_string();
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            crate::config::default_model_fallback_for_provider(Some(&provider_name)).to_string()
+        });
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name,
-        model: model_name,
+        provider: provider_name.clone(),
+        model: model_name.clone(),
     });
 
     if let Some(msg) = message {
@@ -564,6 +748,8 @@ pub async fn run(
     }
 
     agent.observer.record_event(&ObserverEvent::AgentEnd {
+        provider: provider_name,
+        model: model_name,
         duration: start.elapsed(),
         tokens_used: None,
         cost_usd: None,
@@ -577,6 +763,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
 
     struct MockProvider {
         responses: Mutex<Vec<crate::providers::ChatResponse>>,
@@ -605,6 +793,47 @@ mod tests {
                 return Ok(crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                    quota_metadata: None,
+                });
+            }
+            Ok(guard.remove(0))
+        }
+    }
+
+    struct ModelCaptureProvider {
+        responses: Mutex<Vec<crate::providers::ChatResponse>>,
+        seen_models: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for ModelCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            self.seen_models.lock().push(model.to_string());
+            let mut guard = self.responses.lock();
+            if guard.is_empty() {
+                return Ok(crate::providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
             Ok(guard.remove(0))
@@ -642,6 +871,9 @@ mod tests {
             responses: Mutex::new(vec![crate::providers::ChatResponse {
                 text: Some("hello".into()),
                 tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
             }]),
         });
 
@@ -650,7 +882,8 @@ mod tests {
             ..crate::config::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -662,7 +895,7 @@ mod tests {
             .tool_dispatcher(Box::new(XmlToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
-            .unwrap();
+            .expect("agent builder should succeed with valid config");
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
@@ -679,10 +912,16 @@ mod tests {
                         name: "echo".into(),
                         arguments: "{}".into(),
                     }],
+                    usage: None,
+                    reasoning_content: None,
+                    quota_metadata: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                    quota_metadata: None,
                 },
             ]),
         });
@@ -692,7 +931,8 @@ mod tests {
             ..crate::config::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -704,7 +944,7 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
-            .unwrap();
+            .expect("agent builder should succeed with valid config");
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");
@@ -712,5 +952,100 @@ mod tests {
             .history()
             .iter()
             .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+    }
+
+    #[tokio::test]
+    async fn turn_routes_with_hint_when_query_classification_matches() {
+        let seen_models = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(ModelCaptureProvider {
+            responses: Mutex::new(vec![crate::providers::ChatResponse {
+                text: Some("classified".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+            }]),
+            seen_models: seen_models.clone(),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut route_model_by_hint = HashMap::new();
+        route_model_by_hint.insert("fast".to_string(), "anthropic/claude-haiku-4-5".to_string());
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .classification_config(crate::config::QueryClassificationConfig {
+                enabled: true,
+                rules: vec![crate::config::ClassificationRule {
+                    hint: "fast".to_string(),
+                    keywords: vec!["quick".to_string()],
+                    patterns: vec![],
+                    min_length: None,
+                    max_length: None,
+                    priority: 10,
+                }],
+            })
+            .available_hints(vec!["fast".to_string()])
+            .route_model_by_hint(route_model_by_hint)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let response = agent.turn("quick summary please").await.unwrap();
+        assert_eq!(response, "classified");
+        let seen = seen_models.lock();
+        assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
+    }
+
+    #[test]
+    fn from_config_loads_plugin_declared_tools() {
+        let tmp = TempDir::new().expect("temp dir");
+        let plugin_dir = tmp.path().join("plugins");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        std::fs::create_dir_all(tmp.path().join("workspace")).expect("create workspace dir");
+
+        std::fs::write(
+            plugin_dir.join("agent_from_config.plugin.toml"),
+            r#"
+id = "agent-from-config"
+version = "1.0.0"
+module_path = "plugins/agent-from-config.wasm"
+wit_packages = ["zeroclaw:tools@1.0.0"]
+
+[[tools]]
+name = "__agent_from_config_plugin_tool"
+description = "plugin tool exposed for from_config tests"
+"#,
+        )
+        .expect("write plugin manifest");
+
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().join("workspace");
+        config.config_path = tmp.path().join("config.toml");
+        config.default_provider = Some("ollama".to_string());
+        config.memory.backend = "none".to_string();
+        config.plugins = crate::config::PluginsConfig {
+            enabled: true,
+            load_paths: vec![plugin_dir.to_string_lossy().to_string()],
+            ..crate::config::PluginsConfig::default()
+        };
+
+        let agent = Agent::from_config(&config).expect("agent from config should build");
+        assert!(agent
+            .tools
+            .iter()
+            .any(|tool| tool.name() == "__agent_from_config_plugin_tool"));
     }
 }

@@ -8,9 +8,8 @@
 //! - Database column encryption for PII in memory entries
 //! - File encryption for exported snapshots and backups
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use rand::RngCore;
 use std::path::Path;
 
 /// Nonce size for AES-256-GCM (12 bytes / 96 bits).
@@ -44,7 +43,7 @@ impl AesEncryptor {
     /// Generate a new random AES-256 key and save it to a file.
     pub fn generate_key_file(path: &Path) -> anyhow::Result<Self> {
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        rand::fill(&mut key);
         std::fs::write(path, key)?;
         Ok(Self { key })
     }
@@ -55,7 +54,7 @@ impl AesEncryptor {
             .map_err(|e| anyhow::anyhow!("AES cipher init failed: {e}"))?;
 
         let mut nonce_bytes = [0u8; AES_GCM_NONCE_SIZE];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        rand::fill(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
@@ -132,7 +131,7 @@ mod tests {
     #[test]
     fn encrypt_decrypt_roundtrip() {
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        rand::fill(&mut key);
 
         let encryptor = AesEncryptor::new(key);
         let plaintext = "Hello, ZeroClaw!";
@@ -148,7 +147,7 @@ mod tests {
     #[test]
     fn encrypt_decrypt_empty_string() {
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        rand::fill(&mut key);
 
         let encryptor = AesEncryptor::new(key);
         let encrypted = encryptor.encrypt("").unwrap();
@@ -159,7 +158,7 @@ mod tests {
     #[test]
     fn encrypt_decrypt_unicode() {
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        rand::fill(&mut key);
 
         let encryptor = AesEncryptor::new(key);
         let plaintext = "안녕하세요 ZeroClaw 🦀";
@@ -173,8 +172,8 @@ mod tests {
     fn wrong_key_fails_decryption() {
         let mut key1 = [0u8; 32];
         let mut key2 = [0u8; 32];
-        OsRng.fill_bytes(&mut key1);
-        OsRng.fill_bytes(&mut key2);
+        rand::fill(&mut key1);
+        rand::fill(&mut key2);
 
         let enc1 = AesEncryptor::new(key1);
         let enc2 = AesEncryptor::new(key2);
@@ -211,7 +210,7 @@ mod tests {
         std::fs::write(&file_path, original).unwrap();
 
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        rand::fill(&mut key);
 
         encrypt_file(&key, &file_path).unwrap();
         let encrypted_content = std::fs::read_to_string(&file_path).unwrap();
