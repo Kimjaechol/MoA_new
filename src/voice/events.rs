@@ -190,9 +190,10 @@ pub enum ServerMessage {
 // ── Interpretation mode ───────────────────────────────────────────
 
 /// Mode of interpretation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum InterpretationMode {
     /// Simultaneous: translate while speaker is still talking.
+    #[default]
     #[serde(rename = "simul")]
     Simultaneous,
     /// Consecutive: wait for speaker to finish, then translate.
@@ -201,12 +202,6 @@ pub enum InterpretationMode {
     /// Bidirectional: auto-detect language and interpret both ways.
     #[serde(rename = "bidirectional")]
     Bidirectional,
-}
-
-impl Default for InterpretationMode {
-    fn default() -> Self {
-        Self::Simultaneous
-    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -258,7 +253,7 @@ mod tests {
         let msg = ClientMessage::AudioChunk {
             session_id: "s1".into(),
             seq: 42,
-            ts: 1700000000000,
+            ts: 1_700_000_000_000,
             pcm16le: "AAAA".into(),
         };
         let json = serde_json::to_string(&msg).unwrap();
