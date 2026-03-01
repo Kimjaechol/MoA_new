@@ -2,14 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
+use tauri_plugin_shell::ShellExt;
 
 // ── State ────────────────────────────────────────────────────────
 
 /// Shared application state for Tauri commands.
 ///
-/// Architecture: Local-first design.
-/// - `server_url`: Local ZeroClaw gateway (chat, voice, AI ops — runs on this device)
-/// - `relay_url`: Railway relay server (memory sync + operator key fallback only)
+/// Architecture: MoA = ZeroClaw installer/launcher.
+/// The Tauri app bundles the ZeroClaw binary and launches it as a sidecar
+/// process on startup. All AI operations (chat, voice, coding, tools) run
+/// on the local ZeroClaw gateway. The relay server is used only for
+/// cross-device memory sync and operator key fallback.
 struct AppState {
     /// Local ZeroClaw gateway URL (default: http://127.0.0.1:3000)
     server_url: std::sync::Mutex<String>,
@@ -22,7 +25,13 @@ struct AppState {
     sync_stop: AtomicBool,
     /// App data directory (platform-specific).
     data_dir: PathBuf,
+    /// Whether the local ZeroClaw gateway is running.
+    gateway_running: AtomicBool,
 }
+
+/// Default gateway host and port for the local ZeroClaw instance.
+const DEFAULT_GATEWAY_HOST: &str = "127.0.0.1";
+const DEFAULT_GATEWAY_PORT: u16 = 3000;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -515,6 +524,107 @@ fn get_device_id(data_dir: &std::path::Path) -> String {
     id
 }
 
+// ── ZeroClaw Gateway Lifecycle ────────────────────────────────────
+
+/// Check if a ZeroClaw gateway is already running at the given URL.
+async fn is_gateway_reachable(url: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+    client.get(format!("{url}/health")).send().await.is_ok()
+}
+
+/// Launch the bundled ZeroClaw binary as a sidecar process.
+///
+/// MoA = ZeroClaw launcher. This is the core of what MoA does:
+/// 1. Check if ZeroClaw is already running (user may have started it manually)
+/// 2. If not, launch the bundled sidecar binary with `gateway` command
+/// 3. Wait until the gateway health endpoint responds
+/// 4. Mark gateway_running = true
+fn spawn_zeroclaw_gateway(app: &tauri::App) {
+    let gateway_url = format!("http://{DEFAULT_GATEWAY_HOST}:{DEFAULT_GATEWAY_PORT}");
+    let state = app.state::<AppState>();
+
+    // Try sidecar first, fall back to system PATH
+    let sidecar_result = app.shell().sidecar("zeroclaw");
+    let gateway_running = state.gateway_running.clone();
+
+    tauri::async_runtime::spawn(async move {
+        // Step 1: Check if gateway is already running
+        if is_gateway_reachable(&gateway_url).await {
+            eprintln!("[MoA] ZeroClaw gateway already running at {gateway_url}");
+            gateway_running.store(true, Ordering::SeqCst);
+            return;
+        }
+
+        // Step 2: Launch ZeroClaw sidecar
+        let spawn_result = match sidecar_result {
+            Ok(sidecar) => sidecar
+                .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
+                .spawn(),
+            Err(_) => {
+                eprintln!("[MoA] Sidecar binary not found. Trying system zeroclaw...");
+                // Fall back: try to find zeroclaw on system PATH.
+                // This supports development mode where zeroclaw is `cargo install`-ed.
+                match std::process::Command::new("zeroclaw")
+                    .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(_child) => {
+                        eprintln!("[MoA] Launched zeroclaw from system PATH");
+                        // Wait for gateway readiness
+                        for i in 0..30 {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            if is_gateway_reachable(&gateway_url).await {
+                                eprintln!("[MoA] ZeroClaw gateway ready after {}ms", (i + 1) * 500);
+                                gateway_running.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                        eprintln!("[MoA] Warning: ZeroClaw launched but gateway not responding");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[MoA] Failed to find zeroclaw binary: {e}");
+                        eprintln!("[MoA] Please install ZeroClaw: cargo install --path .");
+                        return;
+                    }
+                }
+            }
+        };
+
+        match spawn_result {
+            Ok((_rx, _child)) => {
+                eprintln!("[MoA] ZeroClaw sidecar launched, waiting for gateway...");
+
+                // Step 3: Wait for gateway health (up to 15 seconds)
+                for i in 0..30 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if is_gateway_reachable(&gateway_url).await {
+                        eprintln!("[MoA] ZeroClaw gateway ready after {}ms", (i + 1) * 500);
+                        gateway_running.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                eprintln!("[MoA] Warning: ZeroClaw sidecar started but gateway not responding after 15s");
+            }
+            Err(e) => {
+                eprintln!("[MoA] Failed to launch ZeroClaw sidecar: {e}");
+                eprintln!("[MoA] Start ZeroClaw manually: zeroclaw gateway");
+            }
+        }
+    });
+}
+
+/// Get the gateway running status.
+#[tauri::command]
+fn is_gateway_running(state: tauri::State<'_, AppState>) -> bool {
+    state.gateway_running.load(Ordering::SeqCst)
+}
+
 // ── Entry Point ──────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -525,7 +635,7 @@ pub fn run() {
             // Local ZeroClaw gateway (runs on this device)
             server_url: std::sync::Mutex::new(
                 std::env::var("MOA_LOCAL_GATEWAY_URL")
-                    .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
+                    .unwrap_or_else(|_| format!("http://{DEFAULT_GATEWAY_HOST}:{DEFAULT_GATEWAY_PORT}")),
             ),
             // Railway relay server (memory sync + operator key fallback only)
             relay_url: std::sync::Mutex::new(
@@ -535,6 +645,7 @@ pub fn run() {
             token: std::sync::Mutex::new(None),
             sync_connected: AtomicBool::new(false),
             sync_stop: AtomicBool::new(false),
+            gateway_running: AtomicBool::new(false),
             data_dir: {
                 // Use platform-appropriate data directory
                 let dir = if cfg!(target_os = "android") || cfg!(target_os = "ios") {
@@ -569,6 +680,7 @@ pub fn run() {
             trigger_full_sync,
             on_app_pause,
             on_app_resume,
+            is_gateway_running,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path
@@ -596,6 +708,12 @@ pub fn run() {
                     }
                 }
             }
+
+            // ── Launch ZeroClaw Gateway ──────────────────────────────
+            // MoA's primary mission: start ZeroClaw so the user has a
+            // local AI assistant running. Everything else (UI, sync,
+            // operator keys) is built around this.
+            spawn_zeroclaw_gateway(app);
 
             #[cfg(debug_assertions)]
             {

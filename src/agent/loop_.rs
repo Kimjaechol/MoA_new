@@ -2249,13 +2249,27 @@ pub async fn run(
     ));
 
     // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
-    tracing::info!(backend = mem.name(), "Memory initialized");
+    // When sync is enabled, wrap memory with SyncedMemory so every mutation
+    // is recorded in the delta journal for cross-device replication.
+    let (mem, _sync_engine): (Arc<dyn Memory>, _) = if config.sync.enabled {
+        let (synced_mem, engine) = memory::create_synced_memory(
+            &config.memory,
+            &config.sync,
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?;
+        tracing::info!(backend = synced_mem.name(), "Memory initialized (sync enabled)");
+        (synced_mem, engine)
+    } else {
+        let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?);
+        tracing::info!(backend = mem.name(), "Memory initialized");
+        (mem, None)
+    };
 
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {
@@ -2890,12 +2904,23 @@ pub async fn process_message_with_session(
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    let (mem, _sync_engine): (Arc<dyn Memory>, _) = if config.sync.enabled {
+        let (synced_mem, engine) = memory::create_synced_memory(
+            &config.memory,
+            &config.sync,
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?;
+        (synced_mem, engine)
+    } else {
+        let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?);
+        (mem, None)
+    };
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
