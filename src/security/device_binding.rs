@@ -125,8 +125,7 @@ impl DeviceBinding {
         let fingerprint = Self::collect_fingerprint();
 
         let mut salt = [0u8; SALT_SIZE];
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::fill(&mut salt);
 
         let binding_key = Self::derive_binding_key(&fingerprint, &salt);
 

@@ -363,8 +363,8 @@ pub fn persist_channel_allowlist(channel_name: &str, identity: &str) -> anyhow::
     };
 
     if added {
-        config
-            .save()
+        tokio::runtime::Handle::current()
+            .block_on(config.save())
             .map_err(|e| anyhow::anyhow!("Failed to save config: {e}"))?;
         tracing::info!(
             channel = channel_name,

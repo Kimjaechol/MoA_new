@@ -64,11 +64,11 @@ impl RemoteWipe {
 
     /// Generate a one-time confirmation token for wipe authorization.
     pub fn generate_confirmation_token() -> String {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let chars: Vec<char> = (0..WIPE_TOKEN_LENGTH)
             .map(|_| {
-                let idx = rng.gen_range(0..36);
+                let idx = rng.random_range(0..36u8);
                 if idx < 10 {
                     (b'0' + idx) as char
                 } else {

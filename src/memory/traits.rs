@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// A single memory entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub id: String,
     pub key: String,
@@ -11,6 +11,19 @@ pub struct MemoryEntry {
     pub timestamp: String,
     pub session_id: Option<String>,
     pub score: Option<f64>,
+}
+
+impl std::fmt::Debug for MemoryEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryEntry")
+            .field("id", &self.id)
+            .field("key", &self.key)
+            .field("content", &self.content)
+            .field("category", &self.category)
+            .field("timestamp", &self.timestamp)
+            .field("score", &self.score)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Memory categories for organization
@@ -79,6 +92,16 @@ pub trait Memory: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> bool;
+
+    /// Rebuild embeddings for all memories using the current embedding provider.
+    /// Returns the number of memories reindexed, or an error if not supported.
+    /// 
+    /// Use this after changing the embedding model to ensure vector search
+    /// works correctly with the new embeddings.
+    async fn reindex(&self, progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>) -> anyhow::Result<usize> {
+        let _ = progress_callback;
+        anyhow::bail!("Reindex not supported by {} backend", self.name())
+    }
 }
 
 #[cfg(test)]

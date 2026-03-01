@@ -12,9 +12,8 @@
 //! - Rotation prunes old backups automatically
 //! - Recovery via 12-word recovery code or key file
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use rand::RngCore;
 use std::path::{Path, PathBuf};
 
 /// AES-GCM nonce size.
@@ -259,7 +258,7 @@ impl EncryptedVault {
             .map_err(|e| anyhow::anyhow!("Cipher init failed: {e}"))?;
 
         let mut nonce_bytes = [0u8; NONCE_SIZE];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        rand::fill(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
@@ -311,7 +310,7 @@ mod tests {
 
     fn test_key() -> [u8; 32] {
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        rand::fill(&mut key);
         key
     }
 
