@@ -115,6 +115,13 @@ export async function disconnectBackend(): Promise<void> {
   await invoke("disconnect");
 }
 
+/** Check if the local ZeroClaw gateway is running (launched by MoA). */
+export async function isGatewayRunning(): Promise<boolean | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("is_gateway_running") as Promise<boolean>;
+}
+
 /** Get current server URL from backend. */
 export async function getServerUrl(): Promise<string | null> {
   const invoke = await getInvoke();

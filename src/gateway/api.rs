@@ -192,6 +192,57 @@ pub async fn handle_api_config_put(
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
+/// PUT /api/config/api-key — set a single provider API key.
+///
+/// Body: `{"provider": "openai", "api_key": "sk-..."}`
+///
+/// Updates the primary `api_key` in config for the given provider.
+/// This lightweight endpoint avoids requiring the full config TOML roundtrip.
+pub async fn handle_api_config_api_key_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let provider = body.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+    let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+
+    if provider.is_empty() || api_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "provider and api_key are required"})),
+        )
+            .into_response();
+    }
+
+    let mut config = state.config.lock().clone();
+
+    // Set the API key based on provider name
+    match provider {
+        "openai" | "openrouter" | "anthropic" | "google" | "gemini" => {
+            config.api_key = Some(api_key.to_string());
+        }
+        _ => {
+            config.api_key = Some(api_key.to_string());
+        }
+    }
+
+    if let Err(e) = config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save: {e}")})),
+        )
+            .into_response();
+    }
+
+    *state.config.lock() = config;
+
+    Json(serde_json::json!({"status": "ok", "provider": provider})).into_response()
+}
+
 /// GET /api/tools — list registered tool specs
 pub async fn handle_api_tools(
     State(state): State<AppState>,
