@@ -28,6 +28,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::traits::ToolSpec;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
+use crate::voice::VoiceSessionManager;
 use anyhow::{Context, Result};
 use axum::{
     body::{Body, Bytes},
@@ -348,6 +349,8 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// Voice session manager for simultaneous interpretation
+    pub voice_sessions: Arc<VoiceSessionManager>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -456,6 +459,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // SSE broadcast channel for real-time events
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+
+    // Voice session manager (for simultaneous interpretation)
+    let voice_sessions = Arc::new(VoiceSessionManager::with_defaults(
+        config.voice.enabled,
+        config.voice.max_sessions_per_user,
+        config.voice.default_source_language.clone(),
+        config.voice.default_target_language.clone(),
+        config.voice.default_provider.clone(),
+    ));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -684,6 +696,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  GET  /v1/models — list available models");
     println!("  GET  /api/*     — REST API (bearer token required)");
     println!("  GET  /ws/chat   — WebSocket agent chat");
+    if config.voice.enabled {
+        println!("  GET  /ws/voice  — WebSocket simultaneous interpretation");
+    }
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -747,6 +762,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         max_tool_iterations,
         cost_tracker,
         event_tx,
+        voice_sessions,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -820,6 +836,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── WebSocket voice interpretation ──
+        .route("/ws/voice", get(ws::handle_ws_voice))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──
@@ -2777,6 +2795,7 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -2838,6 +2857,7 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -2882,6 +2902,7 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -2927,6 +2948,7 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let unauthorized =
@@ -3414,6 +3436,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let mut headers = HeaderMap::new();
@@ -3487,6 +3510,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_webhook(
@@ -3541,6 +3565,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_webhook(
@@ -3596,6 +3621,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_webhook(
@@ -3660,6 +3686,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_node_control(
@@ -3716,6 +3743,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_node_control(
@@ -3777,6 +3805,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let headers = HeaderMap::new();
@@ -3864,6 +3893,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_webhook(
@@ -3921,6 +3951,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let mut headers = HeaderMap::new();
@@ -3983,6 +4014,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let mut headers = HeaderMap::new();
@@ -4059,6 +4091,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_github_webhook(
@@ -4114,6 +4147,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let body = r#"{
@@ -4180,6 +4214,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let body = r#"{
@@ -4251,6 +4286,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -4312,6 +4348,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let mut headers = HeaderMap::new();
@@ -4366,6 +4403,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let response = handle_qq_webhook(
@@ -4419,6 +4457,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
         };
 
         let mut headers = HeaderMap::new();

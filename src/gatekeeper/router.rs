@@ -618,6 +618,37 @@ impl GatekeeperRouter {
             .collect()
     }
 
+    /// Check whether a routing decision requires the voice interpreter.
+    ///
+    /// Returns `true` when `tool_needed` is `"voice_interpreter"`, indicating
+    /// the caller should redirect to the `/ws/voice` WebSocket endpoint instead
+    /// of processing the message through the normal chat pipeline.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let decision = router.classify("음성 통역 시작");
+    /// if router.is_voice_interpreter(&decision) {
+    ///     // Redirect client to ws://host/ws/voice
+    /// }
+    /// ```
+    pub fn is_voice_interpreter(decision: &RoutingDecision) -> bool {
+        decision
+            .tool_needed
+            .as_deref()
+            .is_some_and(|t| t == "voice_interpreter")
+    }
+
+    /// Build a voice interpreter redirect response for chat contexts.
+    ///
+    /// When the gatekeeper classifies a message as requiring voice interpretation,
+    /// callers can use this to generate a user-facing redirect instruction.
+    pub fn voice_interpreter_redirect(gateway_host: &str, gateway_port: u16) -> String {
+        format!(
+            "Voice interpretation is available via WebSocket at ws://{gateway_host}:{gateway_port}/ws/voice — \
+             connect with a session_start message to begin simultaneous interpretation."
+        )
+    }
+
     /// Generate a cloud delegation payload when SLM determines cloud is needed.
     pub fn prepare_delegation(&self, message: &str, context: Option<&str>) -> CloudDelegation {
         let context_summary = context
@@ -710,6 +741,27 @@ mod tests {
         let decision = router.classify("음성 통역 시작");
         assert_eq!(decision.category, TaskCategory::Specialized);
         assert_eq!(decision.tool_needed, Some("voice_interpreter".to_string()));
+    }
+
+    #[test]
+    fn is_voice_interpreter_returns_true_for_voice_decision() {
+        let router = make_router();
+        let decision = router.classify("음성 통역 시작");
+        assert!(GatekeeperRouter::is_voice_interpreter(&decision));
+    }
+
+    #[test]
+    fn is_voice_interpreter_returns_false_for_non_voice_decision() {
+        let router = make_router();
+        let decision = router.classify("오늘 날씨 알려줘");
+        assert!(!GatekeeperRouter::is_voice_interpreter(&decision));
+    }
+
+    #[test]
+    fn voice_interpreter_redirect_contains_ws_path() {
+        let msg = GatekeeperRouter::voice_interpreter_redirect("127.0.0.1", 3000);
+        assert!(msg.contains("/ws/voice"));
+        assert!(msg.contains("127.0.0.1:3000"));
     }
 
     #[test]
