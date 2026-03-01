@@ -6,8 +6,15 @@ use tauri::Manager;
 // ── State ────────────────────────────────────────────────────────
 
 /// Shared application state for Tauri commands.
+///
+/// Architecture: Local-first design.
+/// - `server_url`: Local ZeroClaw gateway (chat, voice, AI ops — runs on this device)
+/// - `relay_url`: Railway relay server (memory sync + operator key fallback only)
 struct AppState {
+    /// Local ZeroClaw gateway URL (default: http://127.0.0.1:3000)
     server_url: std::sync::Mutex<String>,
+    /// Railway relay server URL (memory sync + operator key fallback)
+    relay_url: std::sync::Mutex<String>,
     token: std::sync::Mutex<Option<String>>,
     /// Whether sync WebSocket is currently connected.
     sync_connected: AtomicBool,
@@ -264,11 +271,58 @@ fn get_server_url(state: tauri::State<'_, AppState>) -> Result<String, String> {
     Ok(state.server_url.lock().map_err(|e| e.to_string())?.clone())
 }
 
-/// Set the server URL.
+/// Set the local gateway URL.
 #[tauri::command]
 fn set_server_url(url: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     *state.server_url.lock().map_err(|e| e.to_string())? = url;
     Ok(())
+}
+
+/// Get the relay server URL.
+#[tauri::command]
+fn get_relay_url(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    Ok(state.relay_url.lock().map_err(|e| e.to_string())?.clone())
+}
+
+/// Set the relay server URL.
+#[tauri::command]
+fn set_relay_url(url: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    *state.relay_url.lock().map_err(|e| e.to_string())? = url;
+    Ok(())
+}
+
+/// Save an API key to the local ZeroClaw agent config.
+#[tauri::command]
+async fn save_api_key(
+    provider: String,
+    api_key: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let server_url = state.server_url.lock().map_err(|e| e.to_string())?.clone();
+    let token = state.token.lock().map_err(|e| e.to_string())?.clone();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client
+        .put(format!("{server_url}/api/config/api-key"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "provider": provider, "api_key": api_key }));
+
+    if let Some(ref t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+
+    let res = req.send().await.map_err(|e| format!("Failed to save API key: {e}"))?;
+
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        let text = res.text().await.unwrap_or_default();
+        Err(format!("Failed to save API key: {text}"))
+    }
 }
 
 /// Check if we have an active token.
@@ -315,10 +369,11 @@ fn get_sync_status(state: tauri::State<'_, AppState>) -> SyncStatus {
     }
 }
 
-/// Trigger a full sync (Layer 3) with the server.
+/// Trigger a full sync (Layer 3) via relay server.
 #[tauri::command]
 async fn trigger_full_sync(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let server_url = state.server_url.lock().map_err(|e| e.to_string())?.clone();
+    // Full sync uses the relay server, not the local gateway
+    let server_url = state.relay_url.lock().map_err(|e| e.to_string())?.clone();
     let token = state
         .token
         .lock()
@@ -467,8 +522,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
+            // Local ZeroClaw gateway (runs on this device)
             server_url: std::sync::Mutex::new(
-                std::env::var("MOA_SERVER_URL")
+                std::env::var("MOA_LOCAL_GATEWAY_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
+            ),
+            // Railway relay server (memory sync + operator key fallback only)
+            relay_url: std::sync::Mutex::new(
+                std::env::var("MOA_RELAY_URL")
                     .unwrap_or_else(|_| "https://moanew-production.up.railway.app".to_string()),
             ),
             token: std::sync::Mutex::new(None),
@@ -498,6 +559,9 @@ pub fn run() {
             health_check,
             get_server_url,
             set_server_url,
+            get_relay_url,
+            set_relay_url,
+            save_api_key,
             is_authenticated,
             disconnect,
             get_platform_info,

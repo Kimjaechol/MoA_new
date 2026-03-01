@@ -258,7 +258,9 @@ export function Interpreter({
     addTranscript("system", `Connecting to server... (${apiClient.getServerUrl()})`);
 
     try {
-      // 1. Create voice session via REST API
+      // 1. Create voice session via local ZeroClaw gateway
+      //    Voice interpretation runs locally — no Railway server involved.
+      //    Gemini Live API is called directly from the local agent.
       const serverUrl = apiClient.getServerUrl();
       const token = apiClient.getToken();
 

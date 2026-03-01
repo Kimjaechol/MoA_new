@@ -535,6 +535,368 @@ fn extract_query_token(raw_query: Option<&str>) -> Option<String> {
     parse_ws_query_params(raw_query).token
 }
 
+// ── Voice interpretation WebSocket ────────────────────────────────
+
+/// GET /ws/voice — WebSocket upgrade for simultaneous interpretation
+pub async fn handle_ws_voice(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let query_params = parse_ws_query_params(query.as_deref());
+
+    // Auth via Authorization header or websocket protocol token.
+    if state.pairing.require_pairing() {
+        let token =
+            extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
+        if !state.pairing.is_authenticated(&token) {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized — provide Authorization: Bearer <token>, Sec-WebSocket-Protocol: bearer.<token>, or ?token=<token>",
+            )
+                .into_response();
+        }
+    }
+
+    // Check voice feature is enabled
+    {
+        let config_guard = state.config.lock();
+        if !config_guard.voice.enabled {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Voice interpretation is disabled",
+            )
+                .into_response();
+        }
+    }
+
+    ws.on_upgrade(move |socket| handle_voice_socket(socket, state))
+        .into_response()
+}
+
+/// Voice WebSocket handler — manages a simultaneous interpretation session.
+///
+/// Protocol:
+/// ```text
+/// Client -> Server: {"type":"session_start","sessionId":"...","sourceLang":"ko","targetLang":"en",...}
+/// Client -> Server: {"type":"audio_chunk","sessionId":"...","seq":0,"ts":...,"pcm16le":"base64..."}
+/// Client -> Server: {"type":"session_stop","sessionId":"..."}
+/// Server -> Client: {"type":"session_ready","sessionId":"...","liveSessionId":"..."}
+/// Server -> Client: {"type":"partial_src","sessionId":"...","text":"...","stablePrefixLen":5,"final":false}
+/// Server -> Client: {"type":"commit_src","sessionId":"...","commitId":1,"text":"..."}
+/// Server -> Client: {"type":"commit_tgt","sessionId":"...","commitId":1,"text":"..."}
+/// Server -> Client: {"type":"audio_out","sessionId":"...","seq":0,"pcm16le":"base64..."}
+/// Server -> Client: {"type":"session_ended","sessionId":"...","totalSegments":5}
+/// ```
+async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
+    use base64::Engine;
+    use crate::voice::{
+        events::{ClientMessage, ServerMessage},
+        simul::SegmentationConfig,
+        simul_session::{SimulSession, SimulSessionConfig},
+        pipeline::{Domain, Formality, LanguageCode},
+    };
+
+    // Read voice config for session defaults
+    let voice_config = {
+        let config_guard = state.config.lock();
+        config_guard.voice.clone()
+    };
+
+    // Active session handle — set when SessionStart is received
+    let mut active_session: Option<SimulSession> = None;
+    // Event relay task handle — cancelled when session stops
+    let mut relay_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    while let Some(msg) = socket.recv().await {
+        let text = match msg {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => continue,
+        };
+
+        let client_msg: ClientMessage = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                let err = ServerMessage::Error {
+                    session_id: String::new(),
+                    code: "INVALID_MESSAGE".into(),
+                    message: format!("Invalid message: {e}"),
+                };
+                let _ = socket
+                    .send(Message::Text(serde_json::to_string(&err).unwrap_or_default().into()))
+                    .await;
+                continue;
+            }
+        };
+
+        match client_msg {
+            ClientMessage::SessionStart {
+                session_id,
+                source_lang,
+                target_lang,
+                mode,
+                domain,
+                formality,
+                ..
+            } => {
+                // Stop any existing session
+                if let Some(session) = active_session.take() {
+                    session.stop().await;
+                }
+                if let Some(handle) = relay_handle.take() {
+                    handle.abort();
+                }
+
+                // Resolve API key
+                let api_key = voice_config
+                    .gemini_api_key
+                    .clone()
+                    .unwrap_or_default();
+                if api_key.is_empty() {
+                    let err = ServerMessage::Error {
+                        session_id: session_id.clone(),
+                        code: "NO_API_KEY".into(),
+                        message: "Gemini API key not configured".into(),
+                    };
+                    let _ = socket
+                        .send(Message::Text(serde_json::to_string(&err).unwrap_or_default().into()))
+                        .await;
+                    continue;
+                }
+
+                // Parse language codes
+                let src_lang = LanguageCode::from_str_code(&source_lang)
+                    .unwrap_or_else(|| {
+                        LanguageCode::from_str_code(&voice_config.default_source_language)
+                            .unwrap_or(LanguageCode::Ko)
+                    });
+                let tgt_lang = LanguageCode::from_str_code(&target_lang)
+                    .unwrap_or_else(|| {
+                        LanguageCode::from_str_code(&voice_config.default_target_language)
+                            .unwrap_or(LanguageCode::En)
+                    });
+
+                // Parse optional domain/formality
+                let domain_val = domain
+                    .as_deref()
+                    .map(|d| match d {
+                        "business" => Domain::Business,
+                        "medical" => Domain::Medical,
+                        "legal" => Domain::Legal,
+                        "technical" => Domain::Technical,
+                        _ => Domain::General,
+                    })
+                    .unwrap_or(Domain::General);
+
+                let formality_val = formality
+                    .as_deref()
+                    .map(|f| match f {
+                        "formal" => Formality::Formal,
+                        "casual" => Formality::Casual,
+                        _ => Formality::Neutral,
+                    })
+                    .unwrap_or(Formality::Neutral);
+
+                let segmentation = SegmentationConfig {
+                    min_commit_chars: voice_config.min_commit_chars,
+                    max_uncommitted_chars: voice_config.max_uncommitted_chars,
+                    silence_commit_ms: voice_config.silence_commit_ms,
+                    ..SegmentationConfig::default()
+                };
+
+                let config = SimulSessionConfig {
+                    session_id: session_id.clone(),
+                    api_key,
+                    source_lang: src_lang,
+                    target_lang: tgt_lang,
+                    mode,
+                    domain: domain_val,
+                    formality: formality_val,
+                    segmentation,
+                };
+
+                tracing::info!(
+                    session_id = %session_id,
+                    source = src_lang.as_str(),
+                    target = tgt_lang.as_str(),
+                    mode = ?mode,
+                    "Voice WebSocket: starting interpretation session"
+                );
+
+                match SimulSession::start(config).await {
+                    Ok(session) => {
+                        // Spawn event relay task: forward ServerMessages → WebSocket
+                        let event_rx = session.event_rx.clone();
+                        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<String>(256);
+
+                        let relay = tokio::spawn(async move {
+                            let mut rx = event_rx.lock().await;
+                            while let Some(event) = rx.recv().await {
+                                if let Ok(json) = serde_json::to_string(&event) {
+                                    if ws_tx.send(json).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        relay_handle = Some(relay);
+
+                        active_session = Some(session);
+
+                        // Forward relay events to websocket in the background.
+                        // We need a separate task to send relay messages while still
+                        // receiving from the socket. Use a split approach.
+                        // Actually we can't split axum::WebSocket easily, so we'll drain
+                        // the relay channel on each iteration + use try_recv.
+                        // The relay task buffers events; we drain them below.
+
+                        // Drain any initial events (like session_ready) immediately
+                        while let Ok(json) = ws_rx.try_recv() {
+                            let _ = socket.send(Message::Text(json.into())).await;
+                        }
+
+                        // We'll continue draining relay events in each loop iteration below.
+                        // Store the ws_rx for later use by wrapping it.
+                        // Unfortunately we can't easily store it across loop iterations
+                        // without restructuring. Let's restructure the loop.
+
+                        // Break into the voice session event loop
+                        voice_session_loop(&mut socket, active_session.as_ref().unwrap(), &mut ws_rx).await;
+
+                        // Session ended — cleanup
+                        if let Some(session) = active_session.take() {
+                            session.stop().await;
+                        }
+                        if let Some(handle) = relay_handle.take() {
+                            handle.abort();
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to start voice session");
+                        let err = ServerMessage::Error {
+                            session_id,
+                            code: "SESSION_START_FAILED".into(),
+                            message: format!("Failed to start session: {e}"),
+                        };
+                        let _ = socket
+                            .send(Message::Text(serde_json::to_string(&err).unwrap_or_default().into()))
+                            .await;
+                    }
+                }
+            }
+
+            ClientMessage::AudioChunk { pcm16le, .. } => {
+                if let Some(ref session) = active_session {
+                    if let Ok(pcm_data) = base64::engine::general_purpose::STANDARD.decode(&pcm16le) {
+                        if let Err(e) = session.send_audio(pcm_data).await {
+                            tracing::warn!(error = %e, "Failed to send audio to session");
+                        }
+                    }
+                }
+            }
+
+            ClientMessage::SessionStop { session_id } => {
+                tracing::info!(session_id = %session_id, "Voice WebSocket: session stop requested");
+                if let Some(session) = active_session.take() {
+                    session.stop().await;
+                }
+                if let Some(handle) = relay_handle.take() {
+                    handle.abort();
+                }
+            }
+
+            ClientMessage::ActivitySignal { .. } => {
+                // Activity signals are informational; Gemini handles VAD internally.
+            }
+        }
+    }
+
+    // Connection closed — cleanup
+    if let Some(session) = active_session.take() {
+        session.stop().await;
+    }
+    if let Some(handle) = relay_handle.take() {
+        handle.abort();
+    }
+}
+
+/// Inner loop for an active voice interpretation session.
+///
+/// Simultaneously drains relay events (ServerMessage → WebSocket) and receives
+/// new client messages (AudioChunk, SessionStop, etc.).
+async fn voice_session_loop(
+    socket: &mut WebSocket,
+    session: &crate::voice::simul_session::SimulSession,
+    relay_rx: &mut tokio::sync::mpsc::Receiver<String>,
+) {
+    use base64::Engine;
+    use crate::voice::events::{ClientMessage, ServerMessage};
+
+    loop {
+        tokio::select! {
+            // Forward server events to client
+            Some(json) = relay_rx.recv() => {
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
+
+            // Receive client messages
+            msg = socket.recv() => {
+                let Some(msg) = msg else { break };
+                let text = match msg {
+                    Ok(Message::Text(text)) => text,
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => continue,
+                };
+
+                let client_msg: ClientMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                match client_msg {
+                    ClientMessage::AudioChunk { pcm16le, .. } => {
+                        if let Ok(pcm_data) = base64::engine::general_purpose::STANDARD.decode(&pcm16le) {
+                            if let Err(e) = session.send_audio(pcm_data).await {
+                                tracing::warn!(error = %e, "Failed to send audio");
+                                break;
+                            }
+                        }
+                    }
+                    ClientMessage::SessionStop { session_id } => {
+                        tracing::info!(session_id = %session_id, "Voice session stop requested");
+                        session.stop().await;
+
+                        // Drain remaining relay events before exiting
+                        while let Ok(json) = relay_rx.try_recv() {
+                            let _ = socket.send(Message::Text(json.into())).await;
+                        }
+                        return;
+                    }
+                    ClientMessage::ActivitySignal { .. } => {
+                        // Informational only
+                    }
+                    ClientMessage::SessionStart { session_id, .. } => {
+                        // Cannot start a new session from within an active one
+                        let err = ServerMessage::Error {
+                            session_id,
+                            code: "SESSION_ACTIVE".into(),
+                            message: "A session is already active. Stop it first.".into(),
+                        };
+                        if let Ok(json) = serde_json::to_string(&err) {
+                            let _ = socket.send(Message::Text(json.into())).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

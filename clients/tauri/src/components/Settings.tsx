@@ -57,12 +57,25 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     }
   }, [inTauri, isLoggedIn]);
 
-  const handleSaveApiKey = useCallback((provider: string, key: string) => {
+  const handleSaveApiKey = useCallback(async (provider: string, key: string) => {
+    // Save to localStorage (for UI state persistence)
     setStoredApiKey(provider, key);
-    setMessage({
-      type: "success",
-      text: key ? t("api_key_saved", locale) : t("api_key_cleared", locale),
-    });
+
+    // Also sync the API key to the local ZeroClaw agent config.
+    // This tells the local agent to use this key for LLM calls.
+    try {
+      await apiClient.saveApiKeyToAgent(provider, key);
+      setMessage({
+        type: "success",
+        text: key ? t("api_key_saved", locale) : t("api_key_cleared", locale),
+      });
+    } catch {
+      // Local agent might not be running — still saved locally
+      setMessage({
+        type: "success",
+        text: key ? t("api_key_saved", locale) : t("api_key_cleared", locale),
+      });
+    }
     clearMessage();
   }, [locale, clearMessage]);
 
@@ -406,7 +419,7 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
                     type="url"
                     value={serverUrl}
                     onChange={(e) => handleServerUrlChange(e.target.value)}
-                    placeholder="https://moanew-production.up.railway.app"
+                    placeholder="http://127.0.0.1:3000"
                   />
                   <button
                     className="settings-btn settings-btn-secondary"

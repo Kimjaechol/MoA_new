@@ -11,10 +11,17 @@ import {
 
 const STORAGE_KEY_TOKEN = "moa_token";
 const STORAGE_KEY_SERVER = "moa_server_url";
+const STORAGE_KEY_RELAY = "moa_relay_url";
 const STORAGE_KEY_USER = "moa_user";
 const STORAGE_KEY_DEVICE_ID = "moa_device_id";
-const DEFAULT_SERVER_URL =
-  import.meta.env.VITE_SERVER_URL || "https://moanew-production.up.railway.app";
+
+// Local-first architecture:
+// - LOCAL_GATEWAY_URL: ZeroClaw agent running on this device (chat, voice, tools)
+// - RELAY_SERVER_URL: Railway relay for memory sync + operator key fallback only
+const DEFAULT_LOCAL_GATEWAY_URL =
+  import.meta.env.VITE_LOCAL_GATEWAY_URL || "http://127.0.0.1:3000";
+const DEFAULT_RELAY_SERVER_URL =
+  import.meta.env.VITE_RELAY_SERVER_URL || "https://moanew-production.up.railway.app";
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -69,14 +76,18 @@ export type { SyncStatus, PlatformInfo };
 // ── Client ──────────────────────────────────────────────────────
 
 export class MoAClient {
+  // Local ZeroClaw gateway URL (chat, voice, tools — runs on this device)
   private serverUrl: string;
+  // Railway relay server URL (memory sync + operator API key fallback only)
+  private relayUrl: string;
   private token: string | null;
   private user: UserInfo | null;
   private deviceId: string;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
-    this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || DEFAULT_SERVER_URL;
+    this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || DEFAULT_LOCAL_GATEWAY_URL;
+    this.relayUrl = localStorage.getItem(STORAGE_KEY_RELAY) || DEFAULT_RELAY_SERVER_URL;
     this.token = localStorage.getItem(STORAGE_KEY_TOKEN);
     const storedUser = localStorage.getItem(STORAGE_KEY_USER);
     this.user = storedUser ? JSON.parse(storedUser) : null;
@@ -93,9 +104,15 @@ export class MoAClient {
   }
 
   // ── Server URL ─────────────────────────────────────────────────
+  // serverUrl = local ZeroClaw gateway (chat, voice, AI operations)
+  // relayUrl  = Railway relay (memory sync + operator key fallback only)
 
   getServerUrl(): string {
     return this.serverUrl;
+  }
+
+  getRelayUrl(): string {
+    return this.relayUrl;
   }
 
   setServerUrl(url: string): void {
@@ -104,6 +121,11 @@ export class MoAClient {
     if (isTauri()) {
       setBackendServerUrl(this.serverUrl).catch(() => {});
     }
+  }
+
+  setRelayUrl(url: string): void {
+    this.relayUrl = url.replace(/\/+$/, "");
+    localStorage.setItem(STORAGE_KEY_RELAY, this.relayUrl);
   }
 
   // ── Auth State ─────────────────────────────────────────────────
@@ -195,8 +217,9 @@ export class MoAClient {
     this.user = null;
     localStorage.removeItem(STORAGE_KEY_TOKEN);
     localStorage.removeItem(STORAGE_KEY_USER);
-    localStorage.removeItem(STORAGE_KEY_SERVER);
-    this.serverUrl = DEFAULT_SERVER_URL;
+    // Reset to local gateway, keep relay URL
+    this.serverUrl = DEFAULT_LOCAL_GATEWAY_URL;
+    localStorage.setItem(STORAGE_KEY_SERVER, this.serverUrl);
     this.stopHeartbeat();
     if (isTauri()) {
       disconnectBackend().catch(() => {});
@@ -388,18 +411,67 @@ export class MoAClient {
     return getPlatformInfo();
   }
 
-  // ── Credits ──────────────────────────────────────────────────
+  // ── Credits (via relay server — billing is server-side) ──────
 
   async getCreditBalance(): Promise<number> {
     if (!this.token) return 0;
 
-    const res = await fetch(`${this.serverUrl}/api/credits/balance`, {
-      headers: { Authorization: `Bearer ${this.token}` },
-    });
+    try {
+      const res = await fetch(`${this.relayUrl}/api/credits/balance`, {
+        headers: { Authorization: `Bearer ${this.token}` },
+      });
 
-    if (!res.ok) return 0;
-    const data = await res.json();
-    return data.balance ?? 0;
+      if (!res.ok) return 0;
+      const data = await res.json();
+      return data.balance ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  // ── API Key Management ──────────────────────────────────────
+  // Save API keys to the local ZeroClaw agent config.
+  // When user provides their own keys, ZeroClaw uses them directly.
+  // When no key is set, ZeroClaw falls back to operator keys via relay.
+
+  async saveApiKeyToAgent(provider: string, key: string): Promise<void> {
+    try {
+      await fetch(`${this.serverUrl}/api/config/api-key`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({ provider, api_key: key }),
+      });
+    } catch {
+      // Local agent might not be running — key is still saved in localStorage
+    }
+  }
+
+  // ── Operator Key Fallback (via relay server) ────────────────
+  // When user has no API key, fetch operator's key from relay for use
+  // with 2x credit deduction per API call
+
+  async getOperatorKeyProxy(provider: string): Promise<string | null> {
+    if (!this.token) return null;
+
+    try {
+      const res = await fetch(`${this.relayUrl}/api/operator/key-proxy`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({ provider, device_id: this.deviceId }),
+      });
+
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.proxied_key ?? null;
+    } catch {
+      return null;
+    }
   }
 
   // ── Helpers ────────────────────────────────────────────────────

@@ -690,6 +690,64 @@ fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
 
+/// Tools whose executions are persisted to long-term coding memory.
+/// These represent coding activities that the agent should remember across sessions.
+const CODING_MEMORY_TOOLS: &[&str] = &[
+    "shell",
+    "file_write",
+    "file_read",
+    "file_edit",
+    "memory_store",
+];
+
+/// Extract coding tool calls from chat history messages added during a tool loop turn,
+/// and persist them to long-term memory with the `coding` category.
+///
+/// This scans assistant messages for tool_call JSON blocks and corresponding
+/// tool_result XML blocks in the history, then saves coding-related ones.
+async fn save_coding_memory_from_history(
+    new_messages: &[ChatMessage],
+    mem: &Arc<dyn Memory>,
+) {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // Collect tool results from user messages (XML format: <tool_result name="...">...</tool_result>)
+    static TOOL_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<tool_result name="([^"]+)">\n([\s\S]*?)\n</tool_result>"#).unwrap()
+    });
+
+    let mut coding_entries: Vec<String> = Vec::new();
+
+    for msg in new_messages {
+        let content = &msg.content;
+        // Look for tool results in user messages (both XML-wrapped and raw)
+        for cap in TOOL_RESULT_RE.captures_iter(content) {
+            let tool_name = &cap[1];
+            if !CODING_MEMORY_TOOLS.contains(&tool_name) {
+                continue;
+            }
+            let output = &cap[2];
+            // Truncate output for memory storage (keep first 500 chars)
+            let output_preview = if output.len() > 500 {
+                format!("{}...[truncated]", &output[..500])
+            } else {
+                output.to_string()
+            };
+            coding_entries.push(format!(
+                "[{now}] {tool_name}\nOutput: {output_preview}"
+            ));
+        }
+    }
+
+    // Save each coding entry to long-term memory
+    for entry in coding_entries {
+        let key = autosave_memory_key("coding");
+        let _ = mem
+            .store(&key, &entry, MemoryCategory::Custom("coding".into()), None)
+            .await;
+    }
+}
+
 /// Build assistant history entry in JSON format for native tool-call APIs.
 /// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
 /// the proper `NativeMessage` with structured `tool_calls`.
@@ -2511,6 +2569,7 @@ pub async fn run(
         } else {
             None
         };
+        let history_len_before = history.len();
         let response = scope_cost_enforcement_context(
             cost_enforcement_context.clone(),
             SAFETY_HEARTBEAT_CONFIG.scope(
@@ -2550,6 +2609,11 @@ pub async fn run(
                     None,
                 )
                 .await;
+        }
+        // ── Coding memory persistence ─────────────────────────────
+        // Save coding tool calls from this turn to long-term memory.
+        if config.memory.auto_save {
+            save_coding_memory_from_history(&history[history_len_before..], &mem).await;
         }
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
@@ -2690,6 +2754,7 @@ pub async fn run(
             } else {
                 None
             };
+            let history_len_before = history.len();
             let response = match scope_cost_enforcement_context(
                 cost_enforcement_context.clone(),
                 SAFETY_HEARTBEAT_CONFIG.scope(
@@ -2755,6 +2820,11 @@ pub async fn run(
                         None,
                     )
                     .await;
+            }
+            // ── Coding memory persistence ─────────────────────────────
+            // Save coding tool calls from this turn to long-term memory.
+            if config.memory.auto_save {
+                save_coding_memory_from_history(&history[history_len_before..], &mem).await;
             }
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
