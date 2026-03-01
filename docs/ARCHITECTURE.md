@@ -251,6 +251,34 @@ When a device comes online after being offline for more than 5 minutes:
 4. **Deletion guarantee**: Server data is ephemeral (5-minute TTL)
 5. **No server-side backup**: There is no "cloud copy" of user data
 
+### Patent Full Text (특허출원서 전문)
+
+The complete patent specification is maintained in
+[`docs/ephemeral-relay-sync-patent.md`](./ephemeral-relay-sync-patent.md).
+
+This includes:
+- **발명의 명칭**: 서버 비저장 방식의 다중 기기 간 종단간 암호화 메모리 동기화 시스템 및 방법
+- **기술분야**: Multi-device memory synchronization without persistent server storage
+- **배경기술**: Analysis of prior art (cloud-sync vs P2P) and their limitations
+- **발명의 내용**: 3-tier hierarchical sync (Layer 1: TTL relay, Layer 2: delta journal + version vectors + order buffer, Layer 3: manifest-based full sync)
+- **실시예 1-7**: Detailed implementation examples with sequence diagrams
+  - System architecture block diagram
+  - Layer 1 real-time relay sequence
+  - Layer 2 order guarantee mechanism
+  - Layer 2 offline reconnection auto-resync
+  - Layer 3 manual full sync via manifest comparison
+  - 3-tier integrated decision flowchart
+  - Data structure specifications (SyncDelta, VersionVector, FullSyncManifest, BroadcastMessage, ReconcilerState)
+- **청구범위**: 13 claims (3 independent + 10 dependent)
+  - Claim 1: Method for multi-device sync without persistent server storage
+  - Claim 2: Sequence ordering with order buffer
+  - Claim 3: Idempotency via duplicate detection
+  - Claim 4: Manual full sync for long-offline devices
+  - Claim 8: AES-256-GCM + PBKDF2 key derivation
+  - Claim 11: System claim (device module + relay server)
+  - Claim 13: Computer-readable recording medium
+- **요약서**: Summary with representative diagram (Figure 6: 3-tier decision flow)
+
 ---
 
 ## 4. Target Users
@@ -503,6 +531,87 @@ Code diff ──┬─▸ GeminiReviewer ─▸ ReviewReport ─┐
 5. Comment is idempotent (updates existing, doesn't duplicate)
 
 **Required secret**: `GEMINI_API_KEY` in repository Actions secrets.
+
+### Coding Long-Term Memory (MoA Advantage)
+
+**Key differentiator**: Unlike Claude Code, Cursor, or other AI coding tools
+that **forget everything between sessions** due to context window limits, MoA
+**persists all coding activity to long-term memory** — and **synchronizes it
+in real-time** across all of the user's devices.
+
+#### What Gets Remembered
+
+Every coding interaction is stored in MoA's local SQLite long-term memory:
+
+| Memory Category | Content | Example |
+|----------------|---------|---------|
+| `coding:session` | Full coding session transcript (prompts + responses + tool calls + results) | "User asked to refactor auth module → Claude wrote code → Gemini reviewed → 3 iterations → final commit" |
+| `coding:file_change` | File diffs and change rationale | "Modified src/auth/jwt.rs: added token refresh, reason: session expiry bug #142" |
+| `coding:architecture_decision` | Design decisions and trade-offs discussed | "Chose SQLite over Postgres for memory backend because: local-first, no server dependency, mobile-compatible" |
+| `coding:error_pattern` | Errors encountered and how they were resolved | "Borrow checker error in sync.rs → resolved by Arc<Mutex<>> wrapping" |
+| `coding:review_finding` | Code review findings from Gemini/Claude | "Gemini flagged: missing error handling in gateway webhook → Claude fixed with proper bail!()" |
+| `coding:project_context` | Project structure, conventions, patterns learned | "This project uses trait+factory pattern, snake_case modules, PascalCase types" |
+
+#### How It Works
+
+```
+1. User gives coding instruction to MoA
+   ↓
+2. MoA (ZeroClaw agent) executes coding pipeline:
+   Claude writes → Gemini reviews → consensus → commit
+   ↓
+3. EVERY step is auto-saved to local SQLite long-term memory:
+   - The original instruction
+   - All code generated/modified (full diffs)
+   - Tool calls (shell commands, file reads/writes)
+   - Review feedback from Gemini/Claude
+   - Final commit message and files changed
+   - Errors encountered and resolutions
+   ↓
+4. Memory is tagged with:
+   - category: "coding"
+   - project: repository name
+   - session_id: unique coding session
+   - timestamp: when it happened
+   ↓
+5. Real-time sync to all user's other MoA devices:
+   - Delta encrypted → relay server → other devices apply
+   - User can continue coding on another device with FULL context
+```
+
+#### Cross-Device Coding Continuity
+
+```
+Device A (Desktop, morning)          Device B (Laptop, evening)
+┌────────────────────────┐          ┌────────────────────────┐
+│ MoA codes auth module  │──sync──▸│ MoA remembers ALL of   │
+│ 3 sessions, 47 files   │          │ Device A's coding work │
+│ stored in SQLite memory│          │                        │
+└────────────────────────┘          │ User: "Continue the    │
+                                    │ auth module from this  │
+                                    │ morning"               │
+                                    │                        │
+                                    │ MoA: "I recall the 3   │
+                                    │ sessions. Last change  │
+                                    │ was jwt.rs refresh     │
+                                    │ token. Shall I proceed │
+                                    │ with the OAuth2 flow?" │
+                                    └────────────────────────┘
+```
+
+#### Why This Matters
+
+| Traditional AI Coding Tool | MoA |
+|---------------------------|-----|
+| Forgets after session ends | Remembers everything permanently |
+| Context window limit (~200K tokens) | Unlimited via SQLite + RAG retrieval |
+| Single device only | Multi-device synced memory |
+| No cross-session continuity | Full project history recalled |
+| Manual context loading (paste code) | Automatic recall from memory |
+
+**Implementation**: The agent loop (`src/agent/loop_.rs`) auto-saves coding
+sessions to memory. The `SyncedMemory` wrapper ensures deltas propagate to
+other devices via the 3-tier sync protocol.
 
 ---
 
