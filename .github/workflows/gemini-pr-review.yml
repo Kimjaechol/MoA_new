@@ -1,0 +1,189 @@
+name: Gemini PR Review
+
+on:
+    pull_request:
+        branches: [main, dev]
+        types: [opened, synchronize, reopened]
+
+concurrency:
+    group: gemini-review-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    pull-requests: write
+
+env:
+    GEMINI_MODEL: "gemini-2.5-flash"
+    MAX_DIFF_CHARS: "120000"
+
+jobs:
+    gemini-review:
+        name: Gemini Architecture Review
+        runs-on: ubuntu-22.04
+        timeout-minutes: 10
+        # Only run when the secret is configured
+        if: ${{ secrets.GEMINI_API_KEY != '' }}
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+
+            - name: Get PR diff and context
+              id: context
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  # Get PR diff (truncated to fit model context)
+                  gh pr diff "${{ github.event.pull_request.number }}" \
+                    --repo "${{ github.repository }}" \
+                    | head -c "${MAX_DIFF_CHARS}" > /tmp/pr_diff.txt
+
+                  # Get list of changed files
+                  gh pr diff "${{ github.event.pull_request.number }}" \
+                    --repo "${{ github.repository }}" --name-only > /tmp/changed_files.txt
+
+                  # Collect architecture context documents
+                  CONTEXT=""
+                  for doc in CLAUDE.md docs/ARCHITECTURE.md docs/CODING_GUIDELINES.md; do
+                    if [ -f "$doc" ]; then
+                      CONTEXT="${CONTEXT}\n\n--- ${doc} ---\n$(head -c 30000 "$doc")"
+                    fi
+                  done
+                  # Escape for JSON
+                  echo "$CONTEXT" > /tmp/arch_context.txt
+
+                  echo "pr_title=${{ github.event.pull_request.title }}" >> "$GITHUB_OUTPUT"
+                  echo "pr_body<<GHEOF" >> "$GITHUB_OUTPUT"
+                  echo "${{ github.event.pull_request.body }}" >> "$GITHUB_OUTPUT"
+                  echo "GHEOF" >> "$GITHUB_OUTPUT"
+
+            - name: Call Gemini API for review
+              id: review
+              env:
+                  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+              shell: bash
+              run: |
+                  DIFF=$(cat /tmp/pr_diff.txt)
+                  CHANGED=$(cat /tmp/changed_files.txt)
+                  ARCH_CONTEXT=$(cat /tmp/arch_context.txt)
+                  PR_TITLE="${{ github.event.pull_request.title }}"
+
+                  # Build the review prompt
+                  PROMPT=$(cat <<'PROMPT_EOF'
+                  You are a senior software architect reviewing a pull request for the ZeroClaw/MoA project.
+
+                  ## Your Role
+                  You are the architecture quality gatekeeper. Your job is to verify that:
+                  1. The PR aligns with the project's overall architecture and design principles
+                  2. The code is efficient and follows established patterns
+                  3. There are no logic errors, missing edge cases, or security issues
+                  4. The changes are consistent with the project roadmap
+
+                  ## Review Instructions
+                  - Read the architecture context documents carefully first
+                  - Then review the PR diff against those architectural principles
+                  - Focus on SUBSTANTIVE issues, not style nitpicks
+                  - Rate each issue as [CRITICAL], [HIGH], [MEDIUM], or [LOW]
+                  - Be specific: reference file paths and line numbers when possible
+                  - If the PR looks good, say so clearly
+
+                  ## Output Format
+                  ### Summary
+                  (1-3 sentences: what this PR does)
+
+                  ### Architecture Alignment
+                  (Does this PR follow the project's architecture? Any violations?)
+
+                  ### Issues Found
+                  (List issues with severity tags, or "No issues found")
+
+                  ### Suggestions
+                  (Optional improvements, not blockers)
+
+                  ### Verdict
+                  One of: APPROVE / REQUEST_CHANGES / COMMENT
+                  PROMPT_EOF
+                  )
+
+                  # Build JSON payload using jq for proper escaping
+                  PAYLOAD=$(jq -n \
+                    --arg model "$GEMINI_MODEL" \
+                    --arg prompt "$PROMPT" \
+                    --arg title "$PR_TITLE" \
+                    --arg diff "$DIFF" \
+                    --arg changed "$CHANGED" \
+                    --arg arch "$ARCH_CONTEXT" \
+                    '{
+                      model: $model,
+                      contents: [{
+                        parts: [{
+                          text: ($prompt + "\n\n## Architecture Context\n" + $arch + "\n\n## Changed Files\n" + $changed + "\n\n## PR Title\n" + $title + "\n\n## Diff\n```diff\n" + $diff + "\n```")
+                        }]
+                      }],
+                      generationConfig: {
+                        temperature: 0.2,
+                        maxOutputTokens: 4096
+                      }
+                    }')
+
+                  # Call Gemini API with retry
+                  RESPONSE=""
+                  for attempt in 1 2 3; do
+                    HTTP_CODE=$(curl -s -o /tmp/gemini_response.json -w "%{http_code}" \
+                      -X POST \
+                      "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}" \
+                      -H "Content-Type: application/json" \
+                      -d "$PAYLOAD" \
+                      --max-time 120)
+
+                    if [ "$HTTP_CODE" = "200" ]; then
+                      RESPONSE=$(jq -r '.candidates[0].content.parts[0].text // "No response generated"' /tmp/gemini_response.json)
+                      break
+                    fi
+                    echo "Attempt $attempt failed with HTTP $HTTP_CODE, retrying..."
+                    sleep $((attempt * 2))
+                  done
+
+                  if [ -z "$RESPONSE" ]; then
+                    RESPONSE="Gemini review could not be completed (API error). Please review manually."
+                  fi
+
+                  # Save response for the comment step
+                  echo "$RESPONSE" > /tmp/review_result.txt
+
+            - name: Post review comment on PR
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const fs = require('fs');
+                      const review = fs.readFileSync('/tmp/review_result.txt', 'utf8');
+
+                      // Find and update existing bot comment, or create new one
+                      const marker = '<!-- gemini-architecture-review -->';
+                      const body = `${marker}\n## Gemini Architecture Review\n\n${review}\n\n---\n*Automated review by Gemini ${process.env.GEMINI_MODEL}*`;
+
+                      const { data: comments } = await github.rest.issues.listComments({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: context.issue.number,
+                      });
+
+                      const existing = comments.find(c => c.body.includes(marker));
+
+                      if (existing) {
+                        await github.rest.issues.updateComment({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          comment_id: existing.id,
+                          body,
+                        });
+                      } else {
+                        await github.rest.issues.createComment({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          issue_number: context.issue.number,
+                          body,
+                        });
+                      }

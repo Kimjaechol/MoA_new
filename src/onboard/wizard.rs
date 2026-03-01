@@ -242,6 +242,7 @@ pub async fn run_wizard_with_migration(
         sync: Default::default(),
         telemetry: Default::default(),
         voice: Default::default(),
+        coding: Default::default(),
     };
 
     println!(
@@ -763,6 +764,7 @@ async fn run_quick_setup_with_home(
         sync: Default::default(),
         telemetry: Default::default(),
         voice: Default::default(),
+        coding: Default::default(),
     };
     if no_totp {
         config.security.otp.enabled = false;

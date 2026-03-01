@@ -410,6 +410,10 @@ pub struct Config {
     /// Voice / translation / interpretation settings.
     #[serde(default)]
     pub voice: VoiceConfig,
+
+    /// Multi-model coding review pipeline settings.
+    #[serde(default)]
+    pub coding: CodingConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -6327,6 +6331,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
             voice: VoiceConfig::default(),
+            coding: CodingConfig::default(),
         }
     }
 }
@@ -10142,6 +10147,7 @@ ws_url = "ws://127.0.0.1:3002"
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
             voice: VoiceConfig::default(),
+            coding: CodingConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
@@ -10522,6 +10528,7 @@ tool_dispatcher = "xml"
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
             voice: VoiceConfig::default(),
+            coding: CodingConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
@@ -14596,6 +14603,64 @@ impl Default for VoiceConfig {
             min_commit_chars: default_voice_min_commit_chars(),
             max_uncommitted_chars: default_voice_max_uncommitted_chars(),
             silence_commit_ms: default_voice_silence_commit_ms(),
+        }
+    }
+}
+
+// ── MoA: Coding Review Pipeline ──────────────────────────────────
+
+/// Configuration for the multi-model coding review pipeline.
+///
+/// Controls which AI models are used for automated code review,
+/// enabling the "Claude codes, Gemini reviews, Claude validates" workflow.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CodingConfig {
+    /// Enable automated multi-model code review.
+    #[serde(default)]
+    pub review_enabled: bool,
+    /// Gemini API key for architecture review (falls back to GEMINI_API_KEY env).
+    #[serde(default)]
+    pub gemini_api_key: Option<String>,
+    /// Gemini model for code review (default: "gemini-2.5-flash").
+    #[serde(default = "default_coding_gemini_model")]
+    pub gemini_model: String,
+    /// Anthropic API key for secondary review (falls back to ANTHROPIC_API_KEY env).
+    #[serde(default)]
+    pub claude_api_key: Option<String>,
+    /// Claude model for secondary review (default: "claude-sonnet-4-6").
+    #[serde(default = "default_coding_claude_model")]
+    pub claude_model: String,
+    /// Enable secondary Claude review after Gemini review.
+    #[serde(default = "default_coding_secondary_review")]
+    pub enable_secondary_review: bool,
+    /// Maximum diff size in characters to send for review (prevents token overflow).
+    #[serde(default = "default_coding_max_diff_chars")]
+    pub max_diff_chars: usize,
+}
+
+fn default_coding_gemini_model() -> String {
+    "gemini-2.5-flash".to_string()
+}
+fn default_coding_claude_model() -> String {
+    "claude-sonnet-4-6".to_string()
+}
+fn default_coding_secondary_review() -> bool {
+    true
+}
+fn default_coding_max_diff_chars() -> usize {
+    120_000
+}
+
+impl Default for CodingConfig {
+    fn default() -> Self {
+        Self {
+            review_enabled: false,
+            gemini_api_key: None,
+            gemini_model: default_coding_gemini_model(),
+            claude_api_key: None,
+            claude_model: default_coding_claude_model(),
+            enable_secondary_review: default_coding_secondary_review(),
+            max_diff_chars: default_coding_max_diff_chars(),
         }
     }
 }
