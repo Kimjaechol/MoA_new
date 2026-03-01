@@ -14535,6 +14535,21 @@ pub struct VoiceConfig {
     /// VAD prefix padding in ms (audio before speech start to include).
     #[serde(default = "default_voice_prefix_padding_ms")]
     pub prefix_padding_ms: u32,
+
+    // ── Simultaneous interpretation settings ──────────────────────
+
+    /// Default interpretation mode: "simul", "consecutive", or "bidirectional".
+    #[serde(default = "default_voice_interp_mode")]
+    pub default_interp_mode: String,
+    /// Minimum characters before a segment can be committed for translation.
+    #[serde(default = "default_voice_min_commit_chars")]
+    pub min_commit_chars: usize,
+    /// Maximum uncommitted characters before forcing a commit.
+    #[serde(default = "default_voice_max_uncommitted_chars")]
+    pub max_uncommitted_chars: usize,
+    /// Milliseconds of silence before committing remaining stable text.
+    #[serde(default = "default_voice_silence_commit_ms")]
+    pub silence_commit_ms: u64,
 }
 
 fn default_voice_max_sessions() -> usize {
@@ -14552,6 +14567,18 @@ fn default_voice_silence_ms() -> u32 {
 fn default_voice_prefix_padding_ms() -> u32 {
     100
 }
+fn default_voice_interp_mode() -> String {
+    "simul".to_string()
+}
+fn default_voice_min_commit_chars() -> usize {
+    10
+}
+fn default_voice_max_uncommitted_chars() -> usize {
+    80
+}
+fn default_voice_silence_commit_ms() -> u64 {
+    600
+}
 
 impl Default for VoiceConfig {
     fn default() -> Self {
@@ -14565,6 +14592,10 @@ impl Default for VoiceConfig {
             default_provider: None,
             silence_duration_ms: default_voice_silence_ms(),
             prefix_padding_ms: default_voice_prefix_padding_ms(),
+            default_interp_mode: default_voice_interp_mode(),
+            min_commit_chars: default_voice_min_commit_chars(),
+            max_uncommitted_chars: default_voice_max_uncommitted_chars(),
+            silence_commit_ms: default_voice_silence_commit_ms(),
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Voice processing pipeline for ZeroClaw.
 //!
 //! Provides real-time voice interpretation and voice-to-voice conversation
-//! capabilities using multiple voice providers (Gemini Live, OpenAI Realtime).
+//! capabilities using Gemini Live Native Audio.
 //!
 //! ## Design
 //! - Trait-driven voice provider abstraction (`VoiceProvider`)
@@ -11,18 +11,25 @@
 //! - Domain specialization (general / business / medical / legal / technical)
 //! - Per-session billing integration (token-equivalent credit deduction)
 //! - Gemini Live WebSocket client with automatic VAD for hands-free interpretation
+//!
+//! ## Simultaneous Interpretation
+//! - `simul` — commit-point segmentation engine for phrase-level translation
+//! - `events` — WebSocket event schema for client-server communication
+//! - `simul_session` — session manager tying Live API + segmentation + events
 
+pub mod events;
 pub mod gemini_live;
 pub mod openai_realtime;
 pub mod pipeline;
+pub mod simul;
+pub mod simul_session;
 
 // ── Shared voice event type ──────────────────────────────────────
 
-/// Provider-agnostic event produced by any voice session (Gemini Live, OpenAI Realtime, etc.).
+/// Provider-agnostic event produced by any voice session.
 ///
-/// Both `GeminiLiveSession` and `OpenAiRealtimeSession` emit these events
-/// through their `event_rx` channels, enabling the gateway to relay them
-/// to the browser with identical logic regardless of provider.
+/// Voice sessions emit these events through their `event_rx` channels,
+/// enabling the gateway to relay them to the browser/client.
 #[derive(Debug, Clone)]
 pub enum VoiceEvent {
     /// Provider setup completed — ready to stream.
@@ -50,3 +57,9 @@ pub use pipeline::{
     Domain, Formality, InterpreterConfig, InterpreterSession, InterpreterStats, InterpreterStatus,
     LanguageCode, VoiceProvider, VoiceProviderKind, VoiceSessionManager,
 };
+#[allow(unused_imports)]
+pub use events::{ClientMessage, InterpretationMode, ServerMessage};
+#[allow(unused_imports)]
+pub use simul::{CommittedSegment, SegmentationConfig, SegmentationEngine};
+#[allow(unused_imports)]
+pub use simul_session::{SimulSession, SimulSessionConfig};
