@@ -388,6 +388,20 @@ export class MoAClient {
     return getPlatformInfo();
   }
 
+  // ── Credits ──────────────────────────────────────────────────
+
+  async getCreditBalance(): Promise<number> {
+    if (!this.token) return 0;
+
+    const res = await fetch(`${this.serverUrl}/api/credits/balance`, {
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
+
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return data.balance ?? 0;
+  }
+
   // ── Helpers ────────────────────────────────────────────────────
 
   private async getDeviceName(): Promise<string> {

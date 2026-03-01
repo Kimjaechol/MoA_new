@@ -1807,6 +1807,13 @@ pub struct SyncConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// User passphrase for PBKDF2-based sync encryption key derivation.
+    /// When set, the encryption key is derived from this passphrase using
+    /// PBKDF2-HMAC-SHA256 (600k iterations). When absent, falls back to
+    /// a random key file (.sync_key) for backward compatibility.
+    #[serde(default)]
+    pub passphrase: Option<String>,
+
     /// TTL for temporary relay entries in seconds (default: 300 = 5 minutes).
     #[serde(default = "default_relay_ttl_secs")]
     pub relay_ttl_secs: u64,
@@ -1839,6 +1846,7 @@ impl Default for SyncConfig {
             relay_ttl_secs: default_relay_ttl_secs(),
             journal_retention_days: default_journal_retention_days(),
             batch_size: default_sync_batch_size(),
+            passphrase: None,
         }
     }
 }

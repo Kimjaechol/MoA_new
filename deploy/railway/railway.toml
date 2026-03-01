@@ -29,5 +29,6 @@ restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
 
 [env]
-# Railway injects PORT automatically. Map it to 3000 as a default fallback.
-PORT = "3000"
+# Railway injects PORT automatically. Map it to 8080 as a default fallback.
+# Must match the EXPOSE / CMD default in deploy/railway/Dockerfile.
+PORT = "8080"

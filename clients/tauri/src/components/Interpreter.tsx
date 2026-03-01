@@ -127,7 +127,7 @@ export function Interpreter({
 }: InterpreterProps) {
   void onBack; // available for future navigation
   const [status, setStatus] = useState<ConnectionStatus>("idle");
-  const [provider, setProvider] = useState<VoiceProvider>("openai");
+  const [provider, setProvider] = useState<VoiceProvider>("gemini");
   const [sourceLang, setSourceLang] = useState("ko");
   const [targetLang, setTargetLang] = useState("ja");
   const [bidirectional, setBidirectional] = useState(true);

@@ -9,8 +9,10 @@
 //! - Configurable spending limits (daily/monthly) with alerts
 //! - Usage summary export for billing reconciliation
 
+pub mod llm_router;
 pub mod payment;
 pub mod tracker;
 
+pub use llm_router::{AdminKeys, KeySource, ResolvedKey};
 pub use payment::{CreditPackage, PaymentManager, PaymentRecord, PaymentStatus};
 pub use tracker::{CostEntry, CostTracker, UsageSummary};
