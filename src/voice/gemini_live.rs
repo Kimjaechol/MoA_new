@@ -1002,7 +1002,7 @@ mod tests {
         let vad = VadConfig::default();
         let json = serde_json::to_string(&vad).unwrap();
         assert!(json.contains("startOfSpeechSensitivity"));
-        assert!(json.contains("START_SENSITIVITY_LOW"));
+        assert!(json.contains("START_SENSITIVITY_HIGH"));
         assert!(json.contains("silenceDurationMs"));
     }
 
