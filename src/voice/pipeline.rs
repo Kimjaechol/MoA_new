@@ -387,24 +387,37 @@ impl InterpreterConfig {
 
         let direction = if self.bidirectional {
             format!(
-                "Bidirectional: {} ↔ {}. \
-                 Detect input language. Output the OTHER language immediately. \
-                 Never output the same language as input.",
+                "You operate in bidirectional mode between {} and {}. \
+                 When the speaker speaks {}, immediately interpret into {}. \
+                 When the speaker speaks {}, immediately interpret into {}. \
+                 Detect the language automatically from each utterance and always \
+                 output in the opposite language. Never repeat the input language.",
                 self.source_language.display_name(),
                 self.target_language.display_name(),
+                self.source_language.display_name(),
+                self.target_language.display_name(),
+                self.target_language.display_name(),
+                self.source_language.display_name(),
             )
         } else {
             format!(
-                "{} → {} only.",
+                "Interpret from {} to {} only. All output must be in {}.",
                 self.source_language.display_name(),
+                self.target_language.display_name(),
                 self.target_language.display_name(),
             )
         };
 
         format!(
-            "You are a live interpreter. {direction} {formality_instruction}{domain_instruction}{tone_instruction} \
-             CRITICAL: Speak the translation IMMEDIATELY. Never explain, never describe what you are doing, \
-             never output text like \"Translating...\" — just speak the translated words directly."
+            "You are a real-time simultaneous interpreter. {direction} {formality_instruction}{domain_instruction}{tone_instruction} \
+             CRITICAL RULES FOR SIMULTANEOUS INTERPRETATION: \
+             1. Start translating AS SOON AS you understand a meaningful phrase — do NOT wait for the full sentence to finish. \
+             2. When the speaker pauses briefly, use that pause to output the translation of what was just said. \
+             3. Translate in phrase-level chunks (clauses, noun phrases, verb phrases) rather than waiting for complete sentences. \
+             4. Preserve the speaker's pauses and pacing — if they pause deliberately, reflect that in your output timing. \
+             5. Never explain, narrate, or add commentary. Output ONLY the translated speech. \
+             6. If the speaker is still talking, output what you have so far and continue with the next chunk seamlessly. \
+             7. Maintain natural prosody and flow — each chunk should sound like natural speech, not a fragmented list."
         )
     }
 }
@@ -1038,10 +1051,10 @@ mod tests {
         };
 
         let prompt = config.build_system_prompt();
-        assert!(prompt.contains("Bidirectional: Japanese ↔ Korean"));
-        // Should instruct detection and output in the OTHER language
-        assert!(prompt.contains("Detect input language"));
-        assert!(prompt.contains("Output the OTHER language immediately"));
+        assert!(prompt.contains("bidirectional mode between Japanese and Korean"));
+        // Should instruct detection and output in the opposite language
+        assert!(prompt.contains("Detect the language automatically"));
+        assert!(prompt.contains("output in the opposite language"));
     }
 
     #[test]
