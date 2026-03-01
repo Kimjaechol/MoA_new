@@ -158,6 +158,7 @@ impl LineChannel {
                 content: text,
                 channel: "line".to_string(),
                 timestamp,
+                thread_ts: None,
             });
         }
 

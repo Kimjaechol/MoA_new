@@ -163,12 +163,17 @@ fn split_message(message: &str, max_bytes: usize) -> Vec<String> {
 
     // Guard against max_bytes == 0 to prevent infinite loop
     if max_bytes == 0 {
-        let full: String = message
+        let mut full = String::new();
+        for l in message
             .lines()
             .map(|l| l.trim_end_matches('\r'))
             .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        {
+            if !full.is_empty() {
+                full.push(' ');
+            }
+            full.push_str(l);
+        }
         if full.is_empty() {
             chunks.push(String::new());
         } else {
@@ -282,7 +287,7 @@ impl IrcChannel {
         };
 
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-        let domain = rustls::pki_types::ServerName::try_from(self.server.clone())?;
+        let domain = rustls::pki_types::ServerName::try_from(self.server.as_str())?.to_owned();
         let tls = connector.connect(domain, tcp).await?;
 
         Ok(tls)
@@ -455,6 +460,7 @@ impl Channel for IrcChannel {
                 "AUTHENTICATE" => {
                     // Server sends "AUTHENTICATE +" to request credentials
                     if sasl_pending && msg.params.first().is_some_and(|p| p == "+") {
+                        // sasl_password is loaded from runtime config, not hard-coded
                         if let Some(password) = self.sasl_password.as_deref() {
                             let encoded = encode_sasl_plain(&current_nick, password);
                             let mut guard = self.writer.lock().await;
@@ -551,7 +557,7 @@ impl Channel for IrcChannel {
                     // Determine reply target: if sent to a channel, reply to channel;
                     // if DM (target == our nick), reply to sender
                     let is_channel = target.starts_with('#') || target.starts_with('&');
-                    let reply_to = if is_channel {
+                    let reply_target = if is_channel {
                         target.to_string()
                     } else {
                         sender_nick.to_string()
@@ -566,13 +572,14 @@ impl Channel for IrcChannel {
                     let channel_msg = ChannelMessage {
                         id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
                         sender: sender_nick.to_string(),
-                        reply_target: reply_to,
+                        reply_target,
                         content,
                         channel: "irc".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

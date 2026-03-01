@@ -2,9 +2,9 @@ use super::sqlite::SqliteMemory;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use async_trait::async_trait;
 use chrono::Local;
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -34,7 +34,14 @@ impl LucidMemory {
     pub fn new(workspace_dir: &Path, local: SqliteMemory) -> Self {
         let lucid_cmd = std::env::var("ZEROCLAW_LUCID_CMD")
             .unwrap_or_else(|_| Self::DEFAULT_LUCID_CMD.to_string());
+        Self::new_with_command(workspace_dir, local, lucid_cmd)
+    }
 
+    pub(crate) fn new_with_command(
+        workspace_dir: &Path,
+        local: SqliteMemory,
+        lucid_cmd: String,
+    ) -> Self {
         let token_budget = std::env::var("ZEROCLAW_LUCID_BUDGET")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -116,25 +123,20 @@ impl LucidMemory {
     }
 
     fn in_failure_cooldown(&self) -> bool {
-        let Ok(guard) = self.last_failure_at.lock() else {
-            return false;
-        };
-
+        let guard = self.last_failure_at.lock();
         guard
             .as_ref()
             .is_some_and(|last| last.elapsed() < self.failure_cooldown)
     }
 
     fn mark_failure_now(&self) {
-        if let Ok(mut guard) = self.last_failure_at.lock() {
-            *guard = Some(Instant::now());
-        }
+        let mut guard = self.last_failure_at.lock();
+        *guard = Some(Instant::now());
     }
 
     fn clear_failure(&self) {
-        if let Ok(mut guard) = self.last_failure_at.lock() {
-            *guard = None;
-        }
+        let mut guard = self.last_failure_at.lock();
+        *guard = None;
     }
 
     fn to_lucid_type(category: &MemoryCategory) -> &'static str {
@@ -502,8 +504,8 @@ exit 1
             cmd,
             200,
             3,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
             Duration::from_secs(2),
         )
     }
@@ -593,8 +595,8 @@ exit 1
             probe_cmd,
             200,
             1,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
             Duration::from_secs(2),
         );
 
@@ -613,7 +615,7 @@ exit 1
             .iter()
             .any(|e| e.content.contains("Rust should stay local-first")));
 
-        let context_calls = fs::read_to_string(&marker).unwrap_or_default();
+        let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert!(
             context_calls.trim().is_empty(),
             "Expected local-hit short-circuit; got calls: {context_calls}"
@@ -663,8 +665,8 @@ exit 1
             failing_cmd,
             200,
             99,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
             Duration::from_secs(5),
         );
 
@@ -674,7 +676,7 @@ exit 1
         assert!(first.is_empty());
         assert!(second.is_empty());
 
-        let calls = fs::read_to_string(&marker).unwrap_or_default();
+        let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
     }
 }

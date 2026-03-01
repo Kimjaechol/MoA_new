@@ -487,7 +487,7 @@ impl GeminiLiveSession {
         let setup_json = serde_json::to_string(&setup)?;
         tracing::debug!(session_id = %session_id, setup = %setup_json, "Sending Gemini Live setup");
         ws_stream
-            .send(WsMessage::Text(setup_json))
+            .send(WsMessage::Text(setup_json.into()))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send setup message: {e}"))?;
 
@@ -693,7 +693,7 @@ impl GeminiLiveSession {
                                 }
                             }
                             let mut sender = ws_sender.lock().await;
-                            if sender.send(WsMessage::Text(json)).await.is_err() {
+                            if sender.send(WsMessage::Text(json.into())).await.is_err() {
                                 tracing::warn!(
                                     session_id = %session_id,
                                     "WebSocket send failed, closing outbound loop"
@@ -723,7 +723,7 @@ impl GeminiLiveSession {
                     });
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let mut sender = ws_sender.lock().await;
-                        if sender.send(WsMessage::Text(json)).await.is_err() {
+                        if sender.send(WsMessage::Text(json.into())).await.is_err() {
                             break;
                         }
                     }
@@ -733,7 +733,7 @@ impl GeminiLiveSession {
                     if let Ok(json) = serde_json::to_string(&msg) {
                         tracing::info!(session_id = %session_id, "Sending activityStart to Gemini Live");
                         let mut sender = ws_sender.lock().await;
-                        if sender.send(WsMessage::Text(json)).await.is_err() {
+                        if sender.send(WsMessage::Text(json.into())).await.is_err() {
                             tracing::warn!(session_id = %session_id, "WebSocket send failed for activityStart");
                             break;
                         }
@@ -744,7 +744,7 @@ impl GeminiLiveSession {
                     if let Ok(json) = serde_json::to_string(&msg) {
                         tracing::info!(session_id = %session_id, "Sending activityEnd to Gemini Live");
                         let mut sender = ws_sender.lock().await;
-                        if sender.send(WsMessage::Text(json)).await.is_err() {
+                        if sender.send(WsMessage::Text(json.into())).await.is_err() {
                             tracing::warn!(session_id = %session_id, "WebSocket send failed for activityEnd");
                             break;
                         }
@@ -759,7 +759,7 @@ impl GeminiLiveSession {
                                 "Sending audioStreamEnd to Gemini Live"
                             );
                             let mut sender = ws_sender.lock().await;
-                            if sender.send(WsMessage::Text(json)).await.is_err() {
+                            if sender.send(WsMessage::Text(json.into())).await.is_err() {
                                 tracing::warn!(
                                     session_id = %session_id,
                                     "WebSocket send failed for audioStreamEnd"
