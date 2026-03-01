@@ -165,8 +165,8 @@ impl SegmentationEngine {
 
         // ── Silence-based commit ─────────────────────────────────
         // If speaker has paused long enough, commit everything stable.
-        let silence_elapsed = self.last_update_time.elapsed().as_millis() as u64;
-        if silence_elapsed >= self.config.silence_commit_ms && available_len > 0 {
+        let silence_elapsed_ms = self.last_update_time.elapsed().as_millis();
+        if silence_elapsed_ms >= u128::from(self.config.silence_commit_ms) && available_len > 0 {
             return Some(self.do_commit(stable_end));
         }
 
@@ -264,7 +264,7 @@ impl SegmentationEngine {
 
         // Subtract unstable tail
         let tail = self.config.unstable_tail_chars;
-        let stable = if common > tail { common - tail } else { 0 };
+        let stable = common.saturating_sub(tail);
 
         // Snap result to char boundary
         let mut result = stable;
@@ -275,11 +275,7 @@ impl SegmentationEngine {
         // For streaming append mode: if the new text is strictly longer and
         // starts with the old text, the entire old text is stable.
         if new.len() > old.len() && new.starts_with(old) {
-            let append_stable = if old.len() > tail {
-                old.len() - tail
-            } else {
-                0
-            };
+            let append_stable = old.len().saturating_sub(tail);
             result = result.max(append_stable);
             while result > 0 && !self.partial_text.is_char_boundary(result) {
                 result -= 1;
