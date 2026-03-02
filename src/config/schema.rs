@@ -14826,6 +14826,11 @@ pub struct SyncConfig {
     /// Enable cross-device memory synchronization (default: false).
     #[serde(default)]
     pub enabled: bool,
+    /// WebSocket URL of the Railway relay server for cross-device sync.
+    /// Example: "wss://moanew-production.up.railway.app/sync"
+    /// When empty, only in-memory relay is used (single-process mode).
+    #[serde(default)]
+    pub relay_url: Option<String>,
     /// TTL for temporary relay entries in seconds (default: 300 = 5 minutes).
     #[serde(default = "default_relay_ttl_secs")]
     pub relay_ttl_secs: u64,
@@ -14853,6 +14858,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            relay_url: None,
             relay_ttl_secs: default_relay_ttl_secs(),
             journal_retention_days: default_journal_retention_days(),
             batch_size: default_sync_batch_size(),

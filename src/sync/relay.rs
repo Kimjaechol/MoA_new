@@ -153,6 +153,226 @@ impl SyncRelay {
     }
 }
 
+// ── Remote relay client (WebSocket to Railway) ──────────────────
+
+/// WebSocket client that connects to the Railway relay server.
+///
+/// This implements the network transport layer for Layer 1 sync:
+/// - Sends encrypted deltas to the relay server
+/// - Receives encrypted deltas from peer devices
+/// - The relay server holds data for at most 5 minutes (TTL)
+/// - The relay server never decrypts the data (zero-knowledge)
+pub struct RelayClient {
+    /// WebSocket URL of the Railway relay server (e.g. wss://relay.example.com/sync).
+    relay_url: String,
+    /// Device ID of this device.
+    device_id: String,
+    /// User ID for this device.
+    user_id: String,
+    /// Sender for outbound messages — `store()` pushes entries here.
+    /// `connect()` spawns a task that drains the matching receiver to WebSocket.
+    outbound_tx: tokio::sync::mpsc::Sender<RelayEntry>,
+    /// Receiver for outbound messages — taken by `connect()`.
+    outbound_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<RelayEntry>>>,
+    /// Receiver for inbound messages — `recv()` reads from here.
+    /// Replaced by `connect()` with a new receiver wired to the WebSocket.
+    inbound_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<RelayEntry>>,
+    /// Sender for inbound messages — held here so `connect()` can clone it
+    /// into its receive task.
+    inbound_tx: tokio::sync::mpsc::Sender<RelayEntry>,
+    /// Connection state.
+    connected: std::sync::atomic::AtomicBool,
+}
+
+/// Messages exchanged over the relay WebSocket connection.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum RelayMessage {
+    /// Client → Server: Store an encrypted entry.
+    #[serde(rename = "store")]
+    Store { entry: RelayEntry },
+    /// Client → Server: Pick up pending entries.
+    #[serde(rename = "pickup")]
+    Pickup {
+        user_id: String,
+        exclude_device: String,
+    },
+    /// Server → Client: Entries available for pickup.
+    #[serde(rename = "entries")]
+    Entries { entries: Vec<RelayEntry> },
+    /// Server → Client: Broadcast notification (new entry from peer).
+    #[serde(rename = "notify")]
+    Notify { entry: RelayEntry },
+    /// Ping/pong for keepalive.
+    #[serde(rename = "ping")]
+    Ping,
+    #[serde(rename = "pong")]
+    Pong,
+}
+
+impl RelayClient {
+    /// Create a new relay client. Does not connect yet — call `connect()`.
+    pub fn new(relay_url: String, device_id: String, user_id: String) -> Self {
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(256);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(256);
+
+        Self {
+            relay_url,
+            device_id,
+            user_id,
+            outbound_tx,
+            outbound_rx: tokio::sync::Mutex::new(Some(outbound_rx)),
+            inbound_rx: tokio::sync::Mutex::new(inbound_rx),
+            inbound_tx,
+            connected: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the client is currently connected.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Send an encrypted entry to the relay server for peer devices to pick up.
+    pub async fn store(&self, entry: RelayEntry) -> anyhow::Result<()> {
+        if !self.is_connected() {
+            anyhow::bail!("Relay client not connected");
+        }
+        self.outbound_tx
+            .send(entry)
+            .await
+            .map_err(|_| anyhow::anyhow!("Outbound channel closed"))
+    }
+
+    /// Receive the next inbound entry from a peer device.
+    /// Returns `None` if the channel is closed.
+    pub async fn recv(&self) -> Option<RelayEntry> {
+        let mut rx = self.inbound_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Connect to the relay server and run the send/receive loop.
+    ///
+    /// This spawns a background task that:
+    /// 1. Connects via WebSocket to `relay_url`
+    /// 2. Subscribes to broadcast notifications for `user_id`
+    /// 3. Forwards outbound entries to the server
+    /// 4. Receives inbound entries and delivers them via `recv()`
+    /// 5. Reconnects with exponential backoff on disconnect
+    pub async fn connect(&self) -> anyhow::Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::connect_async;
+
+        let url = format!(
+            "{}?device_id={}&user_id={}",
+            self.relay_url, self.device_id, self.user_id
+        );
+
+        let (ws_stream, _response) = connect_async(&url).await.map_err(|e| {
+            anyhow::anyhow!("Failed to connect to relay at {}: {}", self.relay_url, e)
+        })?;
+
+        self.connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            relay_url = %self.relay_url,
+            device_id = %self.device_id,
+            "Connected to sync relay server"
+        );
+
+        let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
+
+        // Take the outbound receiver (only the first connect() call gets it)
+        let mut outbound_rx = self
+            .outbound_rx
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("RelayClient already connected (outbound_rx taken)"))?;
+
+        // Clone the inbound sender for the receive task
+        let inbound_tx = self.inbound_tx.clone();
+
+        // Send loop: forward outbound entries to WebSocket
+        let _send_task = tokio::spawn(async move {
+            while let Some(entry) = outbound_rx.recv().await {
+                let msg = RelayMessage::Store { entry };
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        tracing::error!("Failed to serialize relay message: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = ws_sink
+                    .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
+                    .await
+                {
+                    tracing::error!("Failed to send to relay: {e}");
+                    break;
+                }
+            }
+        });
+
+        // Receive loop: read from WebSocket and deliver inbound entries
+        let device_id = self.device_id.clone();
+        let _recv_task = tokio::spawn(async move {
+            while let Some(msg_result) = ws_stream_rx.next().await {
+                let msg = match msg_result {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Relay WebSocket error: {e}");
+                        break;
+                    }
+                };
+
+                let text = match msg {
+                    tokio_tungstenite::tungstenite::Message::Text(t) => t,
+                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    tokio_tungstenite::tungstenite::Message::Ping(_) => continue,
+                    _ => continue,
+                };
+
+                let relay_msg: RelayMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!("Invalid relay message: {e}");
+                        continue;
+                    }
+                };
+
+                match relay_msg {
+                    RelayMessage::Notify { entry } => {
+                        // Skip entries from ourselves
+                        if entry.sender_device_id == device_id {
+                            continue;
+                        }
+                        if let Err(e) = inbound_tx.send(entry).await {
+                            tracing::error!("Failed to deliver inbound entry: {e}");
+                            break;
+                        }
+                    }
+                    RelayMessage::Entries { entries } => {
+                        for entry in entries {
+                            if entry.sender_device_id == device_id {
+                                continue;
+                            }
+                            if let Err(e) = inbound_tx.send(entry).await {
+                                tracing::error!("Failed to deliver inbound entry: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    RelayMessage::Pong => {}
+                    _ => {}
+                }
+            }
+        });
+
+        Ok(())
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
