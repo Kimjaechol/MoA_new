@@ -92,14 +92,22 @@ jobs:
                   echo "Changed files:"
                   cat /tmp/changed_files.txt
 
-                  # Architecture context
-                  CONTEXT=""
-                  for doc in CLAUDE.md docs/ARCHITECTURE.md docs/CODING_GUIDELINES.md; do
+                  # Architecture context — ARCHITECTURE.md is PRIMARY (loaded in full)
+                  # Load ARCHITECTURE.md first and in full (up to 50KB)
+                  ARCH_PRIMARY=""
+                  if [ -f "docs/ARCHITECTURE.md" ]; then
+                    ARCH_PRIMARY="$(head -c 50000 docs/ARCHITECTURE.md)"
+                  fi
+                  echo "$ARCH_PRIMARY" > /tmp/arch_primary.txt
+
+                  # Load supplementary context docs (CLAUDE.md, etc.)
+                  ARCH_SUPPLEMENTARY=""
+                  for doc in CLAUDE.md docs/CODING_GUIDELINES.md; do
                     if [ -f "$doc" ]; then
-                      CONTEXT="${CONTEXT}\n\n--- ${doc} ---\n$(head -c 30000 "$doc")"
+                      ARCH_SUPPLEMENTARY="${ARCH_SUPPLEMENTARY}\n\n--- ${doc} ---\n$(head -c 30000 "$doc")"
                     fi
                   done
-                  echo "$CONTEXT" > /tmp/arch_context.txt
+                  echo "$ARCH_SUPPLEMENTARY" > /tmp/arch_supplementary.txt
 
                   # Commit info
                   echo "commit_msg=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
@@ -160,7 +168,8 @@ jobs:
               run: |
                   DIFF=$(cat /tmp/pr_diff.txt)
                   CHANGED=$(cat /tmp/changed_files.txt)
-                  ARCH_CONTEXT=$(cat /tmp/arch_context.txt)
+                  ARCH_PRIMARY=$(cat /tmp/arch_primary.txt)
+                  ARCH_SUPPLEMENTARY=$(cat /tmp/arch_supplementary.txt)
 
                   PREV_REVIEW=""
                   if [ "$HAS_PREVIOUS" = "true" ] && [ -f /tmp/previous_review.txt ]; then
@@ -178,21 +187,32 @@ jobs:
                   PROMPT=$(cat <<'PROMPT_EOF'
                   You are a senior software architect (Gemini) cross-reviewing code written by Claude (Opus 4.6) for the ZeroClaw/MoA project.
 
+                  ## MANDATORY: Read ARCHITECTURE.md FIRST
+                  You MUST read the "## PRIMARY — docs/ARCHITECTURE.md" section below BEFORE
+                  reviewing any code. This document defines the authoritative product vision,
+                  deployment architecture, module structure, data flow, and technology stack.
+                  Every review judgment you make MUST reference specific sections of
+                  ARCHITECTURE.md to justify your assessment.
+
                   ## Your Role
                   You are the architecture quality gatekeeper in a Claude ↔ Gemini cross-review loop.
                   Your job is to:
-                  1. Verify the code aligns with the project architecture (CLAUDE.md, ARCHITECTURE.md)
-                  2. Find logic errors, missing edge cases, security issues
-                  3. Check code efficiency and established patterns
-                  4. For follow-up rounds: verify whether previous issues were actually fixed
+                  1. **Architecture compliance** — verify the code matches the architecture defined in ARCHITECTURE.md (module boundaries, data flow, technology choices, deployment model)
+                  2. **Logic correctness** — find logic errors, missing edge cases, compilation errors
+                  3. **Security** — check for vulnerabilities (injection, secret leaks, permission issues)
+                  4. **Pattern consistency** — verify code follows established patterns from CLAUDE.md
+                  5. **Follow-up rounds** — verify whether previous issues were actually fixed
 
                   ## Review Instructions
-                  - Read the architecture context documents carefully first
-                  - Focus on SUBSTANTIVE issues: logic errors, security vulnerabilities, architecture violations, missing error handling, compilation errors
-                  - Do NOT flag: style nitpicks, formatting preferences, comment style, naming opinions
-                  - Rate each issue as [CRITICAL], [HIGH], [MEDIUM], or [LOW]
-                  - Be specific: reference file paths and line numbers
-                  - If the code looks good, say so clearly and give APPROVE verdict
+                  - FIRST: Read ARCHITECTURE.md thoroughly — understand the product vision, module map, data flow, and tech stack
+                  - THEN: Check if the code changes are consistent with that architecture
+                  - Flag as [CRITICAL] any code that CONTRADICTS the architecture (wrong module boundary, wrong data flow, wrong technology choice)
+                  - Flag as [HIGH] any logic error, security vulnerability, or compilation error
+                  - Flag as [MEDIUM] missing error handling, missing edge cases
+                  - Flag as [LOW] minor improvements
+                  - Do NOT flag: style nitpicks, formatting, comment style, naming opinions
+                  - Be specific: reference file paths, line numbers, AND the ARCHITECTURE.md section that applies
+                  - If the code looks good and aligns with architecture, say so clearly and give APPROVE
                   - For follow-up rounds: explicitly mark each previous issue as RESOLVED or REMAINING
 
                   ## Output Format (follow exactly)
@@ -200,11 +220,12 @@ jobs:
                   (1-3 sentences: what this push does)
 
                   ### Architecture Alignment
-                  (Does this code follow the project architecture? Any violations?)
+                  (Does this code follow ARCHITECTURE.md? Reference specific sections.)
+                  (Example: "Section 5.2 defines module X as responsible for Y — this code correctly/incorrectly...")
 
                   ### Issues Found
                   (List issues with severity tags, or state "No issues found")
-                  - **[SEVERITY]** `file/path.rs:line` — Description
+                  - **[SEVERITY]** `file/path.rs:line` — Description — **Ref: ARCHITECTURE.md Section N.N**
 
                   ### Issue Count
                   CRITICAL: <number> | HIGH: <number> | MEDIUM: <number> | LOW: <number>
@@ -228,8 +249,11 @@ jobs:
                   ## Branch: ${BRANCH_NAME}
                   ## Commit: ${COMMIT_MSG}
 
-                  ## Architecture Context
-                  ${ARCH_CONTEXT}
+                  ## PRIMARY — docs/ARCHITECTURE.md (READ THIS FIRST)
+                  ${ARCH_PRIMARY}
+
+                  ## SUPPLEMENTARY — CLAUDE.md and other guidelines
+                  ${ARCH_SUPPLEMENTARY}
 
                   ## Changed Files
                   ${CHANGED}"
