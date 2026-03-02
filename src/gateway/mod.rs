@@ -950,6 +950,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/credits/purchase",
             post(api::handle_api_credits_purchase),
         )
+        .route(
+            "/api/credits/history",
+            get(api::handle_api_credits_history),
+        )
+        .route("/api/credits/usage", get(api::handle_api_credits_usage))
+        // ── Payment callbacks (Kakao Pay redirects) ──
+        .route(
+            "/api/payment/approve",
+            get(api::handle_api_payment_approve),
+        )
+        .route(
+            "/api/payment/cancel",
+            get(api::handle_api_payment_cancel),
+        )
+        .route("/api/payment/fail", get(api::handle_api_payment_fail))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/node-control", post(handle_node_control))
@@ -2922,6 +2937,9 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -2984,6 +3002,9 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3029,6 +3050,9 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -3075,6 +3099,9 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let unauthorized =
@@ -3563,6 +3590,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3637,6 +3667,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_webhook(
@@ -3692,6 +3725,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_webhook(
@@ -3748,6 +3784,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_webhook(
@@ -3813,6 +3852,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_node_control(
@@ -3870,6 +3912,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_node_control(
@@ -3932,6 +3977,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let headers = HeaderMap::new();
@@ -4020,6 +4068,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_webhook(
@@ -4078,6 +4129,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4141,6 +4195,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4218,6 +4275,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_github_webhook(
@@ -4274,6 +4334,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let body = r#"{
@@ -4341,6 +4404,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let body = r#"{
@@ -4413,6 +4479,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -4475,6 +4544,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4530,6 +4602,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let response = handle_qq_webhook(
@@ -4584,6 +4659,9 @@ Reminder set successfully."#;
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             voice_sessions: Arc::new(VoiceSessionManager::new(true, 5)),
+            sync_coordinator: None,
+            relay_client: None,
+            payment_manager: None,
         };
 
         let mut headers = HeaderMap::new();

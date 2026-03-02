@@ -10,8 +10,7 @@ crate-type = ["staticlib"]
 name = "zeroclaw_ios"
 
 [dependencies]
-# Note: zeroclaw dep commented out until we integrate properly
-# zeroclaw = { path = "../.." }
+zeroclaw = { path = "../..", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time"] }
 anyhow = "1"
 serde = { version = "1", default-features = false, features = ["derive"] }

@@ -8,6 +8,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
+use chrono::Datelike;
 use serde::Deserialize;
 
 const MASKED_SECRET: &str = "***MASKED***";
@@ -663,6 +664,219 @@ pub async fn handle_api_credits_purchase(
         )
             .into_response(),
     }
+}
+
+/// GET /api/payment/approve — Kakao Pay approval callback
+///
+/// After Kakao Pay redirects the user here with `pg_token`, this endpoint
+/// completes the payment and grants credits atomically.
+pub async fn handle_api_payment_approve(
+    State(state): State<AppState>,
+    Query(params): Query<PaymentCallbackParams>,
+) -> impl IntoResponse {
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment system not configured"})),
+        )
+            .into_response();
+    };
+
+    let tx_id = params.tx.unwrap_or_default();
+    if tx_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing tx parameter"})),
+        )
+            .into_response();
+    }
+
+    let pm_guard = pm.lock();
+    match pm_guard.complete_payment(&tx_id) {
+        Ok(record) => {
+            tracing::info!(
+                transaction_id = %tx_id,
+                credits = record.credits,
+                "Payment completed — credits granted"
+            );
+            Json(serde_json::json!({
+                "status": "completed",
+                "transaction_id": record.transaction_id,
+                "credits": record.credits,
+                "message": "Credits added to your account",
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Payment completion failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/payment/cancel — Kakao Pay cancellation callback
+pub async fn handle_api_payment_cancel(
+    State(state): State<AppState>,
+    Query(params): Query<PaymentCallbackParams>,
+) -> impl IntoResponse {
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment system not configured"})),
+        )
+            .into_response();
+    };
+
+    let tx_id = params.tx.unwrap_or_default();
+    if tx_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing tx parameter"})),
+        )
+            .into_response();
+    }
+
+    let pm_guard = pm.lock();
+    match pm_guard.cancel_payment(&tx_id) {
+        Ok(()) => {
+            tracing::info!(transaction_id = %tx_id, "Payment cancelled by user");
+            Json(serde_json::json!({
+                "status": "cancelled",
+                "transaction_id": tx_id,
+                "message": "Payment cancelled",
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Cancellation failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/payment/fail — Kakao Pay failure callback
+pub async fn handle_api_payment_fail(
+    State(state): State<AppState>,
+    Query(params): Query<PaymentCallbackParams>,
+) -> impl IntoResponse {
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment system not configured"})),
+        )
+            .into_response();
+    };
+
+    let tx_id = params.tx.unwrap_or_default();
+    if tx_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing tx parameter"})),
+        )
+            .into_response();
+    }
+
+    let pm_guard = pm.lock();
+    match pm_guard.fail_payment(&tx_id) {
+        Ok(()) => {
+            tracing::warn!(transaction_id = %tx_id, "Payment failed");
+            Json(serde_json::json!({
+                "status": "failed",
+                "transaction_id": tx_id,
+                "message": "Payment failed",
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to record failure: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// Query params for payment callback URLs.
+#[derive(Debug, Deserialize)]
+pub struct PaymentCallbackParams {
+    /// Transaction ID.
+    pub tx: Option<String>,
+}
+
+/// GET /api/credits/history — payment history for the current user
+pub async fn handle_api_credits_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref pm) = state.payment_manager else {
+        return Json(serde_json::json!({"payments": [], "enabled": false})).into_response();
+    };
+
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+
+    let pm_guard = pm.lock();
+    match pm_guard.list_user_payments(&user_id, 50) {
+        Ok(payments) => {
+            let records: Vec<serde_json::Value> = payments
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "transaction_id": p.transaction_id,
+                        "package_id": p.package_id,
+                        "amount_krw": p.amount_krw,
+                        "credits": p.credits,
+                        "status": p.status.as_str(),
+                        "created_at": p.created_at,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({"payments": records, "enabled": true})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to get history: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/credits/usage — API usage cost summary
+pub async fn handle_api_credits_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref ct) = state.cost_tracker else {
+        return Json(serde_json::json!({"usage": null, "enabled": false})).into_response();
+    };
+
+    let today = chrono::Utc::now().date_naive();
+    let today_cost = ct.get_daily_cost(today).unwrap_or(0.0);
+    let month_cost = ct
+        .get_monthly_cost(today.year(), today.month())
+        .unwrap_or(0.0);
+
+    let summary = ct.get_summary().ok();
+
+    Json(serde_json::json!({
+        "enabled": true,
+        "today_usd": today_cost,
+        "month_usd": month_cost,
+        "summary": summary,
+    }))
+    .into_response()
 }
 
 /// GET /api/cli-tools — discovered CLI tools

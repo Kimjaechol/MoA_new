@@ -27,6 +27,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
+use tokio::sync::watch;
 
 /// Global runtime for async operations.
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -46,6 +47,8 @@ struct BridgeState {
     gateway_url: String,
     token: Option<String>,
     running: bool,
+    /// Shutdown signal sender — dropping or sending triggers graceful stop.
+    shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 static STATE: OnceLock<Arc<Mutex<BridgeState>>> = OnceLock::new();
@@ -56,6 +59,7 @@ fn state() -> &'static Arc<Mutex<BridgeState>> {
             gateway_url: "http://127.0.0.1:3000".to_string(),
             token: None,
             running: false,
+            shutdown_tx: None,
         }))
     })
 }
@@ -86,15 +90,15 @@ pub unsafe extern "C" fn zeroclaw_start(
         return -1;
     }
 
-    let _data_dir = match unsafe { CStr::from_ptr(data_dir) }.to_str() {
+    let data_dir_str = match unsafe { CStr::from_ptr(data_dir) }.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return -1,
     };
-    let _provider = match unsafe { CStr::from_ptr(provider) }.to_str() {
+    let provider_str = match unsafe { CStr::from_ptr(provider) }.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return -1,
     };
-    let _api_key = if api_key.is_null() {
+    let api_key_str = if api_key.is_null() {
         None
     } else {
         unsafe { CStr::from_ptr(api_key) }
@@ -103,16 +107,70 @@ pub unsafe extern "C" fn zeroclaw_start(
             .map(String::from)
     };
 
-    let gateway_url = format!("http://127.0.0.1:{port}");
+    let gateway_port = if port == 0 { 3000 } else { port };
+    let gateway_url = format!("http://127.0.0.1:{gateway_port}");
 
-    // TODO: When zeroclaw dependency is enabled, start the gateway here:
-    // runtime().block_on(async {
-    //     zeroclaw::gateway::start_gateway(config).await
-    // });
+    // Build a ZeroClaw config for in-process gateway mode.
+    let mut config = zeroclaw::config::Config::default();
 
-    let mut s = state().lock().unwrap();
-    s.gateway_url = gateway_url;
-    s.running = true;
+    // Set workspace to the iOS app sandbox data directory.
+    config.workspace_dir = std::path::PathBuf::from(&data_dir_str);
+
+    // Configure the provider with the given API key.
+    config.default_provider = Some(provider_str.clone());
+
+    // Set the API key via environment (providers read from env).
+    if let Some(ref key) = api_key_str {
+        let env_var = match provider_str.as_str() {
+            "openai" => "OPENAI_API_KEY",
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "gemini" | "google" => "GEMINI_API_KEY",
+            _ => "OPENAI_API_KEY",
+        };
+        std::env::set_var(env_var, key);
+    }
+
+    // Create shutdown signal.
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+    // Store state.
+    {
+        let mut s = state().lock().unwrap();
+        if s.running {
+            // Already running — return success.
+            return 0;
+        }
+        s.gateway_url = gateway_url;
+        s.running = true;
+        s.shutdown_tx = Some(shutdown_tx);
+    }
+
+    // Spawn the gateway on the Tokio runtime (non-blocking).
+    let host = "127.0.0.1".to_string();
+    runtime().spawn(async move {
+        tokio::select! {
+            result = zeroclaw::gateway::run_gateway(&host, gateway_port, config) => {
+                if let Err(e) = result {
+                    tracing::error!("Gateway exited with error: {e}");
+                }
+            }
+            _ = async {
+                while shutdown_rx.changed().await.is_ok() {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            } => {
+                tracing::info!("Gateway shutdown signal received");
+            }
+        }
+
+        // Mark as stopped.
+        if let Ok(mut s) = state().lock() {
+            s.running = false;
+            s.shutdown_tx = None;
+        }
+    });
 
     0
 }
@@ -207,7 +265,10 @@ pub extern "C" fn zeroclaw_get_status() -> i32 {
 pub extern "C" fn zeroclaw_stop() {
     let mut s = state().lock().unwrap();
     s.running = false;
-    // TODO: When zeroclaw dependency is enabled, signal shutdown here
+    // Send shutdown signal to the gateway task.
+    if let Some(tx) = s.shutdown_tx.take() {
+        let _ = tx.send(true);
+    }
 }
 
 /// Free a string returned by zeroclaw_send_message.
