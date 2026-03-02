@@ -68,7 +68,11 @@ impl GeminiReviewer {
         format!(
             r#"You are a senior software architect performing a code review.
 
-## Architecture Context
+## MANDATORY: Read Architecture Context FIRST
+You MUST read the architecture context below BEFORE reviewing any code.
+Every review judgment MUST reference the architecture to justify your assessment.
+
+## Architecture Context (READ THIS FIRST)
 {arch}
 
 ## PR Information
@@ -85,7 +89,8 @@ Description: {desc}
 {prior}
 
 ## Instructions
-Review this PR against the architecture context. Respond in EXACTLY this JSON format:
+Review this PR against the architecture context above. For each issue found,
+reference the relevant architecture section. Respond in EXACTLY this JSON format:
 
 ```json
 {{
@@ -186,6 +191,7 @@ impl CodeReviewer for GeminiReviewer {
         let url = format!("{}?key={}", self.endpoint, self.api_key);
         let resp = self.client
             .post(&url)
+            .header("x-goog-api-key", &self.api_key)
             .json(&payload)
             .timeout(std::time::Duration::from_secs(120))
             .send()
