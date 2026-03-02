@@ -628,7 +628,10 @@ fn is_gateway_running(state: tauri::State<'_, AppState>) -> bool {
 /// Write a minimal ZeroClaw config.toml with provider and API key.
 ///
 /// Called by the setup wizard to directly configure ZeroClaw before
-/// the gateway starts. Creates ~/.zeroclaw/ directory and config.toml.
+/// the gateway starts. Creates ~/.zeroclaw/ directory and config.toml
+/// with restrictive file permissions (0700 directory, 0600 file) to
+/// protect API keys until the ZeroClaw gateway auto-encrypts them
+/// via `SecretStore` on first config save.
 #[tauri::command]
 fn write_zeroclaw_config(
     provider: String,
@@ -639,6 +642,15 @@ fn write_zeroclaw_config(
     let zeroclaw_dir = home.join(".zeroclaw");
     std::fs::create_dir_all(&zeroclaw_dir)
         .map_err(|e| format!("Failed to create ~/.zeroclaw: {e}"))?;
+
+    // Set directory permissions to 0700 (owner-only access)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir_perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(&zeroclaw_dir, dir_perms)
+            .map_err(|e| format!("Failed to set directory permissions: {e}"))?;
+    }
 
     let config_path = zeroclaw_dir.join("config.toml");
 
@@ -658,7 +670,9 @@ fn write_zeroclaw_config(
         toml::Value::String(provider.clone()),
     );
 
-    // Set API key if provided
+    // Set API key if provided — stored as plaintext initially.
+    // The ZeroClaw gateway encrypts plaintext keys to `enc2:` format
+    // (ChaCha20-Poly1305) on first config save via SecretStore.
     if let Some(ref key) = api_key {
         if !key.is_empty() {
             table.insert("api_key".to_string(), toml::Value::String(key.clone()));
@@ -675,11 +689,29 @@ fn write_zeroclaw_config(
         }
     }
 
-    // Write back
+    // Enable secrets encryption so the gateway auto-encrypts on first save
+    let secrets_table = table
+        .entry("secrets".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let toml::Value::Table(ref mut st) = secrets_table {
+        st.entry("encrypt".to_string())
+            .or_insert(toml::Value::Boolean(true));
+    }
+
+    // Write config file
     let config_content = toml::to_string_pretty(&table)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
     std::fs::write(&config_path, &config_content)
         .map_err(|e| format!("Failed to write config.toml: {e}"))?;
+
+    // Set file permissions to 0600 (owner read/write only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file_perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&config_path, file_perms)
+            .map_err(|e| format!("Failed to set file permissions: {e}"))?;
+    }
 
     Ok(config_path.to_string_lossy().to_string())
 }

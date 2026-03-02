@@ -24,4 +24,4 @@ pub use protocol::{
     lww_resolve, merge_deltas_lww, BroadcastMessage, FullSyncManifest, FullSyncPlan, OrderBuffer,
 };
 #[allow(unused_imports)]
-pub use relay::SyncRelay;
+pub use relay::{RelayClient, SyncRelay};
