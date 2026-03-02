@@ -1,0 +1,5 @@
+# ZeroClaw sidecar binaries (built by scripts/build-tauri.sh)
+# Only .gitkeep is tracked; actual binaries are built locally.
+zeroclaw-*
+!.gitkeep
+!.gitignore

@@ -748,6 +748,197 @@ async fn save_coding_memory_from_history(
     }
 }
 
+/// Multi-model coding review pipeline.
+///
+/// When `CodingConfig.review_enabled` is true and the response contains
+/// code-related content, this function sends the response through a
+/// secondary review model (Gemini for architecture review, optionally
+/// followed by a Claude validation pass).
+///
+/// Returns the original response augmented with review feedback,
+/// or the original response unchanged if review is disabled/fails.
+async fn run_coding_review(
+    response: &str,
+    coding_config: &crate::config::CodingConfig,
+    history: &[ChatMessage],
+) -> Option<String> {
+    if !coding_config.review_enabled {
+        return None;
+    }
+
+    // Only review responses that look like they contain code
+    let has_code_markers = response.contains("```")
+        || response.contains("fn ")
+        || response.contains("def ")
+        || response.contains("class ")
+        || response.contains("function ")
+        || response.contains("impl ");
+
+    if !has_code_markers {
+        return None;
+    }
+
+    // Truncate the content for review to prevent token overflow
+    let review_content = if response.len() > coding_config.max_diff_chars {
+        format!(
+            "{}...\n[Content truncated at {} chars for review]",
+            &response[..coding_config.max_diff_chars],
+            coding_config.max_diff_chars
+        )
+    } else {
+        response.to_string()
+    };
+
+    // Build context from recent history (last few messages for context)
+    let context_msgs: Vec<&str> = history
+        .iter()
+        .rev()
+        .take(4)
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .collect();
+    let context_summary = if context_msgs.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nUser's recent requests:\n{}", context_msgs.join("\n---\n"))
+    };
+
+    // ── Gemini Review (primary) ──────────────────────────────────
+    let gemini_key = coding_config
+        .gemini_api_key
+        .clone()
+        .or_else(|| std::env::var("GEMINI_API_KEY").ok());
+
+    let gemini_review = if let Some(api_key) = gemini_key {
+        let review_prompt = format!(
+            "You are a senior code reviewer. Review the following code response for:\n\
+             1. Correctness and potential bugs\n\
+             2. Security vulnerabilities\n\
+             3. Performance concerns\n\
+             4. Best practices adherence\n\n\
+             Be concise. Only flag real issues, not style preferences.\n\
+             If the code looks good, say \"LGTM\" with a brief reason.\n\
+             {context_summary}\n\n\
+             Code to review:\n{review_content}"
+        );
+
+        match providers::create_provider("google", Some(&api_key)) {
+            Ok(reviewer) => {
+                let review_messages = vec![ChatMessage::user(&review_prompt)];
+                match reviewer
+                    .chat(
+                        ChatRequest {
+                            messages: &review_messages,
+                            tools: &[],
+                        },
+                        &coding_config.gemini_model,
+                        0.3,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        tracing::info!(
+                            model = %coding_config.gemini_model,
+                            "Coding review: Gemini review complete"
+                        );
+                        Some(result.text)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Coding review: Gemini review failed: {e}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Coding review: Failed to create Gemini provider: {e}");
+                None
+            }
+        }
+    } else {
+        tracing::debug!("Coding review: No Gemini API key, skipping primary review");
+        None
+    };
+
+    // ── Claude Review (secondary, optional) ──────────────────────
+    let claude_review = if coding_config.enable_secondary_review {
+        let claude_key = coding_config
+            .claude_api_key
+            .clone()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
+
+        if let (Some(api_key), Some(gemini_feedback)) = (claude_key, &gemini_review) {
+            let validation_prompt = format!(
+                "A code reviewer provided the following feedback. \
+                 Validate their review — confirm valid points, dismiss false positives, \
+                 and add any critical issues they missed. Be very concise.\n\n\
+                 Review feedback:\n{gemini_feedback}\n\n\
+                 Original code:\n{review_content}"
+            );
+
+            match providers::create_provider("anthropic", Some(&api_key)) {
+                Ok(validator) => {
+                    let validation_messages = vec![ChatMessage::user(&validation_prompt)];
+                    match validator
+                        .chat(
+                            ChatRequest {
+                                messages: &validation_messages,
+                                tools: &[],
+                            },
+                            &coding_config.claude_model,
+                            0.3,
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            tracing::info!(
+                                model = %coding_config.claude_model,
+                                "Coding review: Claude validation complete"
+                            );
+                            Some(result.text)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Coding review: Claude validation failed: {e}");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Coding review: Failed to create Claude provider: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // ── Compose final response with review feedback ──────────────
+    if gemini_review.is_none() && claude_review.is_none() {
+        return None;
+    }
+
+    let mut augmented = response.to_string();
+    augmented.push_str("\n\n---\n**Code Review**\n");
+
+    if let Some(gemini) = &gemini_review {
+        augmented.push_str(&format!(
+            "\n_Reviewer ({})_:\n{}\n",
+            coding_config.gemini_model, gemini
+        ));
+    }
+
+    if let Some(claude) = &claude_review {
+        augmented.push_str(&format!(
+            "\n_Validator ({})_:\n{}\n",
+            coding_config.claude_model, claude
+        ));
+    }
+
+    Some(augmented)
+}
+
 /// Build assistant history entry in JSON format for native tool-call APIs.
 /// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
 /// the proper `NativeMessage` with structured `tool_calls`.
@@ -2629,7 +2820,13 @@ pub async fn run(
         if config.memory.auto_save {
             save_coding_memory_from_history(&history[history_len_before..], &mem).await;
         }
-        println!("{response}");
+        // ── Multi-model coding review ────────────────────────────
+        if let Some(reviewed) = run_coding_review(&response, &config.coding, &history).await {
+            final_output = reviewed.clone();
+            println!("{reviewed}");
+        } else {
+            println!("{response}");
+        }
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
@@ -2840,9 +3037,21 @@ pub async fn run(
             if config.memory.auto_save {
                 save_coding_memory_from_history(&history[history_len_before..], &mem).await;
             }
+            // ── Multi-model coding review ────────────────────────────
+            let display_response = if let Some(reviewed) =
+                run_coding_review(&response, &config.coding, &history).await
+            {
+                final_output = reviewed.clone();
+                reviewed
+            } else {
+                response.clone()
+            };
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
-                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
+                &crate::channels::traits::SendMessage::new(
+                    format!("\n{display_response}\n"),
+                    "user",
+                ),
             )
             .await
             {

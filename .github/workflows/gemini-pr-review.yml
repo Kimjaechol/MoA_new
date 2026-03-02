@@ -16,6 +16,7 @@ permissions:
 env:
     GEMINI_MODEL: "gemini-2.5-flash"
     MAX_DIFF_CHARS: "120000"
+    MAX_REVIEW_ROUNDS: "3"
 
 jobs:
     gemini-review:
@@ -29,6 +30,43 @@ jobs:
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
+
+            - name: Detect review round
+              id: round
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const marker = '<!-- gemini-architecture-review -->';
+                      const roundPattern = /<!-- review-round: (\d+) -->/;
+
+                      const { data: comments } = await github.rest.issues.listComments({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: context.issue.number,
+                      });
+
+                      // Count all review comments (each synchronize creates a new one)
+                      const reviewComments = comments.filter(c => c.body.includes(marker));
+                      let currentRound = 1;
+
+                      if (reviewComments.length > 0) {
+                        const lastComment = reviewComments[reviewComments.length - 1];
+                        const match = lastComment.body.match(roundPattern);
+                        if (match) {
+                          currentRound = parseInt(match[1], 10) + 1;
+                        } else {
+                          currentRound = reviewComments.length + 1;
+                        }
+                      }
+
+                      const maxRounds = parseInt(process.env.MAX_REVIEW_ROUNDS, 10);
+                      const isFinalRound = currentRound >= maxRounds;
+
+                      core.setOutput('current_round', currentRound.toString());
+                      core.setOutput('is_final_round', isFinalRound.toString());
+                      core.setOutput('max_rounds', maxRounds.toString());
+
+                      console.log(`Review round: ${currentRound}/${maxRounds} (final: ${isFinalRound})`);
 
             - name: Get PR diff and context
               id: context
@@ -51,18 +89,42 @@ jobs:
                       CONTEXT="${CONTEXT}\n\n--- ${doc} ---\n$(head -c 30000 "$doc")"
                     fi
                   done
-                  # Escape for JSON
                   echo "$CONTEXT" > /tmp/arch_context.txt
 
                   echo "pr_title=${{ github.event.pull_request.title }}" >> "$GITHUB_OUTPUT"
-                  echo "pr_body<<GHEOF" >> "$GITHUB_OUTPUT"
-                  echo "${{ github.event.pull_request.body }}" >> "$GITHUB_OUTPUT"
-                  echo "GHEOF" >> "$GITHUB_OUTPUT"
+
+            - name: Get previous review issues (for follow-up rounds)
+              if: steps.round.outputs.current_round != '1'
+              id: prev_review
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const marker = '<!-- gemini-architecture-review -->';
+
+                      const { data: comments } = await github.rest.issues.listComments({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: context.issue.number,
+                      });
+
+                      const reviewComments = comments.filter(c => c.body.includes(marker));
+                      if (reviewComments.length > 0) {
+                        const lastReview = reviewComments[reviewComments.length - 1].body;
+                        const fs = require('fs');
+                        fs.writeFileSync('/tmp/previous_review.txt', lastReview);
+                        core.setOutput('has_previous', 'true');
+                      } else {
+                        core.setOutput('has_previous', 'false');
+                      }
 
             - name: Call Gemini API for review
               id: review
               env:
                   GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+                  CURRENT_ROUND: ${{ steps.round.outputs.current_round }}
+                  IS_FINAL_ROUND: ${{ steps.round.outputs.is_final_round }}
+                  MAX_ROUNDS: ${{ steps.round.outputs.max_rounds }}
+                  HAS_PREVIOUS: ${{ steps.prev_review.outputs.has_previous }}
               shell: bash
               run: |
                   DIFF=$(cat /tmp/pr_diff.txt)
@@ -70,7 +132,21 @@ jobs:
                   ARCH_CONTEXT=$(cat /tmp/arch_context.txt)
                   PR_TITLE="${{ github.event.pull_request.title }}"
 
-                  # Build the review prompt
+                  # Load previous review if available
+                  PREV_REVIEW=""
+                  if [ "$HAS_PREVIOUS" = "true" ] && [ -f /tmp/previous_review.txt ]; then
+                    PREV_REVIEW=$(cat /tmp/previous_review.txt)
+                  fi
+
+                  # Build the review prompt with round awareness
+                  if [ "$CURRENT_ROUND" = "1" ]; then
+                    ROUND_INSTRUCTION="This is the FIRST review (Round 1/${MAX_ROUNDS})."
+                  elif [ "$IS_FINAL_ROUND" = "true" ]; then
+                    ROUND_INSTRUCTION="This is the FINAL review round (Round ${CURRENT_ROUND}/${MAX_ROUNDS}). Focus on remaining critical issues only. If all previous CRITICAL/HIGH issues are resolved, approve the PR."
+                  else
+                    ROUND_INSTRUCTION="This is review Round ${CURRENT_ROUND}/${MAX_ROUNDS}. Compare the current diff against the previous review below and check whether previously reported issues have been fixed."
+                  fi
+
                   PROMPT=$(cat <<'PROMPT_EOF'
                   You are a senior software architect reviewing a pull request for the ZeroClaw/MoA project.
 
@@ -84,12 +160,14 @@ jobs:
                   ## Review Instructions
                   - Read the architecture context documents carefully first
                   - Then review the PR diff against those architectural principles
-                  - Focus on SUBSTANTIVE issues, not style nitpicks
+                  - Focus on SUBSTANTIVE issues: logic errors, security vulnerabilities, architecture violations, missing error handling
+                  - Do NOT flag: style nitpicks, formatting preferences, comment style, naming opinions
                   - Rate each issue as [CRITICAL], [HIGH], [MEDIUM], or [LOW]
                   - Be specific: reference file paths and line numbers when possible
-                  - If the PR looks good, say so clearly
+                  - If the PR looks good, say so clearly and give APPROVE verdict
+                  - For follow-up rounds: explicitly note which previous issues are RESOLVED vs REMAINING
 
-                  ## Output Format
+                  ## Output Format (follow exactly)
                   ### Summary
                   (1-3 sentences: what this PR does)
 
@@ -97,29 +175,61 @@ jobs:
                   (Does this PR follow the project's architecture? Any violations?)
 
                   ### Issues Found
-                  (List issues with severity tags, or "No issues found")
+                  (List issues with severity tags, or state "No issues found")
+                  Format each issue as:
+                  - **[SEVERITY]** `file/path.rs:line` — Description of the issue
+
+                  ### Issue Count
+                  CRITICAL: <number> | HIGH: <number> | MEDIUM: <number> | LOW: <number>
+
+                  ### Resolved from Previous Round
+                  (Only for rounds 2+: list issues from previous review that are now fixed, or "N/A — first round")
 
                   ### Suggestions
-                  (Optional improvements, not blockers)
+                  (Optional improvements that are NOT blockers)
 
                   ### Verdict
                   One of: APPROVE / REQUEST_CHANGES / COMMENT
                   PROMPT_EOF
                   )
 
+                  # Build full prompt with round context
+                  FULL_PROMPT="${PROMPT}
+
+                  ## Round Information
+                  ${ROUND_INSTRUCTION}
+
+                  ## Architecture Context
+                  ${ARCH_CONTEXT}
+
+                  ## Changed Files
+                  ${CHANGED}
+
+                  ## PR Title
+                  ${PR_TITLE}"
+
+                  # Add previous review for follow-up rounds
+                  if [ -n "$PREV_REVIEW" ]; then
+                    FULL_PROMPT="${FULL_PROMPT}
+
+                  ## Previous Review (check if issues are resolved)
+                  ${PREV_REVIEW}"
+                  fi
+
+                  FULL_PROMPT="${FULL_PROMPT}
+
+                  ## Diff
+                  \`\`\`diff
+                  ${DIFF}
+                  \`\`\`"
+
                   # Build JSON payload using jq for proper escaping
                   PAYLOAD=$(jq -n \
-                    --arg model "$GEMINI_MODEL" \
-                    --arg prompt "$PROMPT" \
-                    --arg title "$PR_TITLE" \
-                    --arg diff "$DIFF" \
-                    --arg changed "$CHANGED" \
-                    --arg arch "$ARCH_CONTEXT" \
+                    --arg prompt "$FULL_PROMPT" \
                     '{
-                      model: $model,
                       contents: [{
                         parts: [{
-                          text: ($prompt + "\n\n## Architecture Context\n" + $arch + "\n\n## Changed Files\n" + $changed + "\n\n## PR Title\n" + $title + "\n\n## Diff\n```diff\n" + $diff + "\n```")
+                          text: $prompt
                         }]
                       }],
                       generationConfig: {
@@ -155,35 +265,63 @@ jobs:
 
             - name: Post review comment on PR
               uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              env:
+                  CURRENT_ROUND: ${{ steps.round.outputs.current_round }}
+                  IS_FINAL_ROUND: ${{ steps.round.outputs.is_final_round }}
+                  MAX_ROUNDS: ${{ steps.round.outputs.max_rounds }}
               with:
                   script: |
                       const fs = require('fs');
                       const review = fs.readFileSync('/tmp/review_result.txt', 'utf8');
+                      const round = process.env.CURRENT_ROUND;
+                      const maxRounds = process.env.MAX_ROUNDS;
+                      const isFinal = process.env.IS_FINAL_ROUND === 'true';
 
-                      // Find and update existing bot comment, or create new one
                       const marker = '<!-- gemini-architecture-review -->';
-                      const body = `${marker}\n## Gemini Architecture Review\n\n${review}\n\n---\n*Automated review by Gemini ${process.env.GEMINI_MODEL}*`;
+                      const roundMarker = `<!-- review-round: ${round} -->`;
 
-                      const { data: comments } = await github.rest.issues.listComments({
+                      // Build status badge
+                      let statusBadge;
+                      if (isFinal) {
+                        statusBadge = `> **Review Round ${round}/${maxRounds} — FINAL ROUND**`;
+                      } else {
+                        statusBadge = `> **Review Round ${round}/${maxRounds}**`;
+                      }
+
+                      // Parse issue counts from the review text
+                      const criticalMatch = review.match(/CRITICAL:\s*(\d+)/i);
+                      const highMatch = review.match(/HIGH:\s*(\d+)/i);
+                      const criticalCount = criticalMatch ? parseInt(criticalMatch[1], 10) : 0;
+                      const highCount = highMatch ? parseInt(highMatch[1], 10) : 0;
+                      const hasBlockers = criticalCount > 0 || highCount > 0;
+
+                      let loopNote = '';
+                      if (isFinal) {
+                        loopNote = '\n\n> This is the **final automated review round**. The contributor should perform manual verification for any remaining items.';
+                      } else if (hasBlockers) {
+                        loopNote = `\n\n> **${criticalCount} critical + ${highCount} high** issues detected. Fix and push again for re-review (round ${parseInt(round, 10) + 1}/${maxRounds}).`;
+                      } else {
+                        loopNote = '\n\n> No blocking issues found. Ready for merge after human approval.';
+                      }
+
+                      const body = [
+                        marker,
+                        roundMarker,
+                        `## Gemini Architecture Review`,
+                        '',
+                        statusBadge,
+                        loopNote,
+                        '',
+                        review,
+                        '',
+                        '---',
+                        `*Automated review by Gemini ${process.env.GEMINI_MODEL} · Round ${round}/${maxRounds}*`,
+                      ].join('\n');
+
+                      // Always create a new comment per round (history preserved)
+                      await github.rest.issues.createComment({
                         owner: context.repo.owner,
                         repo: context.repo.repo,
                         issue_number: context.issue.number,
+                        body,
                       });
-
-                      const existing = comments.find(c => c.body.includes(marker));
-
-                      if (existing) {
-                        await github.rest.issues.updateComment({
-                          owner: context.repo.owner,
-                          repo: context.repo.repo,
-                          comment_id: existing.id,
-                          body,
-                        });
-                      } else {
-                        await github.rest.issues.createComment({
-                          owner: context.repo.owner,
-                          repo: context.repo.repo,
-                          issue_number: context.issue.number,
-                          body,
-                        });
-                      }

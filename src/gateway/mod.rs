@@ -351,6 +351,9 @@ pub struct AppState {
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// Voice session manager for simultaneous interpretation
     pub voice_sessions: Arc<VoiceSessionManager>,
+    /// Sync coordinator for cross-device memory synchronization (Layer 2 + 3).
+    /// Present only when config.sync.enabled == true.
+    pub sync_coordinator: Option<Arc<crate::sync::SyncCoordinator>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -402,12 +405,43 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    // Create memory backend, optionally with cross-device sync support.
+    let (mem, sync_coordinator): (Arc<dyn Memory>, Option<Arc<crate::sync::SyncCoordinator>>) =
+        if config.sync.enabled {
+            // Build base memory, then wrap with SyncedMemory for the coordinator
+            let base = memory::create_memory_with_storage(
+                &config.memory,
+                Some(&config.storage.provider.config),
+                &config.workspace_dir,
+                config.api_key.as_deref(),
+            )?;
+            let engine = crate::memory::sync::SyncEngine::new(
+                &config.workspace_dir,
+                true,
+            )?;
+            let engine = Arc::new(parking_lot::Mutex::new(engine));
+            let synced = Arc::new(crate::memory::synced::SyncedMemory::new(
+                Arc::from(base),
+                engine,
+            ));
+            let coordinator = Arc::new(crate::sync::SyncCoordinator::new(
+                synced.clone(),
+                config.sync.batch_size,
+            ));
+            tracing::info!(
+                device_id = %synced.device_id(),
+                "Gateway memory initialized with sync enabled"
+            );
+            (synced as Arc<dyn Memory>, Some(coordinator))
+        } else {
+            let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+                &config.memory,
+                Some(&config.storage.provider.config),
+                &config.workspace_dir,
+                config.api_key.as_deref(),
+            )?);
+            (mem, None)
+        };
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -763,6 +797,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         cost_tracker,
         event_tx,
         voice_sessions,
+        sync_coordinator,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -839,6 +874,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket voice interpretation ──
         .route("/ws/voice", get(ws::handle_ws_voice))
+        // ── Sync endpoints (cross-device memory sync) ──
+        .route("/api/sync/push", post(api::handle_sync_push))
+        .route("/api/sync/pull", post(api::handle_sync_pull))
+        .route("/api/sync/status", get(api::handle_sync_status))
+        .route("/ws/sync", get(ws::handle_ws_sync))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──

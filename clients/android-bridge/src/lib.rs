@@ -4,10 +4,13 @@
 //!
 //! This crate provides UniFFI bindings for ZeroClaw to be used from Kotlin/Android.
 //! It exposes a simplified API for:
-//! - Starting/stopping the gateway
-//! - Sending messages to the agent
+//! - Starting/stopping the local gateway process
+//! - Sending messages to the agent via HTTP
 //! - Receiving responses
 //! - Managing configuration
+//!
+//! Architecture: MoA Android launches the ZeroClaw binary as a child process.
+//! This bridge communicates with the local gateway via HTTP (127.0.0.1:3000).
 
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
@@ -26,6 +29,9 @@ fn runtime() -> &'static Runtime {
             .expect("Failed to create Tokio runtime")
     })
 }
+
+/// Default gateway URL for the local ZeroClaw instance.
+const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:3000";
 
 /// Agent status enum exposed to Kotlin
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -82,8 +88,9 @@ pub struct ZeroClawController {
     config: Mutex<ZeroClawConfig>,
     status: Mutex<AgentStatus>,
     messages: Mutex<Vec<ChatMessage>>,
-    // TODO: Add actual gateway handle
-    // gateway: Mutex<Option<GatewayHandle>>,
+    gateway_url: Mutex<String>,
+    /// Handle to the gateway child process (if launched by us).
+    gateway_process: Mutex<Option<u32>>, // PID
 }
 
 #[uniffi::export]
@@ -91,7 +98,6 @@ impl ZeroClawController {
     /// Create a new controller with the given config
     #[uniffi::constructor]
     pub fn new(config: ZeroClawConfig) -> Arc<Self> {
-        // Initialize logging
         let _ = tracing_subscriber::fmt()
             .with_env_filter("zeroclaw=info")
             .try_init();
@@ -100,6 +106,8 @@ impl ZeroClawController {
             config: Mutex::new(config),
             status: Mutex::new(AgentStatus::Stopped),
             messages: Mutex::new(Vec::new()),
+            gateway_url: Mutex::new(DEFAULT_GATEWAY_URL.to_string()),
+            gateway_process: Mutex::new(None),
         })
     }
 
@@ -111,7 +119,10 @@ impl ZeroClawController {
         Self::new(config)
     }
 
-    /// Start the ZeroClaw gateway
+    /// Start the ZeroClaw gateway.
+    ///
+    /// Tries to launch the zeroclaw binary from the app's native libs directory.
+    /// If a gateway is already running (health check passes), reuses it.
     pub fn start(&self) -> Result<(), ZeroClawError> {
         let mut status = self.status.lock().map_err(|_| ZeroClawError::LockError)?;
 
@@ -122,30 +133,99 @@ impl ZeroClawController {
         *status = AgentStatus::Starting;
         drop(status);
 
-        // TODO: Actually start the gateway
-        // runtime().spawn(async move {
-        //     let config = zeroclaw::Config::load()?;
-        //     let gateway = zeroclaw::Gateway::new(config).await?;
-        //     gateway.run().await
-        // });
+        let gateway_url = self
+            .gateway_url
+            .lock()
+            .map_err(|_| ZeroClawError::LockError)?
+            .clone();
+        let data_dir = self
+            .config
+            .lock()
+            .map_err(|_| ZeroClawError::LockError)?
+            .data_dir
+            .clone();
 
-        // For now, simulate successful start
+        // Check if gateway is already running
+        let is_running = runtime().block_on(async {
+            check_gateway_health(&gateway_url).await
+        });
+
+        if is_running {
+            let mut status = self.status.lock().map_err(|_| ZeroClawError::LockError)?;
+            *status = AgentStatus::Running;
+            tracing::info!("ZeroClaw gateway already running at {gateway_url}");
+            return Ok(());
+        }
+
+        // Try to launch zeroclaw binary
+        let zeroclaw_bin = find_zeroclaw_binary(&data_dir);
+        if let Some(bin_path) = zeroclaw_bin {
+            match std::process::Command::new(&bin_path)
+                .arg("daemon")
+                .arg("--host")
+                .arg("127.0.0.1")
+                .arg("--port")
+                .arg("3000")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    let pid = child.id();
+                    if let Ok(mut proc) = self.gateway_process.lock() {
+                        *proc = Some(pid);
+                    }
+                    tracing::info!(pid, bin = %bin_path, "Launched ZeroClaw gateway");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to launch ZeroClaw binary: {e}");
+                }
+            }
+        }
+
+        // Wait for gateway to become ready (up to 10 seconds)
+        let ready = runtime().block_on(async {
+            for _ in 0..20 {
+                if check_gateway_health(&gateway_url).await {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            false
+        });
+
         let mut status = self.status.lock().map_err(|_| ZeroClawError::LockError)?;
-        *status = AgentStatus::Running;
+        if ready {
+            *status = AgentStatus::Running;
+            tracing::info!("ZeroClaw gateway is ready");
+        } else {
+            *status = AgentStatus::Error {
+                message: "Gateway failed to start within 10s".to_string(),
+            };
+            return Err(ZeroClawError::GatewayError {
+                message: "Gateway not ready after 10s".to_string(),
+            });
+        }
 
-        tracing::info!("ZeroClaw gateway started");
         Ok(())
     }
 
     /// Stop the gateway
     pub fn stop(&self) -> Result<(), ZeroClawError> {
+        // Kill the child process if we launched it
+        if let Ok(mut proc) = self.gateway_process.lock() {
+            if let Some(pid) = proc.take() {
+                #[cfg(unix)]
+                {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                }
+                tracing::info!(pid, "Sent SIGTERM to ZeroClaw gateway");
+            }
+        }
+
         let mut status = self.status.lock().map_err(|_| ZeroClawError::LockError)?;
-
-        // TODO: Actually stop the gateway
-        // if let Some(gateway) = self.gateway.lock()?.take() {
-        //     gateway.shutdown();
-        // }
-
         *status = AgentStatus::Stopped;
         tracing::info!("ZeroClaw gateway stopped");
         Ok(())
@@ -161,11 +241,11 @@ impl ZeroClawController {
             })
     }
 
-    /// Send a message to the agent
+    /// Send a message to the agent via the local gateway HTTP API.
     pub fn send_message(&self, content: String) -> SendResult {
         let msg_id = uuid_v4();
 
-        // Add user message
+        // Add user message to local history
         if let Ok(mut messages) = self.messages.lock() {
             messages.push(ChatMessage {
                 id: msg_id.clone(),
@@ -175,21 +255,50 @@ impl ZeroClawController {
             });
         }
 
-        // TODO: Actually send to gateway and get response
-        // For now, echo back
-        if let Ok(mut messages) = self.messages.lock() {
-            messages.push(ChatMessage {
-                id: uuid_v4(),
-                content: format!("Echo: {}", content),
-                role: "assistant".to_string(),
-                timestamp_ms: current_timestamp_ms(),
-            });
+        // Set status to thinking
+        if let Ok(mut status) = self.status.lock() {
+            *status = AgentStatus::Thinking;
         }
 
-        SendResult {
-            success: true,
-            message_id: Some(msg_id),
-            error: None,
+        let gateway_url = self
+            .gateway_url
+            .lock()
+            .map(|u| u.clone())
+            .unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_string());
+
+        // Send to local gateway via HTTP
+        let result = runtime().block_on(async {
+            send_to_gateway(&gateway_url, &content).await
+        });
+
+        // Restore status
+        if let Ok(mut status) = self.status.lock() {
+            *status = AgentStatus::Running;
+        }
+
+        match result {
+            Ok(response) => {
+                // Add assistant response to local history
+                if let Ok(mut messages) = self.messages.lock() {
+                    messages.push(ChatMessage {
+                        id: uuid_v4(),
+                        content: response,
+                        role: "assistant".to_string(),
+                        timestamp_ms: current_timestamp_ms(),
+                    });
+                }
+
+                SendResult {
+                    success: true,
+                    message_id: Some(msg_id),
+                    error: None,
+                }
+            }
+            Err(e) => SendResult {
+                success: false,
+                message_id: Some(msg_id),
+                error: Some(e),
+            },
         }
     }
 
@@ -230,6 +339,16 @@ impl ZeroClawController {
             .map(|c| !c.api_key.is_empty())
             .unwrap_or(false)
     }
+
+    /// Check if the gateway is reachable
+    pub fn is_gateway_running(&self) -> bool {
+        let url = self
+            .gateway_url
+            .lock()
+            .map(|u| u.clone())
+            .unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_string());
+        runtime().block_on(async { check_gateway_health(&url).await })
+    }
 }
 
 /// Errors that can occur in the bridge
@@ -256,7 +375,91 @@ impl std::fmt::Display for ZeroClawError {
 
 impl std::error::Error for ZeroClawError {}
 
-// Helper functions
+// ── HTTP communication with local gateway ────────────────────────
+
+/// Check if the gateway is responding to health checks.
+async fn check_gateway_health(gateway_url: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    client
+        .get(format!("{gateway_url}/health"))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// Send a chat message to the local gateway and return the response text.
+async fn send_to_gateway(gateway_url: &str, message: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let body = serde_json::json!({ "message": message });
+
+    let res = client
+        .post(format!("{gateway_url}/webhook"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Gateway error ({status}): {text}"));
+    }
+
+    let json: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("Response parse error: {e}"))?;
+
+    Ok(json
+        .get("response")
+        .and_then(|v| v.as_str())
+        .unwrap_or("No response")
+        .to_string())
+}
+
+/// Find the zeroclaw binary in common Android locations.
+fn find_zeroclaw_binary(data_dir: &str) -> Option<String> {
+    let candidates = [
+        format!("{data_dir}/zeroclaw"),
+        format!("{data_dir}/bin/zeroclaw"),
+        format!("{data_dir}/../lib/libzeroclaw.so"), // Packed as native lib
+        "/data/local/tmp/zeroclaw".to_string(),
+    ];
+
+    for path in &candidates {
+        if std::path::Path::new(path).exists() {
+            return Some(path.clone());
+        }
+    }
+
+    // Also check PATH
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("zeroclaw")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+// ── Helpers ────────────────────────────────────────────────────────
+
 fn uuid_v4() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -285,21 +488,28 @@ mod tests {
     }
 
     #[test]
-    fn test_start_stop() {
+    fn test_send_message_without_gateway() {
         let controller = ZeroClawController::with_defaults("/tmp/zeroclaw".to_string());
-        controller.start().unwrap();
-        assert!(matches!(controller.get_status(), AgentStatus::Running));
-        controller.stop().unwrap();
-        assert!(matches!(controller.get_status(), AgentStatus::Stopped));
+        let result = controller.send_message("Hello".to_string());
+        // Without a gateway running, this will fail
+        // But the user message should still be in history
+        let messages = controller.get_messages();
+        assert!(!messages.is_empty());
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "Hello");
     }
 
     #[test]
-    fn test_send_message() {
+    fn test_config_update() {
         let controller = ZeroClawController::with_defaults("/tmp/zeroclaw".to_string());
-        let result = controller.send_message("Hello".to_string());
-        assert!(result.success);
-
-        let messages = controller.get_messages();
-        assert_eq!(messages.len(), 2); // User + assistant
+        let new_config = ZeroClawConfig {
+            data_dir: "/tmp/new".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            api_key: "test-key".to_string(),
+            system_prompt: None,
+        };
+        controller.update_config(new_config).unwrap();
+        assert!(controller.is_configured());
     }
 }
