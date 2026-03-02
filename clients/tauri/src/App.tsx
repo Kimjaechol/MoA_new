@@ -178,7 +178,12 @@ function App() {
       );
 
       try {
-        const response = await apiClient.chat(content);
+        // Build conversation context from recent messages for the agent loop
+        const currentChat = chats.find((c) => c.id === chatId);
+        const recentContext = (currentChat?.messages ?? [])
+          .slice(-10)
+          .map((m) => `${m.role}: ${m.content}`);
+        const response = await apiClient.chat(content, recentContext);
         const assistantMsg = createMessage("assistant", response.response, response.model);
 
         setChats((prev) =>

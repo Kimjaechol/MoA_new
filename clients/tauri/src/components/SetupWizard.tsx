@@ -1,7 +1,7 @@
 import { useState, useCallback } from "react";
 import { type Locale, t } from "../lib/i18n";
 import { apiClient } from "../lib/api";
-import { isTauri, isGatewayRunning } from "../lib/tauri-bridge";
+import { isTauri, isGatewayRunning, writeZeroClawConfig } from "../lib/tauri-bridge";
 
 // ── i18n keys for setup wizard ──────────────────────────────────
 // These are defined inline since they're only used here.
@@ -128,7 +128,12 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
   const handleNext = useCallback(async () => {
     if (step === "provider") {
       if (selectedProvider === "ollama") {
-        // Ollama doesn't need an API key, skip to complete
+        // Ollama doesn't need an API key — write config and skip to complete
+        localStorage.setItem("moa_setup_provider", selectedProvider);
+        if (isTauri()) {
+          await writeZeroClawConfig(selectedProvider).catch(() => {});
+        }
+        localStorage.setItem("moa_setup_complete", "true");
         setStep("complete");
         checkGateway();
         return;
@@ -137,16 +142,27 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
     } else if (step === "apikey") {
       setSaving(true);
       try {
-        // Save provider preference
+        // Save provider preference to localStorage (for frontend reference)
         localStorage.setItem("moa_setup_provider", selectedProvider);
 
-        // Save API key if provided
+        // Write directly to ZeroClaw's config.toml via Tauri bridge.
+        // This ensures the gateway starts with the correct provider/key
+        // even before the gateway is running.
+        if (isTauri()) {
+          await writeZeroClawConfig(
+            selectedProvider,
+            apiKey.trim() || undefined,
+            undefined,
+          );
+        }
+
+        // Save API key to localStorage as backup
         if (apiKey.trim()) {
           const storageKey = `moa_api_key_${selectedProvider}`;
           localStorage.setItem(storageKey, apiKey.trim());
 
-          // Also sync to local ZeroClaw agent
-          await apiClient.saveApiKeyToAgent(selectedProvider, apiKey.trim());
+          // Also try syncing to running gateway (best-effort)
+          await apiClient.saveApiKeyToAgent(selectedProvider, apiKey.trim()).catch(() => {});
         }
 
         localStorage.setItem("moa_setup_complete", "true");
@@ -161,6 +177,10 @@ export function SetupWizard({ locale, onComplete }: SetupWizardProps) {
 
   const handleSkipApiKey = useCallback(async () => {
     localStorage.setItem("moa_setup_provider", selectedProvider);
+    // Write provider to config.toml even without API key
+    if (isTauri()) {
+      await writeZeroClawConfig(selectedProvider).catch(() => {});
+    }
     localStorage.setItem("moa_setup_complete", "true");
     setStep("complete");
     checkGateway();

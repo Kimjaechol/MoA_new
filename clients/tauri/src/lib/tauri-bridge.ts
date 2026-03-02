@@ -165,6 +165,30 @@ export async function authRegister(
   return invoke("auth_register", { username, password });
 }
 
+// ── ZeroClaw Config Commands ─────────────────────────────────────
+
+/** Write provider/API key to ZeroClaw's ~/.zeroclaw/config.toml. */
+export async function writeZeroClawConfig(
+  provider: string,
+  apiKey?: string,
+  model?: string,
+): Promise<string | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("write_zeroclaw_config", {
+    provider,
+    api_key: apiKey ?? null,
+    model: model ?? null,
+  }) as Promise<string>;
+}
+
+/** Check if ZeroClaw config.toml already exists. */
+export async function isZeroClawConfigured(): Promise<boolean | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("is_zeroclaw_configured") as Promise<boolean>;
+}
+
 // ── Mobile lifecycle event listeners ─────────────────────────────
 
 /** Register a handler for Tauri lifecycle events. Returns an unlisten fn. */

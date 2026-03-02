@@ -625,6 +625,73 @@ fn is_gateway_running(state: tauri::State<'_, AppState>) -> bool {
     state.gateway_running.load(Ordering::SeqCst)
 }
 
+/// Write a minimal ZeroClaw config.toml with provider and API key.
+///
+/// Called by the setup wizard to directly configure ZeroClaw before
+/// the gateway starts. Creates ~/.zeroclaw/ directory and config.toml.
+#[tauri::command]
+fn write_zeroclaw_config(
+    provider: String,
+    api_key: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
+    let home = dirs_next::home_dir().ok_or_else(|| "Cannot find home directory".to_string())?;
+    let zeroclaw_dir = home.join(".zeroclaw");
+    std::fs::create_dir_all(&zeroclaw_dir)
+        .map_err(|e| format!("Failed to create ~/.zeroclaw: {e}"))?;
+
+    let config_path = zeroclaw_dir.join("config.toml");
+
+    // Read existing config if present to preserve other settings
+    let existing = if config_path.exists() {
+        std::fs::read_to_string(&config_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Parse as TOML table for surgical updates
+    let mut table: toml::Table = existing.parse().unwrap_or_else(|_| toml::Table::new());
+
+    // Set provider
+    table.insert(
+        "default_provider".to_string(),
+        toml::Value::String(provider.clone()),
+    );
+
+    // Set API key if provided
+    if let Some(ref key) = api_key {
+        if !key.is_empty() {
+            table.insert("api_key".to_string(), toml::Value::String(key.clone()));
+        }
+    }
+
+    // Set model if provided
+    if let Some(ref m) = model {
+        if !m.is_empty() {
+            table.insert(
+                "default_model".to_string(),
+                toml::Value::String(m.clone()),
+            );
+        }
+    }
+
+    // Write back
+    let config_content = toml::to_string_pretty(&table)
+        .map_err(|e| format!("Failed to serialize config: {e}"))?;
+    std::fs::write(&config_path, &config_content)
+        .map_err(|e| format!("Failed to write config.toml: {e}"))?;
+
+    Ok(config_path.to_string_lossy().to_string())
+}
+
+/// Check if ZeroClaw config.toml exists (setup already done).
+#[tauri::command]
+fn is_zeroclaw_configured() -> bool {
+    dirs_next::home_dir()
+        .map(|h| h.join(".zeroclaw").join("config.toml").exists())
+        .unwrap_or(false)
+}
+
 // ── Entry Point ──────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -681,6 +748,8 @@ pub fn run() {
             on_app_pause,
             on_app_resume,
             is_gateway_running,
+            write_zeroclaw_config,
+            is_zeroclaw_configured,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path

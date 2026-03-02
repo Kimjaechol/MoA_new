@@ -343,19 +343,21 @@ export class MoAClient {
   }
 
   // ── Chat ───────────────────────────────────────────────────────
+  // Uses /api/chat which routes through the full ZeroClaw agent loop
+  // (provider LLM + tools: shell, file, memory, browser, etc.)
 
-  async chat(message: string): Promise<ChatResponse> {
+  async chat(message: string, context: string[] = []): Promise<ChatResponse> {
     if (!this.token) {
       throw new Error("Not authenticated. Please login first.");
     }
 
-    const res = await fetch(`${this.serverUrl}/webhook`, {
+    const res = await fetch(`${this.serverUrl}/api/chat`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${this.token}`,
       },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, context }),
     });
 
     if (!res.ok) {
