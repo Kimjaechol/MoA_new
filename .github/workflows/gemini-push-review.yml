@@ -1,0 +1,382 @@
+name: Gemini Push Review
+
+on:
+    push:
+        branches:
+            - "claude/**"
+            - "feat/**"
+            - "fix/**"
+
+concurrency:
+    group: gemini-review-${{ github.ref_name }}
+    cancel-in-progress: true
+
+permissions:
+    contents: write
+    statuses: write
+
+env:
+    GEMINI_MODEL: "gemini-2.5-flash"
+    MAX_DIFF_CHARS: "120000"
+    MAX_REVIEW_ROUNDS: "3"
+
+jobs:
+    gemini-review:
+        name: "Gemini Review"
+        runs-on: ubuntu-22.04
+        timeout-minutes: 10
+        if: ${{ secrets.GEMINI_API_KEY != '' }}
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+
+            - name: Detect review round from previous commit comments
+              id: round
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const branch = context.ref.replace('refs/heads/', '');
+                      const roundPattern = /<!-- gemini-round: (\d+) -->/;
+
+                      // Look at the last 10 commits on this branch for previous reviews
+                      const { data: commits } = await github.rest.repos.listCommits({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        sha: branch,
+                        per_page: 10,
+                      });
+
+                      let maxRound = 0;
+                      // Check commit comments for previous review rounds (skip current commit)
+                      for (const commit of commits.slice(1)) {
+                        try {
+                          const { data: comments } = await github.rest.repos.listCommentsForCommit({
+                            owner: context.repo.owner,
+                            repo: context.repo.repo,
+                            commit_sha: commit.sha,
+                          });
+                          for (const c of comments) {
+                            const match = c.body.match(roundPattern);
+                            if (match) {
+                              maxRound = Math.max(maxRound, parseInt(match[1], 10));
+                            }
+                          }
+                        } catch (e) {
+                          // commit may not exist yet, skip
+                        }
+                      }
+
+                      const currentRound = maxRound + 1;
+                      const maxRounds = parseInt(process.env.MAX_REVIEW_ROUNDS, 10);
+                      const isFinalRound = currentRound >= maxRounds;
+
+                      core.setOutput('current_round', currentRound.toString());
+                      core.setOutput('is_final_round', isFinalRound.toString());
+                      core.setOutput('max_rounds', maxRounds.toString());
+
+                      console.log(`Review round: ${currentRound}/${maxRounds} (final: ${isFinalRound})`);
+
+            - name: Get diff against main and context
+              id: context
+              shell: bash
+              run: |
+                  # Diff between main and current HEAD
+                  git diff origin/main...HEAD | head -c "${MAX_DIFF_CHARS}" > /tmp/pr_diff.txt
+                  DIFF_SIZE=$(wc -c < /tmp/pr_diff.txt)
+                  echo "Diff size: ${DIFF_SIZE} bytes"
+
+                  # Changed files list
+                  git diff origin/main...HEAD --name-only > /tmp/changed_files.txt
+                  echo "Changed files:"
+                  cat /tmp/changed_files.txt
+
+                  # Architecture context
+                  CONTEXT=""
+                  for doc in CLAUDE.md docs/ARCHITECTURE.md docs/CODING_GUIDELINES.md; do
+                    if [ -f "$doc" ]; then
+                      CONTEXT="${CONTEXT}\n\n--- ${doc} ---\n$(head -c 30000 "$doc")"
+                    fi
+                  done
+                  echo "$CONTEXT" > /tmp/arch_context.txt
+
+                  # Commit info
+                  echo "commit_msg=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
+                  echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+                  echo "branch=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+            - name: Load previous review (for follow-up rounds)
+              if: steps.round.outputs.current_round != '1'
+              id: prev_review
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const branch = context.ref.replace('refs/heads/', '');
+                      const marker = '<!-- gemini-architecture-review -->';
+
+                      const { data: commits } = await github.rest.repos.listCommits({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        sha: branch,
+                        per_page: 10,
+                      });
+
+                      let lastReviewBody = '';
+                      for (const commit of commits.slice(1)) {
+                        try {
+                          const { data: comments } = await github.rest.repos.listCommentsForCommit({
+                            owner: context.repo.owner,
+                            repo: context.repo.repo,
+                            commit_sha: commit.sha,
+                          });
+                          const review = comments.find(c => c.body.includes(marker));
+                          if (review) {
+                            lastReviewBody = review.body;
+                            break;
+                          }
+                        } catch (e) { /* skip */ }
+                      }
+
+                      if (lastReviewBody) {
+                        const fs = require('fs');
+                        fs.writeFileSync('/tmp/previous_review.txt', lastReviewBody);
+                        core.setOutput('has_previous', 'true');
+                      } else {
+                        core.setOutput('has_previous', 'false');
+                      }
+
+            - name: Call Gemini API for review
+              id: review
+              env:
+                  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+                  CURRENT_ROUND: ${{ steps.round.outputs.current_round }}
+                  IS_FINAL_ROUND: ${{ steps.round.outputs.is_final_round }}
+                  MAX_ROUNDS: ${{ steps.round.outputs.max_rounds }}
+                  HAS_PREVIOUS: ${{ steps.prev_review.outputs.has_previous }}
+                  COMMIT_MSG: ${{ steps.context.outputs.commit_msg }}
+                  BRANCH_NAME: ${{ steps.context.outputs.branch }}
+              shell: bash
+              run: |
+                  DIFF=$(cat /tmp/pr_diff.txt)
+                  CHANGED=$(cat /tmp/changed_files.txt)
+                  ARCH_CONTEXT=$(cat /tmp/arch_context.txt)
+
+                  PREV_REVIEW=""
+                  if [ "$HAS_PREVIOUS" = "true" ] && [ -f /tmp/previous_review.txt ]; then
+                    PREV_REVIEW=$(cat /tmp/previous_review.txt)
+                  fi
+
+                  if [ "$CURRENT_ROUND" = "1" ]; then
+                    ROUND_INSTRUCTION="This is the FIRST review (Round 1/${MAX_ROUNDS})."
+                  elif [ "$IS_FINAL_ROUND" = "true" ]; then
+                    ROUND_INSTRUCTION="This is the FINAL review round (Round ${CURRENT_ROUND}/${MAX_ROUNDS}). Focus on remaining critical issues only. If all previous CRITICAL/HIGH issues are resolved, give APPROVE verdict."
+                  else
+                    ROUND_INSTRUCTION="This is review Round ${CURRENT_ROUND}/${MAX_ROUNDS}. Compare against the previous review and check whether previously reported issues have been fixed."
+                  fi
+
+                  PROMPT=$(cat <<'PROMPT_EOF'
+                  You are a senior software architect (Gemini) cross-reviewing code written by Claude (Opus 4.6) for the ZeroClaw/MoA project.
+
+                  ## Your Role
+                  You are the architecture quality gatekeeper in a Claude ↔ Gemini cross-review loop.
+                  Your job is to:
+                  1. Verify the code aligns with the project architecture (CLAUDE.md, ARCHITECTURE.md)
+                  2. Find logic errors, missing edge cases, security issues
+                  3. Check code efficiency and established patterns
+                  4. For follow-up rounds: verify whether previous issues were actually fixed
+
+                  ## Review Instructions
+                  - Read the architecture context documents carefully first
+                  - Focus on SUBSTANTIVE issues: logic errors, security vulnerabilities, architecture violations, missing error handling, compilation errors
+                  - Do NOT flag: style nitpicks, formatting preferences, comment style, naming opinions
+                  - Rate each issue as [CRITICAL], [HIGH], [MEDIUM], or [LOW]
+                  - Be specific: reference file paths and line numbers
+                  - If the code looks good, say so clearly and give APPROVE verdict
+                  - For follow-up rounds: explicitly mark each previous issue as RESOLVED or REMAINING
+
+                  ## Output Format (follow exactly)
+                  ### Summary
+                  (1-3 sentences: what this push does)
+
+                  ### Architecture Alignment
+                  (Does this code follow the project architecture? Any violations?)
+
+                  ### Issues Found
+                  (List issues with severity tags, or state "No issues found")
+                  - **[SEVERITY]** `file/path.rs:line` — Description
+
+                  ### Issue Count
+                  CRITICAL: <number> | HIGH: <number> | MEDIUM: <number> | LOW: <number>
+
+                  ### Resolved from Previous Round
+                  (For rounds 2+: list which previous issues are fixed. For round 1: "N/A — first round")
+
+                  ### Suggestions
+                  (Optional non-blocking improvements)
+
+                  ### Verdict
+                  APPROVE / REQUEST_CHANGES / COMMENT
+                  PROMPT_EOF
+                  )
+
+                  FULL_PROMPT="${PROMPT}
+
+                  ## Round Information
+                  ${ROUND_INSTRUCTION}
+
+                  ## Branch: ${BRANCH_NAME}
+                  ## Commit: ${COMMIT_MSG}
+
+                  ## Architecture Context
+                  ${ARCH_CONTEXT}
+
+                  ## Changed Files
+                  ${CHANGED}"
+
+                  if [ -n "$PREV_REVIEW" ]; then
+                    FULL_PROMPT="${FULL_PROMPT}
+
+                  ## Previous Review (check if issues are resolved)
+                  ${PREV_REVIEW}"
+                  fi
+
+                  FULL_PROMPT="${FULL_PROMPT}
+
+                  ## Diff (against main)
+                  \`\`\`diff
+                  ${DIFF}
+                  \`\`\`"
+
+                  PAYLOAD=$(jq -n \
+                    --arg prompt "$FULL_PROMPT" \
+                    '{
+                      contents: [{
+                        parts: [{ text: $prompt }]
+                      }],
+                      generationConfig: {
+                        temperature: 0.2,
+                        maxOutputTokens: 4096
+                      }
+                    }')
+
+                  RESPONSE=""
+                  for attempt in 1 2 3; do
+                    HTTP_CODE=$(curl -s -o /tmp/gemini_response.json -w "%{http_code}" \
+                      -X POST \
+                      "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}" \
+                      -H "Content-Type: application/json" \
+                      -d "$PAYLOAD" \
+                      --max-time 120)
+
+                    if [ "$HTTP_CODE" = "200" ]; then
+                      RESPONSE=$(jq -r '.candidates[0].content.parts[0].text // "No response generated"' /tmp/gemini_response.json)
+                      break
+                    fi
+                    echo "Attempt $attempt failed with HTTP $HTTP_CODE, retrying..."
+                    sleep $((attempt * 2))
+                  done
+
+                  if [ -z "$RESPONSE" ]; then
+                    RESPONSE="Gemini review could not be completed (API error after 3 attempts). Please review manually."
+                  fi
+
+                  echo "$RESPONSE" > /tmp/review_result.txt
+
+            - name: Post commit comment + Job Summary
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              env:
+                  CURRENT_ROUND: ${{ steps.round.outputs.current_round }}
+                  IS_FINAL_ROUND: ${{ steps.round.outputs.is_final_round }}
+                  MAX_ROUNDS: ${{ steps.round.outputs.max_rounds }}
+              with:
+                  script: |
+                      const fs = require('fs');
+                      const review = fs.readFileSync('/tmp/review_result.txt', 'utf8');
+                      const round = process.env.CURRENT_ROUND;
+                      const maxRounds = process.env.MAX_ROUNDS;
+                      const isFinal = process.env.IS_FINAL_ROUND === 'true';
+                      const sha = context.sha;
+                      const branch = context.ref.replace('refs/heads/', '');
+
+                      const marker = '<!-- gemini-architecture-review -->';
+                      const roundMarker = `<!-- gemini-round: ${round} -->`;
+
+                      // Status badge
+                      let statusBadge;
+                      if (isFinal) {
+                        statusBadge = `> **🔍 Gemini ↔ Claude Cross-Review · Round ${round}/${maxRounds} — FINAL**`;
+                      } else {
+                        statusBadge = `> **🔍 Gemini ↔ Claude Cross-Review · Round ${round}/${maxRounds}**`;
+                      }
+
+                      // Parse issue counts
+                      const criticalMatch = review.match(/CRITICAL:\s*(\d+)/i);
+                      const highMatch = review.match(/HIGH:\s*(\d+)/i);
+                      const mediumMatch = review.match(/MEDIUM:\s*(\d+)/i);
+                      const lowMatch = review.match(/LOW:\s*(\d+)/i);
+                      const critical = criticalMatch ? parseInt(criticalMatch[1], 10) : 0;
+                      const high = highMatch ? parseInt(highMatch[1], 10) : 0;
+                      const medium = mediumMatch ? parseInt(mediumMatch[1], 10) : 0;
+                      const low = lowMatch ? parseInt(lowMatch[1], 10) : 0;
+                      const hasBlockers = critical > 0 || high > 0;
+
+                      let loopNote = '';
+                      if (isFinal) {
+                        loopNote = '\n\n> **Final round complete.** Human verification recommended for any remaining items.';
+                      } else if (hasBlockers) {
+                        loopNote = `\n\n> **${critical} critical + ${high} high** issues found. Claude should fix and push again → triggers round ${parseInt(round, 10) + 1}/${maxRounds}.`;
+                      } else {
+                        loopNote = '\n\n> **No blocking issues.** Code is ready for PR and merge.';
+                      }
+
+                      const body = [
+                        marker,
+                        roundMarker,
+                        `## Gemini Architecture Review`,
+                        '',
+                        `**Branch:** \`${branch}\` · **Commit:** \`${sha.slice(0, 8)}\``,
+                        '',
+                        statusBadge,
+                        loopNote,
+                        '',
+                        `| CRITICAL | HIGH | MEDIUM | LOW |`,
+                        `|----------|------|--------|-----|`,
+                        `| ${critical} | ${high} | ${medium} | ${low} |`,
+                        '',
+                        review,
+                        '',
+                        '---',
+                        `*Gemini ${process.env.GEMINI_MODEL} · Round ${round}/${maxRounds} · ${new Date().toISOString().slice(0, 19)}Z*`,
+                      ].join('\n');
+
+                      // 1) Post as commit comment (visible on commit page)
+                      await github.rest.repos.createCommitComment({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        commit_sha: sha,
+                        body,
+                      });
+                      console.log(`Commit comment posted on ${sha.slice(0, 8)}`);
+
+                      // 2) Write to Job Summary (visible in Actions tab)
+                      const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+                      if (summaryPath) {
+                        fs.appendFileSync(summaryPath, body + '\n');
+                        console.log('Job summary written');
+                      }
+
+                      // 3) Set commit status to show result at a glance
+                      const state = hasBlockers ? 'failure' : 'success';
+                      const description = hasBlockers
+                        ? `Round ${round}: ${critical}C ${high}H issues — fix needed`
+                        : `Round ${round}: No blockers — ready`;
+                      await github.rest.repos.createCommitStatus({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        sha: sha,
+                        state,
+                        description,
+                        context: `gemini-review/round-${round}`,
+                      });
+                      console.log(`Commit status set: ${state}`);
