@@ -82,7 +82,7 @@ This "mixture of agents" philosophy applies everywhere:
    memory through real-time sync
 5. **Normal AI operations do NOT go through the relay server** — the app
    calls LLM APIs directly from the device
-6. **MoA = one app** — the ZeroClaw runtime is bundled inside every MoA
+6. **MoA = one GUI app** — the ZeroClaw runtime is bundled inside every MoA
    installer as a sidecar binary. Users download and install one file.
    There is no separate "ZeroClaw" install step. See "Unified App
    Experience" section below for the full contract.
