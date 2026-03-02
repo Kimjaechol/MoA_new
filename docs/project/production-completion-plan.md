@@ -10,7 +10,7 @@
 
 | # | 항목 | ARCHITECTURE.md 요구사항 | 현재 상태 | 프로덕션 갭 |
 |---|------|--------------------------|-----------|-------------|
-| 1 | Tauri 임베딩 | ZeroClaw 풀 런타임이 앱에 임베딩 | ⚠️ 사이드카 방식 (별도 바이너리 실행) | 사이드카 빌드/번들 자동화 필요 |
+| 1 | Tauri 임베딩 (단일 앱) | ZeroClaw 번들된 단일 앱 | ⚠️ 사이드카 번들됨, UX 미완성 | 원클릭 설치 + 투명 사이드카 UX + WS IPC |
 | 2 | Gateway 동기화 릴레이 | 3-Tier 동기화 (Layer 1 TTL relay) | ⚠️ 엔드포인트 구현됨, RelayClient 미연결 | RelayClient → Gateway 와이어업 |
 | 3 | 플랫폼 임베딩 | 모든 플랫폼에서 ZeroClaw 풀 런타임 | ⚠️ Android HTTP 프록시, iOS 미구현 | Android NDK 빌드, iOS 브릿지 신규 |
 | 4 | SQLite + 장기기억 | SQLite + sqlite-vec + FTS5 | ✅ 완전 구현 (148+ 테스트) | sqlite-vec 미사용 (수동 벡터 → OK) |
@@ -36,42 +36,59 @@ scripts/build-tauri.sh                  → zeroclaw 바이너리 → binaries/ 
 
 **현재 작동 여부**: ✅ 로컬 빌드 시 작동. `scripts/build-tauri.sh`가 zeroclaw 바이너리를 `binaries/zeroclaw-{target-triple}` 형식으로 복사.
 
+### 핵심 요구사항: 단일 앱 UX (ARCHITECTURE.md §2 "Unified App Experience")
+
+> MoA와 ZeroClaw는 사용자에게 **하나의 앱**으로 보여야 함.
+> 사이드카 아키텍처는 내부 구현 상세이며, 사용자 경험에 노출되지 않아야 함.
+
 ### 프로덕션 미비 사항
 
 | 항목 | 상태 | 필요 작업 |
 |------|------|-----------|
 | 로컬 빌드 스크립트 | ✅ 있음 | - |
+| **원클릭 설치 (단일 파일)** | ✅ 사이드카 번들됨 | 첫 실행 GUI 설정 마법사 추가 |
 | CI/CD 멀티 플랫폼 빌드 | ❌ 없음 | GitHub Actions 워크플로우 추가 |
 | 코드 서명 (Windows/macOS) | ❌ 없음 | Tauri signing 설정 |
-| 자동 업데이트 | ❌ 없음 | Tauri updater 플러그인 |
+| **통합 자동 업데이트** | ❌ 없음 | Tauri updater (프론트엔드+사이드카 원자적) |
 | 프로세스 정리 (앱 종료 시) | ⚠️ 부분 | graceful shutdown hook 추가 |
-| 사이드카 실패 시 UX | ⚠️ "Starting..." 무한 | 타임아웃 + 수동 시작 다이얼로그 |
+| 사이드카 실패 시 UX | ⚠️ "Starting..." 무한 | 자동 재시작 + 사용자 투명 복구 |
+| **IPC 지연시간** | ⚠️ 미측정 | WebSocket 상시 연결, <1ms 보장 |
 
 ### 구현 계획
 
-**Phase 1 — 사이드카 안정화 (1PR)**
+**Phase 1 — 사이드카 투명 UX (1PR)**
 
 1. `clients/tauri/src-tauri/lib.rs` 수정:
    - `spawn_zeroclaw_gateway()`에 30초 타임아웃 추가 (현재 15초)
-   - 실패 시 사용자 알림 다이얼로그 (재시도/수동 시작 옵션)
+   - 실패 시 자동 재시작 (최대 3회) → 모두 실패 시에만 오류 다이얼로그
    - 앱 종료 시 사이드카 프로세스 kill 로직 추가 (Tauri `on_window_event` hook)
+   - "ZeroClaw" 문자열이 사용자에게 노출되는 모든 곳 제거/숨김
+   - 시스템 트레이: "MoA" 아이콘만 표시 (사이드카 상태 미노출)
 
-2. `scripts/build-tauri.sh` 강화:
-   - `--target` 플래그로 크로스 컴파일 지원 검증
-   - Android/iOS 대상 빌드 경로 추가
+2. `clients/tauri/src/` — 첫 실행 설정 마법사:
+   - 언어 선택 → API 키 입력(또는 크레딧 사용) → 채널 설정 → 메모리 동기화 페어링
+   - ZeroClaw의 `config.toml`을 GUI에서 자동 생성
 
-**Phase 2 — CI/CD 파이프라인 (1PR)**
+3. IPC를 HTTP POST → **WebSocket 상시 연결**로 전환:
+   - 앱 시작 시 `ws://127.0.0.1:{PORT}/ws/chat` 연결
+   - 연결 유지 (heartbeat), 끊김 시 자동 재연결
+   - 지연시간 0.1~0.5ms 보장 (localhost WebSocket)
+
+**Phase 2 — CI/CD + 통합 설치 파이프라인 (1PR)**
 
 3. `.github/workflows/build-tauri.yml` 신규:
    - Matrix: `[windows-latest, macos-latest, ubuntu-latest]`
-   - Steps: Rust 빌드 → 사이드카 복사 → Tauri 빌드 → 아티팩트 업로드
+   - Steps: Rust 빌드 → 사이드카 복사 → Tauri 빌드 → **단일 설치 파일 생성**
    - 코드 서명: macOS notarization, Windows authenticode (시크릿 기반)
+   - 결과물: `MoA-1.0.0-x86_64.msi`, `MoA-1.0.0.dmg`, `MoA-1.0.0.AppImage`
 
-**Phase 3 — 자동 업데이트 (1PR)**
+**Phase 3 — 통합 자동 업데이트 (1PR)**
 
 4. Tauri updater 설정:
    - `tauri.conf.json`에 `updater` 섹션 추가
    - GitHub Releases 기반 업데이트 채널
+   - **원자적 업데이트**: 프론트엔드 + ZeroClaw 사이드카가 항상 같은 버전으로 업데이트
+   - 업데이트 UI: "MoA 업데이트 가능" (ZeroClaw 언급 없음)
 
 ---
 
