@@ -10,6 +10,8 @@
 pub mod api;
 mod openai_compat;
 mod openclaw_compat;
+pub mod pair;
+pub mod remote;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -361,6 +363,15 @@ pub struct AppState {
     /// Payment manager for credit-based billing (Kakao Pay).
     /// Wrapped in Mutex because rusqlite::Connection is not Sync.
     pub payment_manager: Option<Arc<Mutex<PaymentManager>>>,
+    /// SQLite-backed user authentication store for multi-user auth.
+    /// Used by channel auto-pairing and remote device access.
+    pub auth_store: Option<Arc<crate::auth::store::AuthStore>>,
+    /// Channel pairing store for one-click messaging channel auth.
+    pub channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>>,
+    /// Whether new user registration is allowed.
+    pub auth_allow_registration: bool,
+    /// Device router for cross-device remote access via web chat.
+    pub device_router: Option<Arc<remote::DeviceRouter>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -803,6 +814,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if config.voice.enabled {
         println!("  GET  /ws/voice  — WebSocket simultaneous interpretation");
     }
+    if config.auth.enabled {
+        println!("  POST /api/remote/login — remote device login (username + password + pairing code)");
+        println!("  GET  /api/remote/devices — list user devices with online status");
+        println!("  GET  /ws/remote — WebSocket remote device chat (from web browser)");
+        println!("  GET  /ws/device-link — WebSocket device agent registration");
+    }
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -835,6 +852,59 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     );
     let broadcast_observer: Arc<dyn crate::observability::Observer> =
         Arc::new(sse::BroadcastObserver::new(base_observer, event_tx.clone()));
+
+    // ── Auth store + channel pairing + device router ─────────────
+    let (auth_store, channel_pairing, auth_allow_registration, device_router) =
+        if config.auth.enabled {
+            let auth_db_path = std::path::Path::new(&config.workspace_dir).join("auth.db");
+            match crate::auth::store::AuthStore::new(
+                &auth_db_path,
+                Some(config.auth.session_ttl_secs),
+            ) {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    if let Err(e) = store.ensure_channel_links_table() {
+                        tracing::warn!("Failed to ensure channel_links table: {e}");
+                    }
+
+                    // Channel pairing store
+                    let pairing_db_path =
+                        std::path::Path::new(&config.workspace_dir).join("channel_pairing.db");
+                    let channel_pairing_store =
+                        match crate::channels::pairing::ChannelPairingStore::open(&pairing_db_path)
+                        {
+                            Ok(s) => Some(Arc::new(s)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to open channel pairing store: {e}"
+                                );
+                                None
+                            }
+                        };
+
+                    // Device router for remote access
+                    let router = Arc::new(remote::DeviceRouter::new());
+
+                    tracing::info!(
+                        "Multi-user auth enabled (registration={})",
+                        config.auth.allow_registration,
+                    );
+
+                    (
+                        Some(store),
+                        channel_pairing_store,
+                        config.auth.allow_registration,
+                        Some(router),
+                    )
+                }
+                Err(e) => {
+                    tracing::error!("Failed to initialize auth store: {e}");
+                    (None, None, false, None)
+                }
+            }
+        } else {
+            (None, None, false, None)
+        };
 
     let state = AppState {
         config: config_state,
@@ -870,6 +940,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         sync_coordinator,
         relay_client: None, // RelayClient runs as background task, not stored in AppState
         payment_manager,
+        auth_store,
+        channel_pairing,
+        auth_allow_registration,
+        device_router,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -974,6 +1048,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket voice interpretation ──
         .route("/ws/voice", get(ws::handle_ws_voice))
+        // ── Remote device access ──
+        .route("/api/remote/login", post(remote::handle_remote_login))
+        .route("/api/remote/devices", get(remote::handle_remote_devices))
+        .route("/api/remote/logout", post(remote::handle_remote_logout))
+        .route("/ws/remote", get(remote::handle_ws_remote))
+        .route("/ws/device-link", get(remote::handle_ws_device_link))
+        // ── Channel auto-pairing web flow ──
+        .route("/pair/auto/{token}", get(pair::handle_auto_pair_page))
+        .route(
+            "/pair/auto/{token}",
+            post(pair::handle_auto_pair_login),
+        )
+        .route("/pair/signup", get(pair::handle_pair_signup_page))
+        .route("/pair/signup", post(pair::handle_pair_signup_submit))
         // ── Sync endpoints (cross-device memory sync) ──
         .route("/api/sync/push", post(api::handle_sync_push))
         .route("/api/sync/pull", post(api::handle_sync_pull))
