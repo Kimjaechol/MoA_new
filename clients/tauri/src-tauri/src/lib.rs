@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 
@@ -26,7 +27,7 @@ struct AppState {
     /// App data directory (platform-specific).
     data_dir: PathBuf,
     /// Whether the local ZeroClaw gateway is running.
-    gateway_running: AtomicBool,
+    gateway_running: Arc<AtomicBool>,
 }
 
 /// Default gateway host and port for the local ZeroClaw instance.
@@ -552,10 +553,8 @@ const GATEWAY_READY_TIMEOUT_MS: u64 = 30_000;
 fn spawn_zeroclaw_gateway(app: &tauri::App) {
     let gateway_url = format!("http://{DEFAULT_GATEWAY_HOST}:{DEFAULT_GATEWAY_PORT}");
     let state = app.state::<AppState>();
-
-    // Try sidecar first, fall back to system PATH
-    let sidecar_result = app.shell().sidecar("zeroclaw");
     let gateway_running = state.gateway_running.clone();
+    let app_handle = app.handle().clone();
 
     tauri::async_runtime::spawn(async move {
         // Step 1: Check if gateway is already running
@@ -569,7 +568,8 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
         for attempt in 1..=MAX_SIDECAR_RETRIES {
             eprintln!("[MoA] Starting backend service (attempt {attempt}/{MAX_SIDECAR_RETRIES})...");
 
-            let launched = match &sidecar_result {
+            // Create a fresh sidecar command each attempt (Command is consumed on spawn)
+            let launched = match app_handle.shell().sidecar("zeroclaw") {
                 Ok(sidecar) => sidecar
                     .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
                     .spawn()
@@ -740,7 +740,7 @@ pub fn run() {
             token: std::sync::Mutex::new(None),
             sync_connected: AtomicBool::new(false),
             sync_stop: AtomicBool::new(false),
-            gateway_running: AtomicBool::new(false),
+            gateway_running: Arc::new(AtomicBool::new(false)),
             data_dir: {
                 // Use platform-appropriate data directory
                 let dir = if cfg!(target_os = "android") || cfg!(target_os = "ios") {
