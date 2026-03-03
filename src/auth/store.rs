@@ -7,7 +7,6 @@
 
 use anyhow::{bail, Result};
 use parking_lot::Mutex;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -526,15 +525,13 @@ impl AuthStore {
 
 /// Generate a random salt (hex-encoded).
 fn generate_salt() -> String {
-    let mut bytes = [0u8; SALT_BYTES];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let bytes: [u8; SALT_BYTES] = rand::random();
     hex::encode(bytes)
 }
 
 /// Generate a random session token (hex-encoded).
 fn generate_token() -> String {
-    let mut bytes = [0u8; TOKEN_BYTES];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let bytes: [u8; TOKEN_BYTES] = rand::random();
     hex::encode(bytes)
 }
 

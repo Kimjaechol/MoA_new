@@ -3,6 +3,7 @@ pub mod gemini_oauth;
 pub mod oauth_common;
 pub mod openai_oauth;
 pub mod profiles;
+pub mod store;
 
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
