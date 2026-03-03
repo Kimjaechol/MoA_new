@@ -8,6 +8,7 @@ import android.os.Binder
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import ai.zeroclaw.android.MainActivity
+import ai.zeroclaw.android.R
 import ai.zeroclaw.android.ZeroClawApp
 import ai.zeroclaw.android.bridge.ZeroClawBridge
 import kotlinx.coroutines.*
@@ -112,7 +113,7 @@ class ZeroClawService : Service() {
         return NotificationCompat.Builder(this, ZeroClawApp.CHANNEL_ID)
             .setContentTitle("ZeroClaw is running")
             .setContentText("Your AI assistant is active")
-            .setSmallIcon(android.R.drawable.ic_menu_manage) // TODO: Replace with custom icon
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setSilent(true)

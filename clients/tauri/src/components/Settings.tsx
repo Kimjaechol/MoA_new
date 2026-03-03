@@ -51,19 +51,24 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     if (isLoggedIn) {
       apiClient.getDevices().then(setDevices).catch(() => {});
       // Load credit balance (try local gateway first, then relay)
+      const token = apiClient.getToken() || "";
       fetch(`${apiClient.getServerUrl()}/api/credits/balance`, {
-        headers: { Authorization: `Bearer ${apiClient.getToken?.() || ""}` },
+        headers: { Authorization: `Bearer ${token}` },
       })
         .then((r) => r.ok ? r.json() : null)
         .then((d) => setCreditBalance(d?.balance ?? null))
         .catch(() => {
           // Fallback to relay server
-          apiClient.getCreditBalance?.()
+          apiClient.getCreditBalance()
             .then((b: number) => setCreditBalance(b))
             .catch(() => setCreditBalance(null));
         });
     }
   }, [inTauri, isLoggedIn]);
+
+  const clearMessage = useCallback(() => {
+    setTimeout(() => setMessage(null), 5000);
+  }, []);
 
   const handleSaveApiKey = useCallback(async (provider: string, key: string) => {
     // Save to localStorage (for UI state persistence)
@@ -86,10 +91,6 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     }
     clearMessage();
   }, [locale, clearMessage]);
-
-  const clearMessage = useCallback(() => {
-    setTimeout(() => setMessage(null), 5000);
-  }, []);
 
   const handleServerUrlChange = useCallback(
     (url: string) => {
@@ -403,7 +404,7 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
                             method: "POST",
                             headers: {
                               "Content-Type": "application/json",
-                              "Authorization": `Bearer ${apiClient.getToken?.() || ""}`,
+                              "Authorization": `Bearer ${apiClient.getToken() || ""}`,
                             },
                             body: JSON.stringify({ package_id: pkg.id }),
                           });
@@ -418,7 +419,7 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
                             setMessage({ type: "success", text: locale === "ko" ? "\uACB0\uC81C \uC694\uCCAD \uC644\uB8CC" : "Payment initiated" });
                           }
                         } catch {
-                          setMessage({ type: "success", text: `${pkg.name} - ${locale === "ko" ? "\uACB0\uC81C \uAE30\uB2A5 \uC900\uBE44 \uC911" : "Payment coming soon"}` });
+                          setMessage({ type: "error", text: `${pkg.name} - ${locale === "ko" ? "\uACB0\uC81C \uAE30\uB2A5 \uC900\uBE44 \uC911" : "Payment coming soon"}` });
                         }
                         clearMessage();
                       }}

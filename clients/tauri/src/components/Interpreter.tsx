@@ -263,6 +263,9 @@ export function Interpreter({
       //    Gemini Live API is called directly from the local agent.
       const serverUrl = apiClient.getServerUrl();
       const token = apiClient.getToken();
+      if (!token) {
+        throw new Error("Not authenticated — please log in first");
+      }
 
       const res = await fetch(`${serverUrl}/api/voice/sessions`, {
         method: "POST",

@@ -2,6 +2,8 @@ package ai.zeroclaw.android.worker
 
 import android.content.Context
 import androidx.work.*
+import ai.zeroclaw.android.bridge.AgentStatus
+import ai.zeroclaw.android.bridge.ZeroClawBridge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
@@ -44,29 +46,41 @@ class HeartbeatWorker(
     }
 
     private suspend fun runHeartbeat() {
-        // TODO: Connect to ZeroClaw bridge
-        // val bridge = ZeroClawBridge
-        // bridge.sendHeartbeat()
+        if (!ZeroClawBridge.isLoaded()) {
+            android.util.Log.d(TAG, "Heartbeat skipped: bridge not loaded")
+            return
+        }
 
-        // For now, just log
-        android.util.Log.d(TAG, "Heartbeat executed")
+        val isRunning = ZeroClawBridge.isGatewayRunning()
+        android.util.Log.d(TAG, "Heartbeat executed: gateway running=$isRunning")
     }
 
     private suspend fun runCronJob() {
         val jobId = inputData.getString(KEY_JOB_ID)
         val prompt = inputData.getString(KEY_PROMPT)
 
-        // TODO: Execute cron job via bridge
-        // ZeroClawBridge.executeCronJob(jobId, prompt)
+        if (!ZeroClawBridge.isLoaded() || prompt.isNullOrBlank()) {
+            android.util.Log.w(TAG, "Cron job skipped: bridge not loaded or no prompt")
+            return
+        }
 
-        android.util.Log.d(TAG, "Cron job executed: $jobId")
+        val result = ZeroClawBridge.sendMessage(prompt)
+        result.onSuccess {
+            android.util.Log.d(TAG, "Cron job executed: $jobId")
+        }.onFailure { e ->
+            android.util.Log.e(TAG, "Cron job failed: $jobId — ${e.message}")
+        }
     }
 
     private suspend fun runHealthCheck() {
-        // TODO: Check agent status
-        // val status = ZeroClawBridge.getStatus()
+        if (!ZeroClawBridge.isLoaded()) {
+            android.util.Log.d(TAG, "Health check skipped: bridge not loaded")
+            return
+        }
 
-        android.util.Log.d(TAG, "Health check executed")
+        val status = ZeroClawBridge.getStatus()
+        val isGatewayUp = ZeroClawBridge.isGatewayRunning()
+        android.util.Log.d(TAG, "Health check: status=$status, gateway=$isGatewayUp")
     }
 
     companion object {

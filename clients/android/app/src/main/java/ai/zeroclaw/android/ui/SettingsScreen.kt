@@ -98,9 +98,9 @@ fun SettingsScreen(
                 var modelExpanded by remember { mutableStateOf(false) }
                 val models = when (localSettings.provider) {
                     "anthropic" -> listOf(
-                        "claude-opus-4-5" to "Claude Opus 4.5",
                         "claude-sonnet-4-5" to "Claude Sonnet 4.5",
-                        "claude-haiku-3-5" to "Claude Haiku 3.5"
+                        "claude-haiku-4-5" to "Claude Haiku 4.5",
+                        "claude-opus-4-5" to "Claude Opus 4.5"
                     )
                     "openai" -> listOf(
                         "gpt-4o" to "GPT-4o",

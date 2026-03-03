@@ -90,7 +90,7 @@ pub struct ZeroClawController {
     messages: Mutex<Vec<ChatMessage>>,
     gateway_url: Mutex<String>,
     /// Handle to the gateway child process (if launched by us).
-    gateway_process: Mutex<Option<u32>>, // PID
+    gateway_process: Mutex<Option<std::process::Child>>,
 }
 
 #[uniffi::export]
@@ -107,7 +107,7 @@ impl ZeroClawController {
             status: Mutex::new(AgentStatus::Stopped),
             messages: Mutex::new(Vec::new()),
             gateway_url: Mutex::new(DEFAULT_GATEWAY_URL.to_string()),
-            gateway_process: Mutex::new(None),
+            gateway_process: Mutex::new(None::<std::process::Child>),
         })
     }
 
@@ -171,7 +171,7 @@ impl ZeroClawController {
                 Ok(child) => {
                     let pid = child.id();
                     if let Ok(mut proc) = self.gateway_process.lock() {
-                        *proc = Some(pid);
+                        *proc = Some(child);
                     }
                     tracing::info!(pid, bin = %bin_path, "Launched ZeroClaw gateway");
                 }
@@ -212,14 +212,15 @@ impl ZeroClawController {
     pub fn stop(&self) -> Result<(), ZeroClawError> {
         // Kill the child process if we launched it
         if let Ok(mut proc) = self.gateway_process.lock() {
-            if let Some(pid) = proc.take() {
-                #[cfg(unix)]
-                {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
+            if let Some(mut child) = proc.take() {
+                let pid = child.id();
+                if let Err(e) = child.kill() {
+                    tracing::warn!(pid, "Failed to kill gateway process: {e}");
+                } else {
+                    // Reap the child to avoid zombie process
+                    let _ = child.wait();
+                    tracing::info!(pid, "Stopped ZeroClaw gateway process");
                 }
-                tracing::info!(pid, "Sent SIGTERM to ZeroClaw gateway");
             }
         }
 
