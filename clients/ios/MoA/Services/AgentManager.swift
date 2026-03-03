@@ -30,15 +30,19 @@ class AgentManager: ObservableObject {
         Task.detached { [weak self] in
             guard let self else { return }
             let dataDir = Self.dataDirectory()
-            let providerCStr = provider.withCString { strdup($0) }
-            let dataDirCStr = dataDir.withCString { strdup($0) }
-            let apiKeyCStr = apiKey?.withCString { strdup($0) }
 
-            let result = zeroclaw_start(dataDirCStr, providerCStr, apiKeyCStr, 3000)
-
-            free(dataDirCStr)
-            free(providerCStr)
-            if let ptr = apiKeyCStr { free(ptr) }
+            // Use nested withCString to safely pass C strings without manual alloc/free
+            let result = dataDir.withCString { dataDirPtr in
+                provider.withCString { providerPtr in
+                    if let key = apiKey, !key.isEmpty {
+                        return key.withCString { keyPtr in
+                            zeroclaw_start(dataDirPtr, providerPtr, keyPtr, 3000)
+                        }
+                    } else {
+                        return zeroclaw_start(dataDirPtr, providerPtr, nil, 3000)
+                    }
+                }
+            }
 
             if result == 0 {
                 // Wait for gateway to be ready
@@ -107,7 +111,9 @@ class AgentManager: ObservableObject {
 
     /// Send a message to the local ZeroClaw gateway via HTTP.
     private func sendToGateway(message: String) async throws -> String {
-        let url = URL(string: "\(gatewayUrl)/webhook")!
+        guard let url = URL(string: "\(gatewayUrl)/webhook") else {
+            throw AgentError.requestFailed
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -133,10 +139,7 @@ class AgentManager: ObservableObject {
 
     /// Send a message via the C-FFI bridge (fallback).
     private nonisolated func sendViaFFI(message: String) -> String? {
-        let cMessage = message.withCString { strdup($0) }
-        defer { free(cMessage) }
-
-        guard let responsePtr = zeroclaw_send_message(cMessage) else {
+        guard let responsePtr = message.withCString({ zeroclaw_send_message($0) }) else {
             return nil
         }
 

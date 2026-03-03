@@ -1,0 +1,6 @@
+# Rust toolchain configuration for ZeroClaw.
+# Cargo.toml declares rust-version = "1.87" as MSRV.
+# Pin the toolchain to a compatible stable release.
+
+[toolchain]
+channel = "1.87"

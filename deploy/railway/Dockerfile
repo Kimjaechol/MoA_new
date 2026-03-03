@@ -12,7 +12,7 @@
 #     docker build -f deploy/railway/Dockerfile -t zeroclaw-railway .
 
 # ── Stage 1: Builder ─────────────────────────────────────────
-FROM rust:1.83-slim-bookworm AS builder
+FROM rust:1.87-slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -33,14 +33,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # do not invalidate the (slow) dependency download/compile layer.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release --locked 2>/dev/null || true
+RUN cargo build --release --locked -p zeroclaw 2>/dev/null || true
 RUN rm -rf src
 
 # Copy the full source tree and build the real binary.
 COPY . .
 # Touch main.rs so cargo detects the source change and rebuilds.
 RUN touch src/main.rs
-RUN cargo build --release --locked \
+RUN cargo build --release --locked -p zeroclaw \
     && cp target/release/zeroclaw /build/zeroclaw \
     && strip /build/zeroclaw
 

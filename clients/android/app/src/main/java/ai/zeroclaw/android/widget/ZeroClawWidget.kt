@@ -8,6 +8,8 @@ import android.content.Intent
 import android.widget.RemoteViews
 import ai.zeroclaw.android.MainActivity
 import ai.zeroclaw.android.R
+import ai.zeroclaw.android.bridge.AgentStatus
+import ai.zeroclaw.android.bridge.ZeroClawBridge
 import ai.zeroclaw.android.service.ZeroClawService
 
 /**
@@ -57,11 +59,18 @@ class ZeroClawWidget : AppWidgetProvider() {
     }
 
     private fun toggleAgent(context: Context) {
-        // TODO: Check actual status and toggle
+        val isRunning = ZeroClawBridge.isLoaded() &&
+            ZeroClawBridge.getStatus() == AgentStatus.Running
+
         val serviceIntent = Intent(context, ZeroClawService::class.java).apply {
-            action = ZeroClawService.ACTION_START
+            action = if (isRunning) ZeroClawService.ACTION_STOP else ZeroClawService.ACTION_START
         }
-        context.startForegroundService(serviceIntent)
+
+        if (isRunning) {
+            context.startService(serviceIntent)
+        } else {
+            context.startForegroundService(serviceIntent)
+        }
     }
 
     private fun openAppWithMessage(context: Context, message: String?) {
@@ -85,9 +94,9 @@ class ZeroClawWidget : AppWidgetProvider() {
             // Create RemoteViews
             val views = RemoteViews(context.packageName, R.layout.widget_zeroclaw)
 
-            // Set status text
-            // TODO: Get actual status from bridge
-            val isRunning = false
+            // Set status text from bridge
+            val isRunning = ZeroClawBridge.isLoaded() &&
+                ZeroClawBridge.getStatus() == AgentStatus.Running
             views.setTextViewText(
                 R.id.widget_status,
                 if (isRunning) "🟢 Running" else "⚪ Stopped"

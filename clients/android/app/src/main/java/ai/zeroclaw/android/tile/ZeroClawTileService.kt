@@ -6,6 +6,8 @@ import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import ai.zeroclaw.android.MainActivity
+import ai.zeroclaw.android.bridge.AgentStatus
+import ai.zeroclaw.android.bridge.ZeroClawBridge
 import ai.zeroclaw.android.service.ZeroClawService
 
 /**
@@ -58,9 +60,12 @@ class ZeroClawTileService : TileService() {
     private fun updateTile() {
         val tile = qsTile ?: return
 
-        // TODO: Check actual agent status from bridge
-        // val isRunning = ZeroClawBridge.isRunning()
-        val isRunning = isServiceRunning()
+        val isRunning = if (ZeroClawBridge.isLoaded()) {
+            ZeroClawBridge.getStatus() == AgentStatus.Running ||
+                ZeroClawBridge.getStatus() == AgentStatus.Thinking
+        } else {
+            false
+        }
 
         tile.state = if (isRunning) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         tile.label = "ZeroClaw"
@@ -113,8 +118,7 @@ class ZeroClawTileService : TileService() {
     }
 
     private fun isServiceRunning(): Boolean {
-        // Simple check - in production would check actual service state
-        // TODO: Implement proper service state checking
-        return false
+        return ZeroClawBridge.isLoaded() &&
+            ZeroClawBridge.getStatus() == AgentStatus.Running
     }
 }

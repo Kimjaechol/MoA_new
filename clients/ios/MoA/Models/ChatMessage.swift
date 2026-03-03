@@ -1,13 +1,13 @@
 import Foundation
 
 /// A single chat message in the conversation.
-struct ChatMessage: Identifiable {
+struct ChatMessage: Identifiable, Sendable {
     let id: UUID
     let role: Role
     let content: String
     let timestamp: Date
 
-    enum Role {
+    enum Role: Sendable {
         case user
         case assistant
         case error

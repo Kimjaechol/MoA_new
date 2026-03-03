@@ -6,6 +6,7 @@ import Security
 ///
 /// General settings are stored in UserDefaults.
 /// API keys are stored in the iOS Keychain for security.
+@MainActor
 class SettingsStore: ObservableObject {
     @Published var setupComplete: Bool {
         didSet { UserDefaults.standard.set(setupComplete, forKey: "setupComplete") }
