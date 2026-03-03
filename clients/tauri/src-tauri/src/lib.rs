@@ -553,10 +553,8 @@ const GATEWAY_READY_TIMEOUT_MS: u64 = 30_000;
 fn spawn_zeroclaw_gateway(app: &tauri::App) {
     let gateway_url = format!("http://{DEFAULT_GATEWAY_HOST}:{DEFAULT_GATEWAY_PORT}");
     let state = app.state::<AppState>();
-
-    // Try sidecar first, fall back to system PATH
-    let sidecar_result = app.shell().sidecar("zeroclaw");
     let gateway_running = state.gateway_running.clone();
+    let app_handle = app.handle().clone();
 
     tauri::async_runtime::spawn(async move {
         // Step 1: Check if gateway is already running
@@ -570,7 +568,8 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
         for attempt in 1..=MAX_SIDECAR_RETRIES {
             eprintln!("[MoA] Starting backend service (attempt {attempt}/{MAX_SIDECAR_RETRIES})...");
 
-            let launched = match &sidecar_result {
+            // Create a fresh sidecar command each attempt (Command is consumed on spawn)
+            let launched = match app_handle.shell().sidecar("zeroclaw") {
                 Ok(sidecar) => sidecar
                     .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
                     .spawn()
