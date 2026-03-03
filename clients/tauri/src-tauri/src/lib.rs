@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 
@@ -26,7 +27,7 @@ struct AppState {
     /// App data directory (platform-specific).
     data_dir: PathBuf,
     /// Whether the local ZeroClaw gateway is running.
-    gateway_running: AtomicBool,
+    gateway_running: Arc<AtomicBool>,
 }
 
 /// Default gateway host and port for the local ZeroClaw instance.
@@ -740,7 +741,7 @@ pub fn run() {
             token: std::sync::Mutex::new(None),
             sync_connected: AtomicBool::new(false),
             sync_stop: AtomicBool::new(false),
-            gateway_running: AtomicBool::new(false),
+            gateway_running: Arc::new(AtomicBool::new(false)),
             data_dir: {
                 // Use platform-appropriate data directory
                 let dir = if cfg!(target_os = "android") || cfg!(target_os = "ios") {
