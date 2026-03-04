@@ -56,9 +56,11 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
       >
         <div className="flex items-center justify-between px-5 py-5 border-b border-gray-800">
           <div className="flex items-center gap-2">
-            <div className="h-8 w-8 rounded-lg bg-blue-600 flex items-center justify-center text-white font-bold text-sm">
-              ZC
-            </div>
+            <img
+              src={`${import.meta.env.BASE_URL}MoA_icon_128px.png`}
+              alt="ZeroClaw"
+              className="h-8 w-8 rounded-lg object-cover"
+            />
             <span className="text-lg font-semibold text-white tracking-wide">
               ZeroClaw
             </span>
