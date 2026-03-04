@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod auth_api;
 mod openai_compat;
 mod openclaw_compat;
 pub mod pair;
@@ -1070,6 +1071,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket voice interpretation ──
         .route("/ws/voice", get(ws::handle_ws_voice))
+        // ── User auth API (Tauri/web client) ──
+        .route("/api/auth/register", post(auth_api::handle_auth_register))
+        .route("/api/auth/login", post(auth_api::handle_auth_login))
+        .route("/api/auth/logout", post(auth_api::handle_auth_logout))
+        .route("/api/auth/devices", get(auth_api::handle_auth_devices_list))
+        .route("/api/auth/devices", post(auth_api::handle_auth_devices_register))
+        .route(
+            "/api/auth/devices/{device_id}/pairing-code",
+            put(auth_api::handle_auth_device_set_pairing_code),
+        )
+        .route(
+            "/api/auth/devices/{device_id}/verify-pairing",
+            post(auth_api::handle_auth_device_verify_pairing),
+        )
+        .route("/api/auth/heartbeat", post(auth_api::handle_auth_heartbeat))
+        .route("/api/agent/info", get(auth_api::handle_agent_info))
         // ── Remote device access ──
         .route("/api/remote/login", post(remote::handle_remote_login))
         .route("/api/remote/devices", get(remote::handle_remote_devices))
