@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { authRegister, authLogin, authKakaoCallback } from '@/lib/api';
+import { authRegister, authLogin } from '@/lib/api';
 
 type AuthMode = 'login' | 'register' | 'pairing';
 
@@ -9,7 +9,6 @@ interface AuthPageProps {
   showPairing: boolean;
 }
 
-const KAKAO_JS_KEY = import.meta.env.VITE_KAKAO_JS_KEY || '';
 const KAKAO_REST_KEY = import.meta.env.VITE_KAKAO_REST_API_KEY || '';
 
 function getKakaoRedirectUri(): string {
