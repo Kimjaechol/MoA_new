@@ -32,6 +32,7 @@ impl OntologyRepo {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
+             PRAGMA busy_timeout = 5000;
              PRAGMA cache_size   = -2000;
              PRAGMA temp_store   = MEMORY;
              PRAGMA foreign_keys = ON;",
@@ -66,45 +67,37 @@ impl OntologyRepo {
     /// Resolve an object type name to its ID.
     pub fn object_type_id(&self, name: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT id FROM ontology_object_types WHERE name = ?1",
-            params![name],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("unknown object type '{}': {}", name, e))
+        let mut stmt = conn.prepare_cached("SELECT id FROM ontology_object_types WHERE name = ?1")?;
+        let id = stmt.query_row(params![name], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("unknown object type '{}': {}", name, e))?;
+        Ok(id)
     }
 
     /// Resolve a link type name to its ID.
     pub fn link_type_id(&self, name: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT id FROM ontology_link_types WHERE name = ?1",
-            params![name],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("unknown link type '{}': {}", name, e))
+        let mut stmt = conn.prepare_cached("SELECT id FROM ontology_link_types WHERE name = ?1")?;
+        let id = stmt.query_row(params![name], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("unknown link type '{}': {}", name, e))?;
+        Ok(id)
     }
 
     /// Resolve an action type name to its ID.
     pub fn action_type_id(&self, name: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT id FROM ontology_action_types WHERE name = ?1",
-            params![name],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("unknown action type '{}': {}", name, e))
+        let mut stmt = conn.prepare_cached("SELECT id FROM ontology_action_types WHERE name = ?1")?;
+        let id = stmt.query_row(params![name], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("unknown action type '{}': {}", name, e))?;
+        Ok(id)
     }
 
     /// Resolve an action type ID to its name.
     pub fn action_type_name(&self, id: i64) -> anyhow::Result<String> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT name FROM ontology_action_types WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("unknown action type id {}: {}", id, e))
+        let mut stmt = conn.prepare_cached("SELECT name FROM ontology_action_types WHERE id = ?1")?;
+        let name = stmt.query_row(params![id], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("unknown action type id {}: {}", id, e))?;
+        Ok(name)
     }
 
     // -----------------------------------------------------------------------
@@ -222,78 +215,86 @@ impl OntologyRepo {
         let conn = self.conn.lock();
         let mut results = Vec::new();
 
+        // Resolve optional type filter to a type_id (using parameter binding, never format!).
+        let type_id: Option<i64> = if let Some(tn) = type_name {
+            Some(
+                conn.query_row(
+                    "SELECT id FROM ontology_object_types WHERE name = ?1",
+                    params![tn],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(|e| anyhow::anyhow!("unknown type '{}': {}", tn, e))?,
+            )
+        } else {
+            None
+        };
+
+        let row_mapper = |r: &rusqlite::Row| -> rusqlite::Result<OntologyObject> {
+            Ok(OntologyObject {
+                id: r.get(0)?,
+                type_id: r.get(1)?,
+                title: r.get(2)?,
+                properties: parse_json_col(r.get::<_, String>(3)?),
+                owner_user_id: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        };
+
         if query.is_empty() {
             // No FTS query — simple list by type.
-            let type_filter = if let Some(tn) = type_name {
-                let tid = conn
-                    .query_row(
-                        "SELECT id FROM ontology_object_types WHERE name = ?1",
-                        params![tn],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map_err(|e| anyhow::anyhow!("unknown type '{}': {}", tn, e))?;
-                format!("AND o.type_id = {tid}")
+            if let Some(tid) = type_id {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                     FROM ontology_objects o
+                     WHERE o.owner_user_id = ?1 AND o.type_id = ?2
+                     ORDER BY o.updated_at DESC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![owner_user_id, tid, limit as i64], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
             } else {
-                String::new()
-            };
-            let sql = format!(
-                "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
-                 FROM ontology_objects o
-                 WHERE o.owner_user_id = ?1 {type_filter}
-                 ORDER BY o.updated_at DESC LIMIT ?2"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![owner_user_id, limit as i64], |r| {
-                Ok(OntologyObject {
-                    id: r.get(0)?,
-                    type_id: r.get(1)?,
-                    title: r.get(2)?,
-                    properties: parse_json_col(r.get::<_, String>(3)?),
-                    owner_user_id: r.get(4)?,
-                    created_at: r.get(5)?,
-                    updated_at: r.get(6)?,
-                })
-            })?;
-            for row in rows {
-                results.push(row?);
+                let mut stmt = conn.prepare_cached(
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                     FROM ontology_objects o
+                     WHERE o.owner_user_id = ?1
+                     ORDER BY o.updated_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![owner_user_id, limit as i64], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
             }
         } else {
-            // FTS5 search.
-            let type_filter = if let Some(tn) = type_name {
-                let tid = conn
-                    .query_row(
-                        "SELECT id FROM ontology_object_types WHERE name = ?1",
-                        params![tn],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map_err(|e| anyhow::anyhow!("unknown type '{}': {}", tn, e))?;
-                format!("AND o.type_id = {tid}")
+            // FTS5 search — always use parameter binding.
+            if let Some(tid) = type_id {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                     FROM ontology_objects_fts f
+                     JOIN ontology_objects o ON o.id = f.rowid
+                     WHERE ontology_objects_fts MATCH ?1
+                       AND o.owner_user_id = ?2
+                       AND o.type_id = ?3
+                     ORDER BY rank LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(params![query, owner_user_id, tid, limit as i64], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
             } else {
-                String::new()
-            };
-            let sql = format!(
-                "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
-                 FROM ontology_objects_fts f
-                 JOIN ontology_objects o ON o.id = f.rowid
-                 WHERE ontology_objects_fts MATCH ?1
-                   AND o.owner_user_id = ?2
-                   {type_filter}
-                 ORDER BY rank LIMIT ?3"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![query, owner_user_id, limit as i64], |r| {
-                Ok(OntologyObject {
-                    id: r.get(0)?,
-                    type_id: r.get(1)?,
-                    title: r.get(2)?,
-                    properties: parse_json_col(r.get::<_, String>(3)?),
-                    owner_user_id: r.get(4)?,
-                    created_at: r.get(5)?,
-                    updated_at: r.get(6)?,
-                })
-            })?;
-            for row in rows {
-                results.push(row?);
+                let mut stmt = conn.prepare_cached(
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                     FROM ontology_objects_fts f
+                     JOIN ontology_objects o ON o.id = f.rowid
+                     WHERE ontology_objects_fts MATCH ?1
+                       AND o.owner_user_id = ?2
+                     ORDER BY rank LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![query, owner_user_id, limit as i64], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
             }
         }
         Ok(results)
