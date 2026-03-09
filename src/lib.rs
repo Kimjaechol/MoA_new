@@ -67,6 +67,7 @@ pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;
 pub mod observability;
+pub mod ontology;
 pub(crate) mod onboard;
 pub mod peripherals;
 #[allow(unused_imports)]
