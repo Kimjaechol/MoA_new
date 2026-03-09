@@ -678,6 +678,54 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // ── Ontology tools ──────────────────────────────────────────────
+    // Expose the Palantir-style ontology layer to the LLM as three
+    // high-level tools: get_context, search_objects, execute_action.
+    {
+        use crate::ontology::{
+            ContextBuilder, ActionDispatcher, OntologyRepo, RuleEngine,
+            tools::{
+                OntologyGetContextTool, OntologySearchObjectsTool,
+                OntologyExecuteActionTool,
+            },
+        };
+
+        let owner_user_id = root_config
+            .identity
+            .aieos_inline
+            .as_deref()
+            .unwrap_or("default_user")
+            .to_string();
+
+        if let Ok(onto_repo) = OntologyRepo::open(&workspace_dir) {
+            let onto_repo = Arc::new(onto_repo);
+            let rule_engine = Arc::new(RuleEngine::new(Arc::clone(&onto_repo)));
+            let ctx_builder = Arc::new(ContextBuilder::new(Arc::clone(&onto_repo)));
+
+            // Give the dispatcher access to the current tool set for routing.
+            let dispatcher = Arc::new(ActionDispatcher::new(
+                Arc::clone(&onto_repo),
+                rule_engine,
+                tool_arcs.clone(),
+            ));
+
+            tool_arcs.push(Arc::new(OntologyGetContextTool::new(
+                ctx_builder,
+                owner_user_id.clone(),
+            )));
+            tool_arcs.push(Arc::new(OntologySearchObjectsTool::new(
+                Arc::clone(&onto_repo),
+                owner_user_id.clone(),
+            )));
+            tool_arcs.push(Arc::new(OntologyExecuteActionTool::new(
+                dispatcher,
+                owner_user_id,
+            )));
+        } else {
+            tracing::warn!("ontology: failed to open repo; ontology tools disabled");
+        }
+    }
+
     // Attach background execution wrappers to the finalized registry.
     // This ensures `bg_run` / `bg_status` are available anywhere the
     // runtime tool graph is used.
