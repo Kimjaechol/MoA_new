@@ -954,6 +954,17 @@ pub async fn handle_api_checkout_create(
         }
     };
 
+    // Derive user_id from auth context; fall back to request body
+    let user_id = if body.user_id.is_empty() {
+        state
+            .sync_coordinator
+            .as_ref()
+            .map(|sc| sc.device_id().to_string())
+            .unwrap_or_else(|| "local_user".to_string())
+    } else {
+        body.user_id.clone()
+    };
+
     let transaction_id = uuid::Uuid::new_v4().to_string();
     let callback_base_url = {
         let config = state.config.lock();
@@ -981,7 +992,7 @@ pub async fn handle_api_checkout_create(
                 &key,
                 package,
                 &transaction_id,
-                &body.user_id,
+                &user_id,
                 &callback_base_url,
                 body.save_method,
             )
@@ -1017,7 +1028,7 @@ pub async fn handle_api_checkout_create(
                 &key,
                 package,
                 &transaction_id,
-                &body.user_id,
+                &user_id,
                 &callback_base_url,
             )
             .await

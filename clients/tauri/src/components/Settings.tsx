@@ -378,12 +378,11 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
                     {creditBalance !== null ? `${creditBalance.toLocaleString()} C` : "---"}
                   </div>
                 </div>
-                <div className="settings-credit-packages" style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <div className="settings-credit-packages" style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
                   {[
-                    { id: "basic_1000", name: t("credit_package_basic", locale), price: "\u20A91,000", credits: "100C" },
-                    { id: "standard_3000", name: t("credit_package_standard", locale), price: "\u20A93,000", credits: "350C" },
-                    { id: "premium_5000", name: t("credit_package_premium", locale), price: "\u20A95,000", credits: "650C" },
-                    { id: "pro_10000", name: t("credit_package_pro", locale), price: "\u20A910,000", credits: "1,500C" },
+                    { id: "starter_10", name: "Starter", price: "$10", priceKrw: "\u20A914,000", credits: "1,500C" },
+                    { id: "standard_20", name: "Standard", price: "$20", priceKrw: "\u20A928,000", credits: "3,200C" },
+                    { id: "power_50", name: "Power", price: "$50", priceKrw: "\u20A969,000", credits: "8,500C" },
                   ].map((pkg) => (
                     <button
                       key={pkg.id}
@@ -403,7 +402,8 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
                       }}
                     >
                       <span style={{ fontWeight: 600 }}>{pkg.name}</span>
-                      <span style={{ color: "var(--color-text-muted)" }}>{pkg.price} = {pkg.credits}</span>
+                      <span style={{ color: "var(--color-text-muted)" }}>{pkg.price} ({pkg.priceKrw})</span>
+                      <span style={{ color: "var(--color-accent)", fontSize: 11 }}>{pkg.credits}</span>
                     </button>
                   ))}
                 </div>
