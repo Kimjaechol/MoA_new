@@ -223,7 +223,9 @@ pub async fn handle_auth_devices_list(
         Err(resp) => return resp.into_response(),
     };
 
-    let auth_store = state.auth_store.as_ref().unwrap();
+    let Some(auth_store) = state.auth_store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+    };
     let devices = auth_store
         .list_devices_with_status(&user_id, 300)
         .unwrap_or_default()
@@ -262,7 +264,9 @@ pub async fn handle_auth_devices_register(
         Err(resp) => return resp.into_response(),
     };
 
-    let auth_store = state.auth_store.as_ref().unwrap();
+    let Some(auth_store) = state.auth_store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+    };
     match auth_store.register_device(&user_id, &body.device_id, &body.device_name, body.platform.as_deref()) {
         Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
         Err(e) => (
@@ -291,7 +295,9 @@ pub async fn handle_auth_device_set_pairing_code(
         Err(resp) => return resp.into_response(),
     };
 
-    let auth_store = state.auth_store.as_ref().unwrap();
+    let Some(auth_store) = state.auth_store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+    };
     match auth_store.set_device_pairing_code(&user_id, &device_id, body.pairing_code.as_deref()) {
         Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
         Err(e) => (
@@ -320,7 +326,9 @@ pub async fn handle_auth_device_verify_pairing(
         Err(resp) => return resp.into_response(),
     };
 
-    let auth_store = state.auth_store.as_ref().unwrap();
+    let Some(auth_store) = state.auth_store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+    };
     match auth_store.verify_device_pairing_code(&device_id, &body.pairing_code) {
         Ok(verified) => Json(serde_json::json!({ "verified": verified })).into_response(),
         Err(e) => (
@@ -348,7 +356,9 @@ pub async fn handle_auth_heartbeat(
         Err(resp) => return resp.into_response(),
     };
 
-    let auth_store = state.auth_store.as_ref().unwrap();
+    let Some(auth_store) = state.auth_store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+    };
     let _ = auth_store.touch_device(&body.device_id);
 
     Json(serde_json::json!({ "status": "ok" })).into_response()
