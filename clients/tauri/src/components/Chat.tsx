@@ -112,7 +112,7 @@ export function Chat({
       <div className="chat-messages">
         {messages.length === 0 ? (
           <div className="chat-welcome">
-            <div className="chat-welcome-icon">MoA</div>
+            <div className="chat-welcome-icon">ZC</div>
             <h2>{t("welcome_title", locale)}</h2>
             <p>{t("welcome_subtitle", locale)}</p>
             <p>

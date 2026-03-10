@@ -1,5 +1,5 @@
-const STORAGE_KEY_CHATS = "moa_chats";
-const STORAGE_KEY_ACTIVE_CHAT = "moa_active_chat";
+const STORAGE_KEY_CHATS = "zeroclaw_chats";
+const STORAGE_KEY_ACTIVE_CHAT = "zeroclaw_active_chat";
 
 export interface ChatMessage {
   id: string;

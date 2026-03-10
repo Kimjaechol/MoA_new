@@ -10,7 +10,7 @@ interface SettingsProps {
   onLogout: () => void;
 }
 
-const API_KEY_STORAGE_PREFIX = "moa_api_key_";
+const API_KEY_STORAGE_PREFIX = "zeroclaw_api_key_";
 
 function getStoredApiKey(provider: string): string {
   return localStorage.getItem(`${API_KEY_STORAGE_PREFIX}${provider}`) || "";

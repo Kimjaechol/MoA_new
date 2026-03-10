@@ -1,6 +1,6 @@
 export type Locale = "en" | "ko";
 
-const STORAGE_KEY_LOCALE = "moa_locale";
+const STORAGE_KEY_LOCALE = "zeroclaw_locale";
 
 export function getStoredLocale(): Locale {
   const stored = localStorage.getItem(STORAGE_KEY_LOCALE);
@@ -190,7 +190,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     language: "Language",
     no_chats: "No conversations yet",
     welcome_title: "Welcome to ZeroClaw",
-    welcome_subtitle: "Master of AI - Powered by ZeroClaw",
+    welcome_subtitle: "Your autonomous AI assistant",
     welcome_hint: "Start a conversation by typing a message below",
     delete_chat: "Delete",
     delete_confirm: "Delete this conversation?",
@@ -209,7 +209,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     // Auth flow
     login: "Login",
     login_title: "Login to ZeroClaw",
-    login_subtitle: "Master of AI",
+    login_subtitle: "Your autonomous AI assistant",
     login_button: "Login",
     logging_in: "Logging in...",
     login_failed: "Login failed",
@@ -330,7 +330,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     language: "\uC5B8\uC5B4",
     no_chats: "\uC544\uC9C1 \uB300\uD654\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4",
     welcome_title: "ZeroClaw\uC5D0 \uC624\uC2E0 \uAC83\uC744 \uD658\uC601\uD569\uB2C8\uB2E4",
-    welcome_subtitle: "Master of AI - ZeroClaw \uAE30\uBC18",
+    welcome_subtitle: "\uC790\uC728 AI \uC5B4\uC2DC\uC2A4\uD134\uD2B8",
     welcome_hint: "\uC544\uB798\uC5D0 \uBA54\uC2DC\uC9C0\uB97C \uC785\uB825\uD558\uC5EC \uB300\uD654\uB97C \uC2DC\uC791\uD558\uC138\uC694",
     delete_chat: "\uC0AD\uC81C",
     delete_confirm: "\uC774 \uB300\uD654\uB97C \uC0AD\uC81C\uD558\uC2DC\uACA0\uC2B5\uB2C8\uAE4C?",
@@ -349,7 +349,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     // Auth flow
     login: "\uB85C\uADF8\uC778",
     login_title: "ZeroClaw \uB85C\uADF8\uC778",
-    login_subtitle: "Master of AI",
+    login_subtitle: "\uC790\uC728 AI \uC5B4\uC2DC\uC2A4\uD134\uD2B8",
     login_button: "\uB85C\uADF8\uC778",
     logging_in: "\uB85C\uADF8\uC778 \uC911...",
     login_failed: "\uB85C\uADF8\uC778 \uC2E4\uD328",
