@@ -1,4 +1,7 @@
-import { NavLink } from 'react-router-dom';
+'use client';
+
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard,
   MessageSquare,
@@ -9,7 +12,6 @@ import {
   Smartphone,
   Settings,
   DollarSign,
-  Coins,
   Activity,
   Stethoscope,
   X,
@@ -17,26 +19,27 @@ import {
 import { t } from '@/lib/i18n';
 
 const navItems = [
-  { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
-  { to: '/agent', icon: MessageSquare, labelKey: 'nav.agent' },
-  { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
-  { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
-  { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
-  { to: '/memory', icon: Brain, labelKey: 'nav.memory' },
-  { to: '/devices', icon: Smartphone, labelKey: 'nav.devices' },
-  { to: '/config', icon: Settings, labelKey: 'nav.config' },
-  { to: '/credits', icon: Coins, labelKey: 'nav.credits' },
-  { to: '/cost', icon: DollarSign, labelKey: 'nav.cost' },
-  { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
-  { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
+  { href: '/workspace/dashboard', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
+  { href: '/chat', icon: MessageSquare, labelKey: 'nav.agent' },
+  { href: '/workspace/tools', icon: Wrench, labelKey: 'nav.tools' },
+  { href: '/workspace/cron', icon: Clock, labelKey: 'nav.cron' },
+  { href: '/workspace/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
+  { href: '/workspace/memory', icon: Brain, labelKey: 'nav.memory' },
+  { href: '/workspace/devices', icon: Smartphone, labelKey: 'nav.devices' },
+  { href: '/workspace/config', icon: Settings, labelKey: 'nav.config' },
+  { href: '/workspace/cost', icon: DollarSign, labelKey: 'nav.cost' },
+  { href: '/workspace/logs', icon: Activity, labelKey: 'nav.logs' },
+  { href: '/workspace/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
 ];
 
-interface SidebarProps {
+interface WorkspaceSidebarProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
-export default function Sidebar({ isOpen, onClose }: SidebarProps) {
+export default function WorkspaceSidebar({ isOpen, onClose }: WorkspaceSidebarProps) {
+  const pathname = usePathname();
+
   return (
     <>
       <button
@@ -57,16 +60,16 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
         ].join(' ')}
       >
         <div className="flex items-center justify-between px-5 py-5 border-b border-gray-800">
-          <div className="flex items-center gap-2">
+          <Link href="/" className="flex items-center gap-2">
             <img
-              src={`${import.meta.env.BASE_URL}MoA_icon_128px.png`}
-              alt="ZeroClaw"
+              src="/MoA_icon_128px.png"
+              alt="MoA"
               className="h-8 w-8 rounded-lg object-cover"
             />
             <span className="text-lg font-semibold text-white tracking-wide">
               MoA
             </span>
-          </div>
+          </Link>
           <button
             type="button"
             onClick={onClose}
@@ -78,25 +81,25 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
         </div>
 
         <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
-          {navItems.map(({ to, icon: Icon, labelKey }) => (
-            <NavLink
-              key={to}
-              to={to}
-              end={to === '/'}
-              onClick={onClose}
-              className={({ isActive }) =>
-                [
+          {navItems.map(({ href, icon: Icon, labelKey }) => {
+            const isActive = pathname === href;
+            return (
+              <Link
+                key={href}
+                href={href}
+                onClick={onClose}
+                className={[
                   'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors',
                   isActive
                     ? 'bg-blue-600 text-white'
                     : 'text-gray-300 hover:bg-gray-800 hover:text-white',
-                ].join(' ')
-              }
-            >
-              <Icon className="h-5 w-5 flex-shrink-0" />
-              <span>{t(labelKey)}</span>
-            </NavLink>
-          ))}
+                ].join(' ')}
+              >
+                <Icon className="h-5 w-5 flex-shrink-0" />
+                <span>{t(labelKey)}</span>
+              </Link>
+            );
+          })}
         </nav>
       </aside>
     </>

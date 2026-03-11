@@ -1,3 +1,5 @@
+'use client';
+
 import {
   createContext,
   useContext,
@@ -14,32 +16,18 @@ import {
   isAuthenticated as checkAuth,
   TOKEN_STORAGE_KEY,
 } from '../lib/auth';
-import { pair as apiPair, getPublicHealth } from '../lib/api';
-
-// ---------------------------------------------------------------------------
-// Context shape
-// ---------------------------------------------------------------------------
+import { pair as apiPair, getPublicHealth } from '../lib/gateway-api';
 
 export interface AuthState {
-  /** The current bearer token, or null if not authenticated. */
   token: string | null;
-  /** Whether the user is currently authenticated. */
   isAuthenticated: boolean;
-  /** True while the initial auth check is in progress. */
   loading: boolean;
-  /** Pair with the agent using a pairing code. Stores the token on success. */
   pair: (code: string) => Promise<void>;
-  /** Clear the stored token and sign out. */
   logout: () => void;
-  /** Re-check auth state (e.g. after external login sets a token). */
   refreshAuth: () => void;
 }
 
 const AuthContext = createContext<AuthState | null>(null);
-
-// ---------------------------------------------------------------------------
-// Provider
-// ---------------------------------------------------------------------------
 
 export interface AuthProviderProps {
   children: ReactNode;
@@ -50,9 +38,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [authenticated, setAuthenticated] = useState<boolean>(checkAuth);
   const [loading, setLoading] = useState<boolean>(!checkAuth());
 
-  // On mount: check if server requires pairing at all
   useEffect(() => {
-    if (checkAuth()) return; // already have a token, no need to check
+    if (checkAuth()) return;
     let cancelled = false;
     getPublicHealth()
       .then((health) => {
@@ -61,9 +48,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
           setAuthenticated(true);
         }
       })
-      .catch(() => {
-        // health endpoint unreachable — fall back to showing pairing dialog
-      })
+      .catch(() => {})
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
@@ -72,7 +57,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
     };
   }, []);
 
-  // Keep state in sync if token storage is changed from another browser context.
   useEffect(() => {
     const handler = (e: StorageEvent) => {
       if (e.key === TOKEN_STORAGE_KEY) {
@@ -116,14 +100,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
   return React.createElement(AuthContext.Provider, { value }, children);
 }
 
-// ---------------------------------------------------------------------------
-// Hook
-// ---------------------------------------------------------------------------
-
-/**
- * Access the authentication state from any component inside `<AuthProvider>`.
- * Throws if used outside the provider.
- */
 export function useAuth(): AuthState {
   const ctx = useContext(AuthContext);
   if (!ctx) {

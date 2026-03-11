@@ -10,16 +10,15 @@ import type {
   CostSummary,
   CliTool,
   HealthSnapshot,
-  CreditBalance,
-  CreditPackagesResponse,
-  CheckoutResponse,
-  CreditHistory,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 
-// ---------------------------------------------------------------------------
-// Base fetch wrapper
-// ---------------------------------------------------------------------------
+const API_BASE = process.env.NEXT_PUBLIC_DEFAULT_SERVER_URL || '';
+
+function resolveUrl(path: string): string {
+  if (API_BASE) return `${API_BASE}${path}`;
+  return path;
+}
 
 export class UnauthorizedError extends Error {
   constructor() {
@@ -47,7 +46,7 @@ export async function apiFetch<T = unknown>(
     headers.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(path, { ...options, headers });
+  const response = await fetch(resolveUrl(path), { ...options, headers });
 
   if (response.status === 401) {
     clearToken();
@@ -60,7 +59,6 @@ export async function apiFetch<T = unknown>(
     throw new Error(`API ${response.status}: ${text || response.statusText}`);
   }
 
-  // Some endpoints may return 204 No Content
   if (response.status === 204) {
     return undefined as unknown as T;
   }
@@ -78,12 +76,9 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
   return value as T;
 }
 
-// ---------------------------------------------------------------------------
 // Pairing
-// ---------------------------------------------------------------------------
-
 export async function pair(code: string): Promise<{ token: string }> {
-  const response = await fetch('/pair', {
+  const response = await fetch(resolveUrl('/pair'), {
     method: 'POST',
     headers: { 'X-Pairing-Code': code },
   });
@@ -98,22 +93,16 @@ export async function pair(code: string): Promise<{ token: string }> {
   return data;
 }
 
-// ---------------------------------------------------------------------------
 // Public health (no auth required)
-// ---------------------------------------------------------------------------
-
 export async function getPublicHealth(): Promise<{ require_pairing: boolean; paired: boolean }> {
-  const response = await fetch('/health');
+  const response = await fetch(resolveUrl('/health'));
   if (!response.ok) {
     throw new Error(`Health check failed (${response.status})`);
   }
   return response.json() as Promise<{ require_pairing: boolean; paired: boolean }>;
 }
 
-// ---------------------------------------------------------------------------
 // Status / Health
-// ---------------------------------------------------------------------------
-
 export function getStatus(): Promise<StatusResponse> {
   return apiFetch<StatusResponse>('/api/status');
 }
@@ -124,10 +113,7 @@ export function getHealth(): Promise<HealthSnapshot> {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
-
 export function getConfig(): Promise<string> {
   return apiFetch<string | { format?: string; content: string }>('/api/config').then((data) =>
     typeof data === 'string' ? data : data.content,
@@ -142,20 +128,14 @@ export function putConfig(toml: string): Promise<void> {
   });
 }
 
-// ---------------------------------------------------------------------------
 // Tools
-// ---------------------------------------------------------------------------
-
 export function getTools(): Promise<ToolSpec[]> {
   return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>('/api/tools').then((data) =>
     unwrapField(data, 'tools'),
   );
 }
 
-// ---------------------------------------------------------------------------
 // Cron
-// ---------------------------------------------------------------------------
-
 export function getCronJobs(): Promise<CronJob[]> {
   return apiFetch<CronJob[] | { jobs: CronJob[] }>('/api/cron').then((data) =>
     unwrapField(data, 'jobs'),
@@ -180,10 +160,7 @@ export function deleteCronJob(id: string): Promise<void> {
   });
 }
 
-// ---------------------------------------------------------------------------
 // Integrations
-// ---------------------------------------------------------------------------
-
 export function getIntegrations(): Promise<Integration[]> {
   return apiFetch<Integration[] | { integrations: Integration[] }>('/api/integrations').then(
     (data) => unwrapField(data, 'integrations'),
@@ -207,10 +184,7 @@ export function putIntegrationCredentials(
   );
 }
 
-// ---------------------------------------------------------------------------
 // Doctor / Diagnostics
-// ---------------------------------------------------------------------------
-
 export function runDoctor(): Promise<DiagResult[]> {
   return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>('/api/doctor', {
     method: 'POST',
@@ -218,10 +192,7 @@ export function runDoctor(): Promise<DiagResult[]> {
   }).then((data) => (Array.isArray(data) ? data : data.results));
 }
 
-// ---------------------------------------------------------------------------
 // Memory
-// ---------------------------------------------------------------------------
-
 export function getMemory(
   query?: string,
   category?: string,
@@ -252,10 +223,7 @@ export function deleteMemory(key: string): Promise<void> {
   });
 }
 
-// ---------------------------------------------------------------------------
 // Paired Devices
-// ---------------------------------------------------------------------------
-
 export function getPairedDevices(): Promise<PairedDevice[]> {
   return apiFetch<PairedDevice[] | { devices: PairedDevice[] }>('/api/pairing/devices').then(
     (data) => unwrapField(data, 'devices'),
@@ -268,65 +236,21 @@ export function revokePairedDevice(id: string): Promise<void> {
   });
 }
 
-// ---------------------------------------------------------------------------
 // Cost
-// ---------------------------------------------------------------------------
-
 export function getCost(): Promise<CostSummary> {
   return apiFetch<CostSummary | { cost: CostSummary }>('/api/cost').then((data) =>
     unwrapField(data, 'cost'),
   );
 }
 
-// ---------------------------------------------------------------------------
 // CLI Tools
-// ---------------------------------------------------------------------------
-
 export function getCliTools(): Promise<CliTool[]> {
   return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) =>
     unwrapField(data, 'cli_tools'),
   );
 }
 
-// ---------------------------------------------------------------------------
-// Credits / Billing
-// ---------------------------------------------------------------------------
-
-export function getCreditBalance(): Promise<CreditBalance> {
-  return apiFetch<CreditBalance>('/api/credits/balance');
-}
-
-export function getCreditPackages(): Promise<CreditPackagesResponse> {
-  return apiFetch<CreditPackagesResponse>('/api/credits/packages/usd');
-}
-
-export function createCheckout(
-  packageId: string,
-  provider: 'stripe' | 'toss',
-  userId: string,
-  saveMethod?: boolean,
-): Promise<CheckoutResponse> {
-  return apiFetch<CheckoutResponse>('/api/checkout/create', {
-    method: 'POST',
-    body: JSON.stringify({
-      package_id: packageId,
-      provider,
-      user_id: userId,
-      save_method: saveMethod ?? false,
-    }),
-  });
-}
-
-export function getCreditHistory(): Promise<CreditHistory[]> {
-  return apiFetch<{ payments: CreditHistory[]; enabled: boolean }>('/api/credits/history').then(
-    (data) => data.payments,
-  );
-}
-
-// ---------------------------------------------------------------------------
-// User Auth (register / login / logout)
-// ---------------------------------------------------------------------------
-
+// User Auth
 export interface AuthRegisterResponse {
   status: string;
   user_id: string;
@@ -344,7 +268,7 @@ export async function authRegister(
   username: string,
   password: string,
 ): Promise<AuthRegisterResponse> {
-  const response = await fetch('/api/auth/register', {
+  const response = await fetch(resolveUrl('/api/auth/register'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
@@ -364,7 +288,7 @@ export async function authLogin(
   deviceId?: string,
   deviceName?: string,
 ): Promise<AuthLoginResponse> {
-  const response = await fetch('/api/auth/login', {
+  const response = await fetch(resolveUrl('/api/auth/login'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -388,7 +312,7 @@ export async function authLogin(
 export async function authLogout(): Promise<void> {
   const token = getToken();
   if (token) {
-    await fetch('/api/auth/logout', {
+    await fetch(resolveUrl('/api/auth/logout'), {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
     }).catch(() => {});
@@ -396,10 +320,7 @@ export async function authLogout(): Promise<void> {
   clearToken();
 }
 
-// ---------------------------------------------------------------------------
 // Kakao OAuth
-// ---------------------------------------------------------------------------
-
 export interface KakaoAuthResponse {
   status: string;
   token: string;
@@ -409,7 +330,7 @@ export interface KakaoAuthResponse {
 }
 
 export async function authKakaoCallback(code: string): Promise<KakaoAuthResponse> {
-  const response = await fetch('/api/auth/kakao/callback', {
+  const response = await fetch(resolveUrl('/api/auth/kakao/callback'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code }),
