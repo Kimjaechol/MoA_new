@@ -60,7 +60,7 @@ export function Sidebar({
         {/* Logo and New Chat */}
         <div className="sidebar-header">
           <div className="sidebar-logo">
-            <div className="sidebar-logo-icon">MoA</div>
+            <div className="sidebar-logo-icon">ZC</div>
             <span className="sidebar-logo-text">{t("app_title", locale)}</span>
           </div>
           <button

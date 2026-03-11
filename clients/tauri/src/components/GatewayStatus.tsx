@@ -61,7 +61,7 @@ export function GatewayStatus({ onReady }: GatewayStatusProps) {
   return (
     <div style={overlayStyle}>
       <div style={cardStyle}>
-        <div style={logoStyle}>MoA</div>
+        <div style={logoStyle}>ZeroClaw</div>
         {status === "starting" && (
           <>
             <div style={spinnerStyle} />
@@ -72,7 +72,7 @@ export function GatewayStatus({ onReady }: GatewayStatusProps) {
           <>
             <p style={{ ...messageStyle, color: "#e74c3c" }}>{message}</p>
             <p style={hintStyle}>
-              Please install ZeroClaw or start it manually, then restart MoA.
+              Please install ZeroClaw or start it manually, then restart the app.
             </p>
           </>
         )}

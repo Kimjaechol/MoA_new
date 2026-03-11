@@ -52,7 +52,7 @@ export function SignUp({ locale, onSignUpSuccess, onGoToLogin }: SignUpProps) {
     <div className="auth-container">
       <div className="auth-card">
         <div className="auth-logo">
-          <div className="auth-logo-icon">MoA</div>
+          <div className="auth-logo-icon">ZC</div>
           <h1 className="auth-title">{t("signup_title", locale)}</h1>
           <p className="auth-subtitle">{t("signup_subtitle", locale)}</p>
         </div>

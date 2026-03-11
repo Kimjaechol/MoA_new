@@ -26,7 +26,7 @@ export function DeviceSelect({ locale, devices, onDeviceSelected, onLogout }: De
     if (deviceList.length === 0) {
       // No devices registered → auto-register this device and proceed
       setAutoConnecting(true);
-      apiClient.registerDevice("MoA Device").then(() => {
+      apiClient.registerDevice("ZeroClaw Device").then(() => {
         apiClient.startHeartbeat();
         onDeviceSelected();
       }).catch(() => {
@@ -119,7 +119,7 @@ export function DeviceSelect({ locale, devices, onDeviceSelected, onLogout }: De
       <div className="auth-container">
         <div className="auth-card">
           <div className="auth-logo">
-            <div className="auth-logo-icon">MoA</div>
+            <div className="auth-logo-icon">ZC</div>
             <p className="auth-subtitle">{t("auto_connecting", locale)}</p>
           </div>
         </div>
@@ -133,7 +133,7 @@ export function DeviceSelect({ locale, devices, onDeviceSelected, onLogout }: De
       <div className="auth-container">
         <div className="auth-card">
           <div className="auth-logo">
-            <div className="auth-logo-icon">MoA</div>
+            <div className="auth-logo-icon">ZC</div>
             <h1 className="auth-title">{t("device_pairing_required", locale)}</h1>
             <p className="auth-subtitle">{selectedDevice.device_name}</p>
           </div>
@@ -177,7 +177,7 @@ export function DeviceSelect({ locale, devices, onDeviceSelected, onLogout }: De
     <div className="auth-container">
       <div className="auth-card" style={{ maxWidth: 480 }}>
         <div className="auth-logo">
-          <div className="auth-logo-icon">MoA</div>
+          <div className="auth-logo-icon">ZC</div>
           <h1 className="auth-title">{t("select_device", locale)}</h1>
           <p className="auth-subtitle">{t("select_device_subtitle", locale)}</p>
         </div>

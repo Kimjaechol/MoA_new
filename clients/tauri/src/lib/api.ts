@@ -9,11 +9,11 @@ import {
   type PlatformInfo,
 } from "./tauri-bridge";
 
-const STORAGE_KEY_TOKEN = "moa_token";
-const STORAGE_KEY_SERVER = "moa_server_url";
-const STORAGE_KEY_RELAY = "moa_relay_url";
-const STORAGE_KEY_USER = "moa_user";
-const STORAGE_KEY_DEVICE_ID = "moa_device_id";
+const STORAGE_KEY_TOKEN = "zeroclaw_token";
+const STORAGE_KEY_SERVER = "zeroclaw_server_url";
+const STORAGE_KEY_RELAY = "zeroclaw_relay_url";
+const STORAGE_KEY_USER = "zeroclaw_user";
+const STORAGE_KEY_DEVICE_ID = "zeroclaw_device_id";
 
 // Local-first architecture:
 // - LOCAL_GATEWAY_URL: ZeroClaw agent running on this device (chat, voice, tools)
@@ -75,7 +75,7 @@ export type { SyncStatus, PlatformInfo };
 
 // ── Client ──────────────────────────────────────────────────────
 
-export class MoAClient {
+export class ZeroClawClient {
   // Local ZeroClaw gateway URL (chat, voice, tools — runs on this device)
   private serverUrl: string;
   // Railway relay server URL (memory sync + operator API key fallback only)
@@ -502,11 +502,11 @@ export class MoAClient {
     if (isTauri()) {
       const info = await getPlatformInfo();
       if (info) {
-        return `MoA ${info.os} ${info.is_mobile ? "Mobile" : "Desktop"}`;
+        return `ZeroClaw ${info.os} ${info.is_mobile ? "Mobile" : "Desktop"}`;
       }
     }
-    return `MoA ${navigator.platform || "Web"}`;
+    return `ZeroClaw ${navigator.platform || "Web"}`;
   }
 }
 
-export const apiClient = new MoAClient();
+export const apiClient = new ZeroClawClient();

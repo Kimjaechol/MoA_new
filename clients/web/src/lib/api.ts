@@ -1,6 +1,6 @@
-const STORAGE_KEY_TOKEN = "moa_token";
-const STORAGE_KEY_SERVER = "moa_server_url";
-const STORAGE_KEY_MESSAGES = "moa_chat_messages";
+const STORAGE_KEY_TOKEN = "zeroclaw_token";
+const STORAGE_KEY_SERVER = "zeroclaw_server_url";
+const STORAGE_KEY_MESSAGES = "zeroclaw_chat_messages";
 
 export interface PairResponse {
   paired: boolean;
@@ -28,7 +28,7 @@ function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).substring(2, 8);
 }
 
-export class MoAClient {
+export class ZeroClawClient {
   private serverUrl: string;
   private token: string | null;
 
@@ -329,14 +329,14 @@ export class MoAClient {
 }
 
 // Singleton for client-side use
-let clientInstance: MoAClient | null = null;
+let clientInstance: ZeroClawClient | null = null;
 
-export function getClient(): MoAClient {
+export function getClient(): ZeroClawClient {
   if (typeof window === "undefined") {
-    return new MoAClient();
+    return new ZeroClawClient();
   }
   if (!clientInstance) {
-    clientInstance = new MoAClient();
+    clientInstance = new ZeroClawClient();
   }
   return clientInstance;
 }
