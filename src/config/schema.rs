@@ -9304,6 +9304,219 @@ impl Config {
         }
 
         set_runtime_proxy_config(self.proxy.clone());
+
+        // ── Model route env overrides ───────────────────────────────
+        //
+        // Add model routes via environment variables with the pattern:
+        //   ZEROCLAW_ROUTE_<HINT>_PROVIDER=<provider>
+        //   ZEROCLAW_ROUTE_<HINT>_MODEL=<model>
+        //   ZEROCLAW_ROUTE_<HINT>_MAX_TOKENS=<n>  (optional)
+        //   ZEROCLAW_ROUTE_<HINT>_API_KEY=<key>    (optional)
+        //
+        // Env-defined routes are appended after TOML routes.
+        // If a hint already exists from TOML, the env var version takes precedence.
+        //
+        // Well-known hint names (convention, not enforced):
+        //   DAILY     — router/daily tasks (fast, cheap)
+        //   DOCUMENT  — document writing, summarization
+        //   CODE      — coding, architecture, refactoring
+        //   REVIEW    — optional premium code review
+        {
+            let known_hints = [
+                "DAILY", "DOCUMENT", "CODE", "REVIEW", "REASONING", "FAST", "SUMMARIZE",
+            ];
+
+            let mut env_routes: Vec<ModelRouteConfig> = Vec::new();
+
+            for hint_upper in &known_hints {
+                let provider_key = format!("ZEROCLAW_ROUTE_{hint_upper}_PROVIDER");
+                let model_key = format!("ZEROCLAW_ROUTE_{hint_upper}_MODEL");
+
+                let provider = std::env::var(&provider_key).ok().filter(|v| !v.is_empty());
+                let model = std::env::var(&model_key).ok().filter(|v| !v.is_empty());
+
+                if let (Some(provider), Some(model)) = (provider, model) {
+                    let hint = hint_upper.to_lowercase();
+
+                    let max_tokens_key = format!("ZEROCLAW_ROUTE_{hint_upper}_MAX_TOKENS");
+                    let max_tokens = std::env::var(&max_tokens_key)
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|&n| n > 0);
+
+                    let api_key_key = format!("ZEROCLAW_ROUTE_{hint_upper}_API_KEY");
+                    let api_key = std::env::var(&api_key_key).ok().filter(|v| !v.is_empty());
+
+                    env_routes.push(ModelRouteConfig {
+                        hint,
+                        provider,
+                        model,
+                        max_tokens,
+                        api_key,
+                        transport: None,
+                    });
+                }
+            }
+
+            // Env routes override TOML routes with the same hint.
+            for env_route in env_routes {
+                if let Some(existing) = self
+                    .model_routes
+                    .iter_mut()
+                    .find(|r| r.hint == env_route.hint)
+                {
+                    *existing = env_route;
+                } else {
+                    self.model_routes.push(env_route);
+                }
+            }
+        }
+
+        // ── Query classification env override ───────────────────────
+        //
+        // ZEROCLAW_QUERY_CLASSIFICATION_ENABLED=1  enables auto-classification.
+        // When enabled and no rules are defined, injects default tiered rules
+        // matching the well-known hints (daily, document, code, review).
+        if let Ok(val) = std::env::var("ZEROCLAW_QUERY_CLASSIFICATION_ENABLED") {
+            let enabled = matches!(
+                val.to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+            self.query_classification.enabled = enabled;
+
+            // Inject default classification rules only when enabled and no
+            // rules have been defined (TOML or otherwise).
+            if enabled && self.query_classification.rules.is_empty() {
+                let hint_exists = |h: &str| self.model_routes.iter().any(|r| r.hint == h);
+
+                let mut default_rules = Vec::new();
+
+                // Code detection (highest priority)
+                if hint_exists("code") {
+                    default_rules.push(ClassificationRule {
+                        hint: "code".into(),
+                        keywords: vec![
+                            "code".into(),
+                            "코드".into(),
+                            "코딩".into(),
+                            "implement".into(),
+                            "구현".into(),
+                            "refactor".into(),
+                            "리팩토링".into(),
+                            "debug".into(),
+                            "디버그".into(),
+                            "compile".into(),
+                            "컴파일".into(),
+                            "function".into(),
+                            "함수".into(),
+                            "class".into(),
+                            "클래스".into(),
+                            "variable".into(),
+                            "변수".into(),
+                            "api".into(),
+                            "bug".into(),
+                            "버그".into(),
+                            "error".into(),
+                            "에러".into(),
+                            "fix".into(),
+                            "수정".into(),
+                            "algorithm".into(),
+                            "알고리즘".into(),
+                        ],
+                        patterns: vec![
+                            "```".into(),
+                            "fn ".into(),
+                            "def ".into(),
+                            "class ".into(),
+                            "import ".into(),
+                            "const ".into(),
+                            "let ".into(),
+                            "var ".into(),
+                            "func ".into(),
+                            "pub fn".into(),
+                            "async fn".into(),
+                        ],
+                        priority: 20,
+                        ..Default::default()
+                    });
+                }
+
+                // Document writing (high priority)
+                if hint_exists("document") {
+                    default_rules.push(ClassificationRule {
+                        hint: "document".into(),
+                        keywords: vec![
+                            "write".into(),
+                            "작성".into(),
+                            "draft".into(),
+                            "초안".into(),
+                            "report".into(),
+                            "보고서".into(),
+                            "document".into(),
+                            "문서".into(),
+                            "essay".into(),
+                            "에세이".into(),
+                            "article".into(),
+                            "기사".into(),
+                            "summarize".into(),
+                            "요약".into(),
+                            "analyze".into(),
+                            "분석".into(),
+                            "plan".into(),
+                            "기획".into(),
+                            "proposal".into(),
+                            "제안서".into(),
+                            "email".into(),
+                            "이메일".into(),
+                            "letter".into(),
+                            "편지".into(),
+                        ],
+                        min_length: Some(30),
+                        priority: 15,
+                        ..Default::default()
+                    });
+                }
+
+                // Daily/fast (low priority — catch-all for simple queries)
+                if hint_exists("daily") {
+                    default_rules.push(ClassificationRule {
+                        hint: "daily".into(),
+                        keywords: vec![
+                            "hi".into(),
+                            "hello".into(),
+                            "안녕".into(),
+                            "thanks".into(),
+                            "감사".into(),
+                            "schedule".into(),
+                            "일정".into(),
+                            "remind".into(),
+                            "리마인드".into(),
+                            "weather".into(),
+                            "날씨".into(),
+                            "time".into(),
+                            "시간".into(),
+                            "what".into(),
+                            "뭐".into(),
+                            "who".into(),
+                            "누구".into(),
+                            "when".into(),
+                            "언제".into(),
+                            "where".into(),
+                            "어디".into(),
+                            "search".into(),
+                            "검색".into(),
+                            "find".into(),
+                            "찾아".into(),
+                        ],
+                        max_length: Some(200),
+                        priority: 5,
+                        ..Default::default()
+                    });
+                }
+
+                self.query_classification.rules = default_rules;
+            }
+        }
     }
 
     pub async fn save(&self) -> Result<()> {
@@ -14536,6 +14749,179 @@ reserve_percent = 15
         config
             .validate()
             .expect("matching route_down hint route should validate");
+    }
+
+    // ── Model route env override tests ──────────────────────────
+
+    fn clear_route_env_vars() {
+        for hint in ["DAILY", "DOCUMENT", "CODE", "REVIEW", "REASONING", "FAST", "SUMMARIZE"] {
+            std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_PROVIDER"));
+            std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_MODEL"));
+            std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_MAX_TOKENS"));
+            std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_API_KEY"));
+        }
+        std::env::remove_var("ZEROCLAW_QUERY_CLASSIFICATION_ENABLED");
+    }
+
+    #[test]
+    async fn env_override_model_routes_adds_new_routes() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+        assert!(config.model_routes.is_empty());
+
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_MODEL", "gemini-2.5-flash-lite-preview");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_PROVIDER", "anthropic");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_MODEL", "claude-opus-4-20250514");
+
+        config.apply_env_overrides();
+
+        assert_eq!(config.model_routes.len(), 2);
+        assert!(config.model_routes.iter().any(|r| r.hint == "daily"
+            && r.provider == "google"
+            && r.model == "gemini-2.5-flash-lite-preview"));
+        assert!(config.model_routes.iter().any(|r| r.hint == "code"
+            && r.provider == "anthropic"
+            && r.model == "claude-opus-4-20250514"));
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_model_routes_overrides_toml_route() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "daily".to_string(),
+            provider: "ollama".to_string(),
+            model: "llama3.2".to_string(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+        }];
+
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_MODEL", "gemini-2.5-flash-lite-preview");
+
+        config.apply_env_overrides();
+
+        assert_eq!(config.model_routes.len(), 1);
+        assert_eq!(config.model_routes[0].provider, "google");
+        assert_eq!(config.model_routes[0].model, "gemini-2.5-flash-lite-preview");
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_model_routes_with_max_tokens_and_api_key() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_PROVIDER", "anthropic");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_MODEL", "claude-opus-4-20250514");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_MAX_TOKENS", "8192");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_API_KEY", "sk-test-route-key");
+
+        config.apply_env_overrides();
+
+        assert_eq!(config.model_routes.len(), 1);
+        let route = &config.model_routes[0];
+        assert_eq!(route.hint, "code");
+        assert_eq!(route.max_tokens, Some(8192));
+        assert_eq!(route.api_key.as_deref(), Some("sk-test-route-key"));
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_classification_enabled_injects_default_rules() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+        assert!(!config.query_classification.enabled);
+        assert!(config.query_classification.rules.is_empty());
+
+        // Add routes so default rules have matching hints
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_MODEL", "gemini-2.5-flash-lite-preview");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_PROVIDER", "anthropic");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_MODEL", "claude-opus-4-20250514");
+        std::env::set_var("ZEROCLAW_QUERY_CLASSIFICATION_ENABLED", "true");
+
+        config.apply_env_overrides();
+
+        assert!(config.query_classification.enabled);
+        assert!(!config.query_classification.rules.is_empty());
+
+        // Should have rules for 'code' and 'daily' (matching routes)
+        let hints: Vec<&str> = config
+            .query_classification
+            .rules
+            .iter()
+            .map(|r| r.hint.as_str())
+            .collect();
+        assert!(hints.contains(&"code"));
+        assert!(hints.contains(&"daily"));
+        // No document rule (no document route defined)
+        assert!(!hints.contains(&"document"));
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_classification_does_not_overwrite_existing_rules() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+        config.query_classification.rules = vec![ClassificationRule {
+            hint: "custom".into(),
+            keywords: vec!["test".into()],
+            ..Default::default()
+        }];
+
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_MODEL", "gemini-flash");
+        std::env::set_var("ZEROCLAW_QUERY_CLASSIFICATION_ENABLED", "true");
+
+        config.apply_env_overrides();
+
+        assert!(config.query_classification.enabled);
+        // Existing rules preserved, no default injection
+        assert_eq!(config.query_classification.rules.len(), 1);
+        assert_eq!(config.query_classification.rules[0].hint, "custom");
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_ignores_partial_route_definition() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+
+        // Only provider, no model — should be ignored
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
+
+        config.apply_env_overrides();
+
+        assert!(config.model_routes.is_empty());
+
+        clear_route_env_vars();
     }
 }
 
