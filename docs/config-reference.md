@@ -1046,25 +1046,25 @@ default_model = "hint:daily"
 [[model_routes]]
 hint = "daily"
 provider = "google"
-model = "gemini-2.5-flash-lite-preview"
+model = "gemini-3.1-flash-lite-preview"
 
 # Tier 2 — Document: reports, essays, deep summaries, planning
 [[model_routes]]
 hint = "document"
 provider = "google"
-model = "gemini-2.5-pro-preview"
+model = "gemini-3.1-pro-preview"
 
 # Tier 3 — Code: implementation, architecture, refactoring
 [[model_routes]]
 hint = "code"
 provider = "anthropic"
-model = "claude-opus-4-20250514"
+model = "claude-4.6-opus"
 
 # Tier 4 — Review: optional premium code review (user-initiated only)
 [[model_routes]]
 hint = "review"
 provider = "openai"
-model = "gpt-4.1"
+model = "gpt-5.4"
 
 [query_classification]
 enabled = true
@@ -1096,19 +1096,19 @@ ZEROCLAW_MODEL=hint:daily
 
 # Tier 1 — Daily
 ZEROCLAW_ROUTE_DAILY_PROVIDER=google
-ZEROCLAW_ROUTE_DAILY_MODEL=gemini-2.5-flash-lite-preview
+ZEROCLAW_ROUTE_DAILY_MODEL=gemini-3.1-flash-lite-preview
 
 # Tier 2 — Document
 ZEROCLAW_ROUTE_DOCUMENT_PROVIDER=google
-ZEROCLAW_ROUTE_DOCUMENT_MODEL=gemini-2.5-pro-preview
+ZEROCLAW_ROUTE_DOCUMENT_MODEL=gemini-3.1-pro-preview
 
 # Tier 3 — Code
 ZEROCLAW_ROUTE_CODE_PROVIDER=anthropic
-ZEROCLAW_ROUTE_CODE_MODEL=claude-opus-4-20250514
+ZEROCLAW_ROUTE_CODE_MODEL=claude-4.6-opus
 
 # Tier 4 — Review (user-initiated via chat command)
 ZEROCLAW_ROUTE_REVIEW_PROVIDER=openai
-ZEROCLAW_ROUTE_REVIEW_MODEL=gpt-4.1
+ZEROCLAW_ROUTE_REVIEW_MODEL=gpt-5.4
 
 # Enable auto-classification (injects default rules for defined hints)
 ZEROCLAW_QUERY_CLASSIFICATION_ENABLED=true
