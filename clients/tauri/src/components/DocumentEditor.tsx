@@ -102,45 +102,29 @@ export function DocumentEditor({
   const tiptapRef = useRef<TiptapEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // ── File upload routing ──────────────────────────────────────────
-  const handleFileUpload = useCallback(async (file: File) => {
-    const ext = "." + file.name.split(".").pop()?.toLowerCase();
-    if (!SUPPORTED_EXTENSIONS.includes(ext)) {
-      setError(
-        locale === "ko"
-          ? `지원되지 않는 파일 형식입니다: ${ext}. 지원 형식: ${SUPPORTED_EXTENSIONS.join(", ")}`
-          : `Unsupported file format: ${ext}. Supported: ${SUPPORTED_EXTENSIONS.join(", ")}`
-      );
-      return;
+  // ── Apply conversion result (sets both viewer HTML and editor Markdown) ──
+  const applyDualResult = useCallback((result: {
+    viewer_html: string;
+    markdown: string;
+    doc_type: string;
+    engine: string;
+    page_count: number;
+  }, fileName: string) => {
+    setDoc({
+      viewerHtml: result.viewer_html,
+      markdown: result.markdown,
+      tiptapJson: null,
+      fileName,
+      docType: result.doc_type,
+      engine: result.engine,
+      isModified: false,
+    });
+
+    // Notify parent with initial markdown
+    if (onDocumentUpdate && result.markdown) {
+      onDocumentUpdate(result.markdown, result.viewer_html);
     }
-
-    setIsUploading(true);
-    setError(null);
-    setEditorOpen(false);
-    setUploadProgress(
-      locale === "ko" ? `${file.name} 처리 중...` : `Processing ${file.name}...`
-    );
-
-    try {
-      const isPdf = ext === ".pdf";
-      const isOffice = OFFICE_EXTENSIONS.includes(ext);
-
-      if (isPdf) {
-        await handlePdfUpload(file);
-      } else if (isOffice) {
-        await handleOfficeUpload(file);
-      } else {
-        throw new Error(`Unsupported: ${ext}`);
-      }
-      setUploadProgress("");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Upload failed";
-      setError(msg);
-      setUploadProgress("");
-    } finally {
-      setIsUploading(false);
-    }
-  }, [locale, onDocumentUpdate]);
+  }, [onDocumentUpdate]);
 
   // ── PDF upload: 2-layer pipeline ──────────────────────────────────
   // Step 1: pdf2htmlEX → viewer HTML (layout-preserving)
@@ -160,8 +144,15 @@ export function DocumentEditor({
         const tempPath = `${tempDir}/moa_pdf_upload_${Date.now()}.pdf`;
 
         // Write file via Tauri invoke (binary data as base64)
+        // Chunked encoding to avoid stack overflow with spread operator on large files
         const bytes = new Uint8Array(arrayBuf);
-        const base64 = btoa(String.fromCharCode(...bytes));
+        const chunkSize = 8192;
+        let binaryStr = "";
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          const chunk = bytes.subarray(i, i + chunkSize);
+          binaryStr += String.fromCharCode.apply(null, Array.from(chunk));
+        }
+        const base64 = btoa(binaryStr);
         await tauriInvoke!("write_temp_file", {
           path: tempPath,
           base64Data: base64,
@@ -305,7 +296,7 @@ export function DocumentEditor({
       engine: result.engine || "upstage",
       page_count: result.page_count || 0,
     }, file.name);
-  }, [locale, onDocumentUpdate]);
+  }, [locale, applyDualResult]);
 
   // ── Office upload → Hancom API ────────────────────────────────────
   const handleOfficeUpload = useCallback(async (file: File) => {
@@ -340,31 +331,47 @@ export function DocumentEditor({
       engine: result.engine || "hancom",
       page_count: result.page_count || 0,
     }, file.name);
-  }, [locale, onDocumentUpdate]);
+  }, [locale, applyDualResult]);
 
-  // ── Apply conversion result (sets both viewer HTML and editor Markdown) ──
-  const applyDualResult = useCallback((result: {
-    viewer_html: string;
-    markdown: string;
-    doc_type: string;
-    engine: string;
-    page_count: number;
-  }, fileName: string) => {
-    setDoc({
-      viewerHtml: result.viewer_html,
-      markdown: result.markdown,
-      tiptapJson: null,
-      fileName,
-      docType: result.doc_type,
-      engine: result.engine,
-      isModified: false,
-    });
-
-    // Notify parent with initial markdown
-    if (onDocumentUpdate && result.markdown) {
-      onDocumentUpdate(result.markdown, result.viewer_html);
+  // ── File upload routing ──────────────────────────────────────────
+  const handleFileUpload = useCallback(async (file: File) => {
+    const ext = "." + file.name.split(".").pop()?.toLowerCase();
+    if (!SUPPORTED_EXTENSIONS.includes(ext)) {
+      setError(
+        locale === "ko"
+          ? `지원되지 않는 파일 형식입니다: ${ext}. 지원 형식: ${SUPPORTED_EXTENSIONS.join(", ")}`
+          : `Unsupported file format: ${ext}. Supported: ${SUPPORTED_EXTENSIONS.join(", ")}`
+      );
+      return;
     }
-  }, [onDocumentUpdate]);
+
+    setIsUploading(true);
+    setError(null);
+    setEditorOpen(false);
+    setUploadProgress(
+      locale === "ko" ? `${file.name} 처리 중...` : `Processing ${file.name}...`
+    );
+
+    try {
+      const isPdf = ext === ".pdf";
+      const isOffice = OFFICE_EXTENSIONS.includes(ext);
+
+      if (isPdf) {
+        await handlePdfUpload(file);
+      } else if (isOffice) {
+        await handleOfficeUpload(file);
+      } else {
+        throw new Error(`Unsupported: ${ext}`);
+      }
+      setUploadProgress("");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Upload failed";
+      setError(msg);
+      setUploadProgress("");
+    } finally {
+      setIsUploading(false);
+    }
+  }, [locale, handlePdfUpload, handleOfficeUpload]);
 
   // ── "Edit" button: open Tiptap editor pane ───────────────────────
   const handleOpenEditor = useCallback(() => {

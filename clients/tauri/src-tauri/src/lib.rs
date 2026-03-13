@@ -1014,13 +1014,19 @@ async fn convert_pdf_dual(
     let mut engine = String::new();
 
     // Step 1: Try pdf2htmlEX for viewer HTML (best layout preservation)
-    let pdf2htmlex_available = which_pdf2htmlex().is_some();
-    if pdf2htmlex_available {
+    let pdf2htmlex_path = which_pdf2htmlex();
+    if let Some(ref pdf2htmlex_bin) = pdf2htmlex_path {
         let output_dir = std::env::temp_dir().join(format!("moa_pdf2html_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&output_dir);
-        let output_file = output_dir.join("viewer.html");
 
-        let result = tokio::process::Command::new(which_pdf2htmlex().unwrap())
+        // pdf2htmlEX names output after input file stem (e.g. "report.pdf" → "report.html")
+        let input_stem = std::path::Path::new(&file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        let output_file = output_dir.join(format!("{input_stem}.html"));
+
+        let result = tokio::process::Command::new(pdf2htmlex_bin)
             .arg(&file_path)
             .arg("--dest-dir")
             .arg(output_dir.to_string_lossy().as_ref())
@@ -1123,7 +1129,7 @@ fn which_pdf2htmlex() -> Option<String> {
 ///     editor.html        — HTML rendered by Tiptap (for export)
 ///     viewer.html        — Original pdf2htmlEX HTML (if saved separately)
 #[tauri::command]
-async fn save_document(
+fn save_document(
     file_name: String,
     markdown: String,
     tiptap_json: Option<String>,
@@ -1166,7 +1172,7 @@ async fn save_document(
 
 /// Load a previously saved document's Markdown and optional Tiptap JSON.
 #[tauri::command]
-async fn load_document(
+fn load_document(
     file_name: String,
 ) -> Result<serde_json::Value, String> {
     let home = dirs_next::home_dir()
