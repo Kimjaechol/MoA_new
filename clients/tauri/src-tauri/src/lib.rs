@@ -984,6 +984,222 @@ fn find_pymupdf_script() -> Option<String> {
     None
 }
 
+/// Write binary data (base64-encoded) to a temporary file path.
+/// Used by the frontend to stage PDF uploads for local conversion.
+#[tauri::command]
+fn write_temp_file(path: String, base64_data: String) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&base64_data)
+        .map_err(|e| format!("Base64 decode failed: {e}"))?;
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("Failed to write temp file: {e}"))
+}
+
+// ── 2-Layer Document Commands ─────────────────────────────────────
+
+/// Convert a PDF using the dual pipeline:
+///   1. pdf2htmlEX → viewer HTML (layout-preserving, read-only)
+///   2. PyMuPDF    → Markdown (structure for Tiptap editor)
+///
+/// If pdf2htmlEX is not installed, falls back to PyMuPDF for both layers.
+/// Returns JSON with `viewer_html`, `markdown`, `page_count`, and `engine`.
+#[tauri::command]
+async fn convert_pdf_dual(
+    file_path: String,
+) -> Result<serde_json::Value, String> {
+    let mut viewer_html = String::new();
+    let mut markdown = String::new();
+    let mut page_count: u64 = 0;
+    let mut engine = String::new();
+
+    // Step 1: Try pdf2htmlEX for viewer HTML (best layout preservation)
+    let pdf2htmlex_available = which_pdf2htmlex().is_some();
+    if pdf2htmlex_available {
+        let output_dir = std::env::temp_dir().join(format!("moa_pdf2html_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&output_dir);
+        let output_file = output_dir.join("viewer.html");
+
+        let result = tokio::process::Command::new(which_pdf2htmlex().unwrap())
+            .arg(&file_path)
+            .arg("--dest-dir")
+            .arg(output_dir.to_string_lossy().as_ref())
+            .arg("--optimize-text")
+            .arg("1")
+            .arg("--embed-css")
+            .arg("1")
+            .arg("--embed-font")
+            .arg("1")
+            .arg("--embed-image")
+            .arg("1")
+            .arg("--embed-javascript")
+            .arg("0")
+            .arg("--embed-outline")
+            .arg("1")
+            .arg("--process-nontext")
+            .arg("1")
+            .output()
+            .await;
+
+        if let Ok(output) = result {
+            if output.status.success() {
+                // Read the generated HTML
+                if let Ok(html) = std::fs::read_to_string(&output_file) {
+                    viewer_html = html;
+                    engine.push_str("pdf2htmlEX");
+                }
+            }
+        }
+        // Clean up temp dir (best effort)
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    // Step 2: PyMuPDF for Markdown (structure extraction for editor)
+    let pymupdf_script = find_pymupdf_script();
+    if let Some(script_path) = pymupdf_script {
+        let output = tokio::process::Command::new("python3")
+            .arg(&script_path)
+            .arg(&file_path)
+            .arg("--format")
+            .arg("both")
+            .output()
+            .await;
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Ok(result) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                if result.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+                    markdown = result.get("markdown").and_then(|m| m.as_str()).unwrap_or("").to_string();
+                    page_count = result.get("page_count").and_then(|p| p.as_u64()).unwrap_or(0);
+
+                    // If pdf2htmlEX was not available, use PyMuPDF HTML as viewer fallback
+                    if viewer_html.is_empty() {
+                        viewer_html = result.get("html").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                        engine = "pymupdf4llm".to_string();
+                    } else {
+                        engine.push_str("+pymupdf4llm");
+                    }
+                }
+            }
+        }
+    }
+
+    if viewer_html.is_empty() && markdown.is_empty() {
+        return Err("Both pdf2htmlEX and PyMuPDF conversion failed. Install pdf2htmlEX and/or pymupdf4llm.".to_string());
+    }
+
+    Ok(serde_json::json!({
+        "success": true,
+        "viewer_html": viewer_html,
+        "markdown": markdown,
+        "page_count": page_count,
+        "engine": engine,
+    }))
+}
+
+/// Find the pdf2htmlEX binary on the system.
+fn which_pdf2htmlex() -> Option<String> {
+    // Common binary names for pdf2htmlEX
+    let names = ["pdf2htmlEX", "pdf2htmlex"];
+    for name in &names {
+        if let Ok(output) = std::process::Command::new("which").arg(name).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Save a document's Markdown, Tiptap JSON, and editor HTML to the local filesystem.
+///
+/// Files are stored under the MoA documents directory:
+///   ~/.moa/documents/<filename_stem>/
+///     content.md         — Markdown (primary editable content)
+///     content.json       — Tiptap JSON (structured document tree)
+///     editor.html        — HTML rendered by Tiptap (for export)
+///     viewer.html        — Original pdf2htmlEX HTML (if saved separately)
+#[tauri::command]
+async fn save_document(
+    file_name: String,
+    markdown: String,
+    tiptap_json: Option<String>,
+    editor_html: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let home = dirs_next::home_dir()
+        .ok_or_else(|| "Cannot find home directory".to_string())?;
+    let doc_dir = home
+        .join(".moa")
+        .join("documents")
+        .join(sanitize_filename(&file_name));
+
+    std::fs::create_dir_all(&doc_dir)
+        .map_err(|e| format!("Failed to create document directory: {e}"))?;
+
+    // Save Markdown
+    let md_path = doc_dir.join("content.md");
+    std::fs::write(&md_path, &markdown)
+        .map_err(|e| format!("Failed to write content.md: {e}"))?;
+
+    // Save Tiptap JSON
+    if let Some(ref json_str) = tiptap_json {
+        let json_path = doc_dir.join("content.json");
+        std::fs::write(&json_path, json_str)
+            .map_err(|e| format!("Failed to write content.json: {e}"))?;
+    }
+
+    // Save editor HTML
+    if let Some(ref html) = editor_html {
+        let html_path = doc_dir.join("editor.html");
+        std::fs::write(&html_path, html)
+            .map_err(|e| format!("Failed to write editor.html: {e}"))?;
+    }
+
+    Ok(serde_json::json!({
+        "success": true,
+        "path": doc_dir.to_string_lossy(),
+    }))
+}
+
+/// Load a previously saved document's Markdown and optional Tiptap JSON.
+#[tauri::command]
+async fn load_document(
+    file_name: String,
+) -> Result<serde_json::Value, String> {
+    let home = dirs_next::home_dir()
+        .ok_or_else(|| "Cannot find home directory".to_string())?;
+    let doc_dir = home
+        .join(".moa")
+        .join("documents")
+        .join(sanitize_filename(&file_name));
+
+    let md_path = doc_dir.join("content.md");
+    let json_path = doc_dir.join("content.json");
+
+    let markdown = std::fs::read_to_string(&md_path).unwrap_or_default();
+    let tiptap_json = std::fs::read_to_string(&json_path).ok();
+
+    Ok(serde_json::json!({
+        "success": true,
+        "markdown": markdown,
+        "tiptap_json": tiptap_json,
+    }))
+}
+
+/// Sanitize a filename for use as a directory name (remove path separators and special chars).
+fn sanitize_filename(name: &str) -> String {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("untitled");
+    stem.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
+}
+
 // ── Entry Point ──────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1045,6 +1261,10 @@ pub fn run() {
             browse_and_extract,
             web_search,
             convert_pdf_local,
+            convert_pdf_dual,
+            write_temp_file,
+            save_document,
+            load_document,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path

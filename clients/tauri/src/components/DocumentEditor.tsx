@@ -1,27 +1,34 @@
 /**
- * WYSIWYG Document Editor component for MoA.
+ * 2-Layer Document Editor for MoA.
  *
- * Displays converted HTML documents in an editable rich-text editor.
- * When the user edits, the HTML is re-converted to Markdown and sent
- * back to the AI for understanding.
+ * Architecture:
+ *   Layer 1 (Viewer): Read-only iframe rendering the original PDF→HTML
+ *     output (pdf2htmlEX for layout-preserving display, or PyMuPDF/Hancom
+ *     HTML). Always shows the unmodified original.
+ *   Layer 2 (Editor): Tiptap rich-text editor working on Markdown/JSON.
+ *     Opens on "Edit" click in a side-by-side split pane to the right
+ *     of the viewer.
  *
- * Supports:
- * - Split view: Source HTML / Visual preview
- * - Toolbar: Bold, Italic, Headings (H1-H3), Lists, Tables
- * - Save/Load: Persist to local filesystem
- * - Export: HTML and Markdown formats
- * - Document upload: PDF, HWP, DOCX, XLSX, PPTX
+ * Data flow:
+ *   Upload → pdf2htmlEX produces viewer.html (Layer 1)
+ *          → PyMuPDF produces content.md  (Layer 2)
+ *   Edit   → Tiptap modifies content.md
+ *   Save   → content.md + Tiptap JSON persisted
+ *          → viewer.html stays as original (no re-render)
+ *
+ * Supports: PDF (digital + image), HWP, HWPX, DOC, DOCX, XLS, XLSX, PPT, PPTX
  */
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback } from "react";
 import { type Locale } from "../lib/i18n";
 import { apiClient } from "../lib/api";
+import { DocumentViewer } from "./DocumentViewer";
+import { TiptapEditor, type TiptapEditorHandle } from "./TiptapEditor";
 
-// Tauri invoke for local commands (PyMuPDF, etc.)
+// Tauri invoke for local commands (PyMuPDF, pdf2htmlEX, etc.)
 let tauriInvoke: ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null = null;
 try {
-  // Dynamic import for Tauri environment
-  const tauri = (window as Record<string, unknown>).__TAURI__;
+  const tauri = (window as unknown as Record<string, unknown>).__TAURI__;
   if (tauri && typeof (tauri as Record<string, unknown>).invoke === "function") {
     tauriInvoke = (tauri as Record<string, (cmd: string, args?: Record<string, unknown>) => Promise<unknown>>).invoke;
   }
@@ -29,13 +36,9 @@ try {
   // Not in Tauri environment (web mode)
 }
 
-/** Check if running inside Tauri desktop app */
 function isTauriApp(): boolean {
   return tauriInvoke !== null;
 }
-
-/** PDF type: digital (has text) or image (scanned/no text) */
-type PdfType = "digital" | "image" | "unknown";
 
 /** Office document extensions processed via Hancom API */
 const OFFICE_EXTENSIONS = [".hwp", ".hwpx", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"];
@@ -45,17 +48,19 @@ interface DocumentEditorProps {
   onBack: () => void;
   onToggleSidebar: () => void;
   sidebarOpen: boolean;
-  /** Optional initial HTML content to display */
+  /** Optional initial HTML content to display in the viewer */
   initialHtml?: string;
   /** Callback when document is saved/updated — sends Markdown to AI */
   onDocumentUpdate?: (markdown: string, html: string) => void;
 }
 
-type ViewMode = "visual" | "source" | "split";
-
 interface DocumentState {
-  html: string;
+  /** Original HTML from pdf2htmlEX / converter — never modified after initial set */
+  viewerHtml: string;
+  /** Editable Markdown from PyMuPDF structure extraction */
   markdown: string;
+  /** Tiptap JSON for structured persistence */
+  tiptapJson: Record<string, unknown> | null;
   fileName: string;
   docType: string;
   engine: string;
@@ -79,34 +84,25 @@ export function DocumentEditor({
   initialHtml,
   onDocumentUpdate,
 }: DocumentEditorProps) {
-  const [viewMode, setViewMode] = useState<ViewMode>("visual");
+  // Editor open/close state — starts closed (viewer only)
+  const [editorOpen, setEditorOpen] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [doc, setDoc] = useState<DocumentState>({
-    html: initialHtml || "",
+    viewerHtml: initialHtml || "",
     markdown: "",
+    tiptapJson: null,
     fileName: "",
     docType: "",
     engine: "",
     isModified: false,
   });
 
-  const editorRef = useRef<HTMLDivElement>(null);
-  const sourceRef = useRef<HTMLTextAreaElement>(null);
+  const tiptapRef = useRef<TiptapEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Initialize with initial HTML if provided
-  useEffect(() => {
-    if (initialHtml && editorRef.current) {
-      editorRef.current.innerHTML = initialHtml;
-    }
-  }, [initialHtml]);
-
-  // Handle file upload — routes to appropriate processing pipeline:
-  // 1. Digital PDF → local PyMuPDF (Tauri sidecar, no server needed)
-  // 2. Image PDF → R2 pre-signed URL → Railway → Upstage (operator key on server)
-  // 3. Office docs (HWP, DOCX, etc.) → Hancom DocsConverter API via /api/document/process
+  // ── File upload routing ──────────────────────────────────────────
   const handleFileUpload = useCallback(async (file: File) => {
     const ext = "." + file.name.split(".").pop()?.toLowerCase();
     if (!SUPPORTED_EXTENSIONS.includes(ext)) {
@@ -120,10 +116,9 @@ export function DocumentEditor({
 
     setIsUploading(true);
     setError(null);
+    setEditorOpen(false);
     setUploadProgress(
-      locale === "ko"
-        ? `${file.name} 처리 중...`
-        : `Processing ${file.name}...`
+      locale === "ko" ? `${file.name} 처리 중...` : `Processing ${file.name}...`
     );
 
     try {
@@ -131,15 +126,12 @@ export function DocumentEditor({
       const isOffice = OFFICE_EXTENSIONS.includes(ext);
 
       if (isPdf) {
-        // Route PDF based on type
         await handlePdfUpload(file);
       } else if (isOffice) {
-        // Office docs → Hancom API via local agent
         await handleOfficeUpload(file);
       } else {
         throw new Error(`Unsupported: ${ext}`);
       }
-
       setUploadProgress("");
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Upload failed";
@@ -150,48 +142,86 @@ export function DocumentEditor({
     }
   }, [locale, onDocumentUpdate]);
 
-  // PDF upload: try local PyMuPDF first (digital), fall back to R2→Upstage (image)
+  // ── PDF upload: 2-layer pipeline ──────────────────────────────────
+  // Step 1: pdf2htmlEX → viewer HTML (layout-preserving)
+  // Step 2: PyMuPDF   → Markdown (structure for Tiptap)
+  // Fallback for image PDF: R2 → Upstage OCR
   const handlePdfUpload = useCallback(async (file: File) => {
-    // Step 1: Try local PyMuPDF conversion for digital PDFs
     if (isTauriApp() && tauriInvoke) {
       setUploadProgress(
         locale === "ko"
-          ? "디지털 PDF 로컬 변환 시도 중 (PyMuPDF)..."
-          : "Trying local digital PDF conversion (PyMuPDF)..."
+          ? "PDF 변환 중 (뷰어: pdf2htmlEX + 편집: PyMuPDF)..."
+          : "Converting PDF (Viewer: pdf2htmlEX + Editor: PyMuPDF)..."
       );
 
       try {
-        // Save file to temp path for PyMuPDF processing
         const arrayBuf = await file.arrayBuffer();
         const tempDir = await tauriInvoke("plugin:path|temp_dir") as string;
         const tempPath = `${tempDir}/moa_pdf_upload_${Date.now()}.pdf`;
 
-        // Write file via Tauri FS
-        const { writeFile } = await import("@tauri-apps/plugin-fs");
-        await writeFile(tempPath, new Uint8Array(arrayBuf));
+        // Write file via Tauri invoke (binary data as base64)
+        const bytes = new Uint8Array(arrayBuf);
+        const base64 = btoa(String.fromCharCode(...bytes));
+        await tauriInvoke!("write_temp_file", {
+          path: tempPath,
+          base64Data: base64,
+        });
 
-        const result = await tauriInvoke("convert_pdf_local", {
+        // Run both conversions: pdf2htmlEX (viewer) + PyMuPDF (editor)
+        const result = await tauriInvoke("convert_pdf_dual", {
           filePath: tempPath,
-        }) as { success: boolean; html: string; markdown: string; page_count: number; engine: string };
+        }) as {
+          success: boolean;
+          viewer_html: string;
+          markdown: string;
+          page_count: number;
+          engine: string;
+        };
 
-        if (result.success && result.html && result.html.length > 100) {
-          // Digital PDF converted successfully locally
-          applyDocumentResult({
-            html: result.html,
+        if (result.success && result.viewer_html && result.viewer_html.length > 100) {
+          applyDualResult({
+            viewer_html: result.viewer_html,
             markdown: result.markdown,
             doc_type: "digital_pdf",
-            engine: result.engine || "pymupdf4llm",
+            engine: result.engine || "pdf2htmlEX+pymupdf",
             page_count: result.page_count,
           }, file.name);
           return;
         }
-        // If output is too short, likely image PDF → fall through to R2 flow
+
+        // Fallback: try PyMuPDF-only conversion (pdf2htmlEX not available)
+        setUploadProgress(
+          locale === "ko"
+            ? "PyMuPDF 로컬 변환 중..."
+            : "Trying PyMuPDF local conversion..."
+        );
+
+        const fallback = await tauriInvoke("convert_pdf_local", {
+          filePath: tempPath,
+        }) as {
+          success: boolean;
+          html: string;
+          markdown: string;
+          page_count: number;
+          engine: string;
+        };
+
+        if (fallback.success && fallback.html && fallback.html.length > 100) {
+          applyDualResult({
+            viewer_html: fallback.html,
+            markdown: fallback.markdown,
+            doc_type: "digital_pdf",
+            engine: fallback.engine || "pymupdf4llm",
+            page_count: fallback.page_count,
+          }, file.name);
+          return;
+        }
       } catch {
-        // PyMuPDF not available or conversion failed → try R2 flow
+        // Local conversion not available → fall through to server
       }
     }
 
-    // Step 2: Image PDF → R2 pre-signed URL → Railway → Upstage
+    // Image PDF fallback → R2 pre-signed URL → Railway → Upstage OCR
     setUploadProgress(
       locale === "ko"
         ? "이미지 PDF 처리 중 (Upstage OCR)..."
@@ -201,11 +231,9 @@ export function DocumentEditor({
     const serverUrl = apiClient.getServerUrl();
     const token = apiClient.getToken();
 
-    // Step 2a: Get pre-signed R2 upload URL from Railway
+    // Get pre-signed R2 upload URL
     setUploadProgress(
-      locale === "ko"
-        ? "업로드 URL 발급 중..."
-        : "Requesting upload URL..."
+      locale === "ko" ? "업로드 URL 발급 중..." : "Requesting upload URL..."
     );
 
     const urlResp = await fetch(`${serverUrl}/api/document/upload-url`, {
@@ -228,18 +256,14 @@ export function DocumentEditor({
 
     const { upload_url, object_key } = await urlResp.json();
 
-    // Step 2b: Upload file directly to R2
+    // Upload file to R2
     setUploadProgress(
-      locale === "ko"
-        ? "파일 업로드 중 (R2)..."
-        : "Uploading file (R2)..."
+      locale === "ko" ? "파일 업로드 중 (R2)..." : "Uploading file (R2)..."
     );
 
     const uploadResp = await fetch(upload_url, {
       method: "PUT",
-      headers: {
-        "Content-Type": file.type || "application/pdf",
-      },
+      headers: { "Content-Type": file.type || "application/pdf" },
       body: file,
     });
 
@@ -251,7 +275,7 @@ export function DocumentEditor({
       );
     }
 
-    // Step 2c: Tell Railway to process the file from R2 via Upstage
+    // Process via Upstage OCR
     setUploadProgress(
       locale === "ko"
         ? "OCR 문서 변환 중 (Upstage)..."
@@ -264,11 +288,7 @@ export function DocumentEditor({
         "Content-Type": "application/json",
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({
-        object_key,
-        filename: file.name,
-        estimated_pages: 1,
-      }),
+      body: JSON.stringify({ object_key, filename: file.name, estimated_pages: 1 }),
     });
 
     if (!processResp.ok) {
@@ -277,10 +297,17 @@ export function DocumentEditor({
     }
 
     const result = await processResp.json();
-    applyDocumentResult(result, file.name);
+    // Server returns html + markdown; use html for viewer, markdown for editor
+    applyDualResult({
+      viewer_html: result.html || "",
+      markdown: result.markdown || "",
+      doc_type: result.doc_type || "image_pdf",
+      engine: result.engine || "upstage",
+      page_count: result.page_count || 0,
+    }, file.name);
   }, [locale, onDocumentUpdate]);
 
-  // Office document upload → Hancom API via local agent's /api/document/process
+  // ── Office upload → Hancom API ────────────────────────────────────
   const handleOfficeUpload = useCallback(async (file: File) => {
     setUploadProgress(
       locale === "ko"
@@ -296,9 +323,7 @@ export function DocumentEditor({
 
     const response = await fetch(`${serverUrl}/api/document/process`, {
       method: "POST",
-      headers: {
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: formData,
     });
 
@@ -308,87 +333,102 @@ export function DocumentEditor({
     }
 
     const result = await response.json();
-    applyDocumentResult(result, file.name);
+    applyDualResult({
+      viewer_html: result.html || "",
+      markdown: result.markdown || "",
+      doc_type: result.doc_type || "office",
+      engine: result.engine || "hancom",
+      page_count: result.page_count || 0,
+    }, file.name);
   }, [locale, onDocumentUpdate]);
 
-  // Apply conversion result to the editor
-  const applyDocumentResult = useCallback((result: Record<string, unknown>, fileName: string) => {
-    const html = (result.html as string) || "";
-    const markdown = (result.markdown as string) || "";
-
+  // ── Apply conversion result (sets both viewer HTML and editor Markdown) ──
+  const applyDualResult = useCallback((result: {
+    viewer_html: string;
+    markdown: string;
+    doc_type: string;
+    engine: string;
+    page_count: number;
+  }, fileName: string) => {
     setDoc({
-      html,
-      markdown,
+      viewerHtml: result.viewer_html,
+      markdown: result.markdown,
+      tiptapJson: null,
       fileName,
-      docType: (result.doc_type as string) || "unknown",
-      engine: (result.engine as string) || "unknown",
+      docType: result.doc_type,
+      engine: result.engine,
       isModified: false,
     });
 
-    if (editorRef.current) {
-      editorRef.current.innerHTML = html;
-    }
-
-    if (onDocumentUpdate && markdown) {
-      onDocumentUpdate(markdown, html);
+    // Notify parent with initial markdown
+    if (onDocumentUpdate && result.markdown) {
+      onDocumentUpdate(result.markdown, result.viewer_html);
     }
   }, [onDocumentUpdate]);
 
-  // Handle visual editor changes
-  const handleEditorInput = useCallback(() => {
-    if (!editorRef.current) return;
+  // ── "Edit" button: open Tiptap editor pane ───────────────────────
+  const handleOpenEditor = useCallback(() => {
+    setEditorOpen(true);
+    // Load markdown into Tiptap when it opens
+    setTimeout(() => {
+      tiptapRef.current?.setMarkdown(doc.markdown);
+      tiptapRef.current?.focus();
+    }, 100);
+  }, [doc.markdown]);
 
-    const html = editorRef.current.innerHTML;
-    const markdown = htmlToMarkdown(html);
+  // ── Close editor pane ─────────────────────────────────────────────
+  const handleCloseEditor = useCallback(() => {
+    setEditorOpen(false);
+  }, []);
 
+  // ── Editor content change handler ─────────────────────────────────
+  const handleEditorChange = useCallback((markdown: string) => {
     setDoc((prev) => ({
       ...prev,
-      html,
       markdown,
       isModified: true,
     }));
   }, []);
 
-  // Handle source HTML changes
-  const handleSourceChange = useCallback((newHtml: string) => {
+  // ── Save: persist markdown + JSON, notify parent ──────────────────
+  const handleSave = useCallback(async () => {
+    if (!tiptapRef.current) return;
+
+    const markdown = tiptapRef.current.getMarkdown();
+    const tiptapJson = tiptapRef.current.getJSON();
+    const editorHtml = tiptapRef.current.getHTML();
+
     setDoc((prev) => ({
       ...prev,
-      html: newHtml,
-      markdown: htmlToMarkdown(newHtml),
-      isModified: true,
+      markdown,
+      tiptapJson,
+      isModified: false,
     }));
 
-    // Update visual editor
-    if (editorRef.current) {
-      editorRef.current.innerHTML = newHtml;
+    // Save to filesystem via Tauri if available
+    if (isTauriApp() && tauriInvoke && doc.fileName) {
+      try {
+        await tauriInvoke("save_document", {
+          fileName: doc.fileName,
+          markdown,
+          tiptapJson: JSON.stringify(tiptapJson),
+          editorHtml,
+        });
+      } catch {
+        // Filesystem save failed — content still in memory
+      }
     }
-  }, []);
 
-  // Save and send to AI
-  const handleSave = useCallback(() => {
+    // Notify parent (AI context)
     if (onDocumentUpdate) {
-      onDocumentUpdate(doc.markdown, doc.html);
+      onDocumentUpdate(markdown, editorHtml);
     }
-    setDoc((prev) => ({ ...prev, isModified: false }));
-  }, [doc.markdown, doc.html, onDocumentUpdate]);
+  }, [doc.fileName, onDocumentUpdate]);
 
-  // Toolbar formatting commands
-  const execCmd = useCallback((command: string, value?: string) => {
-    document.execCommand(command, false, value);
-    editorRef.current?.focus();
-    handleEditorInput();
-  }, [handleEditorInput]);
-
-  // File drop handler
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    const file = e.dataTransfer.files[0];
-    if (file) handleFileUpload(file);
-  }, [handleFileUpload]);
-
-  // Export as Markdown file
+  // ── Export as Markdown ────────────────────────────────────────────
   const handleExportMarkdown = useCallback(() => {
-    const blob = new Blob([doc.markdown], { type: "text/markdown" });
+    const md = tiptapRef.current?.getMarkdown() || doc.markdown;
+    const blob = new Blob([md], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -397,17 +437,26 @@ export function DocumentEditor({
     URL.revokeObjectURL(url);
   }, [doc.markdown, doc.fileName]);
 
-  // Export as HTML file
+  // ── Export as HTML ────────────────────────────────────────────────
   const handleExportHtml = useCallback(() => {
-    const blob = new Blob([doc.html], { type: "text/html" });
+    const html = tiptapRef.current?.getHTML() || doc.viewerHtml;
+    const blob = new Blob([html], { type: "text/html" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = doc.fileName.replace(/\.[^.]+$/, ".html") || "document.html";
     a.click();
     URL.revokeObjectURL(url);
-  }, [doc.html, doc.fileName]);
+  }, [doc.viewerHtml, doc.fileName]);
 
+  // ── File drop handler ─────────────────────────────────────────────
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (file) handleFileUpload(file);
+  }, [handleFileUpload]);
+
+  // ── Render ────────────────────────────────────────────────────────
   return (
     <div className="document-editor-page">
       {/* Header */}
@@ -427,7 +476,7 @@ export function DocumentEditor({
         )}
       </div>
 
-      {/* Toolbar */}
+      {/* Top toolbar */}
       <div className="editor-toolbar">
         {/* File operations */}
         <input
@@ -451,79 +500,38 @@ export function DocumentEditor({
 
         <span className="toolbar-divider" />
 
-        {/* Formatting */}
-        <button className="toolbar-btn" onClick={() => execCmd("bold")} title="Bold (Ctrl+B)">
-          <strong>B</strong>
-        </button>
-        <button className="toolbar-btn" onClick={() => execCmd("italic")} title="Italic (Ctrl+I)">
-          <em>I</em>
-        </button>
-        <button className="toolbar-btn" onClick={() => execCmd("underline")} title="Underline (Ctrl+U)">
-          <u>U</u>
-        </button>
-
-        <span className="toolbar-divider" />
-
-        {/* Headings */}
-        <button className="toolbar-btn" onClick={() => execCmd("formatBlock", "h1")} title="Heading 1">
-          H1
-        </button>
-        <button className="toolbar-btn" onClick={() => execCmd("formatBlock", "h2")} title="Heading 2">
-          H2
-        </button>
-        <button className="toolbar-btn" onClick={() => execCmd("formatBlock", "h3")} title="Heading 3">
-          H3
-        </button>
-        <button className="toolbar-btn" onClick={() => execCmd("formatBlock", "p")} title="Paragraph">
-          P
-        </button>
-
-        <span className="toolbar-divider" />
-
-        {/* Lists */}
-        <button className="toolbar-btn" onClick={() => execCmd("insertUnorderedList")} title={locale === "ko" ? "글머리 기호 목록" : "Bullet list"}>
-          {locale === "ko" ? "목록" : "List"}
-        </button>
-        <button className="toolbar-btn" onClick={() => execCmd("insertOrderedList")} title={locale === "ko" ? "번호 목록" : "Numbered list"}>
-          1.
-        </button>
-
-        <span className="toolbar-divider" />
-
-        {/* View mode */}
-        <div className="view-mode-toggle">
+        {/* Edit toggle */}
+        {doc.viewerHtml && !editorOpen && (
           <button
-            className={`view-btn ${viewMode === "visual" ? "active" : ""}`}
-            onClick={() => setViewMode("visual")}
+            className="toolbar-btn edit-toggle-btn"
+            onClick={handleOpenEditor}
+            title={locale === "ko" ? "수정하기 — 에디터 열기" : "Edit — open editor"}
           >
-            {locale === "ko" ? "편집" : "Edit"}
+            {locale === "ko" ? "수정하기" : "Edit"}
           </button>
+        )}
+        {editorOpen && (
           <button
-            className={`view-btn ${viewMode === "source" ? "active" : ""}`}
-            onClick={() => setViewMode("source")}
+            className="toolbar-btn"
+            onClick={handleCloseEditor}
+            title={locale === "ko" ? "에디터 닫기" : "Close editor"}
           >
-            {locale === "ko" ? "소스" : "Source"}
+            {locale === "ko" ? "에디터 닫기" : "Close Editor"}
           </button>
-          <button
-            className={`view-btn ${viewMode === "split" ? "active" : ""}`}
-            onClick={() => setViewMode("split")}
-          >
-            {locale === "ko" ? "분할" : "Split"}
-          </button>
-        </div>
+        )}
 
         <span className="toolbar-divider" />
 
-        {/* Save & Export */}
-        {doc.html && (
+        {/* Save & Export (visible when document is loaded) */}
+        {doc.viewerHtml && (
           <>
             <button
               className="toolbar-btn save-btn"
               onClick={handleSave}
-              disabled={!doc.isModified}
-              title={locale === "ko" ? "저장하고 AI에게 전달" : "Save and send to AI"}
+              disabled={!doc.isModified || !editorOpen}
+              title={locale === "ko" ? "저장 (Markdown + HTML)" : "Save (Markdown + HTML)"}
             >
-              {locale === "ko" ? "저장" : "Save"}
+              {locale === "ko" ? "저장하기" : "Save"}
             </button>
             <button
               className="toolbar-btn"
@@ -541,17 +549,35 @@ export function DocumentEditor({
             </button>
           </>
         )}
+
+        {/* Back button */}
+        <div style={{ marginLeft: "auto" }}>
+          <button className="toolbar-btn" onClick={onBack}>
+            {locale === "ko" ? "뒤로" : "Back"}
+          </button>
+        </div>
       </div>
 
       {/* Document info bar */}
       {doc.docType && (
         <div className="doc-info-bar">
           <span className="doc-info-type">
-            {doc.docType === "digital_pdf" && (locale === "ko" ? "디지털 PDF (PyMuPDF 로컬 변환)" : "Digital PDF (PyMuPDF local conversion)")}
-            {doc.docType === "image_pdf" && (locale === "ko" ? "이미지 PDF (Upstage OCR)" : "Image PDF (Upstage OCR)")}
-            {doc.docType.startsWith("office_") && (locale === "ko" ? `오피스 문서 (한컴 변환기)` : `Office document (Hancom converter)`)}
+            {doc.docType === "digital_pdf" && (locale === "ko"
+              ? "디지털 PDF (뷰어: pdf2htmlEX | 편집: PyMuPDF)"
+              : "Digital PDF (Viewer: pdf2htmlEX | Editor: PyMuPDF)")}
+            {doc.docType === "image_pdf" && (locale === "ko"
+              ? "이미지 PDF (Upstage OCR)"
+              : "Image PDF (Upstage OCR)")}
+            {doc.docType.startsWith("office") && (locale === "ko"
+              ? "오피스 문서 (한컴 변환기)"
+              : "Office document (Hancom converter)")}
           </span>
           <span className="doc-info-engine">{doc.engine}</span>
+          {editorOpen && (
+            <span className="doc-info-mode">
+              {locale === "ko" ? "| 뷰어 + 에디터 모드" : "| Viewer + Editor mode"}
+            </span>
+          )}
         </div>
       )}
 
@@ -570,13 +596,14 @@ export function DocumentEditor({
         </div>
       )}
 
-      {/* Editor area */}
+      {/* Main content area: Viewer (left) + Editor (right) */}
       <div
-        className={`editor-content ${viewMode}`}
+        className={`doc-split-container ${editorOpen ? "editor-visible" : "viewer-only"}`}
         onDrop={handleDrop}
         onDragOver={(e) => e.preventDefault()}
       >
-        {!doc.html && !isUploading && (
+        {/* Empty state / dropzone */}
+        {!doc.viewerHtml && !isUploading && (
           <div
             className="editor-dropzone"
             onClick={() => fileInputRef.current?.click()}
@@ -592,83 +619,44 @@ export function DocumentEditor({
             </p>
             <p className="dropzone-note">
               {locale === "ko"
-                ? "이미지 PDF: Upstage OCR (서버) | 디지털 PDF: PyMuPDF (로컬) | 오피스: 한컴 변환"
-                : "Image PDF: Upstage OCR (server) | Digital PDF: PyMuPDF (local) | Office: Hancom converter"}
+                ? "디지털 PDF: pdf2htmlEX+PyMuPDF (로컬) | 이미지 PDF: Upstage OCR (서버) | 오피스: 한컴 변환"
+                : "Digital PDF: pdf2htmlEX+PyMuPDF (local) | Image PDF: Upstage OCR (server) | Office: Hancom converter"}
             </p>
           </div>
         )}
 
-        {doc.html && (viewMode === "visual" || viewMode === "split") && (
-          <div
-            ref={editorRef}
-            className="visual-editor"
-            contentEditable
-            onInput={handleEditorInput}
-            suppressContentEditableWarning
-            dangerouslySetInnerHTML={{ __html: doc.html }}
-          />
+        {/* Layer 1: Viewer (always visible when document loaded) */}
+        {doc.viewerHtml && (
+          <div className={`doc-viewer-pane ${editorOpen ? "split" : "full"}`}>
+            <div className="pane-header">
+              <span className="pane-label">
+                {locale === "ko" ? "원본 미리보기 (읽기 전용)" : "Original Preview (Read-only)"}
+              </span>
+            </div>
+            <DocumentViewer
+              html={doc.viewerHtml}
+              locale={locale}
+            />
+          </div>
         )}
 
-        {doc.html && (viewMode === "source" || viewMode === "split") && (
-          <textarea
-            ref={sourceRef}
-            className="source-editor"
-            value={doc.html}
-            onChange={(e) => handleSourceChange(e.target.value)}
-            spellCheck={false}
-          />
+        {/* Layer 2: Tiptap Editor (visible when "Edit" is clicked) */}
+        {doc.viewerHtml && editorOpen && (
+          <div className="doc-editor-pane">
+            <div className="pane-header">
+              <span className="pane-label">
+                {locale === "ko" ? "편집기 (Markdown 기반)" : "Editor (Markdown-based)"}
+              </span>
+            </div>
+            <TiptapEditor
+              ref={tiptapRef}
+              initialMarkdown={doc.markdown}
+              locale={locale}
+              onChange={handleEditorChange}
+            />
+          </div>
         )}
       </div>
     </div>
   );
-}
-
-/**
- * Simple HTML to Markdown converter (client-side).
- * Used when user edits HTML in the WYSIWYG editor — the Markdown
- * version is what gets sent to the AI for understanding.
- */
-function htmlToMarkdown(html: string): string {
-  let md = html;
-
-  // Headings
-  for (let i = 6; i >= 1; i--) {
-    const prefix = "#".repeat(i);
-    md = md.replace(new RegExp(`<h${i}[^>]*>`, "gi"), `\n${prefix} `);
-    md = md.replace(new RegExp(`</h${i}>`, "gi"), "\n");
-  }
-
-  // Paragraphs and breaks
-  md = md.replace(/<br\s*\/?>/gi, "\n");
-  md = md.replace(/<p[^>]*>/gi, "\n");
-  md = md.replace(/<\/p>/gi, "\n");
-
-  // Bold and italic
-  md = md.replace(/<(strong|b)[^>]*>/gi, "**");
-  md = md.replace(/<\/(strong|b)>/gi, "**");
-  md = md.replace(/<(em|i)[^>]*>/gi, "*");
-  md = md.replace(/<\/(em|i)>/gi, "*");
-
-  // Lists
-  md = md.replace(/<ul[^>]*>/gi, "\n");
-  md = md.replace(/<\/ul>/gi, "\n");
-  md = md.replace(/<ol[^>]*>/gi, "\n");
-  md = md.replace(/<\/ol>/gi, "\n");
-  md = md.replace(/<li[^>]*>/gi, "- ");
-  md = md.replace(/<\/li>/gi, "\n");
-
-  // Strip remaining tags
-  md = md.replace(/<[^>]+>/g, "");
-
-  // HTML entities
-  md = md.replace(/&amp;/g, "&");
-  md = md.replace(/&lt;/g, "<");
-  md = md.replace(/&gt;/g, ">");
-  md = md.replace(/&quot;/g, '"');
-  md = md.replace(/&nbsp;/g, " ");
-
-  // Clean up whitespace
-  md = md.replace(/\n{3,}/g, "\n\n");
-
-  return md.trim();
 }
