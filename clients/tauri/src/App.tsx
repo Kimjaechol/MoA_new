@@ -8,6 +8,7 @@ import { DeviceSelect } from "./components/DeviceSelect";
 import { Interpreter } from "./components/Interpreter";
 import { SetupWizard } from "./components/SetupWizard";
 import { GatewayStatus } from "./components/GatewayStatus";
+import { DocumentEditor } from "./components/DocumentEditor";
 import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, t, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated } from "./lib/tauri-bridge";
@@ -23,7 +24,7 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "setup" | "login" | "signup" | "device_select" | "chat" | "settings" | "interpreter";
+type Page = "setup" | "login" | "signup" | "device_select" | "chat" | "settings" | "interpreter" | "document";
 
 function App() {
   const [page, setPage] = useState<Page>("login");
@@ -436,6 +437,10 @@ function App() {
           setPage("interpreter");
           if (window.innerWidth <= 768) setSidebarOpen(false);
         }}
+        onOpenDocument={() => {
+          setPage("document");
+          if (window.innerWidth <= 768) setSidebarOpen(false);
+        }}
         onToggle={() => setSidebarOpen((p) => !p)}
         currentPage={page}
       />
@@ -457,6 +462,19 @@ function App() {
             onBack={() => setPage("chat")}
             onToggleSidebar={() => setSidebarOpen((p) => !p)}
             sidebarOpen={sidebarOpen}
+          />
+        ) : page === "document" ? (
+          <DocumentEditor
+            locale={locale}
+            onBack={() => setPage("chat")}
+            onToggleSidebar={() => setSidebarOpen((p) => !p)}
+            sidebarOpen={sidebarOpen}
+            onDocumentUpdate={(markdown, _html) => {
+              // Send document content to the active chat as context
+              if (markdown) {
+                handleSendMessage(`[Document updated]\n\n${markdown.substring(0, 2000)}`);
+              }
+            }}
           />
         ) : (
           <Settings

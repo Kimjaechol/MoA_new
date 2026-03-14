@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod auth_api;
+pub mod llm_proxy;
 mod openai_compat;
 mod openclaw_compat;
 pub mod pair;
@@ -378,6 +379,9 @@ pub struct AppState {
     /// Supabase client for cloud user management, credits, and audit logging.
     /// Present only when SUPABASE_URL + SUPABASE_SERVICE_KEY are configured.
     pub supabase: Option<Arc<crate::integrations::supabase::SupabaseClient>>,
+    /// Cloudflare R2 configuration for secure document upload flow.
+    /// Present only when R2_ACCOUNT_ID + R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY are set.
+    pub r2_config: Option<crate::storage::r2::R2Config>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -992,6 +996,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         device_router,
         email_verify_service,
         supabase,
+        r2_config: crate::storage::r2::R2Config::from_env(),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1111,6 +1116,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/node-control", post(handle_node_control))
+        // ── LLM proxy (hybrid architecture: keys stay on server) ──
+        .route("/api/llm/proxy", post(llm_proxy::handle_llm_proxy))
+        .route("/api/llm/upload-token", post(llm_proxy::handle_upload_token))
+        .route("/api/llm/upload-complete", post(llm_proxy::handle_upload_complete))
+        // ── Document processing ──
+        .route("/api/document/process", post(api::handle_api_document_process))
+        // ── R2-based document upload (secure image PDF flow) ──
+        .route("/api/document/upload-url", post(llm_proxy::handle_document_upload_url))
+        .route("/api/document/process-r2", post(llm_proxy::handle_document_process_r2))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
@@ -3123,6 +3137,7 @@ mod tests {
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3194,6 +3209,7 @@ mod tests {
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3248,6 +3264,7 @@ mod tests {
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -3303,6 +3320,7 @@ mod tests {
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let unauthorized =
@@ -3800,6 +3818,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3883,6 +3902,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_webhook(
@@ -3947,6 +3967,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_webhook(
@@ -4012,6 +4033,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_webhook(
@@ -4086,6 +4108,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_node_control(
@@ -4152,6 +4175,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_node_control(
@@ -4223,6 +4247,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let headers = HeaderMap::new();
@@ -4320,6 +4345,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_webhook(
@@ -4387,6 +4413,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4459,6 +4486,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4545,6 +4573,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_github_webhook(
@@ -4610,6 +4639,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let body = r#"{
@@ -4686,6 +4716,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let body = r#"{
@@ -4767,6 +4798,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -4838,6 +4870,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4902,6 +4935,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let response = handle_qq_webhook(
@@ -4965,6 +4999,7 @@ Reminder set successfully."#;
             device_router: None,
             email_verify_service: None,
             supabase: None,
+            r2_config: None,
         };
 
         let mut headers = HeaderMap::new();
