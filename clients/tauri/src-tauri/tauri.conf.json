@@ -76,6 +76,10 @@
     "shell": {
       "open": true
     },
+    "dialog": {
+      "open": true,
+      "save": true
+    },
     "updater": {
       "active": false
     }

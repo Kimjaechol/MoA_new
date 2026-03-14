@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
+use rusqlite::Connection;
 
 // ── State ────────────────────────────────────────────────────────
 
@@ -1453,6 +1454,266 @@ fn list_documents() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "documents": docs }))
 }
 
+// ── SQLite FTS5 Document Storage ─────────────────────────────
+
+/// Open (or create) the MoA documents SQLite database with FTS5 support.
+/// Database path: ~/.moa/moa_documents.db
+fn open_documents_db() -> Result<Connection, String> {
+    let home = dirs_next::home_dir()
+        .ok_or_else(|| "Cannot find home directory".to_string())?;
+    let moa_dir = home.join(".moa");
+    std::fs::create_dir_all(&moa_dir)
+        .map_err(|e| format!("Failed to create .moa directory: {e}"))?;
+
+    let db_path = moa_dir.join("moa_documents.db");
+    let conn = Connection::open(&db_path)
+        .map_err(|e| format!("Failed to open documents database: {e}"))?;
+
+    // Create documents table
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT NOT NULL,
+            markdown TEXT NOT NULL,
+            html TEXT,
+            tiptap_json TEXT,
+            doc_type TEXT,
+            engine TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_file_name
+            ON documents(file_name);
+        "
+    ).map_err(|e| format!("Failed to create documents table: {e}"))?;
+
+    // Create FTS5 virtual table for full-text search
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+            file_name,
+            markdown,
+            content='documents',
+            content_rowid='id',
+            tokenize='unicode61'
+        );
+        -- Triggers to keep FTS index in sync
+        CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
+            INSERT INTO documents_fts(rowid, file_name, markdown)
+            VALUES (new.id, new.file_name, new.markdown);
+        END;
+        CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+            INSERT INTO documents_fts(documents_fts, rowid, file_name, markdown)
+            VALUES ('delete', old.id, old.file_name, old.markdown);
+        END;
+        CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
+            INSERT INTO documents_fts(documents_fts, rowid, file_name, markdown)
+            VALUES ('delete', old.id, old.file_name, old.markdown);
+            INSERT INTO documents_fts(rowid, file_name, markdown)
+            VALUES (new.id, new.file_name, new.markdown);
+        END;
+        "
+    ).map_err(|e| format!("Failed to create FTS5 table: {e}"))?;
+
+    Ok(conn)
+}
+
+/// Save a document to MoA's local SQLite database with FTS5 indexing.
+/// This enables full-text search across all stored documents.
+#[tauri::command]
+fn save_document_to_sqlite(
+    file_name: String,
+    markdown: String,
+    html: Option<String>,
+    tiptap_json: Option<String>,
+    doc_type: Option<String>,
+    engine: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+    let sanitized = sanitize_filename(&file_name);
+
+    conn.execute(
+        "INSERT INTO documents (file_name, markdown, html, tiptap_json, doc_type, engine)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(file_name) DO UPDATE SET
+            markdown = excluded.markdown,
+            html = excluded.html,
+            tiptap_json = excluded.tiptap_json,
+            doc_type = excluded.doc_type,
+            engine = excluded.engine,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            sanitized,
+            markdown,
+            html,
+            tiptap_json,
+            doc_type.unwrap_or_default(),
+            engine.unwrap_or_default(),
+        ],
+    ).map_err(|e| format!("Failed to save document to SQLite: {e}"))?;
+
+    Ok(serde_json::json!({
+        "success": true,
+        "storage": "sqlite",
+        "file_name": sanitized,
+    }))
+}
+
+/// Load a document from MoA's SQLite database.
+#[tauri::command]
+fn load_document_from_sqlite(
+    file_name: String,
+) -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+    let sanitized = sanitize_filename(&file_name);
+
+    let result = conn.query_row(
+        "SELECT file_name, markdown, html, tiptap_json, doc_type, engine, created_at, updated_at
+         FROM documents WHERE file_name = ?1",
+        rusqlite::params![sanitized],
+        |row| {
+            Ok(serde_json::json!({
+                "success": true,
+                "file_name": row.get::<_, String>(0)?,
+                "markdown": row.get::<_, String>(1)?,
+                "html": row.get::<_, Option<String>>(2)?,
+                "tiptap_json": row.get::<_, Option<String>>(3)?,
+                "doc_type": row.get::<_, String>(4)?,
+                "engine": row.get::<_, String>(5)?,
+                "created_at": row.get::<_, String>(6)?,
+                "updated_at": row.get::<_, String>(7)?,
+            }))
+        },
+    );
+
+    match result {
+        Ok(val) => Ok(val),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Ok(serde_json::json!({ "success": false, "error": "Document not found" }))
+        }
+        Err(e) => Err(format!("Failed to load document from SQLite: {e}")),
+    }
+}
+
+/// List all documents stored in MoA's SQLite database.
+#[tauri::command]
+fn list_documents_sqlite() -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT file_name, doc_type, engine, created_at, updated_at FROM documents ORDER BY updated_at DESC"
+    ).map_err(|e| format!("Failed to query documents: {e}"))?;
+
+    let docs: Vec<serde_json::Value> = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "file_name": row.get::<_, String>(0)?,
+            "doc_type": row.get::<_, String>(1)?,
+            "engine": row.get::<_, String>(2)?,
+            "created_at": row.get::<_, String>(3)?,
+            "updated_at": row.get::<_, String>(4)?,
+        }))
+    }).map_err(|e| format!("Failed to iterate documents: {e}"))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    Ok(serde_json::json!({ "documents": docs }))
+}
+
+/// Full-text search across all MoA documents using FTS5.
+#[tauri::command]
+fn search_documents_sqlite(
+    query: String,
+) -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT d.file_name, d.doc_type, d.engine, d.updated_at,
+                snippet(documents_fts, 1, '<mark>', '</mark>', '...', 48) as snippet
+         FROM documents_fts f
+         JOIN documents d ON d.id = f.rowid
+         WHERE documents_fts MATCH ?1
+         ORDER BY rank
+         LIMIT 20"
+    ).map_err(|e| format!("Failed to prepare search query: {e}"))?;
+
+    let results: Vec<serde_json::Value> = stmt.query_map(rusqlite::params![query], |row| {
+        Ok(serde_json::json!({
+            "file_name": row.get::<_, String>(0)?,
+            "doc_type": row.get::<_, String>(1)?,
+            "engine": row.get::<_, String>(2)?,
+            "updated_at": row.get::<_, String>(3)?,
+            "snippet": row.get::<_, String>(4)?,
+        }))
+    }).map_err(|e| format!("Failed to execute search: {e}"))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    Ok(serde_json::json!({ "results": results }))
+}
+
+/// Delete a document from MoA's SQLite database.
+#[tauri::command]
+fn delete_document_sqlite(
+    file_name: String,
+) -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+    let sanitized = sanitize_filename(&file_name);
+
+    let rows = conn.execute(
+        "DELETE FROM documents WHERE file_name = ?1",
+        rusqlite::params![sanitized],
+    ).map_err(|e| format!("Failed to delete document: {e}"))?;
+
+    Ok(serde_json::json!({
+        "success": rows > 0,
+        "deleted": rows,
+    }))
+}
+
+// ── Hard Disk Save (user-chosen directory) ──────────────────
+
+/// Save document files (markdown + HTML) to a user-specified directory.
+/// The directory path is provided by the frontend after the user picks
+/// a folder via the Tauri dialog plugin.
+#[tauri::command]
+fn save_document_to_disk(
+    dir_path: String,
+    file_name: String,
+    markdown: String,
+    html: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let dir = std::path::Path::new(&dir_path);
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("Failed to create directory: {e}"))?;
+    }
+
+    let stem = sanitize_filename(&file_name);
+
+    // Save Markdown
+    let md_path = dir.join(format!("{stem}.md"));
+    std::fs::write(&md_path, &markdown)
+        .map_err(|e| format!("Failed to write markdown file: {e}"))?;
+
+    // Save HTML if provided
+    let mut html_saved = false;
+    if let Some(ref html_content) = html {
+        if !html_content.is_empty() {
+            let html_path = dir.join(format!("{stem}.html"));
+            std::fs::write(&html_path, html_content)
+                .map_err(|e| format!("Failed to write HTML file: {e}"))?;
+            html_saved = true;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "success": true,
+        "storage": "disk",
+        "dir_path": dir_path,
+        "markdown_path": md_path.to_string_lossy(),
+        "html_saved": html_saved,
+    }))
+}
+
 /// Sanitize a filename for use as a directory name (remove path separators and special chars).
 fn sanitize_filename(name: &str) -> String {
     let stem = std::path::Path::new(name)
@@ -1470,6 +1731,7 @@ fn sanitize_filename(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             // Local ZeroClaw gateway (runs on this device)
             server_url: std::sync::Mutex::new(
@@ -1532,6 +1794,12 @@ pub fn run() {
             save_document,
             load_document,
             list_documents,
+            save_document_to_sqlite,
+            load_document_from_sqlite,
+            list_documents_sqlite,
+            search_documents_sqlite,
+            delete_document_sqlite,
+            save_document_to_disk,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path
