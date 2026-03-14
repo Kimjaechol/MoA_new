@@ -984,16 +984,21 @@ fn find_pymupdf_script() -> Option<String> {
     None
 }
 
-/// Write binary data (base64-encoded) to a temporary file path.
-/// Used by the frontend to stage PDF uploads for local conversion.
+/// Write binary data (base64-encoded) to a temporary file.
+/// Returns the generated temp file path. Used by the frontend to stage
+/// PDF uploads for local conversion without needing tauri-plugin-path.
 #[tauri::command]
-fn write_temp_file(path: String, base64_data: String) -> Result<(), String> {
+fn write_temp_file(base64_data: String, extension: Option<String>) -> Result<String, String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&base64_data)
         .map_err(|e| format!("Base64 decode failed: {e}"))?;
-    std::fs::write(&path, &bytes)
-        .map_err(|e| format!("Failed to write temp file: {e}"))
+    let ext = extension.unwrap_or_else(|| "tmp".to_string());
+    let temp_path = std::env::temp_dir()
+        .join(format!("moa_upload_{}.{}", std::process::id(), ext));
+    std::fs::write(&temp_path, &bytes)
+        .map_err(|e| format!("Failed to write temp file: {e}"))?;
+    Ok(temp_path.to_string_lossy().to_string())
 }
 
 // ── 2-Layer Document Commands ─────────────────────────────────────

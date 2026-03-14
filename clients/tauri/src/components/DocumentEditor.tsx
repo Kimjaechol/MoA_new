@@ -140,8 +140,6 @@ export function DocumentEditor({
 
       try {
         const arrayBuf = await file.arrayBuffer();
-        const tempDir = await tauriInvoke("plugin:path|temp_dir") as string;
-        const tempPath = `${tempDir}/moa_pdf_upload_${Date.now()}.pdf`;
 
         // Write file via Tauri invoke (binary data as base64)
         // Chunked encoding to avoid stack overflow with spread operator on large files
@@ -153,10 +151,11 @@ export function DocumentEditor({
           binaryStr += String.fromCharCode.apply(null, Array.from(chunk));
         }
         const base64 = btoa(binaryStr);
-        await tauriInvoke!("write_temp_file", {
-          path: tempPath,
+        // write_temp_file returns the generated temp file path
+        const tempPath = await tauriInvoke!("write_temp_file", {
           base64Data: base64,
-        });
+          extension: "pdf",
+        }) as string;
 
         // Run both conversions: pdf2htmlEX (viewer) + PyMuPDF (editor)
         const result = await tauriInvoke("convert_pdf_dual", {
