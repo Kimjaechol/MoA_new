@@ -84,7 +84,8 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
         if (onChange) {
           // tiptap-markdown extension adds getMarkdown() to editor.storage.markdown
           try {
-            const md = (ed.storage.markdown as { getMarkdown: () => string }).getMarkdown();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const md = (ed.storage as any).markdown.getMarkdown();
             onChange(md);
           } catch {
             // Fallback if tiptap-markdown extension is not loaded
@@ -106,7 +107,8 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
     const getMarkdown = useCallback((): string => {
       if (!editor) return "";
       try {
-        return (editor.storage.markdown as { getMarkdown: () => string }).getMarkdown();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (editor.storage as any).markdown.getMarkdown();
       } catch {
         return editor.getHTML();
       }
