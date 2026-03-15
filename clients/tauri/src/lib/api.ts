@@ -343,20 +343,23 @@ export class MoAClient {
   }
 
   // ── Chat ───────────────────────────────────────────────────────
-  // Routing logic:
-  // - If user has a local API key → chat via local gateway (direct LLM call)
-  // - If no local API key → chat via relay server (operator key, credits deducted)
+  // Routing logic (with automatic fallback):
+  // 1. If user has a local API key → try local gateway first
+  //    - If local gateway fails (network/connection) → fallback to relay
+  // 2. If no local API key → try relay server (operator key, credits deducted)
+  //    - If relay fails → try local gateway as last resort
+  // 3. If API key is invalid (400 from local gateway) → fallback to relay
+
+  private static readonly PROVIDER_KEY_MAP: Record<string, string> = {
+    claude: "anthropic",
+    openai: "openai",
+    gemini: "gemini",
+  };
 
   hasLocalApiKey(): boolean {
     // Check if the SELECTED provider has an API key configured.
-    // Only route to local gateway when the selected provider's key exists.
     const provider = localStorage.getItem("zeroclaw_llm_provider") || "gemini";
-    const providerKeyMap: Record<string, string> = {
-      claude: "anthropic",
-      openai: "openai",
-      gemini: "gemini",
-    };
-    const keyStorageName = providerKeyMap[provider] || provider;
+    const keyStorageName = MoAClient.PROVIDER_KEY_MAP[provider] || provider;
     const key = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`);
     return !!key && key.trim().length > 0;
   }
@@ -370,70 +373,42 @@ export class MoAClient {
     });
   }
 
-  private getChatUrl(): string {
-    return this.hasLocalApiKey() ? this.serverUrl : this.relayUrl;
-  }
-
-  async chat(message: string, context: string[] = []): Promise<ChatResponse> {
-    if (!this.token) {
-      throw new Error("Not authenticated. Please login first.");
-    }
-
-    // Include user's selected provider/model preference
-    const provider = localStorage.getItem("zeroclaw_llm_provider") || "gemini";
-    const model = localStorage.getItem("zeroclaw_llm_model") || "gemini-2.5-flash";
-
-    // Map frontend provider names to API key storage names
-    const providerKeyMap: Record<string, string> = {
-      claude: "anthropic",
-      openai: "openai",
-      gemini: "gemini",
-    };
-    const keyStorageName = providerKeyMap[provider] || provider;
-    const apiKey = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`) || "";
-
-    const hasSelectedProviderKey = !!apiKey && apiKey.trim().length > 0;
-    const chatBaseUrl = this.getChatUrl();
-
-    let res: Response;
+  /**
+   * Try a single chat request against the given base URL.
+   * Returns the Response on success, or null if a network-level failure occurred.
+   * Throws on non-recoverable errors (auth expiry etc.).
+   */
+  private async tryChatRequest(
+    baseUrl: string,
+    body: Record<string, unknown>,
+  ): Promise<Response | null> {
     try {
-      res = await fetch(`${chatBaseUrl}/api/chat`, {
+      return await fetch(`${baseUrl}/api/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${this.token}`,
         },
-        body: JSON.stringify({
-          message,
-          context,
-          provider,
-          model,
-          // Send API key when we have one for the selected provider
-          ...(hasSelectedProviderKey ? { api_key: apiKey } : {}),
-        }),
+        body: JSON.stringify(body),
       });
     } catch (err) {
       if (err instanceof TypeError && err.message === "Failed to fetch") {
-        if (hasSelectedProviderKey) {
-          throw new Error(
-            "Cannot connect to local MoA server. Please check that the server is running.",
-          );
-        }
-        throw new Error(
-          "Cannot connect to server. Please check your network connection.",
-        );
+        // Network-level failure (connection refused, DNS, timeout, etc.)
+        return null;
       }
       throw err;
     }
+  }
 
+  /**
+   * Parse a successful chat response body into ChatResponse.
+   */
+  private async parseChatResponse(res: Response): Promise<ChatResponse> {
     if (!res.ok) {
       if (res.status === 401) {
-        // Don't clear auth — the JWT may still be valid for auth endpoints.
-        // Chat 401 can happen when relay server hasn't accepted the token yet.
         throw new Error("Chat authentication failed. Please check your connection settings.");
       }
       const text = await res.text().catch(() => "Unknown error");
-      // Extract user-friendly error from JSON response if available
       let errorMessage = text;
       try {
         const parsed = JSON.parse(text);
@@ -447,11 +422,94 @@ export class MoAClient {
     }
 
     const data = await res.json();
-    // Server returns "reply", normalize to "response" for the client
     return {
       response: data.response || data.reply || "",
       model: data.model || "",
     };
+  }
+
+  async chat(message: string, context: string[] = []): Promise<ChatResponse> {
+    if (!this.token) {
+      throw new Error("Not authenticated. Please login first.");
+    }
+
+    // Include user's selected provider/model preference
+    const provider = localStorage.getItem("zeroclaw_llm_provider") || "gemini";
+    const model = localStorage.getItem("zeroclaw_llm_model") || "gemini-2.5-flash";
+
+    const keyStorageName = MoAClient.PROVIDER_KEY_MAP[provider] || provider;
+    const apiKey = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`) || "";
+    const hasSelectedProviderKey = !!apiKey && apiKey.trim().length > 0;
+
+    // Build request body — include API key only when available
+    const body: Record<string, unknown> = {
+      message,
+      context,
+      provider,
+      model,
+      ...(hasSelectedProviderKey ? { api_key: apiKey } : {}),
+    };
+
+    // ── Determine routing order with fallback ──
+    // Primary: local gateway if we have a key, relay otherwise
+    // Fallback: the other server if primary fails
+    const primaryUrl = hasSelectedProviderKey ? this.serverUrl : this.relayUrl;
+    const fallbackUrl = hasSelectedProviderKey ? this.relayUrl : this.serverUrl;
+
+    // ── Try primary ──
+    let res = await this.tryChatRequest(primaryUrl, body);
+
+    if (res !== null) {
+      // Primary connected. Check if API key error from local gateway
+      // → fallback to relay which can use operator keys
+      if (primaryUrl === this.serverUrl && res.status === 400) {
+        // Read the error body to check for fallback hint
+        const errorText = await res.text().catch(() => "");
+        let shouldFallback = false;
+        let errorJson: Record<string, unknown> = {};
+        try {
+          errorJson = JSON.parse(errorText);
+          // Gateway returns { fallback_to_relay: true } for missing API key
+          shouldFallback = errorJson.fallback_to_relay === true
+            || errorJson.code === "missing_api_key";
+        } catch {
+          // Not JSON — might still be an API key issue, try fallback anyway
+          shouldFallback = errorText.includes("API key");
+        }
+
+        if (shouldFallback) {
+          const relayBody = { ...body };
+          delete relayBody.api_key; // Let relay use operator key
+          const fallbackRes = await this.tryChatRequest(this.relayUrl, relayBody);
+          if (fallbackRes !== null && fallbackRes.ok) {
+            return this.parseChatResponse(fallbackRes);
+          }
+        }
+        // Relay also failed or not a fallback-eligible error — throw original
+        const errorMessage = (errorJson.error as string) || errorText || `Chat request failed (${res.status})`;
+        throw new Error(errorMessage);
+      }
+
+      return this.parseChatResponse(res);
+    }
+
+    // ── Primary failed (network error) — try fallback ──
+    // When falling back to relay without a local key, omit api_key
+    const fallbackBody = fallbackUrl === this.relayUrl
+      ? { ...body, api_key: undefined }
+      : body;
+
+    res = await this.tryChatRequest(fallbackUrl, fallbackBody);
+
+    if (res !== null) {
+      return this.parseChatResponse(res);
+    }
+
+    // ── Both failed ──
+    throw new Error(
+      "Cannot connect to MoA server. Both local gateway and relay server are unreachable. " +
+        "Please check that either the local server is running or you have network access.",
+    );
   }
 
   // ── Health ─────────────────────────────────────────────────────
