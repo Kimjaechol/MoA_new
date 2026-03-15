@@ -201,7 +201,7 @@ export class MoAClient {
   async logout(): Promise<void> {
     if (this.token) {
       try {
-        await fetch(`${this.serverUrl}/api/auth/logout`, {
+        await fetch(`${this.relayUrl}/api/auth/logout`, {
           method: "POST",
           headers: { Authorization: `Bearer ${this.token}` },
         });
@@ -231,7 +231,7 @@ export class MoAClient {
   async getDevices(): Promise<DeviceInfo[]> {
     if (!this.token) return [];
 
-    const res = await fetch(`${this.serverUrl}/api/auth/devices`, {
+    const res = await fetch(`${this.relayUrl}/api/auth/devices`, {
       headers: { Authorization: `Bearer ${this.token}` },
     });
 
@@ -250,7 +250,7 @@ export class MoAClient {
   async registerDevice(deviceName: string, platform?: string): Promise<void> {
     if (!this.token) return;
 
-    await fetch(`${this.serverUrl}/api/auth/devices`, {
+    await fetch(`${this.relayUrl}/api/auth/devices`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -267,7 +267,7 @@ export class MoAClient {
   async setDevicePairingCode(deviceId: string, code: string | null): Promise<void> {
     if (!this.token) throw new Error("Not authenticated");
 
-    const res = await fetch(`${this.serverUrl}/api/auth/devices/${deviceId}/pairing-code`, {
+    const res = await fetch(`${this.relayUrl}/api/auth/devices/${deviceId}/pairing-code`, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
@@ -285,7 +285,7 @@ export class MoAClient {
   async verifyDevicePairing(deviceId: string, code: string): Promise<boolean> {
     if (!this.token) throw new Error("Not authenticated");
 
-    const res = await fetch(`${this.serverUrl}/api/auth/devices/${deviceId}/verify-pairing`, {
+    const res = await fetch(`${this.relayUrl}/api/auth/devices/${deviceId}/verify-pairing`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -343,15 +343,29 @@ export class MoAClient {
   }
 
   // ── Chat ───────────────────────────────────────────────────────
-  // Uses /api/chat which routes through the full MoA agent loop
-  // (provider LLM + tools: shell, file, memory, browser, etc.)
+  // Routing logic:
+  // - If user has a local API key → chat via local gateway (direct LLM call)
+  // - If no local API key → chat via relay server (operator key, credits deducted)
+
+  hasLocalApiKey(): boolean {
+    const providers = ["claude", "openai", "gemini"];
+    return providers.some((p) => {
+      const key = localStorage.getItem(`zeroclaw_api_key_${p}`);
+      return key && key.trim().length > 0;
+    });
+  }
+
+  private getChatUrl(): string {
+    return this.hasLocalApiKey() ? this.serverUrl : this.relayUrl;
+  }
 
   async chat(message: string, context: string[] = []): Promise<ChatResponse> {
     if (!this.token) {
       throw new Error("Not authenticated. Please login first.");
     }
 
-    const res = await fetch(`${this.serverUrl}/api/chat`, {
+    const chatBaseUrl = this.getChatUrl();
+    const res = await fetch(`${chatBaseUrl}/api/chat`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

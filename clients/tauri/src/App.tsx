@@ -13,6 +13,11 @@ import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, t, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated, onPythonEnvStatus, type PythonEnvStatus } from "./lib/tauri-bridge";
 import {
+  processAttachment,
+  buildChatMessage,
+  type AttachmentFile,
+} from "./lib/chat-attachments";
+import {
   loadChats,
   saveChats,
   getActiveChatId,
@@ -25,6 +30,15 @@ import {
 } from "./lib/storage";
 
 type Page = "setup" | "login" | "signup" | "device_select" | "chat" | "settings" | "interpreter" | "document";
+
+// Lazy-load Tauri invoke for document pre-processing
+let tauriInvoke: ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null = null;
+try {
+  const tauri = (window as Record<string, unknown>).__TAURI__;
+  if (tauri && typeof tauri === "object") {
+    tauriInvoke = (tauri as Record<string, (cmd: string, args?: Record<string, unknown>) => Promise<unknown>>).invoke;
+  }
+} catch { /* not in Tauri */ }
 
 function App() {
   const [page, setPage] = useState<Page>("login");
@@ -180,7 +194,7 @@ function App() {
   );
 
   const handleSendMessage = useCallback(
-    async (content: string) => {
+    async (content: string, attachments?: AttachmentFile[]) => {
       let chatId = activeChatId;
       let isNew = false;
 
@@ -192,7 +206,13 @@ function App() {
         setActiveChatIdState(chatId);
       }
 
-      const userMsg = createMessage("user", content);
+      // Build display message (show filenames to user)
+      const attachNames = attachments?.map((a) => a.name) ?? [];
+      const displayContent = attachNames.length > 0
+        ? `${content}\n\n[${locale === "ko" ? "첨부" : "Attached"}: ${attachNames.join(", ")}]`
+        : content;
+
+      const userMsg = createMessage("user", displayContent);
 
       setChats((prev) =>
         prev.map((c) => {
@@ -210,12 +230,25 @@ function App() {
       );
 
       try {
+        // Process attachments if any
+        let finalMessage = content;
+        if (attachments && attachments.length > 0) {
+          const processed = await Promise.all(
+            attachments.map((a) =>
+              processAttachment(a, { locale, tauriInvoke }),
+            ),
+          );
+          const built = buildChatMessage(content, processed);
+          finalMessage = built.message;
+          // TODO: send built.images via multimodal API when supported
+        }
+
         // Build conversation context from recent messages for the agent loop
         const currentChat = chats.find((c) => c.id === chatId);
         const recentContext = (currentChat?.messages ?? [])
           .slice(-10)
           .map((m) => `${m.role}: ${m.content}`);
-        const response = await apiClient.chat(content, recentContext);
+        const response = await apiClient.chat(finalMessage, recentContext);
         const assistantMsg = createMessage("assistant", response.response, response.model);
 
         setChats((prev) =>
@@ -252,7 +285,7 @@ function App() {
         }
       }
     },
-    [activeChatId],
+    [activeChatId, locale],
   );
 
   const handleRetry = useCallback(
