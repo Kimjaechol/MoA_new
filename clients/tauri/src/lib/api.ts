@@ -348,7 +348,21 @@ export class MoAClient {
   // - If no local API key → chat via relay server (operator key, credits deducted)
 
   hasLocalApiKey(): boolean {
-    // Check all possible key storage names (anthropic = claude provider key)
+    // Check if the SELECTED provider has an API key configured.
+    // Only route to local gateway when the selected provider's key exists.
+    const provider = localStorage.getItem("zeroclaw_llm_provider") || "gemini";
+    const providerKeyMap: Record<string, string> = {
+      claude: "anthropic",
+      openai: "openai",
+      gemini: "gemini",
+    };
+    const keyStorageName = providerKeyMap[provider] || provider;
+    const key = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`);
+    return !!key && key.trim().length > 0;
+  }
+
+  hasAnyLocalApiKey(): boolean {
+    // Check if ANY provider has an API key configured (for Settings display).
     const keyNames = ["anthropic", "openai", "gemini"];
     return keyNames.some((p) => {
       const key = localStorage.getItem(`zeroclaw_api_key_${p}`);
@@ -366,8 +380,8 @@ export class MoAClient {
     }
 
     // Include user's selected provider/model preference
-    const provider = localStorage.getItem("zeroclaw_llm_provider") || "claude";
-    const model = localStorage.getItem("zeroclaw_llm_model") || "claude-opus-4-20250514";
+    const provider = localStorage.getItem("zeroclaw_llm_provider") || "gemini";
+    const model = localStorage.getItem("zeroclaw_llm_model") || "gemini-2.5-flash";
 
     // Map frontend provider names to API key storage names
     const providerKeyMap: Record<string, string> = {
@@ -378,8 +392,8 @@ export class MoAClient {
     const keyStorageName = providerKeyMap[provider] || provider;
     const apiKey = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`) || "";
 
+    const hasSelectedProviderKey = !!apiKey && apiKey.trim().length > 0;
     const chatBaseUrl = this.getChatUrl();
-    const isLocal = this.hasLocalApiKey();
 
     let res: Response;
     try {
@@ -394,13 +408,13 @@ export class MoAClient {
           context,
           provider,
           model,
-          // Only send API key to local gateway, not to relay
-          ...(isLocal && apiKey ? { api_key: apiKey } : {}),
+          // Send API key when we have one for the selected provider
+          ...(hasSelectedProviderKey ? { api_key: apiKey } : {}),
         }),
       });
     } catch (err) {
       if (err instanceof TypeError && err.message === "Failed to fetch") {
-        if (isLocal) {
+        if (hasSelectedProviderKey) {
           throw new Error(
             "Cannot connect to local MoA server. Please check that the server is running.",
           );
