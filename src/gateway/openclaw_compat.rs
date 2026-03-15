@@ -225,9 +225,11 @@ pub async fn handle_api_chat(
         if !has_key {
             let err = serde_json::json!({
                 "error": format!(
-                    "No API key configured for provider '{}'. Please add your API key in Settings.",
+                    "No API key configured for provider '{}'. Please add your API key in Settings or use relay server.",
                     provider_name
-                )
+                ),
+                "code": "missing_api_key",
+                "fallback_to_relay": true
             });
             return (StatusCode::BAD_REQUEST, Json(err));
         }

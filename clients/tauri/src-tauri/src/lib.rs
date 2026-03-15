@@ -69,43 +69,96 @@ fn greet(name: &str) -> String {
 }
 
 /// Send a chat message to the MoA gateway and return the response.
+///
+/// Routing with automatic fallback:
+/// 1. Try local gateway first (via /api/chat)
+/// 2. If local fails (network error or missing API key) → fallback to relay server
+/// 3. If both fail → return combined error
 #[tauri::command]
 async fn chat(
     message: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<ChatResponse, String> {
     let server_url = state.server_url.lock().map_err(|e| e.to_string())?.clone();
+    let relay_url = state.relay_url.lock().map_err(|e| e.to_string())?.clone();
     let token = state
         .token
         .lock()
         .map_err(|e| e.to_string())?
         .clone()
-        .ok_or_else(|| "Not authenticated. Please pair first.".to_string())?;
+        .ok_or_else(|| "Not authenticated. Please login first.".to_string())?;
 
     let client = reqwest::Client::new();
-    let res = client
-        .post(format!("{server_url}/webhook"))
+    let body = serde_json::json!({ "message": message });
+
+    // ── Try local gateway first ──
+    let local_result = client
+        .post(format!("{server_url}/api/chat"))
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({ "message": message }))
+        .json(&body)
+        .send()
+        .await;
+
+    match local_result {
+        Ok(res) if res.status() == 401 => {
+            *state.token.lock().map_err(|e| e.to_string())? = None;
+            return Err("Authentication expired. Please re-login.".to_string());
+        }
+        Ok(res) if res.status().is_success() => {
+            return res.json::<ChatResponse>()
+                .await
+                .map_err(|e| format!("Invalid response: {e}"));
+        }
+        Ok(res) if res.status().as_u16() == 400 => {
+            // API key missing/invalid — check if fallback is suggested
+            let text = res.text().await.unwrap_or_default();
+            let should_fallback = text.contains("fallback_to_relay")
+                || text.contains("missing_api_key")
+                || text.contains("API key");
+
+            if should_fallback {
+                eprintln!("[MoA] Local gateway missing API key, falling back to relay...");
+            } else {
+                return Err(format!("Chat failed: {text}"));
+            }
+        }
+        Ok(res) => {
+            // Other non-success status — still try relay as fallback
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            eprintln!("[MoA] Local gateway error ({status}): {text}, trying relay...");
+        }
+        Err(e) => {
+            eprintln!("[MoA] Local gateway unreachable ({e}), trying relay...");
+        }
+    }
+
+    // ── Fallback to relay server ──
+    let relay_result = client
+        .post(format!("{relay_url}/api/chat"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| format!(
+            "Cannot connect to MoA. Local gateway and relay server both unreachable: {e}"
+        ))?;
 
-    if res.status() == 401 {
-        *state.token.lock().map_err(|e| e.to_string())? = None;
-        return Err("Authentication expired. Please re-pair.".to_string());
+    if relay_result.status() == 401 {
+        return Err("Chat authentication failed on relay. Please re-login.".to_string());
     }
 
-    if !res.status().is_success() {
-        let status = res.status();
-        let text = res.text().await.unwrap_or_default();
-        return Err(format!("Chat failed ({status}): {text}"));
+    if !relay_result.status().is_success() {
+        let status = relay_result.status();
+        let text = relay_result.text().await.unwrap_or_default();
+        return Err(format!("Chat failed on relay ({status}): {text}"));
     }
 
-    res.json::<ChatResponse>()
+    relay_result.json::<ChatResponse>()
         .await
-        .map_err(|e| format!("Invalid response: {e}"))
+        .map_err(|e| format!("Invalid relay response: {e}"))
 }
 
 /// Pair with a MoA gateway server using credentials and/or pairing code.
