@@ -78,6 +78,7 @@ pub mod runtime;
 pub mod sandbox;
 pub(crate) mod security;
 pub(crate) mod service;
+pub(crate) mod skillforge;
 pub(crate) mod storage;
 pub(crate) mod skills;
 pub mod sync;

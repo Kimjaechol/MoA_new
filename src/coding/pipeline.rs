@@ -184,17 +184,18 @@ impl ReviewPipeline {
 
 /// Merge findings from multiple reviewers, deduplicating similar issues.
 ///
-/// When multiple reviewers flag the same file+category, keeps the
-/// highest severity and combines descriptions.
+/// When multiple reviewers flag the same file+category+line_range, keeps the
+/// highest severity finding.
 fn merge_findings(reviews: &[ReviewReport]) -> Vec<ReviewFinding> {
-    // Key: (file_path, category) → highest-severity finding
-    let mut merged: HashMap<(String, String), ReviewFinding> = HashMap::new();
+    // Key: (file_path, category, line_range) → highest-severity finding
+    let mut merged: HashMap<(String, String, Option<(usize, usize)>), ReviewFinding> = HashMap::new();
 
     for review in reviews {
         for finding in &review.findings {
             let key = (
                 finding.file_path.clone().unwrap_or_default(),
                 finding.category.clone(),
+                finding.line_range,
             );
 
             match merged.get(&key) {

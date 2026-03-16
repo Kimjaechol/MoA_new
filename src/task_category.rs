@@ -503,6 +503,7 @@ impl NavigationManifest {
                 ui_mode: match cat {
                     TaskCategory::Translation => Some("voice_interpret".to_string()),
                     TaskCategory::Coding => Some("sandbox".to_string()),
+                    TaskCategory::Document => Some("document".to_string()),
                     _ => None,
                 },
             })
@@ -552,6 +553,15 @@ pub fn tool_preset(category: TaskCategory) -> Option<HashSet<&'static str>> {
     /// Vision tools (screenshot + image metadata).
     const VISION: &[&str] = &["screenshot", "image_info"];
 
+    /// Document tools (PDF, DOCX, XLSX, PPTX processing).
+    const DOCUMENT: &[&str] = &[
+        "document_process",
+        "pdf_read",
+        "docx_read",
+        "xlsx_read",
+        "pptx_read",
+    ];
+
     match category {
         // ── Coding: full toolset + sandbox capabilities ──
         // All tools enabled — sandbox loop handles the extra logic.
@@ -562,8 +572,13 @@ pub fn tool_preset(category: TaskCategory) -> Option<HashSet<&'static str>> {
             Some(BASE.iter().chain(VISION.iter()).copied().collect())
         }
 
-        // ── Document, Music: base (no vision) ──
-        TaskCategory::Document | TaskCategory::Music => Some(BASE.iter().copied().collect()),
+        // ── Document: base + document processing tools ──
+        TaskCategory::Document => {
+            Some(BASE.iter().chain(DOCUMENT.iter()).copied().collect())
+        }
+
+        // ── Music: base (no vision) ──
+        TaskCategory::Music => Some(BASE.iter().copied().collect()),
 
         // ── Translation: minimal toolset (mostly LLM-native) ──
         TaskCategory::Translation => Some(
@@ -787,6 +802,23 @@ mod tests {
         let nav = NavigationManifest::build();
         let coding_item = nav.top_bar.iter().find(|i| i.id == "coding").unwrap();
         assert_eq!(coding_item.ui_mode, Some("sandbox".to_string()));
+    }
+
+    #[test]
+    fn document_nav_item_has_document_ui_mode() {
+        let nav = NavigationManifest::build();
+        let doc_item = nav.top_bar.iter().find(|i| i.id == "document").unwrap();
+        assert_eq!(doc_item.ui_mode, Some("document".to_string()));
+    }
+
+    #[test]
+    fn document_includes_document_tools() {
+        let preset = tool_preset(TaskCategory::Document).unwrap();
+        assert!(preset.contains("document_process"));
+        assert!(preset.contains("pdf_read"));
+        assert!(preset.contains("docx_read"));
+        assert!(preset.contains("xlsx_read"));
+        assert!(preset.contains("pptx_read"));
     }
 
     #[test]

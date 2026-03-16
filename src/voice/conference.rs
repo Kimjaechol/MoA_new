@@ -696,7 +696,7 @@ mod tests {
     async fn conference_manager_create_and_list() {
         let manager = ConferenceManager::new(10);
 
-        let room = manager.create_room(test_config()).await.unwrap();
+        let _room = manager.create_room(test_config()).await.unwrap();
         assert_eq!(manager.room_count().await, 1);
 
         let rooms = manager.list_rooms().await;

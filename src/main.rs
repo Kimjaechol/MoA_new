@@ -70,6 +70,7 @@ mod cost;
 mod cron;
 mod daemon;
 mod doctor;
+mod economic;
 mod gatekeeper;
 mod gateway;
 mod goals;

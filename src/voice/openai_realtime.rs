@@ -195,7 +195,7 @@ impl OpenAiRealtimeSession {
                         "audio": b64,
                     });
                     if let Ok(json) = serde_json::to_string(&msg) {
-                        if audio_chunk_count == 1 || audio_chunk_count.is_multiple_of(50) {
+                        if audio_chunk_count == 1 || audio_chunk_count % 50 == 0 {
                             tracing::info!(
                                 session_id = %session_id,
                                 chunk = audio_chunk_count,
@@ -382,7 +382,7 @@ fn parse_server_event(
                 if let Ok(audio_bytes) = base64::engine::general_purpose::STANDARD.decode(delta_b64)
                 {
                     *audio_response_count += 1;
-                    if *audio_response_count == 1 || (*audio_response_count).is_multiple_of(50) {
+                    if *audio_response_count == 1 || *audio_response_count % 50 == 0 {
                         tracing::info!(
                             session_id = %session_id,
                             t = format!("{elapsed:.1}s"),

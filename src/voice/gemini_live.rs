@@ -669,7 +669,7 @@ impl GeminiLiveSession {
                     match serde_json::to_string(&audio_msg) {
                         Ok(json) => {
                             // Log first chunk and every 50th chunk
-                            if audio_chunk_count == 1 || audio_chunk_count.is_multiple_of(50) {
+                            if audio_chunk_count == 1 || audio_chunk_count % 50 == 0 {
                                 tracing::info!(
                                     session_id = %session_id,
                                     chunk = audio_chunk_count,

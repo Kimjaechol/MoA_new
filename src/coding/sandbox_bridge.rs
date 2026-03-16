@@ -265,7 +265,7 @@ pub struct ReviewFixAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::traits::{ReviewFinding, ReviewReport, ReviewVerdict};
+    use crate::coding::traits::{ReviewFinding, ReviewVerdict};
 
     fn make_finding(severity: Severity, category: &str, suggestion: Option<&str>) -> ReviewFinding {
         ReviewFinding {

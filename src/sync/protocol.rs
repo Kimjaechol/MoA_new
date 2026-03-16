@@ -101,6 +101,15 @@ pub struct FullSyncManifest {
     pub conversation_ids: HashSet<String>,
     /// Settings keys.
     pub setting_keys: HashSet<String>,
+    /// Ontology object IDs (structured relational memory).
+    #[serde(default)]
+    pub ontology_object_ids: HashSet<String>,
+    /// Ontology link IDs.
+    #[serde(default)]
+    pub ontology_link_ids: HashSet<String>,
+    /// Ontology action log IDs.
+    #[serde(default)]
+    pub ontology_action_ids: HashSet<String>,
     /// Timestamp when this manifest was generated.
     pub generated_at: u64,
 }
@@ -124,13 +133,33 @@ impl FullSyncManifest {
                 .difference(&other.setting_keys)
                 .cloned()
                 .collect(),
+            ontology_object_ids: self
+                .ontology_object_ids
+                .difference(&other.ontology_object_ids)
+                .cloned()
+                .collect(),
+            ontology_link_ids: self
+                .ontology_link_ids
+                .difference(&other.ontology_link_ids)
+                .cloned()
+                .collect(),
+            ontology_action_ids: self
+                .ontology_action_ids
+                .difference(&other.ontology_action_ids)
+                .cloned()
+                .collect(),
             generated_at: self.generated_at,
         }
     }
 
     /// Total number of entities in this manifest.
     pub fn total_count(&self) -> usize {
-        self.memory_chunk_ids.len() + self.conversation_ids.len() + self.setting_keys.len()
+        self.memory_chunk_ids.len()
+            + self.conversation_ids.len()
+            + self.setting_keys.len()
+            + self.ontology_object_ids.len()
+            + self.ontology_link_ids.len()
+            + self.ontology_action_ids.len()
     }
 }
 
@@ -362,11 +391,11 @@ impl FullSyncPlan {
 pub fn build_full_sync_data_messages<S: std::hash::BuildHasher>(
     from_device_id: &str,
     missing_keys: &HashSet<String, S>,
-    entries: &[(String, String, String, String)], // (key, entity_type, encrypted_payload, iv)
+    entries: &[(String, String, String, String, String)], // (key, entity_type, encrypted_payload, iv, auth_tag)
 ) -> Vec<BroadcastMessage> {
     let mut messages = Vec::new();
 
-    for (key, entity_type, encrypted_payload, iv) in entries {
+    for (key, entity_type, encrypted_payload, iv, auth_tag) in entries {
         if missing_keys.contains(key) {
             messages.push(BroadcastMessage::FullSyncData {
                 from_device_id: from_device_id.to_string(),
@@ -374,7 +403,7 @@ pub fn build_full_sync_data_messages<S: std::hash::BuildHasher>(
                 entity_id: key.clone(),
                 encrypted_payload: encrypted_payload.clone(),
                 iv: iv.clone(),
-                auth_tag: String::new(),
+                auth_tag: auth_tag.clone(),
             });
         }
     }
@@ -718,9 +747,9 @@ mod tests {
         missing.insert("k3".to_string());
 
         let entries = vec![
-            ("k1".into(), "memory".into(), "enc1".into(), "iv1".into()),
-            ("k2".into(), "memory".into(), "enc2".into(), "iv2".into()),
-            ("k3".into(), "memory".into(), "enc3".into(), "iv3".into()),
+            ("k1".into(), "memory".into(), "enc1".into(), "iv1".into(), "tag1".into()),
+            ("k2".into(), "memory".into(), "enc2".into(), "iv2".into(), "tag2".into()),
+            ("k3".into(), "memory".into(), "enc3".into(), "iv3".into(), "tag3".into()),
         ];
 
         let msgs = super::build_full_sync_data_messages("dev_a", &missing, &entries);

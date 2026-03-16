@@ -5778,7 +5778,6 @@ mod tests {
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
-    use crate::security::AutonomyLevel;
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};

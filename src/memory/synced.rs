@@ -142,6 +142,9 @@ impl SyncedMemory {
             memory_chunk_ids,
             conversation_ids: HashSet::new(),
             setting_keys: HashSet::new(),
+            ontology_object_ids: HashSet::new(),
+            ontology_link_ids: HashSet::new(),
+            ontology_action_ids: HashSet::new(),
             generated_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()

@@ -311,8 +311,12 @@ impl ActionDispatcher {
         )?;
 
         // Update properties if the preference already existed.
-        self.repo
-            .update_object(pref_id, None, Some(&json!({"value": value})))?;
+        self.repo.update_object_for_owner(
+            pref_id,
+            &req.owner_user_id,
+            None,
+            Some(&json!({"value": value})),
+        )?;
 
         Ok(json!({"success": true, "preference_id": pref_id}))
     }

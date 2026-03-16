@@ -57,6 +57,10 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_onto_objects_updated
             ON ontology_objects(updated_at);
 
+        -- Unique constraint for ensure_object() upsert (INSERT OR IGNORE).
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_onto_objects_upsert
+            ON ontology_objects(type_id, title, owner_user_id);
+
         CREATE TABLE IF NOT EXISTS ontology_links (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             link_type_id    INTEGER NOT NULL REFERENCES ontology_link_types(id),

@@ -286,6 +286,9 @@ impl RuleEngine {
         const GROUP_THRESHOLD: usize = 3;
 
         // Only run on CreateTask actions.
+        if req.action_type_name != "CreateTask" {
+            return Ok(());
+        }
         let title = match req.params.get("title").and_then(|v| v.as_str()) {
             Some(t) => t,
             None => return Ok(()),

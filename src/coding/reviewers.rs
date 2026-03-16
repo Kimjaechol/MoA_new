@@ -195,10 +195,9 @@ impl CodeReviewer for GeminiReviewer {
             }
         });
 
-        let url = format!("{}?key={}", self.endpoint, self.api_key);
         let resp = self
             .client
-            .post(&url)
+            .post(&self.endpoint)
             .header("x-goog-api-key", &self.api_key)
             .json(&payload)
             .timeout(std::time::Duration::from_secs(120))

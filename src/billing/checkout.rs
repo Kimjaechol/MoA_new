@@ -147,7 +147,8 @@ pub async fn create_stripe_session(
         ]);
     }
 
-    if save_method {
+    if save_method && mode == "payment" {
+        // setup_future_usage is only valid for payment mode sessions
         params.push(("payment_intent_data[setup_future_usage]", "off_session".to_string()));
     }
 

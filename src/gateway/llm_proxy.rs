@@ -145,13 +145,14 @@ pub async fn handle_llm_proxy(
     match provider.chat_with_history(&messages, &model, temperature).await {
         Ok(response_text) => {
             // 5. Estimate usage and deduct credits
-            let input_tokens = messages.iter().map(|m| m.content.len() as i64 / 4).sum::<i64>();
-            let output_tokens = response_text.len() as i64 / 4;
+            // Use chars().count() instead of len() for correct CJK token estimation
+            let input_tokens = messages.iter().map(|m| m.content.chars().count() as i64 / 4).sum::<i64>();
+            let output_tokens = response_text.chars().count() as i64 / 4;
 
             let cost_usd =
                 crate::billing::tracker::CostTracker::estimate_cost(&model, input_tokens, output_tokens);
-            let base_credits = ((cost_usd / 0.007) * 1.0).ceil() as u32;
-            let credits_to_deduct = base_credits.saturating_mul(2).max(1);
+            // Apply 2.2x operator margin (2.0x base + 10% VAT) per architecture spec
+            let credits_to_deduct = ((cost_usd / 0.007) * 2.2).ceil() as u32;
 
             if let Some(pm) = &state.payment_manager {
                 let pm = pm.lock();
@@ -439,16 +440,22 @@ pub async fn handle_document_process_r2(
         Some("jpg") | Some("jpeg") => "image/jpeg",
         _ => "application/octet-stream",
     };
+    let doc_part = match reqwest::multipart::Part::bytes(file_data)
+        .file_name(req.filename.clone())
+        .mime_str(mime_type)
+    {
+        Ok(part) => part,
+        Err(e) => {
+            tracing::error!(mime_type, error = %e, "Invalid MIME type for document parse");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid MIME type '{}': {}", mime_type, e)})),
+            );
+        }
+    };
+
     let form = reqwest::multipart::Form::new()
-        .part(
-            "document",
-            reqwest::multipart::Part::bytes(file_data)
-                .file_name(req.filename.clone())
-                .mime_str(mime_type)
-                .unwrap_or_else(|_| {
-                    reqwest::multipart::Part::bytes(Vec::new())
-                }),
-        )
+        .part("document", doc_part)
         .text("model", "document-parse")
         .text("ocr", "force")
         .text("output_formats", "[\"html\"]")
