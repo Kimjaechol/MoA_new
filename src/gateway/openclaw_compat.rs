@@ -242,7 +242,15 @@ pub async fn handle_api_chat(
     } else if let Some(stored_key) = config.provider_api_keys.get(provider_name) {
         if !stored_key.trim().is_empty() {
             config.api_key = Some(stored_key.clone());
+        } else {
+            // Clear stale key from a different provider
+            config.api_key = None;
         }
+    } else {
+        // No key found for this provider — clear any previous
+        // provider's key so we don't send a mismatched key.
+        // The provider factory will check env vars as fallback.
+        config.api_key = None;
     }
 
     // ── Validate API key for cloud providers ──
@@ -697,7 +705,12 @@ pub async fn handle_v1_chat_completions_with_tools(
         if let Some(stored_key) = config_guard.provider_api_keys.get(&provider_name).cloned() {
             if !stored_key.trim().is_empty() {
                 config_guard.api_key = Some(stored_key);
+            } else {
+                config_guard.api_key = None;
             }
+        } else {
+            // No key for this provider — clear stale key from another provider
+            config_guard.api_key = None;
         }
     }
 

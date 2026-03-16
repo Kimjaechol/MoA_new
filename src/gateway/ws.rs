@@ -555,7 +555,15 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
             {
                 if !stored_key.trim().is_empty() {
                     config_guard.api_key = Some(stored_key);
+                } else {
+                    // Clear stale key from a different provider
+                    config_guard.api_key = None;
                 }
+            } else {
+                // No key found for this provider — clear any previous
+                // provider's key so we don't send a mismatched key.
+                // The provider factory will check env vars as fallback.
+                config_guard.api_key = None;
             }
         }
 
