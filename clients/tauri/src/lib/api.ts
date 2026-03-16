@@ -412,11 +412,13 @@ export class MoAClient {
       let errorMessage = text;
       try {
         const parsed = JSON.parse(text);
+        // Use the user-friendly 'error' field from the server response
         if (parsed.error) {
           errorMessage = parsed.error;
         }
       } catch {
-        // JSON parse failed, use raw text
+        // JSON parse failed — sanitize raw text for display
+        errorMessage = this.sanitizeErrorForDisplay(text);
       }
       throw new Error(errorMessage || `Chat request failed (${res.status})`);
     }
@@ -426,6 +428,26 @@ export class MoAClient {
       response: data.response || data.reply || "",
       model: data.model || "",
     };
+  }
+
+  /**
+   * Sanitize raw error text into a user-friendly message.
+   */
+  private sanitizeErrorForDisplay(raw: string): string {
+    if (raw.includes("401") || raw.includes("Unauthorized") || raw.includes("authentication")) {
+      return "API key is invalid or expired. Please update your API key in Settings.";
+    }
+    if (raw.includes("429") || raw.includes("rate limit") || raw.includes("Rate limit")) {
+      return "Too many requests. Please wait a moment and try again.";
+    }
+    if (raw.includes("context") || raw.includes("token limit") || raw.includes("too long")) {
+      return "Message too long for the selected model. Try a shorter message.";
+    }
+    // Truncate overly long raw errors
+    if (raw.length > 200) {
+      return raw.substring(0, 200) + "...";
+    }
+    return raw;
   }
 
   async chat(message: string, context: string[] = []): Promise<ChatResponse> {
@@ -460,13 +482,10 @@ export class MoAClient {
     let res = await this.tryChatRequest(primaryUrl, body);
 
     if (res !== null) {
-      // Primary connected. Check if API key error from local gateway
-      // → fallback to relay which can use operator keys.
-      // Gateway returns 400 with { fallback_to_relay: true } for:
-      // - missing API key (code: "missing_api_key")
-      // - provider auth error / 401 (code: "provider_auth_error")
-      if (primaryUrl === this.serverUrl && (res.status === 400 || res.status === 500)) {
-        // Read the error body to check for fallback hint
+      // Primary connected — check for fallback-eligible errors.
+      // Both local gateway and relay can signal fallback via:
+      // - { fallback_to_relay: true } or { code: "missing_api_key" | "provider_auth_error" }
+      if (!res.ok && (res.status === 400 || res.status === 500)) {
         const errorText = await res.text().catch(() => "");
         let shouldFallback = false;
         let errorJson: Record<string, unknown> = {};
@@ -483,25 +502,21 @@ export class MoAClient {
         }
 
         if (shouldFallback) {
-          const relayBody = { ...body };
-          delete relayBody.api_key; // Let relay use operator key
-          const fallbackRes = await this.tryChatRequest(this.relayUrl, relayBody);
+          // Try the other server — omit api_key when falling back to relay
+          const fallbackBody = fallbackUrl === this.relayUrl
+            ? { ...body, api_key: undefined }
+            : body;
+          const fallbackRes = await this.tryChatRequest(fallbackUrl, fallbackBody);
           if (fallbackRes !== null && fallbackRes.ok) {
             return this.parseChatResponse(fallbackRes);
           }
         }
 
-        // Not a fallback-eligible error, or relay also failed — show error
-        if (res.status === 400) {
-          const errorMessage = (errorJson.error as string) || errorText || `Chat request failed (${res.status})`;
-          throw new Error(errorMessage);
-        }
-        // For 500 errors without fallback, fall through to parseChatResponse
-        // which will throw with the error detail from the response body
-        if (errorText) {
-          const errorMessage = (errorJson.error as string) || errorText || `Chat request failed (${res.status})`;
-          throw new Error(errorMessage);
-        }
+        // Fallback didn't work — throw user-friendly error from primary
+        const errorMessage = (errorJson.error as string)
+          || this.sanitizeErrorForDisplay(errorText)
+          || `Chat request failed (${res.status})`;
+        throw new Error(errorMessage);
       }
 
       return this.parseChatResponse(res);

@@ -534,11 +534,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
             }
         }
 
-        // ── Resolve provider-specific key from provider_api_keys map ──
-        // Users configure API keys once via Settings (stored in provider_api_keys).
-        // At chat time, we always look up the correct key for the effective provider.
-        // This prevents the 401 bug where config.api_key holds a DIFFERENT
-        // provider's key (e.g. Gemini key when using Anthropic).
+        // ── Resolve API key: client-provided > provider_api_keys > env ──
+        // Priority: client api_key > server-side provider_api_keys > env vars.
         {
             let mut config_guard = state.config.lock();
             let provider_name = config_guard
@@ -546,7 +543,16 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
                 .clone()
                 .unwrap_or_else(|| "gemini".to_string());
 
-            if let Some(stored_key) = config_guard.provider_api_keys.get(&provider_name).cloned() {
+            let client_key = parsed["api_key"]
+                .as_str()
+                .map(str::trim)
+                .filter(|k| !k.is_empty());
+
+            if let Some(key) = client_key {
+                config_guard.api_key = Some(key.to_string());
+            } else if let Some(stored_key) =
+                config_guard.provider_api_keys.get(&provider_name).cloned()
+            {
                 if !stored_key.trim().is_empty() {
                     config_guard.api_key = Some(stored_key);
                 }
@@ -677,11 +683,22 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
                     || sanitized.contains("Unauthorized")
                     || sanitized.contains("authentication");
 
+                let provider_label = state
+                    .config
+                    .lock()
+                    .default_provider
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+
                 let err = if is_auth_error {
                     serde_json::json!({
                         "type": "error",
                         "code": "provider_auth_error",
-                        "message": format!("LLM request failed: {sanitized}"),
+                        "message": format!(
+                            "API key for '{}' is invalid or expired. Please update your API key in Settings.",
+                            provider_label
+                        ),
+                        "detail": sanitized,
                         "fallback_to_relay": true,
                     })
                 } else {
