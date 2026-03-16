@@ -485,6 +485,7 @@ export class MoAClient {
       // Primary connected — check for fallback-eligible errors.
       // Both local gateway and relay can signal fallback via:
       // - { fallback_to_relay: true } or { code: "missing_api_key" | "provider_auth_error" }
+      // - Or raw error text containing auth-related keywords (e.g. relay without explicit flags)
       if (!res.ok && (res.status === 400 || res.status === 500)) {
         const errorText = await res.text().catch(() => "");
         let shouldFallback = false;
@@ -494,6 +495,15 @@ export class MoAClient {
           shouldFallback = errorJson.fallback_to_relay === true
             || errorJson.code === "missing_api_key"
             || errorJson.code === "provider_auth_error";
+          // Also detect auth errors from the error message itself
+          // (e.g. relay server responses without explicit fallback flags)
+          if (!shouldFallback) {
+            const errMsg = (errorJson.error as string) || "";
+            shouldFallback = errMsg.includes("401")
+              || errMsg.includes("Unauthorized")
+              || errMsg.includes("authentication")
+              || errMsg.includes("API key");
+          }
         } catch {
           // Not JSON — might still be an API key issue, try fallback anyway
           shouldFallback = errorText.includes("API key")
@@ -512,9 +522,9 @@ export class MoAClient {
           }
         }
 
-        // Fallback didn't work — throw user-friendly error from primary
-        const errorMessage = (errorJson.error as string)
-          || this.sanitizeErrorForDisplay(errorText)
+        // Fallback didn't work — always sanitize error for user-friendly display
+        const rawError = (errorJson.error as string) || errorText || "";
+        const errorMessage = this.sanitizeErrorForDisplay(rawError)
           || `Chat request failed (${res.status})`;
         throw new Error(errorMessage);
       }
