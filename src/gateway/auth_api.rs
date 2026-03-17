@@ -386,10 +386,11 @@ pub async fn handle_auth_kakao_callback(
         }
     };
 
-    // Get Kakao REST API key from config
+    // Get Kakao REST API key from config (support both prefixed and plain env var names)
     let kakao_rest_key = match std::env::var("ZEROCLAW_KAKAO_REST_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
+        .or_else(|| std::env::var("KAKAO_REST_API_KEY").ok().filter(|k| !k.is_empty()))
     {
         Some(k) => k,
         None => {
@@ -584,6 +585,29 @@ pub async fn handle_auth_kakao_callback(
                 .into_response();
         }
     };
+
+    // Auto-pair the KakaoTalk channel: mark this kakao_id as paired so the
+    // user can immediately send/receive messages via KakaoTalk without manual
+    // allowlist configuration. This enables the "login-only" flow for regular users.
+    if let Some(ref pairing_store) = state.channel_pairing {
+        if !pairing_store.is_paired("kakao", &kakao_id) {
+            pairing_store.mark_paired("kakao", &kakao_id, &user_id);
+            // Also persist to config allowlist so pairing survives restart
+            let uid_clone = kakao_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) =
+                    crate::channels::pairing::persist_channel_allowlist("kakao", &uid_clone)
+                {
+                    tracing::warn!("Kakao auto-pair: failed to persist allowlist: {e}");
+                }
+            });
+            tracing::info!(
+                "Kakao auto-pair: paired kakao_id={} to user={}",
+                kakao_id,
+                username
+            );
+        }
+    }
 
     // Sync user to Supabase (cloud user management + credits).
     // This runs best-effort: local auth is the source of truth.

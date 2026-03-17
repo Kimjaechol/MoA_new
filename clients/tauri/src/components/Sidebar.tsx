@@ -98,6 +98,11 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   delegate_coordination_status: "Delegation Status",
   wasm_module: "WASM Module",
   composio: "Composio",
+  web_search_brave: "Web Search (Brave)",
+  web_search_perplexity: "Web Search (Perplexity)",
+  web_search_exa: "Web Search (Exa)",
+  web_search_jina: "Web Search (Jina)",
+  pushover: "Pushover",
   openclaw_migration: "OpenClaw Migration",
   manage_auth_profile: "Auth Profile",
   proxy_config: "Proxy Config",
@@ -139,13 +144,9 @@ const TOOLS_REQUIRING_API_KEY: ToolApiKeyInfo[] = [
   { toolId: "pushover", displayName: "Pushover", placeholder: "Pushover Token" },
 ];
 
-/** Set of tool names that need API keys (for sidebar label display) */
-const TOOLS_NEEDING_KEY = new Set([
-  "composio",
-  "web_search_tool",
-  "web_fetch",
-  "pushover",
-]);
+/** Set of tool names that need API keys (for sidebar label display) —
+ *  must include ALL entries from TOOLS_REQUIRING_API_KEY */
+const TOOLS_NEEDING_KEY = new Set(TOOLS_REQUIRING_API_KEY.map((t) => t.toolId));
 
 /** Format a timestamp to a short time string (HH:MM) */
 function formatTime(ts: number): string {
@@ -272,15 +273,24 @@ export function Sidebar({
   // Channel guide modal state
   const [guideChannel, setGuideChannel] = useState<string | null>(null);
 
-  // Sort tools and channels A-Z by display name
-  const sortedTools = useMemo(
-    () => [...tools].sort((a, b) => {
+  // Merge API-key-requiring tools that aren't in the backend list, then sort A-Z
+  const sortedTools = useMemo(() => {
+    const existingIds = new Set(tools.map((t) => t.name));
+    const merged = [...tools];
+    for (const info of TOOLS_REQUIRING_API_KEY) {
+      if (!existingIds.has(info.toolId)) {
+        merged.push({
+          name: info.toolId,
+          description: info.displayName,
+        });
+      }
+    }
+    return merged.sort((a, b) => {
       const na = TOOL_DISPLAY_NAMES[a.name] ?? a.name;
       const nb = TOOL_DISPLAY_NAMES[b.name] ?? b.name;
       return na.localeCompare(nb);
-    }),
-    [tools],
-  );
+    });
+  }, [tools]);
 
   const sortedChannels = useMemo(
     () => [...channelsDetail].sort((a, b) => {

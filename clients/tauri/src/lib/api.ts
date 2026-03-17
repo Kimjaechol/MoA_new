@@ -748,56 +748,25 @@ export class MoAClient {
     }
   }
 
-  /** Save an API key for a specific tool (e.g. composio, web_search_tool, web_fetch) */
+  /** Save an API key for a specific tool (e.g. composio, web_search_tool, web_fetch).
+   *
+   *  Uses the existing /api/config/api-key endpoint with a "tool:<name>" provider
+   *  prefix, which the server routes to the tool-api-key handler internally.
+   *  This avoids CORS / 404 issues with the dedicated tool-api-key endpoint
+   *  that older server binaries may not serve. */
   async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
-    // Try the dedicated tool-api-key endpoint first;
-    // fall back to the general config PUT (TOML merge) if unavailable.
-    let saved = false;
-
-    try {
-      const res = await fetch(`${this.serverUrl}/api/config/tool-api-key`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.token}`,
-        },
-        body: JSON.stringify({ tool, api_key: apiKey }),
-      });
-      if (res.ok) {
-        saved = true;
-      } else if (res.status === 404) {
-        // Endpoint not available in this server version — use fallback
-      } else {
-        const data = await res.json().catch(() => ({ error: "Save failed" }));
-        throw new Error(data.error || `Save failed (${res.status})`);
-      }
-    } catch (err) {
-      // Network error or 404 — try fallback
-      if (err instanceof Error && !err.message.includes("fetch")) throw err;
-    }
-
-    // Fallback: write tool API key via general config TOML PUT
-    if (!saved) {
-      const tomlPatch = this.buildToolKeyToml(tool, apiKey);
-      if (tomlPatch) {
-        const res2 = await fetch(`${this.serverUrl}/api/config`, {
-          method: "PUT",
-          headers: {
-            "Content-Type": "text/plain",
-            Authorization: `Bearer ${this.token}`,
-          },
-          body: tomlPatch,
-        });
-        if (!res2.ok) {
-          const data = await res2.json().catch(() => ({ error: "Save failed" }));
-          throw new Error(data.error || `Save failed (${res2.status})`);
-        }
-        saved = true;
-      }
-    }
-
-    if (!saved) {
-      throw new Error("Could not save tool API key — server unreachable");
+    // Reuse the proven /api/config/api-key endpoint with "tool:" prefix
+    const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ provider: `tool:${tool}`, api_key: apiKey }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Save failed" }));
+      throw new Error(data.error || `Save failed (${res.status})`);
     }
 
     // Store locally for UI state
@@ -805,30 +774,6 @@ export class MoAClient {
       localStorage.setItem(`zeroclaw_tool_api_key_${tool}`, "configured");
     } else {
       localStorage.removeItem(`zeroclaw_tool_api_key_${tool}`);
-    }
-  }
-
-  /** Build a minimal TOML string to set a tool's API key */
-  private buildToolKeyToml(tool: string, apiKey: string): string | null {
-    const val = apiKey ? `"${apiKey.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : '""';
-    switch (tool) {
-      case "composio":
-        return `[composio]\nenabled = true\napi_key = ${val}`;
-      case "web_search_tool":
-      case "web_search":
-        return `[web_search]\nenabled = true\napi_key = ${val}`;
-      case "web_search_brave":
-        return `[web_search]\nbrave_api_key = ${val}`;
-      case "web_search_perplexity":
-        return `[web_search]\nperplexity_api_key = ${val}`;
-      case "web_search_exa":
-        return `[web_search]\nexa_api_key = ${val}`;
-      case "web_search_jina":
-        return `[web_search]\njina_api_key = ${val}`;
-      case "web_fetch":
-        return `[web_fetch]\nenabled = true\napi_key = ${val}`;
-      default:
-        return null;
     }
   }
 
