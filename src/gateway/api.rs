@@ -239,6 +239,18 @@ pub async fn handle_api_config_api_key_put(
             .into_response();
     }
 
+    // Route "tool:<name>" requests to the tool-api-key handler
+    if let Some(tool_name) = provider.strip_prefix("tool:") {
+        let tool_body = serde_json::json!({ "tool": tool_name, "api_key": api_key });
+        return handle_api_config_tool_api_key_put(
+            State(state),
+            headers,
+            Json(tool_body),
+        )
+        .await
+        .into_response();
+    }
+
     let mut config = state.config.lock().clone();
 
     // Map frontend provider names to backend provider names
