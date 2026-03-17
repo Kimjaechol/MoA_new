@@ -22,6 +22,7 @@ interface SidebarProps {
   onOpenSettings: () => void;
   onOpenInterpreter: () => void;
   onOpenDocument: () => void;
+  onLogout: () => void;
   onToggle: () => void;
 }
 
@@ -211,6 +212,7 @@ export function Sidebar({
   onOpenSettings,
   onOpenInterpreter,
   onOpenDocument,
+  onLogout,
   onToggle,
 }: SidebarProps) {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
@@ -730,6 +732,19 @@ export function Sidebar({
               </svg>
             </span>
             {t("settings", locale)}
+          </button>
+          <button
+            className="sidebar-footer-btn sidebar-logout-btn"
+            onClick={onLogout}
+          >
+            <span className="icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                <polyline points="16 17 21 12 16 7" />
+                <line x1="21" y1="12" x2="9" y2="12" />
+              </svg>
+            </span>
+            {t("logout", locale)}
           </button>
         </div>
       </aside>

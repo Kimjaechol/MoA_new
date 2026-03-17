@@ -861,6 +861,15 @@ html, body {
   color: var(--color-primary);
 }
 
+.sidebar-logout-btn {
+  color: #ef4444;
+}
+
+.sidebar-logout-btn:hover {
+  background: rgba(239, 68, 68, 0.1);
+  color: #f87171;
+}
+
 /* ============================================================
    Chat Area
    ============================================================ */

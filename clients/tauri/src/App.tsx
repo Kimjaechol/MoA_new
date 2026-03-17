@@ -618,6 +618,7 @@ function App() {
           setPage("document");
           if (window.innerWidth <= 768) setSidebarOpen(false);
         }}
+        onLogout={handleLogout}
         onToggle={() => setSidebarOpen((p) => !p)}
         currentPage={page}
       />
