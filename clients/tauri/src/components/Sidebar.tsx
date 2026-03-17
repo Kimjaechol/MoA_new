@@ -282,6 +282,11 @@ export function Sidebar({
   const [workspaceStatus, setWorkspaceStatus] = useState<string | null>(null);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
 
+  // Track persistent workspace connection state
+  const [connectedWorkspace, setConnectedWorkspace] = useState<string | null>(
+    () => apiClient.getWorkspacePath(),
+  );
+
   const handleConnectFolder = useCallback(async () => {
     if (workspaceLoading) return;
     try {
@@ -292,9 +297,10 @@ export function Sidebar({
         const dirPath = typeof selected === "string" ? selected : selected[0];
         if (!dirPath) return;
         setWorkspaceLoading(true);
-        await apiClient.setWorkspaceDir(dirPath);
-        setWorkspaceStatus(dirPath);
-        setTimeout(() => setWorkspaceStatus(null), 5000);
+        const resolved = await apiClient.setWorkspaceDir(dirPath);
+        setConnectedWorkspace(resolved);
+        setWorkspaceStatus(locale === "ko" ? "폴더가 연결되었습니다" : "Folder connected");
+        setTimeout(() => setWorkspaceStatus(null), 3000);
       }
     } catch (err) {
       setWorkspaceStatus(err instanceof Error ? err.message : "Error");
@@ -302,7 +308,7 @@ export function Sidebar({
     } finally {
       setWorkspaceLoading(false);
     }
-  }, [workspaceLoading]);
+  }, [workspaceLoading, locale]);
 
   const handleConnectGitHub = useCallback(async () => {
     const url = gitHubUrl.trim();
@@ -310,11 +316,12 @@ export function Sidebar({
     setWorkspaceLoading(true);
     setWorkspaceStatus(null);
     try {
-      await apiClient.connectGitHubRepo(url);
+      const resolved = await apiClient.connectGitHubRepo(url);
+      setConnectedWorkspace(resolved);
       setWorkspaceStatus(locale === "ko" ? "저장소가 연결되었습니다" : "Repository connected");
       setGitHubUrl("");
       setShowGitHubInput(false);
-      setTimeout(() => setWorkspaceStatus(null), 5000);
+      setTimeout(() => setWorkspaceStatus(null), 3000);
     } catch (err) {
       setWorkspaceStatus(err instanceof Error ? err.message : "Error");
       setTimeout(() => setWorkspaceStatus(null), 4000);
@@ -322,6 +329,12 @@ export function Sidebar({
       setWorkspaceLoading(false);
     }
   }, [gitHubUrl, workspaceLoading, locale]);
+
+  const handleDisconnectWorkspace = useCallback(() => {
+    apiClient.disconnectWorkspace();
+    setConnectedWorkspace(null);
+    setWorkspaceStatus(null);
+  }, []);
 
   // Merge API-key-requiring tools that aren't in the backend list, then sort A-Z
   const sortedTools = useMemo(() => {
@@ -691,6 +704,46 @@ export function Sidebar({
 
           {/* Workspace connect buttons */}
           <div className="sidebar-section">
+            {/* Show connected workspace indicator */}
+            {connectedWorkspace && (
+              <div className="sidebar-workspace-connected" style={{
+                padding: "6px 10px",
+                margin: "4px 8px",
+                background: "rgba(74, 222, 128, 0.1)",
+                border: "1px solid rgba(74, 222, 128, 0.3)",
+                borderRadius: 6,
+                fontSize: "0.72rem",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+              }}>
+                <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#4ade80", flexShrink: 0 }} />
+                <span style={{
+                  flex: 1,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  color: "#4ade80",
+                }} title={connectedWorkspace}>
+                  {connectedWorkspace.split("/").pop() || connectedWorkspace}
+                </span>
+                <button
+                  onClick={handleDisconnectWorkspace}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: "#888",
+                    cursor: "pointer",
+                    fontSize: "0.7rem",
+                    padding: "0 2px",
+                    flexShrink: 0,
+                  }}
+                  title={locale === "ko" ? "연결 해제" : "Disconnect"}
+                >
+                  {"\u2715"}
+                </button>
+              </div>
+            )}
             <div className="sidebar-workspace-buttons" style={{ padding: "4px 8px", display: "flex", gap: 6 }}>
               <button
                 className="sidebar-workspace-btn"

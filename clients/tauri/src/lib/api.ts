@@ -649,6 +649,7 @@ export class MoAClient {
       provider,
       model,
       ...(hasSelectedProviderKey ? { api_key: apiKey } : {}),
+      ...(this.workspaceConnected ? { workspace_connected: true } : {}),
     };
 
     // ── Determine routing order with fallback ──
@@ -905,43 +906,68 @@ export class MoAClient {
 
   // ── Workspace Management ──────────────────────────────────────
 
-  /** Set the workspace directory on the local gateway via shell tool. */
-  async setWorkspaceDir(dirPath: string): Promise<void> {
+  /** Whether a workspace (folder or git repo) has been explicitly connected. */
+  private workspaceConnected = false;
+
+  /** The connected workspace directory path (for UI display). */
+  private workspacePath: string | null = null;
+
+  /** Check if a workspace is currently connected. */
+  isWorkspaceConnected(): boolean {
+    return this.workspaceConnected;
+  }
+
+  /** Get the connected workspace path (or null). */
+  getWorkspacePath(): string | null {
+    return this.workspacePath;
+  }
+
+  /** Set the workspace directory on the local gateway. */
+  async setWorkspaceDir(dirPath: string): Promise<string> {
     await this.requireGateway();
-    const res = await fetch(`${this.serverUrl}/api/chat`, {
-      method: "POST",
+    const res = await fetch(`${this.serverUrl}/api/workspace`, {
+      method: "PUT",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${this.token}`,
       },
-      body: JSON.stringify({
-        message: `[system] The user has connected a workspace folder: ${dirPath}. Remember this as the active project directory. When performing file operations, use this directory as the base path.`,
-        context: { workspace_dir: dirPath },
-      }),
+      body: JSON.stringify({ path: dirPath }),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: "Failed to set workspace" }));
       throw new Error(data.error || `Failed to set workspace (${res.status})`);
     }
+    const data = await res.json();
+    this.workspaceConnected = true;
+    this.workspacePath = data.workspace_dir ?? dirPath;
+    return this.workspacePath!;
   }
 
   /** Clone a GitHub repo and set it as workspace. */
-  async connectGitHubRepo(repoUrl: string): Promise<void> {
+  async connectGitHubRepo(repoUrl: string): Promise<string> {
     await this.requireGateway();
-    const res = await fetch(`${this.serverUrl}/api/chat`, {
-      method: "POST",
+    const res = await fetch(`${this.serverUrl}/api/workspace`, {
+      method: "PUT",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${this.token}`,
       },
-      body: JSON.stringify({
-        message: `Please clone the GitHub repository at ${repoUrl} into my workspace and set it as the active project. Use git_operations to clone it.`,
-      }),
+      body: JSON.stringify({ git_url: repoUrl }),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: "Failed to connect repo" }));
       throw new Error(data.error || `Failed to connect repo (${res.status})`);
     }
+    const data = await res.json();
+    this.workspaceConnected = true;
+    this.workspacePath = data.workspace_dir ?? repoUrl;
+    return this.workspacePath!;
+  }
+
+  /** Disconnect the workspace (reset to default). */
+  disconnectWorkspace(): void {
+    this.workspaceConnected = false;
+    this.workspacePath = null;
   }
 
   // ── Operator Key Fallback (via relay server) ────────────────
