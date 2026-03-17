@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback, type FormEvent, type Keyboard
 import { t, type Locale } from "../lib/i18n";
 import { renderMarkdown } from "../lib/markdown";
 import type { ChatSession, ChatMessage } from "../lib/storage";
+import { deriveChatTitle } from "../lib/storage";
 import {
   createAttachment,
   isDocumentFile,
@@ -204,7 +205,13 @@ export function Chat({
           {sidebarOpen ? "\u2715" : "\u2630"}
         </button>
         <span className="chat-header-title">
-          {chat?.title ?? t("app_title", locale)}
+          {chat
+            ? (chat.title && !["MoA", "New Chat"].includes(chat.title)
+              ? chat.title
+              : (chat.messages.length > 0
+                ? deriveChatTitle(chat.messages)
+                : t("new_chat", locale)))
+            : t("app_title", locale)}
         </span>
         <div className="chat-header-status">
           <div className={`status-dot ${isConnected ? "connected" : ""}`} />

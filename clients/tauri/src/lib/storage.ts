@@ -72,7 +72,20 @@ export function createMessage(role: ChatMessage["role"], content: string, model?
 export function deriveChatTitle(messages: ChatMessage[]): string {
   const firstUserMsg = messages.find((m) => m.role === "user");
   if (!firstUserMsg) return "New Chat";
-  const text = firstUserMsg.content.trim();
+
+  let text = firstUserMsg.content.trim();
+
+  // Strip attachment metadata lines (e.g. "[첨부: file.hwp]" or "[Attached: file.pdf]")
+  text = text.replace(/\n*\[(첨부|Attached):.*\]\s*$/i, "").trim();
+
+  // If nothing left after stripping attachments, show the attachment info
+  if (!text) {
+    const attachMatch = firstUserMsg.content.match(/\[(첨부|Attached):\s*(.+)\]/i);
+    if (attachMatch) return `📎 ${attachMatch[2].substring(0, 30)}`;
+    return "New Chat";
+  }
+
+  // Truncate for display
   if (text.length <= 40) return text;
   return text.substring(0, 37) + "...";
 }
