@@ -310,16 +310,36 @@ export class MoAClient {
   async getAgentInfo(): Promise<AgentInfo> {
     try {
       const res = await fetch(`${this.serverUrl}/api/agent/info`);
-      if (!res.ok) return { channels: [], channels_detail: [], tools: [] };
+      if (!res.ok) return this.fallbackAgentInfo();
       const data = await res.json();
+      const channels_detail = data.channels_detail ?? [];
+      // If backend doesn't return channels_detail yet, build from channels array
+      const effectiveDetail = channels_detail.length > 0
+        ? channels_detail
+        : (data.channels ?? []).map((name: string) => ({ name, enabled: true }));
       return {
         channels: data.channels ?? [],
-        channels_detail: data.channels_detail ?? [],
+        channels_detail: effectiveDetail,
         tools: data.tools ?? [],
       };
     } catch {
-      return { channels: [], channels_detail: [], tools: [] };
+      return this.fallbackAgentInfo();
     }
+  }
+
+  /** Fallback agent info with all known ZeroClaw channels */
+  private fallbackAgentInfo(): AgentInfo {
+    const ALL_CHANNELS = [
+      "telegram", "discord", "slack", "mattermost", "whatsapp", "line",
+      "kakao", "qq", "lark", "feishu", "dingtalk", "matrix", "signal",
+      "irc", "email", "github", "nostr", "imessage", "bluebubbles",
+      "linq", "wati", "nextcloud_talk", "napcat", "acp", "clawdtalk", "webhook",
+    ];
+    return {
+      channels: [],
+      channels_detail: ALL_CHANNELS.map((name) => ({ name, enabled: false })),
+      tools: [],
+    };
   }
 
   // ── Heartbeat ──────────────────────────────────────────────────

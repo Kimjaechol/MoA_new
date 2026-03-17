@@ -45,12 +45,13 @@ function App() {
   const [locale, setLocale] = useState<Locale>(getStoredLocale());
   const [chats, setChats] = useState<ChatSession[]>(() => {
     const loaded = loadChats();
-    // Fix stale titles: re-derive from first user message
+    // Fix stale/generic titles: re-derive from first user message
+    const GENERIC_TITLES = ["New Chat", "MoA", "새 대화", "새로운 대화"];
     let updated = false;
     const fixed = loaded.map((c) => {
-      if (c.title === "New Chat" && c.messages.length > 0) {
+      if (GENERIC_TITLES.includes(c.title) && c.messages.length > 0) {
         const derived = deriveChatTitle(c.messages);
-        if (derived !== "New Chat") {
+        if (!GENERIC_TITLES.includes(derived)) {
           updated = true;
           return { ...c, title: derived };
         }
@@ -177,10 +178,10 @@ function App() {
 
     fetchSidebarData();
 
-    // Refresh devices periodically (every 60s, aligned with heartbeat)
+    // Refresh sidebar data periodically (every 30s) to pick up tool/channel updates
     const interval = setInterval(() => {
-      apiClient.getDevices().then(setSidebarDevices).catch(() => {});
-    }, 60_000);
+      fetchSidebarData();
+    }, 30_000);
 
     return () => clearInterval(interval);
   }, [isConnected]);

@@ -85,12 +85,19 @@ function dateKey(ts: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+/** Generic/placeholder titles that should be replaced with derived ones */
+const GENERIC_TITLES = ["New Chat", "MoA", "새 대화", "새로운 대화"];
+
 /** Get effective display title for a chat */
 function getChatDisplayTitle(chat: ChatSession): string {
-  // If title was properly derived, use it
-  if (chat.title && chat.title !== "New Chat") return chat.title;
+  // If title was properly derived (not generic), use it
+  if (chat.title && !GENERIC_TITLES.includes(chat.title)) return chat.title;
   // Try to derive from first user message
-  return deriveChatTitle(chat.messages);
+  const derived = deriveChatTitle(chat.messages);
+  if (!GENERIC_TITLES.includes(derived)) return derived;
+  // Fallback: show timestamp-based title
+  const d = new Date(chat.createdAt);
+  return `${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
 }
 
 export function Sidebar({
