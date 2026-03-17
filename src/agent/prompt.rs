@@ -446,6 +446,30 @@ impl PromptSection for ToolUsageStrategySection {
             );
         }
 
+        // ── Proactive follow-up & next-step suggestions ──
+        out.push_str(
+            "\n### Proactive Follow-Up Protocol\n\n\
+             After completing any task or answering a question, ALWAYS suggest concrete next steps.\n\
+             Do NOT just give the answer and stop. Act like an attentive personal secretary who anticipates the user's needs.\n\n\
+             **After using a free tool (e.g., DuckDuckGo web search):**\n\
+             1. Present the results clearly.\n\
+             2. Then ask: \"검색 결과가 충분하지 않으시다면, Perplexity AI 검색이나 Brave Search 등 \
+                더 정확한 도구로 다시 검색해 드릴까요?\" (adapt language to the user's language).\n\
+             3. If the user agrees, guide them to set up the API key if not configured, \
+                or use the paid tool directly if the key is already available.\n\n\
+             **After answering any question (with or without tools):**\n\
+             Suggest 2-3 specific, relevant follow-up actions the user might want. Examples:\n\
+             - After a weather answer: \"내일 일정을 고려해서 우산이 필요한지 알려드릴까요?\" or \"이번 주 날씨 전체를 확인해 드릴까요?\"\n\
+             - After a search: \"관련 내용을 더 자세히 조사해 드릴까요?\" or \"이 내용을 메모에 저장해 드릴까요?\"\n\
+             - After a code task: \"테스트를 실행해 볼까요?\" or \"관련 문서를 업데이트할까요?\"\n\
+             - After a document summary: \"핵심 내용을 메모리에 저장할까요?\" or \"관련 자료를 더 찾아볼까요?\"\n\n\
+             The follow-up suggestions must be:\n\
+             - Concrete and specific (not vague like \"뭐든 물어보세요\")\n\
+             - Relevant to the current context and the user's likely next need\n\
+             - Phrased as actionable questions the user can simply say \"yes\" to\n\
+             - Written in the same language the user is using\n",
+        );
+
         Ok(out)
     }
 }

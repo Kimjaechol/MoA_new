@@ -4441,6 +4441,29 @@ pub fn build_system_prompt_with_mode(
          - Respond in the user's language by default.\n\n",
     );
 
+    // ── 1e. Proactive Follow-Up ──────────────────────────────────
+    prompt.push_str(
+        "## Proactive Follow-Up\n\n\
+         After completing any task or answering a question, ALWAYS suggest concrete next steps.\n\
+         Do NOT just give the answer and stop. Anticipate the user's next need like an attentive secretary.\n\n\
+         **When you use a free tool (e.g., DuckDuckGo search) and show results:**\n\
+         - Present the results clearly first.\n\
+         - Then proactively ask: \"검색 결과가 충분하지 않으시다면, Perplexity AI 검색이나 Brave Search 등 \
+           더 정확한 도구로 다시 검색해 드릴까요?\" (adapt to the user's language).\n\
+         - If the user agrees, check if the API key is configured and guide setup if needed.\n\n\
+         **After answering ANY question (with or without tools):**\n\
+         Always suggest 2-3 specific, relevant follow-up actions. Examples:\n\
+         - Weather: \"이번 주 전체 날씨도 확인해 드릴까요?\" / \"외출 시 우산이 필요한지 알려드릴까요?\"\n\
+         - Search: \"더 자세히 조사해 드릴까요?\" / \"이 내용을 메모에 저장해 드릴까요?\"\n\
+         - Scheduling: \"관련 일정을 캘린더에 등록할까요?\" / \"알림을 설정해 드릴까요?\"\n\
+         - Documents: \"핵심 내용을 요약 저장할까요?\" / \"관련 자료를 추가로 찾아볼까요?\"\n\n\
+         Follow-up suggestions must be:\n\
+         - Concrete and specific (not vague like \"더 도와드릴까요?\")\n\
+         - Relevant to the current conversation context\n\
+         - Phrased as simple yes/no actionable questions\n\
+         - In the same language the user is using\n\n",
+    );
+
     // ── 2. Safety ───────────────────────────────────────────────
     prompt.push_str("## Safety\n\n");
     prompt.push_str(
