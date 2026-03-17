@@ -204,6 +204,45 @@ export class MoAClient {
     return data;
   }
 
+  /**
+   * Verify password for lock screen unlock.
+   * Re-authenticates using the stored username and provided password.
+   * On success, refreshes the session token (server may issue a new one).
+   * Also checks gateway health and updates liveness state.
+   */
+  async verifyPasswordForUnlock(password: string): Promise<void> {
+    const username = this.user?.username;
+    if (!username) {
+      throw new Error("No stored user session");
+    }
+
+    const deviceName = await this.getDeviceName();
+    const res = await fetch(`${this.relayUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username,
+        password,
+        device_id: this.deviceId,
+        device_name: deviceName,
+      }),
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Verification failed" }));
+      throw new Error(data.error || `Verification failed (${res.status})`);
+    }
+
+    const data: LoginResponse = await res.json();
+
+    // Refresh token with the new one from server
+    this.token = data.token;
+    localStorage.setItem(STORAGE_KEY_TOKEN, data.token);
+
+    // Check gateway health after unlock — triggers watchdog awareness
+    await this.checkGatewayHealth();
+  }
+
   async logout(): Promise<void> {
     if (this.token) {
       try {
