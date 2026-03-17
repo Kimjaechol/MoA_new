@@ -214,8 +214,8 @@ export function Sidebar({
 }: SidebarProps) {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     devices: true,
-    channels: true,
-    tools: true,
+    channels: false,
+    tools: false,
     chats: true,
   });
 
@@ -271,6 +271,37 @@ export function Sidebar({
 
   // Channel guide modal state
   const [guideChannel, setGuideChannel] = useState<string | null>(null);
+
+  // Sort tools and channels A-Z by display name
+  const sortedTools = useMemo(
+    () => [...tools].sort((a, b) => {
+      const na = TOOL_DISPLAY_NAMES[a.name] ?? a.name;
+      const nb = TOOL_DISPLAY_NAMES[b.name] ?? b.name;
+      return na.localeCompare(nb);
+    }),
+    [tools],
+  );
+
+  const sortedChannels = useMemo(
+    () => [...channelsDetail].sort((a, b) => {
+      const na = CHANNEL_DISPLAY_NAMES[a.name] || a.name;
+      const nb = CHANNEL_DISPLAY_NAMES[b.name] || b.name;
+      return na.localeCompare(nb);
+    }),
+    [channelsDetail],
+  );
+
+  /** Open the tool API key dropdown with a specific tool pre-selected */
+  const openToolKeyFor = useCallback((toolId: string) => {
+    setShowToolKeyDropdown(true);
+    setSelectedToolForKey(toolId);
+    setToolKeyInput("");
+    setToolKeySaved(null);
+    setToolKeyError(null);
+    setToolListOpen(false);
+    // Also expand the tools section
+    setExpandedSections((prev) => ({ ...prev, tools: true }));
+  }, []);
 
   const onlineDevices = devices.filter((d) => d.is_online);
 
@@ -369,10 +400,10 @@ export function Sidebar({
             </button>
             {expandedSections.channels && (
               <div className="sidebar-section-content">
-                {channelsDetail.length === 0 ? (
+                {sortedChannels.length === 0 ? (
                   <div className="sidebar-section-empty">{t("sidebar_no_channels", locale)}</div>
                 ) : (
-                  channelsDetail.map((ch) => (
+                  sortedChannels.map((ch) => (
                     <div key={ch.name} className="sidebar-info-item sidebar-channel-item">
                       <div className={`sidebar-status-dot ${ch.enabled ? "online" : ""}`} />
                       <span className="sidebar-info-label">
@@ -530,19 +561,25 @@ export function Sidebar({
 
             {expandedSections.tools && (
               <div className="sidebar-section-content">
-                {tools.length === 0 ? (
+                {sortedTools.length === 0 ? (
                   <div className="sidebar-section-empty">{t("sidebar_no_tools", locale)}</div>
                 ) : (
-                  tools.map((tool) => (
+                  sortedTools.map((tool) => (
                     <div key={tool.name} className="sidebar-info-item" title={tool.description}>
                       <span className="sidebar-device-status active" />
                       <span className="sidebar-info-label">
                         {TOOL_DISPLAY_NAMES[tool.name] ?? tool.name}
                       </span>
                       {toolNeedsKey(tool.name) && (
-                        <span className="sidebar-tool-needs-key">
+                        <button
+                          className="sidebar-tool-needs-key-btn"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openToolKeyFor(tool.name);
+                          }}
+                        >
                           {locale === "ko" ? "API Key 입력필요" : "API Key required"}
-                        </span>
+                        </button>
                       )}
                     </div>
                   ))

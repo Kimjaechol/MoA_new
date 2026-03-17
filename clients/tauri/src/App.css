@@ -537,15 +537,24 @@ html, body {
   word-break: break-word;
 }
 
-.sidebar-tool-needs-key {
+.sidebar-tool-needs-key-btn {
   font-size: 9px;
   font-weight: 600;
-  padding: 1px 5px;
+  padding: 2px 6px;
   border-radius: 3px;
+  border: 1px solid rgba(245, 158, 11, 0.3);
   flex-shrink: 0;
   background: rgba(251, 191, 36, 0.15);
   color: #f59e0b;
   white-space: nowrap;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.sidebar-tool-needs-key-btn:hover {
+  background: rgba(251, 191, 36, 0.25);
+  border-color: rgba(245, 158, 11, 0.5);
 }
 
 /* ── Channel Guide Button ──────────────────────────── */
@@ -578,67 +587,67 @@ html, body {
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: rgba(0, 0, 0, 0.75);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 9999;
-  backdrop-filter: blur(2px);
+  backdrop-filter: blur(6px);
 }
 
 .channel-guide-modal {
-  background: var(--color-bg-primary);
-  border: 1px solid var(--color-border);
+  background: #1e2030;
+  border: 1px solid #3a3f5c;
   border-radius: var(--radius-lg, 12px);
   width: 90%;
-  max-width: 520px;
+  max-width: 540px;
   max-height: 80vh;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
 }
 
 .channel-guide-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--color-border);
-  font-size: 15px;
+  padding: 18px 22px;
+  border-bottom: 1px solid #3a3f5c;
+  font-size: 16px;
   font-weight: 700;
-  color: var(--color-text-primary);
+  color: #f0f1f8;
 }
 
 .channel-guide-close {
   border: none;
   background: transparent;
-  font-size: 20px;
+  font-size: 22px;
   cursor: pointer;
-  color: var(--color-text-muted);
+  color: #8b90b0;
   padding: 0 4px;
   line-height: 1;
 }
 
 .channel-guide-close:hover {
-  color: var(--color-text-primary);
+  color: #f0f1f8;
 }
 
 .channel-guide-body {
-  padding: 16px 20px;
+  padding: 18px 22px;
   overflow-y: auto;
   flex: 1;
 }
 
 .channel-guide-steps {
   margin: 0;
-  padding: 0 0 0 20px;
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--color-text-secondary);
+  padding: 0 0 0 22px;
+  font-size: 13.5px;
+  line-height: 1.8;
+  color: #d0d3e8;
 }
 
 .channel-guide-steps li {
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
 
 .channel-guide-steps li:last-child {
@@ -646,8 +655,8 @@ html, body {
 }
 
 .channel-guide-config-section {
-  margin-top: 16px;
-  border: 1px solid var(--color-border);
+  margin-top: 18px;
+  border: 1px solid #3a3f5c;
   border-radius: var(--radius-md, 8px);
   overflow: hidden;
 }
@@ -656,15 +665,15 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
-  background: var(--color-bg-secondary);
-  border-bottom: 1px solid var(--color-border);
+  padding: 10px 14px;
+  background: #161822;
+  border-bottom: 1px solid #3a3f5c;
 }
 
 .channel-guide-config-title {
   font-size: 11px;
-  font-weight: 600;
-  color: var(--color-text-muted);
+  font-weight: 700;
+  color: #8b90b0;
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
@@ -672,29 +681,29 @@ html, body {
 .channel-guide-copy-btn {
   font-size: 11px;
   font-weight: 600;
-  padding: 2px 8px;
+  padding: 3px 10px;
   border-radius: var(--radius-sm);
-  border: 1px solid var(--color-border);
+  border: 1px solid #3a3f5c;
   background: transparent;
-  color: var(--color-primary);
+  color: #818cf8;
   cursor: pointer;
   font-family: var(--font-sans);
 }
 
 .channel-guide-copy-btn:hover {
-  background: var(--color-primary-bg);
+  background: rgba(99, 102, 241, 0.15);
 }
 
 .channel-guide-config-code {
   margin: 0;
-  padding: 12px;
-  font-size: 12px;
+  padding: 14px;
+  font-size: 12.5px;
   font-family: var(--font-mono);
-  color: var(--color-text-primary);
-  background: var(--color-bg-primary);
+  color: #a5f3fc;
+  background: #0f1117;
   white-space: pre-wrap;
   word-break: break-all;
-  line-height: 1.6;
+  line-height: 1.7;
 }
 
 .sidebar-empty {
