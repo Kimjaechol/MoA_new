@@ -58,6 +58,9 @@ use uuid::Uuid;
 pub const MAX_BODY_SIZE: usize = 65_536;
 /// Request timeout (30s) — prevents slow-loris attacks
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Extended timeout for chat endpoints that go through the agent loop with
+/// tool execution (web search, composio, etc.) — these can easily exceed 30s.
+pub const CHAT_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -1063,6 +1066,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .layer(RequestBodyLimitLayer::new(
             openai_compat::CHAT_COMPLETIONS_MAX_BODY_SIZE,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS),
+        ));
+
+    // Chat endpoint needs extended timeout for agent loop with tool execution
+    // (web search, composio, etc.) — the default 30s global timeout is too short.
+    let chat_routes = Router::new()
+        .route("/api/chat", post(openclaw_compat::handle_api_chat))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS),
         ));
 
     // Build router with middleware
@@ -1081,9 +1097,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/qq", post(handle_qq_webhook))
-        // ── OpenClaw migration: tools-enabled chat endpoint ──
-        .route("/api/chat", post(openclaw_compat::handle_api_chat))
-        // ── OpenAI-compatible endpoints ──
+        // ── OpenClaw migration: tools-enabled chat endpoint (extended timeout) ──
+        .merge(chat_routes)
+        // ── OpenAI-compatible endpoints (extended timeout) ──
         .route("/v1/models", get(openai_compat::handle_v1_models))
         .merge(openai_compat_routes)
         // ── Web Dashboard API routes ──
