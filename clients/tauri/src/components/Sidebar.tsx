@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { t, type Locale } from "../lib/i18n";
 import type { ChatSession } from "../lib/storage";
-import type { DeviceInfo, ToolInfo } from "../lib/api";
+import type { DeviceInfo, ToolInfo, ChannelInfo } from "../lib/api";
 
 interface SidebarProps {
   chats: ChatSession[];
@@ -11,6 +11,7 @@ interface SidebarProps {
   currentPage: string;
   devices: DeviceInfo[];
   channels: string[];
+  channelsDetail: ChannelInfo[];
   tools: ToolInfo[];
   onNewChat: () => void;
   onSelectChat: (id: string) => void;
@@ -21,6 +22,36 @@ interface SidebarProps {
   onToggle: () => void;
 }
 
+/** Pretty display names for channels */
+const CHANNEL_DISPLAY_NAMES: Record<string, string> = {
+  telegram: "Telegram",
+  discord: "Discord",
+  slack: "Slack",
+  mattermost: "Mattermost",
+  whatsapp: "WhatsApp",
+  line: "LINE",
+  kakao: "KakaoTalk",
+  qq: "QQ",
+  lark: "Lark",
+  feishu: "Feishu",
+  dingtalk: "DingTalk",
+  matrix: "Matrix",
+  signal: "Signal",
+  irc: "IRC",
+  email: "Email",
+  github: "GitHub",
+  nostr: "Nostr",
+  imessage: "iMessage",
+  bluebubbles: "BlueBubbles",
+  linq: "Linq",
+  wati: "WATI",
+  nextcloud_talk: "Nextcloud Talk",
+  napcat: "NapCat (QQ)",
+  acp: "ACP",
+  clawdtalk: "ClawdTalk",
+  webhook: "Webhook",
+};
+
 export function Sidebar({
   chats,
   activeChatId,
@@ -29,6 +60,7 @@ export function Sidebar({
   currentPage,
   devices,
   channels,
+  channelsDetail,
   tools,
   onNewChat,
   onSelectChat,
@@ -40,8 +72,8 @@ export function Sidebar({
 }: SidebarProps) {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     devices: true,
-    channels: false,
-    tools: false,
+    channels: true,
+    tools: true,
     chats: true,
   });
 
@@ -131,8 +163,10 @@ export function Sidebar({
                   <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                 </svg>
                 <span>{t("sidebar_channels", locale)}</span>
-                {channels.length > 0 && (
-                  <span className="sidebar-section-badge">{channels.length}</span>
+                {channelsDetail.length > 0 && (
+                  <span className="sidebar-section-badge">
+                    {channelsDetail.filter((c) => c.enabled).length}/{channelsDetail.length}
+                  </span>
                 )}
               </div>
               <svg
@@ -144,16 +178,28 @@ export function Sidebar({
             </button>
             {expandedSections.channels && (
               <div className="sidebar-section-content">
-                {channels.length === 0 ? (
+                {channelsDetail.length === 0 ? (
                   <div className="sidebar-section-empty">{t("sidebar_no_channels", locale)}</div>
                 ) : (
-                  channels.map((ch) => (
-                    <div key={ch} className="sidebar-info-item">
-                      <div className="sidebar-status-dot online" />
-                      <span className="sidebar-info-label">{ch}</span>
+                  channelsDetail.map((ch) => (
+                    <div key={ch.name} className="sidebar-info-item sidebar-channel-item">
+                      <div className={`sidebar-status-dot ${ch.enabled ? "online" : ""}`} />
+                      <span className="sidebar-info-label">
+                        {CHANNEL_DISPLAY_NAMES[ch.name] || ch.name}
+                      </span>
+                      <span className={`sidebar-channel-status ${ch.enabled ? "enabled" : "disabled"}`}>
+                        {ch.enabled
+                          ? (locale === "ko" ? "활성" : "ON")
+                          : (locale === "ko" ? "비활성" : "OFF")}
+                      </span>
                     </div>
                   ))
                 )}
+                <div className="sidebar-channel-hint">
+                  {locale === "ko"
+                    ? "채널 설정은 설정 페이지에서 변경할 수 있습니다"
+                    : "Configure channels in Settings"}
+                </div>
               </div>
             )}
           </div>

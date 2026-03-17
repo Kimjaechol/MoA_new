@@ -2318,7 +2318,7 @@ fn default_browser_webdriver_url() -> String {
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             allowed_domains: Vec::new(),
             browser_open: default_browser_open(),
             session_name: None,
@@ -2405,7 +2405,7 @@ pub struct HttpRequestConfig {
 impl Default for HttpRequestConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             allowed_domains: vec![],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
@@ -4850,6 +4850,39 @@ impl ChannelsConfig {
             self.webhook.is_some(),
         ));
         ret
+    }
+
+    /// Returns all known channel names with their enabled (configured) status.
+    /// Used by the web dashboard to list available channels.
+    pub fn all_channel_status(&self) -> Vec<(&'static str, bool)> {
+        vec![
+            ("telegram", self.telegram.is_some()),
+            ("discord", self.discord.is_some()),
+            ("slack", self.slack.is_some()),
+            ("mattermost", self.mattermost.is_some()),
+            ("whatsapp", self.whatsapp.is_some()),
+            ("line", self.line.is_some()),
+            ("kakao", self.kakao.is_some()),
+            ("qq", self.qq.is_some()),
+            ("lark", self.lark.is_some()),
+            ("feishu", self.feishu.is_some()),
+            ("dingtalk", self.dingtalk.is_some()),
+            ("matrix", self.matrix.is_some()),
+            ("signal", self.signal.is_some()),
+            ("irc", self.irc.is_some()),
+            ("email", self.email.is_some()),
+            ("github", self.github.is_some()),
+            ("nostr", self.nostr.is_some()),
+            ("imessage", self.imessage.is_some()),
+            ("bluebubbles", self.bluebubbles.is_some()),
+            ("linq", self.linq.is_some()),
+            ("wati", self.wati.is_some()),
+            ("nextcloud_talk", self.nextcloud_talk.is_some()),
+            ("napcat", self.napcat.is_some()),
+            ("acp", self.acp.is_some()),
+            ("clawdtalk", self.clawdtalk.is_some()),
+            ("webhook", self.webhook.is_some()),
+        ]
     }
 }
 

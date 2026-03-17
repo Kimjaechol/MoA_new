@@ -66,8 +66,14 @@ export interface ToolInfo {
   description: string;
 }
 
+export interface ChannelInfo {
+  name: string;
+  enabled: boolean;
+}
+
 export interface AgentInfo {
   channels: string[];
+  channels_detail: ChannelInfo[];
   tools: ToolInfo[];
 }
 
@@ -304,10 +310,15 @@ export class MoAClient {
   async getAgentInfo(): Promise<AgentInfo> {
     try {
       const res = await fetch(`${this.serverUrl}/api/agent/info`);
-      if (!res.ok) return { channels: [], tools: [] };
-      return await res.json();
+      if (!res.ok) return { channels: [], channels_detail: [], tools: [] };
+      const data = await res.json();
+      return {
+        channels: data.channels ?? [],
+        channels_detail: data.channels_detail ?? [],
+        tools: data.tools ?? [],
+      };
     } catch {
-      return { channels: [], tools: [] };
+      return { channels: [], channels_detail: [], tools: [] };
     }
   }
 
