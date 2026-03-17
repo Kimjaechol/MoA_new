@@ -734,35 +734,24 @@ export class MoAClient {
   // When no key is set, MoA falls back to operator keys via relay.
 
   async saveApiKeyToAgent(provider: string, key: string): Promise<void> {
-    const body = JSON.stringify({ provider, api_key: key });
-    const headers = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${this.token}`,
-    };
-
-    // Try local gateway first, fall back to relay server
-    for (const baseUrl of [this.serverUrl, this.relayUrl]) {
-      try {
-        const res = await fetch(`${baseUrl}/api/config/api-key`, {
-          method: "PUT",
-          headers,
-          body,
-        });
-        if (!res.ok) {
-          const data = await res.json().catch(() => ({ error: "Save failed" }));
-          throw new Error(data.error || `Save failed (${res.status})`);
-        }
-        return; // success
-      } catch (err) {
-        if (err instanceof TypeError && err.message === "Failed to fetch") {
-          // Network error — try next server
-          if (baseUrl === this.relayUrl) {
-            throw new Error("Failed to fetch: server unreachable");
-          }
-          continue;
-        }
-        throw err; // re-throw non-network errors (e.g. 400/500 responses)
+    try {
+      const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({ provider, api_key: key }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: "Save failed" }));
+        throw new Error(data.error || `Save failed (${res.status})`);
       }
+    } catch (err) {
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+      }
+      throw err;
     }
   }
 
@@ -774,41 +763,31 @@ export class MoAClient {
    *  that older server binaries may not serve. */
   async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
     // Reuse the proven /api/config/api-key endpoint with "tool:" prefix
-    const body = JSON.stringify({ provider: `tool:${tool}`, api_key: apiKey });
-    const headers = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${this.token}`,
-    };
-
-    // Try local gateway first, fall back to relay server
-    for (const baseUrl of [this.serverUrl, this.relayUrl]) {
-      try {
-        const res = await fetch(`${baseUrl}/api/config/api-key`, {
-          method: "PUT",
-          headers,
-          body,
-        });
-        if (!res.ok) {
-          const data = await res.json().catch(() => ({ error: "Save failed" }));
-          throw new Error(data.error || `Save failed (${res.status})`);
-        }
-        // Store locally for UI state
-        if (apiKey) {
-          localStorage.setItem(`zeroclaw_tool_api_key_${tool}`, "configured");
-        } else {
-          localStorage.removeItem(`zeroclaw_tool_api_key_${tool}`);
-        }
-        return; // success
-      } catch (err) {
-        if (err instanceof TypeError && err.message === "Failed to fetch") {
-          // Network error — try next server
-          if (baseUrl === this.relayUrl) {
-            throw new Error("Failed to fetch: server unreachable");
-          }
-          continue;
-        }
-        throw err; // re-throw non-network errors (e.g. 400/500 responses)
+    try {
+      const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({ provider: `tool:${tool}`, api_key: apiKey }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: "Save failed" }));
+        throw new Error(data.error || `Save failed (${res.status})`);
       }
+    } catch (err) {
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+      }
+      throw err;
+    }
+
+    // Store locally for UI state
+    if (apiKey) {
+      localStorage.setItem(`zeroclaw_tool_api_key_${tool}`, "configured");
+    } else {
+      localStorage.removeItem(`zeroclaw_tool_api_key_${tool}`);
     }
   }
 
