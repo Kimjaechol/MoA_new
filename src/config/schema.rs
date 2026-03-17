@@ -9060,28 +9060,41 @@ impl Config {
             }
         }
 
-        // KakaoTalk: ZEROCLAW_KAKAO_REST_API_KEY
-        if let Ok(key) = std::env::var("ZEROCLAW_KAKAO_REST_API_KEY") {
-            if !key.is_empty() {
-                let kk = self
-                    .channels_config
-                    .kakao
-                    .get_or_insert_with(|| KakaoTalkConfig {
-                        rest_api_key: String::new(),
-                        admin_key: String::new(),
-                        webhook_secret: None,
-                        allowed_users: vec![],
-                        port: default_kakao_port(),
-                    });
-                kk.rest_api_key = key;
-            }
+        // KakaoTalk: ZEROCLAW_KAKAO_REST_API_KEY or KAKAO_REST_API_KEY
+        let kakao_rest = std::env::var("ZEROCLAW_KAKAO_REST_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .or_else(|| std::env::var("KAKAO_REST_API_KEY").ok().filter(|k| !k.is_empty()));
+        if let Some(key) = kakao_rest {
+            let kk = self
+                .channels_config
+                .kakao
+                .get_or_insert_with(|| KakaoTalkConfig {
+                    rest_api_key: String::new(),
+                    admin_key: String::new(),
+                    webhook_secret: None,
+                    allowed_users: vec![],
+                    port: default_kakao_port(),
+                });
+            kk.rest_api_key = key;
         }
-        if let Ok(key) = std::env::var("ZEROCLAW_KAKAO_ADMIN_KEY") {
-            if !key.is_empty() {
-                if let Some(ref mut kk) = self.channels_config.kakao {
-                    kk.admin_key = key;
-                }
-            }
+        // ZEROCLAW_KAKAO_ADMIN_KEY or KAKAO_ADMIN_KEY
+        let kakao_admin = std::env::var("ZEROCLAW_KAKAO_ADMIN_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .or_else(|| std::env::var("KAKAO_ADMIN_KEY").ok().filter(|k| !k.is_empty()));
+        if let Some(key) = kakao_admin {
+            let kk = self
+                .channels_config
+                .kakao
+                .get_or_insert_with(|| KakaoTalkConfig {
+                    rest_api_key: String::new(),
+                    admin_key: String::new(),
+                    webhook_secret: None,
+                    allowed_users: vec![],
+                    port: default_kakao_port(),
+                });
+            kk.admin_key = key;
         }
         if let Ok(users) = std::env::var("ZEROCLAW_KAKAO_ALLOWED_USERS") {
             if !users.is_empty() {
