@@ -652,10 +652,31 @@ pub async fn handle_agent_info(State(state): State<AppState>) -> impl IntoRespon
         })
         .collect();
 
-    let channels: Vec<String> = Vec::new();
+    let config = state.config.lock().clone();
+    let channels: Vec<serde_json::Value> = config
+        .channels_config
+        .all_channel_status()
+        .into_iter()
+        .map(|(name, enabled)| {
+            serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+            })
+        })
+        .collect();
+
+    // Also return active channel names for backwards compatibility
+    let active_channels: Vec<String> = config
+        .channels_config
+        .all_channel_status()
+        .into_iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(name, _)| name.to_string())
+        .collect();
 
     Json(serde_json::json!({
-        "channels": channels,
+        "channels": active_channels,
+        "channels_detail": channels,
         "tools": tools,
     }))
 }

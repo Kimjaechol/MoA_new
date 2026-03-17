@@ -9,7 +9,7 @@ import { Interpreter } from "./components/Interpreter";
 import { SetupWizard } from "./components/SetupWizard";
 import { GatewayStatus } from "./components/GatewayStatus";
 import { DocumentEditor } from "./components/DocumentEditor";
-import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
+import { apiClient, type DeviceInfo, type ToolInfo, type ChannelInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, t, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated, onPythonEnvStatus, type PythonEnvStatus } from "./lib/tauri-bridge";
 import {
@@ -50,6 +50,7 @@ function App() {
   const [pendingDevices, setPendingDevices] = useState<DeviceInfo[]>([]);
   const [sidebarDevices, setSidebarDevices] = useState<DeviceInfo[]>([]);
   const [sidebarChannels, setSidebarChannels] = useState<string[]>([]);
+  const [sidebarChannelsDetail, setSidebarChannelsDetail] = useState<ChannelInfo[]>([]);
   const [sidebarTools, setSidebarTools] = useState<ToolInfo[]>([]);
   const lifecycleCleanup = useRef<(() => void) | null>(null);
   // In Tauri mode, wait for the MoA gateway to be ready before
@@ -142,6 +143,7 @@ function App() {
     if (!isConnected) {
       setSidebarDevices([]);
       setSidebarChannels([]);
+      setSidebarChannelsDetail([]);
       setSidebarTools([]);
       return;
     }
@@ -153,6 +155,7 @@ function App() {
       ]);
       setSidebarDevices(devices);
       setSidebarChannels(agentInfo.channels);
+      setSidebarChannelsDetail(agentInfo.channels_detail);
       setSidebarTools(agentInfo.tools);
     };
 
@@ -514,6 +517,7 @@ function App() {
         locale={locale}
         devices={sidebarDevices}
         channels={sidebarChannels}
+        channelsDetail={sidebarChannelsDetail}
         tools={sidebarTools}
         onNewChat={handleNewChat}
         onSelectChat={handleSelectChat}
