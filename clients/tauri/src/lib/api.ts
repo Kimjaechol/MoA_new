@@ -409,6 +409,46 @@ export class MoAClient {
     };
   }
 
+  // ── Gateway Liveness ─────────────────────────────────────────────
+
+  /** Whether the local gateway was reachable on the last heartbeat check. */
+  private gatewayAlive = true;
+
+  /** Check if the local gateway is currently alive. */
+  isGatewayAlive(): boolean {
+    return this.gatewayAlive;
+  }
+
+  /** Quick health probe against the local gateway (2s timeout). */
+  async checkGatewayHealth(): Promise<boolean> {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000);
+      const res = await fetch(`${this.serverUrl}/health`, {
+        method: "GET",
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      this.gatewayAlive = res.ok;
+      return res.ok;
+    } catch {
+      this.gatewayAlive = false;
+      return false;
+    }
+  }
+
+  /**
+   * Assert that the local gateway is reachable.
+   * Throws a user-friendly error if not.
+   */
+  private async requireGateway(): Promise<void> {
+    if (this.gatewayAlive) return; // fast path — last check was ok
+    const alive = await this.checkGatewayHealth();
+    if (!alive) {
+      throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+    }
+  }
+
   // ── Heartbeat ──────────────────────────────────────────────────
 
   startHeartbeat(): void {
@@ -435,8 +475,10 @@ export class MoAClient {
         },
         body: JSON.stringify({ device_id: this.deviceId }),
       });
+      this.gatewayAlive = true;
     } catch {
-      // Heartbeat failures are non-critical
+      // Track gateway liveness — if heartbeat network-fails, gateway is likely down
+      this.gatewayAlive = false;
     }
   }
 
@@ -734,6 +776,7 @@ export class MoAClient {
   // When no key is set, MoA falls back to operator keys via relay.
 
   async saveApiKeyToAgent(provider: string, key: string): Promise<void> {
+    await this.requireGateway();
     try {
       const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
         method: "PUT",
@@ -749,6 +792,7 @@ export class MoAClient {
       }
     } catch (err) {
       if (err instanceof TypeError && err.message === "Failed to fetch") {
+        this.gatewayAlive = false;
         throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
       }
       throw err;
@@ -763,6 +807,7 @@ export class MoAClient {
    *  that older server binaries may not serve. */
   async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
     // Reuse the proven /api/config/api-key endpoint with "tool:" prefix
+    await this.requireGateway();
     try {
       const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
         method: "PUT",
@@ -778,6 +823,7 @@ export class MoAClient {
       }
     } catch (err) {
       if (err instanceof TypeError && err.message === "Failed to fetch") {
+        this.gatewayAlive = false;
         throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
       }
       throw err;
