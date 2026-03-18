@@ -92,11 +92,23 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             result              TEXT,
             channel             TEXT,
             context_id          INTEGER REFERENCES ontology_objects(id),
+            -- When: real-world time the action occurred (ISO-8601 string).
+            -- Distinct from created_at (DB insertion time). Enables timeline
+            -- reconstruction sorted by actual occurrence, not record time.
+            occurred_at         TEXT,
+            -- Where: real-world location of the action (free-form text).
+            -- Enables location-based grouping and relationship inference
+            -- (e.g. same location → likely related events/people).
+            location            TEXT,
             status              TEXT NOT NULL DEFAULT 'pending',
             error_message       TEXT,
             created_at          INTEGER NOT NULL,
             updated_at          INTEGER NOT NULL
         );
+
+        -- Migration: add occurred_at and location to existing tables
+        -- (ALTER TABLE ... ADD COLUMN is a no-op if the column already exists
+        -- in SQLite 3.35+, but we guard with a pragma check pattern below).
 
         CREATE INDEX IF NOT EXISTS idx_onto_actions_actor
             ON ontology_actions(actor_user_id);
@@ -108,6 +120,12 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             ON ontology_actions(created_at);
         CREATE INDEX IF NOT EXISTS idx_onto_actions_status
             ON ontology_actions(status);
+        -- Index on occurred_at for timeline queries (sort by real-world time).
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_occurred
+            ON ontology_actions(occurred_at);
+        -- Index on location for location-based grouping queries.
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_location
+            ON ontology_actions(location);
 
         -- ================================================================
         -- 4. FTS5 indexes for ontology search
@@ -143,6 +161,36 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
         ",
     )?;
 
+    // ── Migration: add occurred_at / location to existing ontology_actions ──
+    // ALTER TABLE ... ADD COLUMN is safe in SQLite (no-op concept check):
+    // we query pragma table_info to see if the columns already exist.
+    migrate_add_column(conn, "ontology_actions", "occurred_at", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "location", "TEXT")?;
+
+    Ok(())
+}
+
+/// Add a column to an existing table if it does not already exist.
+///
+/// Uses `PRAGMA table_info` to check for the column, then runs
+/// `ALTER TABLE ... ADD COLUMN` only when needed. This is safe to
+/// call on every startup.
+fn migrate_add_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    col_type: &str,
+) -> anyhow::Result<()> {
+    let sql = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&sql)?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|r| r.as_deref() == Ok(column));
+    if !has_column {
+        let alter = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type);
+        conn.execute_batch(&alter)?;
+        tracing::info!(table, column, "ontology schema migration: added column");
+    }
     Ok(())
 }
 

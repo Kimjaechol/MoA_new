@@ -143,6 +143,15 @@ impl ActorKind {
 }
 
 /// A recorded action (the "verb" in the ontology).
+///
+/// Every action answers the 5W1H question: **Who** (actor) did **What**
+/// (action_type) to **Whom** (primary_object), **When** (occurred_at),
+/// **Where** (location), and **How** (params/result).
+///
+/// `occurred_at` and `location` are first-class fields because:
+/// - Time-ordered action history enables timeline reconstruction.
+/// - Location-based grouping reveals implicit relationships (e.g. two
+///   people at the same place → likely met, events at same venue → pattern).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OntologyAction {
     pub id: i64,
@@ -161,6 +170,15 @@ pub struct OntologyAction {
     pub channel: Option<String>,
     /// Context object ID for situational awareness.
     pub context_id: Option<i64>,
+    /// **When** — the real-world time this action occurred (ISO-8601 or
+    /// human-readable string, e.g. "2026-03-18T14:30:00+09:00").
+    /// Distinct from `created_at` which is the DB insertion timestamp.
+    /// If not supplied, defaults to the current time as ISO-8601.
+    pub occurred_at: Option<String>,
+    /// **Where** — the real-world location of this action (free-form text,
+    /// e.g. "서울 서초구 법원로 서울중앙지방법원", "골프장 레이크사이드CC",
+    /// "서울 강남구 테헤란로 사무실").
+    pub location: Option<String>,
     pub status: ActionStatus,
     pub error_message: Option<String>,
     pub created_at: i64,
@@ -182,6 +200,10 @@ pub struct ExecuteActionRequest {
     pub params: serde_json::Value,
     pub channel: Option<String>,
     pub context_id: Option<i64>,
+    /// When the action occurred in the real world (ISO-8601 or descriptive).
+    pub occurred_at: Option<String>,
+    /// Where the action occurred (free-form location string).
+    pub location: Option<String>,
 }
 
 /// Parameters for querying the context snapshot.
@@ -205,6 +227,9 @@ pub struct ContextSnapshot {
 }
 
 /// Lightweight summary of a past action for context injection.
+///
+/// Includes **when** and **where** so the LLM can reason about
+/// the user's timeline and location patterns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionSummary {
     pub action_type: String,
@@ -212,6 +237,10 @@ pub struct ActionSummary {
     pub params_summary: serde_json::Value,
     pub result_summary: Option<serde_json::Value>,
     pub channel: Option<String>,
+    /// When the action actually happened (ISO-8601 or descriptive).
+    pub occurred_at: Option<String>,
+    /// Where the action happened (free-form location string).
+    pub location: Option<String>,
     pub status: String,
     pub created_at: i64,
 }

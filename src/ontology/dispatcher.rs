@@ -69,7 +69,7 @@ impl ActionDispatcher {
     pub async fn execute(&self, req: ExecuteActionRequest) -> anyhow::Result<serde_json::Value> {
         let actor_kind = req.actor_kind.clone().unwrap_or(ActorKind::Agent);
 
-        // 1. Log the action as pending.
+        // 1. Log the action as pending (with when/where context).
         let action_id = self.repo.insert_action_pending(
             &req.action_type_name,
             &req.owner_user_id,
@@ -79,6 +79,8 @@ impl ActionDispatcher {
             &req.params,
             req.channel.as_deref(),
             req.context_id,
+            req.occurred_at.as_deref(),
+            req.location.as_deref(),
         )?;
 
         // 2. Route to the appropriate handler.

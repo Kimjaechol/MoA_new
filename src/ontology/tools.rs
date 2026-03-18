@@ -269,6 +269,14 @@ impl Tool for OntologyExecuteActionTool {
                 "context_id": {
                     "type": "integer",
                     "description": "ID of the current Context object"
+                },
+                "occurred_at": {
+                    "type": "string",
+                    "description": "WHEN: Real-world time the action occurred (ISO-8601 e.g. '2026-03-18T14:30:00+09:00', or descriptive e.g. '오늘 오후 2시 30분'). Auto-filled with current time if omitted."
+                },
+                "location": {
+                    "type": "string",
+                    "description": "WHERE: Real-world location of the action (free-form, e.g. '서울 서초구 법원로 서울중앙지방법원', '레이크사이드CC 골프장', '사무실')"
                 }
             },
             "required": ["action_type_name", "params"]
@@ -307,6 +315,14 @@ impl Tool for OntologyExecuteActionTool {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             context_id: args.get("context_id").and_then(|v| v.as_i64()),
+            occurred_at: args
+                .get("occurred_at")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            location: args
+                .get("location")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         };
 
         match self.dispatcher.execute(req).await {

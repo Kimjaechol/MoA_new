@@ -5,6 +5,7 @@
 //! the pattern used by `SqliteMemory`).
 
 use super::types::*;
+use chrono::Utc;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -462,6 +463,11 @@ impl OntologyRepo {
     // -----------------------------------------------------------------------
 
     /// Insert a new action log entry with status "pending". Returns the action ID.
+    ///
+    /// `occurred_at` records **when** the action happened in the real world
+    /// (ISO-8601 or descriptive text). `location` records **where**.
+    /// Both are optional but strongly encouraged — a great secretary always
+    /// notes the time and place of every event.
     pub fn insert_action_pending(
         &self,
         action_type_name: &str,
@@ -472,6 +478,8 @@ impl OntologyRepo {
         params: &serde_json::Value,
         channel: Option<&str>,
         context_id: Option<i64>,
+        occurred_at: Option<&str>,
+        location: Option<&str>,
     ) -> anyhow::Result<i64> {
         let action_type_id = self.action_type_id(action_type_name)?;
         let now = now_millis();
@@ -482,12 +490,21 @@ impl OntologyRepo {
             Some(serde_json::to_string(related_object_ids)?)
         };
 
+        // Default occurred_at to current ISO-8601 UTC if not supplied.
+        let effective_occurred_at = occurred_at
+            .map(String::from)
+            .or_else(|| {
+                Some(Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+            });
+
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO ontology_actions
              (action_type_id, actor_user_id, actor_kind, primary_object_id,
-              related_object_ids, params, channel, context_id, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10)",
+              related_object_ids, params, channel, context_id,
+              occurred_at, location,
+              status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)",
             params![
                 action_type_id,
                 actor_user_id,
@@ -497,6 +514,8 @@ impl OntologyRepo {
                 params_str,
                 channel,
                 context_id,
+                effective_occurred_at,
+                location,
                 now,
                 now,
             ],
@@ -545,11 +564,12 @@ impl OntologyRepo {
             (
                 "SELECT id, action_type_id, actor_user_id, actor_kind,
                         primary_object_id, related_object_ids, params, result,
-                        channel, context_id, status, error_message,
+                        channel, context_id, occurred_at, location,
+                        status, error_message,
                         created_at, updated_at
                  FROM ontology_actions
                  WHERE actor_user_id = ?1 AND channel = ?3
-                 ORDER BY created_at DESC LIMIT ?2"
+                 ORDER BY COALESCE(occurred_at, datetime(created_at/1000, 'unixepoch')) DESC LIMIT ?2"
                     .to_string(),
                 limit as i64,
             )
@@ -557,11 +577,12 @@ impl OntologyRepo {
             (
                 "SELECT id, action_type_id, actor_user_id, actor_kind,
                         primary_object_id, related_object_ids, params, result,
-                        channel, context_id, status, error_message,
+                        channel, context_id, occurred_at, location,
+                        status, error_message,
                         created_at, updated_at
                  FROM ontology_actions
                  WHERE actor_user_id = ?1
-                 ORDER BY created_at DESC LIMIT ?2"
+                 ORDER BY COALESCE(occurred_at, datetime(created_at/1000, 'unixepoch')) DESC LIMIT ?2"
                     .to_string(),
                 limit as i64,
             )
@@ -595,10 +616,12 @@ impl OntologyRepo {
                 result: r.get::<_, Option<String>>(7)?.map(|s| parse_json_col(s)),
                 channel: r.get(8)?,
                 context_id: r.get(9)?,
-                status: ActionStatus::from_str_lossy(&r.get::<_, String>(10)?),
-                error_message: r.get(11)?,
-                created_at: r.get(12)?,
-                updated_at: r.get(13)?,
+                occurred_at: r.get(10)?,
+                location: r.get(11)?,
+                status: ActionStatus::from_str_lossy(&r.get::<_, String>(12)?),
+                error_message: r.get(13)?,
+                created_at: r.get(14)?,
+                updated_at: r.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -736,6 +759,8 @@ mod tests {
                 &serde_json::json!({"title": "test"}),
                 Some("desktop"),
                 None,
+                Some("2026-03-18T14:30:00+09:00"),
+                Some("서울 서초구 사무실"),
             )
             .unwrap();
 
@@ -746,6 +771,14 @@ mod tests {
         let actions = repo.recent_actions("user-1", None, 10).unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].status, ActionStatus::Success);
+        assert_eq!(
+            actions[0].occurred_at.as_deref(),
+            Some("2026-03-18T14:30:00+09:00")
+        );
+        assert_eq!(
+            actions[0].location.as_deref(),
+            Some("서울 서초구 사무실")
+        );
     }
 
     #[test]

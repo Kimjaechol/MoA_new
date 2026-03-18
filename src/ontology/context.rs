@@ -85,6 +85,8 @@ impl ContextBuilder {
                     params_summary: summarize_json(&a.params, 3),
                     result_summary: a.result.as_ref().map(|r| summarize_json(r, 2)),
                     channel: a.channel,
+                    occurred_at: a.occurred_at,
+                    location: a.location,
                     status: a.status.to_string(),
                     created_at: a.created_at,
                 }

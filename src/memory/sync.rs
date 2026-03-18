@@ -120,6 +120,10 @@ pub enum DeltaOperation {
         params_json: String,
         result_json: Option<String>,
         channel: Option<String>,
+        /// When the action occurred in the real world (ISO-8601).
+        occurred_at: Option<String>,
+        /// Where the action occurred (free-form location string).
+        location: Option<String>,
         status: String,
     },
 }
@@ -495,6 +499,10 @@ impl SyncEngine {
     }
 
     /// Record an ontology action log entry in the delta journal.
+    ///
+    /// `occurred_at` and `location` capture the real-world **when** and
+    /// **where** of the action, enabling timeline and location-based
+    /// queries on remote devices after sync.
     pub fn record_ontology_action(
         &mut self,
         action_type_name: &str,
@@ -502,6 +510,8 @@ impl SyncEngine {
         params_json: &str,
         result_json: Option<&str>,
         channel: Option<&str>,
+        occurred_at: Option<&str>,
+        location: Option<&str>,
         status: &str,
     ) {
         if !self.enabled {
@@ -518,6 +528,8 @@ impl SyncEngine {
                 params_json: params_json.to_string(),
                 result_json: result_json.map(String::from),
                 channel: channel.map(String::from),
+                occurred_at: occurred_at.map(String::from),
+                location: location.map(String::from),
                 status: status.to_string(),
             },
             timestamp: current_epoch_secs(),

@@ -426,6 +426,8 @@ mod tests {
             params: json!({"message": "hello"}),
             channel: Some("kakao".to_string()),
             context_id: None,
+            occurred_at: None,
+            location: None,
         };
 
         engine
@@ -458,6 +460,8 @@ mod tests {
             params: json!({"title": "Test task"}),
             channel: Some("desktop".to_string()),
             context_id: Some(ctx_id),
+            occurred_at: None,
+            location: None,
         };
 
         let result = json!({"task_object_id": 999});
