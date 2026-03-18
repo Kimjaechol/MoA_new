@@ -85,6 +85,10 @@ impl ContextBuilder {
                     params_summary: summarize_json(&a.params, 3),
                     result_summary: a.result.as_ref().map(|r| summarize_json(r, 2)),
                     channel: a.channel,
+                    occurred_at_utc: a.occurred_at_utc,
+                    occurred_at_home: a.occurred_at_home,
+                    timezone: a.timezone,
+                    location: a.location,
                     status: a.status.to_string(),
                     created_at: a.created_at,
                 }

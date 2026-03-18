@@ -453,16 +453,19 @@ export class MoAClient {
   /** Whether the local gateway was reachable on the last heartbeat check. */
   private gatewayAlive = true;
 
+  /** Count consecutive heartbeat failures before marking gateway as down. */
+  private heartbeatFailCount = 0;
+
   /** Check if the local gateway is currently alive. */
   isGatewayAlive(): boolean {
     return this.gatewayAlive;
   }
 
-  /** Quick health probe against the local gateway (2s timeout). */
+  /** Quick health probe against the local gateway (5s timeout). */
   async checkGatewayHealth(): Promise<boolean> {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 2000);
+      const timeout = setTimeout(() => controller.abort(), 5000);
       const res = await fetch(`${this.serverUrl}/health`, {
         method: "GET",
         signal: controller.signal,
@@ -478,12 +481,18 @@ export class MoAClient {
 
   /**
    * Assert that the local gateway is reachable.
+   * Retries once after a short delay to handle transient failures
+   * (e.g. gateway still starting up, brief network hiccup).
    * Throws a user-friendly error if not.
    */
   private async requireGateway(): Promise<void> {
     if (this.gatewayAlive) return; // fast path — last check was ok
     const alive = await this.checkGatewayHealth();
-    if (!alive) {
+    if (alive) return;
+    // Retry once after 1s — handles gateway startup race
+    await new Promise((r) => setTimeout(r, 1000));
+    const retryAlive = await this.checkGatewayHealth();
+    if (!retryAlive) {
       throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
     }
   }
@@ -515,9 +524,14 @@ export class MoAClient {
         body: JSON.stringify({ device_id: this.deviceId }),
       });
       this.gatewayAlive = true;
+      this.heartbeatFailCount = 0;
     } catch {
-      // Track gateway liveness — if heartbeat network-fails, gateway is likely down
-      this.gatewayAlive = false;
+      // Only mark gateway as down after 2 consecutive failures to avoid
+      // transient hiccups (e.g. gateway momentarily busy) breaking API key saves.
+      this.heartbeatFailCount += 1;
+      if (this.heartbeatFailCount >= 2) {
+        this.gatewayAlive = false;
+      }
     }
   }
 
@@ -817,7 +831,8 @@ export class MoAClient {
 
   async saveApiKeyToAgent(provider: string, key: string): Promise<void> {
     await this.requireGateway();
-    try {
+
+    const doSave = async (): Promise<void> => {
       const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
         method: "PUT",
         headers: {
@@ -830,10 +845,24 @@ export class MoAClient {
         const data = await res.json().catch(() => ({ error: "Save failed" }));
         throw new Error(data.error || `Save failed (${res.status})`);
       }
+    };
+
+    try {
+      await doSave();
     } catch (err) {
       if (err instanceof TypeError && err.message === "Failed to fetch") {
-        this.gatewayAlive = false;
-        throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+        // Retry once after a short delay — gateway may be momentarily busy
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          await doSave();
+          return;
+        } catch (retryErr) {
+          if (retryErr instanceof TypeError && retryErr.message === "Failed to fetch") {
+            this.gatewayAlive = false;
+            throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+          }
+          throw retryErr;
+        }
       }
       throw err;
     }
@@ -848,7 +877,8 @@ export class MoAClient {
   async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
     // Reuse the proven /api/config/api-key endpoint with "tool:" prefix
     await this.requireGateway();
-    try {
+
+    const doSave = async (): Promise<void> => {
       const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
         method: "PUT",
         headers: {
@@ -861,10 +891,24 @@ export class MoAClient {
         const data = await res.json().catch(() => ({ error: "Save failed" }));
         throw new Error(data.error || `Save failed (${res.status})`);
       }
+    };
+
+    try {
+      await doSave();
     } catch (err) {
       if (err instanceof TypeError && err.message === "Failed to fetch") {
-        this.gatewayAlive = false;
-        throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+        // Retry once after a short delay — gateway may be momentarily busy
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          await doSave();
+        } catch (retryErr) {
+          if (retryErr instanceof TypeError && retryErr.message === "Failed to fetch") {
+            this.gatewayAlive = false;
+            throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+          }
+          throw retryErr;
+        }
+        return; // retry succeeded — skip to localStorage update below
       }
       throw err;
     }

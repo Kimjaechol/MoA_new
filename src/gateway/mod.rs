@@ -16,6 +16,7 @@ pub mod pair;
 pub mod remote;
 pub mod sse;
 pub mod static_files;
+pub mod timesync;
 pub mod ws;
 
 use crate::billing::PaymentManager;
@@ -58,6 +59,9 @@ use uuid::Uuid;
 pub const MAX_BODY_SIZE: usize = 65_536;
 /// Request timeout (30s) — prevents slow-loris attacks
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Extended timeout for chat endpoints that go through the agent loop with
+/// tool execution (web search, composio, etc.) — these can easily exceed 30s.
+pub const CHAT_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -477,8 +481,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
     // Create memory backend, optionally with cross-device sync support.
-    let (mem, sync_coordinator): (Arc<dyn Memory>, Option<Arc<crate::sync::SyncCoordinator>>) =
-        if config.sync.enabled {
+    // `sync_engine_for_ontology` is kept alive so the OntologyRepo can
+    // record deltas for cross-device replication of the knowledge graph.
+    let (mem, sync_coordinator, sync_engine_for_ontology): (
+        Arc<dyn Memory>,
+        Option<Arc<crate::sync::SyncCoordinator>>,
+        Option<Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>>,
+    ) = if config.sync.enabled {
             // Build base memory, then wrap with SyncedMemory for the coordinator
             let base = memory::create_memory_with_storage(
                 &config.memory,
@@ -488,6 +497,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             )?;
             let engine = crate::memory::sync::SyncEngine::new(&config.workspace_dir, true)?;
             let engine = Arc::new(parking_lot::Mutex::new(engine));
+            let engine_for_ontology = Arc::clone(&engine);
             let synced = Arc::new(crate::memory::synced::SyncedMemory::new(
                 Arc::from(base),
                 engine,
@@ -548,7 +558,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                     "Gateway memory initialized with sync enabled (no relay)"
                 );
             }
-            (synced as Arc<dyn Memory>, Some(coordinator))
+            (synced as Arc<dyn Memory>, Some(coordinator), Some(engine_for_ontology))
         } else {
             let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
                 &config.memory,
@@ -556,8 +566,23 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 &config.workspace_dir,
                 config.api_key.as_deref(),
             )?);
-            (mem, None)
+            (mem, None, None)
         };
+
+    // ── Clock drift check ─────────────────────────────────────────────
+    // MoA uses occurred_at (real-world time) as the primary sort key for
+    // ontology actions. Clock drift between devices breaks timeline
+    // consistency, so we check on startup and periodically thereafter.
+    // Always run clock/timezone check — useful even without sync for
+    // accurate occurred_at timestamps in the ontology.
+    {
+        let home_tz = &config.sync.home_timezone;
+        timesync::check_and_log(home_tz).await;
+        if config.sync.enabled {
+            timesync::spawn_periodic_check(home_tz.clone(), None);
+        }
+    }
+
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -588,6 +613,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        sync_engine_for_ontology,
     ));
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_exec.iter().map(|t| t.spec()).collect());
@@ -1063,6 +1089,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .layer(RequestBodyLimitLayer::new(
             openai_compat::CHAT_COMPLETIONS_MAX_BODY_SIZE,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS),
+        ));
+
+    // Chat endpoint needs extended timeout for agent loop with tool execution
+    // (web search, composio, etc.) — the default 30s global timeout is too short.
+    let chat_routes = Router::new()
+        .route("/api/chat", post(openclaw_compat::handle_api_chat))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS),
         ));
 
     // Build router with middleware
@@ -1081,9 +1120,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/qq", post(handle_qq_webhook))
-        // ── OpenClaw migration: tools-enabled chat endpoint ──
-        .route("/api/chat", post(openclaw_compat::handle_api_chat))
-        // ── OpenAI-compatible endpoints ──
+        // ── OpenClaw migration: tools-enabled chat endpoint (extended timeout) ──
+        .merge(chat_routes)
+        // ── OpenAI-compatible endpoints (extended timeout) ──
         .route("/v1/models", get(openai_compat::handle_v1_models))
         .merge(openai_compat_routes)
         // ── Web Dashboard API routes ──

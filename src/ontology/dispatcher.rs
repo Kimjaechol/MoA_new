@@ -38,6 +38,8 @@ pub struct ActionDispatcher {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// Allowlisted base command names for RunCommand.
     runcommand_allowlist: HashSet<String>,
+    /// User's home timezone (IANA name, e.g. "Asia/Seoul") for timestamp normalization.
+    home_timezone: String,
 }
 
 impl ActionDispatcher {
@@ -45,6 +47,7 @@ impl ActionDispatcher {
         repo: Arc<OntologyRepo>,
         rule_engine: Arc<RuleEngine>,
         tool_list: Vec<Arc<dyn Tool>>,
+        home_timezone: String,
     ) -> Self {
         let mut tools = HashMap::new();
         for tool in tool_list {
@@ -59,6 +62,7 @@ impl ActionDispatcher {
             rule_engine,
             tools,
             runcommand_allowlist,
+            home_timezone,
         }
     }
 
@@ -69,7 +73,7 @@ impl ActionDispatcher {
     pub async fn execute(&self, req: ExecuteActionRequest) -> anyhow::Result<serde_json::Value> {
         let actor_kind = req.actor_kind.clone().unwrap_or(ActorKind::Agent);
 
-        // 1. Log the action as pending.
+        // 1. Log the action as pending (with when/where context).
         let action_id = self.repo.insert_action_pending(
             &req.action_type_name,
             &req.owner_user_id,
@@ -79,6 +83,9 @@ impl ActionDispatcher {
             &req.params,
             req.channel.as_deref(),
             req.context_id,
+            req.occurred_at.as_deref(),
+            req.location.as_deref(),
+            &self.home_timezone,
         )?;
 
         // 2. Route to the appropriate handler.

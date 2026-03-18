@@ -92,11 +92,29 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             result              TEXT,
             channel             TEXT,
             context_id          INTEGER REFERENCES ontology_objects(id),
+            -- When (UTC): absolute UTC time (ISO-8601 ending in Z).
+            -- PRIMARY SORT KEY for cross-device timeline ordering.
+            occurred_at_utc     TEXT,
+            -- When (device-local): same instant in device timezone with offset.
+            occurred_at_local   TEXT,
+            -- IANA timezone of the recording device (e.g. America/New_York).
+            timezone            TEXT,
+            -- When (home): same instant converted to user home timezone.
+            -- DISPLAY TIME for consistent single-timeline view.
+            occurred_at_home    TEXT,
+            -- User home timezone IANA name (e.g. Asia/Seoul).
+            home_timezone       TEXT,
+            -- Where: real-world location (free-form text).
+            location            TEXT,
             status              TEXT NOT NULL DEFAULT 'pending',
             error_message       TEXT,
             created_at          INTEGER NOT NULL,
             updated_at          INTEGER NOT NULL
         );
+
+        -- Migration: add occurred_at and location to existing tables
+        -- (ALTER TABLE ... ADD COLUMN is a no-op if the column already exists
+        -- in SQLite 3.35+, but we guard with a pragma check pattern below).
 
         CREATE INDEX IF NOT EXISTS idx_onto_actions_actor
             ON ontology_actions(actor_user_id);
@@ -108,6 +126,21 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             ON ontology_actions(created_at);
         CREATE INDEX IF NOT EXISTS idx_onto_actions_status
             ON ontology_actions(status);
+        -- UTC time is the PRIMARY sort key for cross-device timeline.
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_utc
+            ON ontology_actions(occurred_at_utc);
+        -- Home timezone time for display-oriented queries.
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_home
+            ON ontology_actions(occurred_at_home);
+        -- Location index for place-based grouping.
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_location
+            ON ontology_actions(location);
+        -- Composite: UTC time + location (primary categorization axis).
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_when_where
+            ON ontology_actions(occurred_at_utc, location);
+        -- Composite: location + UTC time (place-first queries).
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_where_when
+            ON ontology_actions(location, occurred_at_utc);
 
         -- ================================================================
         -- 4. FTS5 indexes for ontology search
@@ -143,6 +176,47 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
         ",
     )?;
 
+    // ── Migration: add time/timezone/location columns to existing tables ──
+    // Safe to call on every startup — skips if column already exists.
+    migrate_add_column(conn, "ontology_actions", "occurred_at_utc", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "occurred_at_local", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "timezone", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "occurred_at_home", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "home_timezone", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "location", "TEXT")?;
+    // Legacy migration: rename old occurred_at → occurred_at_utc if present.
+    migrate_add_column(conn, "ontology_actions", "occurred_at", "TEXT")?;
+    // Copy legacy occurred_at data to occurred_at_utc (best-effort).
+    let _ = conn.execute_batch(
+        "UPDATE ontology_actions
+         SET occurred_at_utc = occurred_at
+         WHERE occurred_at IS NOT NULL AND occurred_at_utc IS NULL",
+    );
+
+    Ok(())
+}
+
+/// Add a column to an existing table if it does not already exist.
+///
+/// Uses `PRAGMA table_info` to check for the column, then runs
+/// `ALTER TABLE ... ADD COLUMN` only when needed. This is safe to
+/// call on every startup.
+fn migrate_add_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    col_type: &str,
+) -> anyhow::Result<()> {
+    let sql = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&sql)?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|r| r.as_deref() == Ok(column));
+    if !has_column {
+        let alter = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type);
+        conn.execute_batch(&alter)?;
+        tracing::info!(table, column, "ontology schema migration: added column");
+    }
     Ok(())
 }
 
