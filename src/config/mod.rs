@@ -30,7 +30,7 @@ pub use schema::{
     TelegramConfig, TelemetryConfig, TranscriptionConfig, TunnelConfig, UrlAccessConfig,
     VoiceConfig, WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy,
     WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
-    DEFAULT_MODEL_FALLBACK,
+    DEFAULT_MODEL_FALLBACK, get_home_timezone,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {

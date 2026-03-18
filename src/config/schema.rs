@@ -16081,6 +16081,16 @@ fn default_home_timezone() -> String {
     "Asia/Seoul".to_string()
 }
 
+/// Return the user's home timezone from the `ZEROCLAW_HOME_TIMEZONE` env var
+/// or the compiled-in default ("Asia/Seoul").  This is a lightweight accessor
+/// for the prompt builder so it does not need a full `Config` reference.
+pub fn get_home_timezone() -> Option<String> {
+    std::env::var("ZEROCLAW_HOME_TIMEZONE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(default_home_timezone()))
+}
+
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
