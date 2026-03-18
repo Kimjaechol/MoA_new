@@ -1,7 +1,14 @@
-import { useState, useEffect, useRef } from 'react';
-import { Send, Bot, User, AlertCircle } from 'lucide-react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
+import { marked } from 'marked';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
+
+// Configure marked for safe rendering
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+});
 
 interface ChatMessage {
   id: string;
@@ -22,6 +29,77 @@ function makeMessageId(): string {
   return `msg_${Date.now().toString(36)}_${fallbackMessageIdCounter.toString(36)}_${Math.random()
     .toString(36)
     .slice(2, 10)}`;
+}
+
+/** Render markdown string to sanitized HTML */
+function renderMarkdown(content: string): string {
+  try {
+    return marked.parse(content, { async: false }) as string;
+  } catch {
+    // Fallback: escape HTML and preserve whitespace
+    return content
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br>');
+  }
+}
+
+/** Copy button component */
+function CopyButton({ content }: { content: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Fallback for older browsers
+      const textarea = document.createElement('textarea');
+      textarea.value = content;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  }, [content]);
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors px-2 py-1 rounded hover:bg-gray-700/50"
+      title="Copy as Markdown"
+    >
+      {copied ? (
+        <>
+          <Check className="h-3.5 w-3.5 text-green-400" />
+          <span className="text-green-400">Copied</span>
+        </>
+      ) : (
+        <>
+          <Copy className="h-3.5 w-3.5" />
+          <span>Copy</span>
+        </>
+      )}
+    </button>
+  );
+}
+
+/** Rendered markdown message component */
+function MarkdownMessage({ content }: { content: string }) {
+  const html = useMemo(() => renderMarkdown(content), [content]);
+
+  return (
+    <div
+      className="markdown-body text-sm break-words"
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
 }
 
 export default function AgentChat() {
@@ -101,7 +179,7 @@ export default function AgentChat() {
             {
               id: makeMessageId(),
               role: 'agent',
-              content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
+              content: `\`[Tool Call]\` **${msg.name ?? 'unknown'}**\n\`\`\`json\n${JSON.stringify(msg.args ?? {}, null, 2)}\n\`\`\``,
               timestamp: new Date(),
             },
           ]);
@@ -113,7 +191,7 @@ export default function AgentChat() {
             {
               id: makeMessageId(),
               role: 'agent',
-              content: `[Tool Result] ${msg.output ?? ''}`,
+              content: `\`[Tool Result]\`\n\`\`\`\n${msg.output ?? ''}\n\`\`\``,
               timestamp: new Date(),
             },
           ]);
@@ -124,8 +202,8 @@ export default function AgentChat() {
           const isApiKeyError =
             msg.code === 'missing_api_key' || msg.code === 'provider_auth_error';
           const displayContent = isApiKeyError
-            ? `[API Key Error] ${errorText}\n\nPlease configure your API key in Settings → Integrations.`
-            : `[Error] ${errorText}`;
+            ? `**[API Key Error]** ${errorText}\n\nPlease configure your API key in Settings → Integrations.`
+            : `**[Error]** ${errorText}`;
 
           setMessages((prev) => [
             ...prev,
@@ -235,14 +313,25 @@ export default function AgentChat() {
                   : 'bg-gray-800 text-gray-100 border border-gray-700'
               }`}
             >
-              <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
-              <p
-                className={`text-xs mt-1 ${
-                  msg.role === 'user' ? 'text-blue-200' : 'text-gray-500'
-                }`}
-              >
-                {msg.timestamp.toLocaleTimeString()}
-              </p>
+              {msg.role === 'user' ? (
+                <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
+              ) : (
+                <MarkdownMessage content={msg.content} />
+              )}
+              <div className={`flex items-center justify-between mt-2 ${
+                msg.role === 'user' ? '' : 'border-t border-gray-700/50 pt-1.5'
+              }`}>
+                <p
+                  className={`text-xs ${
+                    msg.role === 'user' ? 'text-blue-200' : 'text-gray-500'
+                  }`}
+                >
+                  {msg.timestamp.toLocaleTimeString()}
+                </p>
+                {msg.role === 'agent' && (
+                  <CopyButton content={msg.content} />
+                )}
+              </div>
             </div>
           </div>
         ))}
