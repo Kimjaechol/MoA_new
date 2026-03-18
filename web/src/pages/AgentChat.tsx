@@ -1,5 +1,9 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Send, Bot, User, AlertCircle, Copy, Check, SquarePen } from 'lucide-react';
+import {
+  Send, Bot, User, AlertCircle, Copy, Check, SquarePen,
+  FileText, FileDown, Volume2, VolumeX, Mic, MicOff,
+  Paperclip, FolderOpen, Github,
+} from 'lucide-react';
 import { marked } from 'marked';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
@@ -43,6 +47,86 @@ function renderMarkdown(content: string): string {
       .replace(/>/g, '&gt;')
       .replace(/\n/g, '<br>');
   }
+}
+
+/** Create a SpeechRecognition instance (cross-browser) */
+function createSpeechRecognition() {
+  const SpeechRecognition =
+    (window as unknown as { SpeechRecognition?: new () => SpeechRecognition }).SpeechRecognition ??
+    (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognition }).webkitSpeechRecognition;
+  if (!SpeechRecognition) return null;
+  const recognition = new SpeechRecognition();
+  recognition.lang = 'ko-KR'; // Default Korean
+  recognition.interimResults = false;
+  recognition.continuous = true;
+  return recognition;
+}
+
+/** Convert markdown content to a simple HTML document for export */
+function markdownToHtmlDoc(content: string, title = 'Export'): string {
+  const body = renderMarkdown(content);
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>${title}</title>
+<style>body{font-family:sans-serif;max-width:800px;margin:2em auto;padding:0 1em;line-height:1.6}
+pre{background:#f4f4f4;padding:1em;overflow-x:auto;border-radius:4px}
+code{background:#f4f4f4;padding:0.2em 0.4em;border-radius:3px}
+blockquote{border-left:4px solid #ddd;margin:0;padding:0 1em;color:#666}</style>
+</head><body>${body}</body></html>`;
+}
+
+/** Export content as a .doc (HTML-based) file */
+function exportToDoc(content: string) {
+  const html = markdownToHtmlDoc(content, 'Document Export');
+  const blob = new Blob(
+    [`<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
+<head><meta charset="utf-8"><title>Export</title></head><body>${renderMarkdown(content)}</body></html>`],
+    { type: 'application/msword' }
+  );
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `export_${Date.now()}.doc`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** Export content as a PDF via print dialog */
+function exportToPdf(content: string) {
+  const html = markdownToHtmlDoc(content, 'PDF Export');
+  const win = window.open('', '_blank');
+  if (!win) return;
+  win.document.write(html);
+  win.document.close();
+  // Small delay to allow styles to load
+  setTimeout(() => {
+    win.print();
+    // Close after print dialog is handled
+    win.addEventListener('afterprint', () => win.close());
+  }, 400);
+}
+
+/** TTS: read content aloud using Web Speech API */
+function speakContent(content: string, onEnd?: () => void) {
+  // Strip markdown syntax for cleaner speech
+  const plain = content
+    .replace(/```[\s\S]*?```/g, ' (code block) ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/#{1,6}\s*/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+    .replace(/[-*_]{3,}/g, '')
+    .trim();
+
+  if (!plain) return;
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(plain);
+  utterance.lang = 'ko-KR'; // Default Korean, browser will fallback
+  utterance.rate = 1.0;
+  if (onEnd) utterance.onend = onEnd;
+  if (onEnd) utterance.onerror = onEnd;
+  window.speechSynthesis.speak(utterance);
 }
 
 /** Copy button component */
@@ -90,6 +174,58 @@ function CopyButton({ content }: { content: string }) {
   );
 }
 
+/** Action buttons for agent messages: Copy, Doc export, PDF export, Listen */
+function MessageActions({ content }: { content: string }) {
+  const [speaking, setSpeaking] = useState(false);
+
+  const handleListen = useCallback(() => {
+    if (speaking) {
+      window.speechSynthesis.cancel();
+      setSpeaking(false);
+    } else {
+      setSpeaking(true);
+      speakContent(content, () => setSpeaking(false));
+    }
+  }, [content, speaking]);
+
+  // Stop speech if component unmounts
+  useEffect(() => {
+    return () => {
+      if (speaking) window.speechSynthesis.cancel();
+    };
+  }, [speaking]);
+
+  const btnClass =
+    'inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors px-2 py-1 rounded hover:bg-gray-700/50';
+
+  return (
+    <div className="flex items-center gap-0.5 flex-wrap">
+      <CopyButton content={content} />
+      <button onClick={() => exportToDoc(content)} className={btnClass} title="Export to Doc">
+        <FileText className="h-3.5 w-3.5" />
+        <span>Doc</span>
+      </button>
+      <button onClick={() => exportToPdf(content)} className={btnClass} title="Export to PDF">
+        <FileDown className="h-3.5 w-3.5" />
+        <span>PDF</span>
+      </button>
+      <button onClick={handleListen} className={btnClass} title={speaking ? 'Stop listening' : 'Listen'}>
+        {speaking ? (
+          <>
+            <VolumeX className="h-3.5 w-3.5 text-blue-400" />
+            <span className="text-blue-400">Stop</span>
+          </>
+        ) : (
+          <>
+            <Volume2 className="h-3.5 w-3.5" />
+            <span>Listen</span>
+          </>
+        )}
+      </button>
+    </div>
+  );
+}
+
 /** Rendered markdown message component */
 function MarkdownMessage({ content }: { content: string }) {
   const html = useMemo(() => renderMarkdown(content), [content]);
@@ -108,11 +244,15 @@ export default function AgentChat() {
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [listening, setListening] = useState(false);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const pendingContentRef = useRef('');
+  const recognitionRef = useRef<ReturnType<typeof createSpeechRecognition> | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -276,6 +416,99 @@ export default function AgentChat() {
     inputRef.current?.focus();
   };
 
+  // --- STT (Speech-to-Text) ---
+  const toggleListening = useCallback(() => {
+    if (listening) {
+      recognitionRef.current?.stop();
+      setListening(false);
+      return;
+    }
+
+    const recognition = createSpeechRecognition();
+    if (!recognition) {
+      setError('Speech recognition is not supported in this browser.');
+      return;
+    }
+
+    recognition.onresult = (event: { results: SpeechRecognitionResultList }) => {
+      let transcript = '';
+      for (let i = 0; i < event.results.length; i++) {
+        transcript += event.results[i][0].transcript;
+      }
+      setInput((prev) => (prev ? prev + ' ' + transcript : transcript));
+    };
+
+    recognition.onerror = () => {
+      setListening(false);
+    };
+
+    recognition.onend = () => {
+      setListening(false);
+    };
+
+    recognitionRef.current = recognition;
+    recognition.start();
+    setListening(true);
+  }, [listening]);
+
+  // Cleanup STT on unmount
+  useEffect(() => {
+    return () => {
+      recognitionRef.current?.stop();
+    };
+  }, []);
+
+  // Close attach menu when clicking outside
+  useEffect(() => {
+    if (!attachMenuOpen) return;
+    const handleClick = () => setAttachMenuOpen(false);
+    // Delay to avoid closing immediately on the same click
+    const timer = setTimeout(() => document.addEventListener('click', handleClick), 0);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('click', handleClick);
+    };
+  }, [attachMenuOpen]);
+
+  // --- File attachment handler ---
+  const handleFileAttach = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleFileSelected = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files?.length) return;
+    const names = Array.from(files).map((f) => f.name).join(', ');
+    setInput((prev) => (prev ? prev + `\n[Attached: ${names}]` : `[Attached: ${names}]`));
+    // Reset so same file can be re-selected
+    e.target.value = '';
+    setAttachMenuOpen(false);
+  }, []);
+
+  // --- Local folder connection ---
+  const handleFolderConnect = useCallback(async () => {
+    setAttachMenuOpen(false);
+    try {
+      if (!('showDirectoryPicker' in window)) {
+        setError('Folder selection is not supported in this browser. Use Chrome or Edge.');
+        return;
+      }
+      const dirHandle = await (window as unknown as { showDirectoryPicker: () => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker();
+      setInput((prev) => (prev ? prev + `\n[Local folder: ${dirHandle.name}]` : `[Local folder: ${dirHandle.name}]`));
+    } catch {
+      // User cancelled - ignore
+    }
+  }, []);
+
+  // --- GitHub repo connection ---
+  const handleGithubConnect = useCallback(() => {
+    setAttachMenuOpen(false);
+    const repo = prompt('Enter GitHub repository URL or owner/repo:');
+    if (repo?.trim()) {
+      setInput((prev) => (prev ? prev + `\n[GitHub: ${repo.trim()}]` : `[GitHub: ${repo.trim()}]`));
+    }
+  }, []);
+
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
       {/* Chat header with New Chat button */}
@@ -355,7 +588,7 @@ export default function AgentChat() {
                   {msg.timestamp.toLocaleTimeString()}
                 </p>
                 {msg.role === 'agent' && (
-                  <CopyButton content={msg.content} />
+                  <MessageActions content={msg.content} />
                 )}
               </div>
             </div>
@@ -383,7 +616,51 @@ export default function AgentChat() {
 
       {/* Input area */}
       <div className="border-t border-gray-800 bg-gray-900 p-4">
-        <div className="flex items-center gap-3 max-w-4xl mx-auto">
+        <div className="flex items-center gap-2 max-w-4xl mx-auto">
+          {/* Left: Attachment menu */}
+          <div className="relative flex-shrink-0">
+            <button
+              onClick={() => setAttachMenuOpen((v) => !v)}
+              className="p-2.5 rounded-xl text-gray-400 hover:text-white hover:bg-gray-700/60 transition-colors"
+              title="Attach file / Connect source"
+            >
+              <Paperclip className="h-5 w-5" />
+            </button>
+            {attachMenuOpen && (
+              <div className="absolute bottom-full left-0 mb-2 bg-gray-800 border border-gray-700 rounded-xl shadow-xl py-1 min-w-[200px] z-50">
+                <button
+                  onClick={handleFileAttach}
+                  className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-gray-300 hover:bg-gray-700 hover:text-white transition-colors"
+                >
+                  <Paperclip className="h-4 w-4" />
+                  <span>Attach File</span>
+                </button>
+                <button
+                  onClick={handleFolderConnect}
+                  className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-gray-300 hover:bg-gray-700 hover:text-white transition-colors"
+                >
+                  <FolderOpen className="h-4 w-4" />
+                  <span>Connect Local Folder</span>
+                </button>
+                <button
+                  onClick={handleGithubConnect}
+                  className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-gray-300 hover:bg-gray-700 hover:text-white transition-colors"
+                >
+                  <Github className="h-4 w-4" />
+                  <span>Connect GitHub</span>
+                </button>
+              </div>
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={handleFileSelected}
+            />
+          </div>
+
+          {/* Center: Text input */}
           <div className="flex-1 relative">
             <input
               ref={inputRef}
@@ -396,6 +673,22 @@ export default function AgentChat() {
               className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
             />
           </div>
+
+          {/* Right: Mic (STT) button */}
+          <button
+            onClick={toggleListening}
+            disabled={!connected}
+            className={`flex-shrink-0 p-2.5 rounded-xl transition-colors ${
+              listening
+                ? 'bg-red-600 text-white animate-pulse'
+                : 'text-gray-400 hover:text-white hover:bg-gray-700/60'
+            } disabled:opacity-50 disabled:cursor-not-allowed`}
+            title={listening ? 'Stop recording' : 'Voice input'}
+          >
+            {listening ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+          </button>
+
+          {/* Send button */}
           <button
             onClick={handleSend}
             disabled={!connected || !input.trim()}
