@@ -3,7 +3,7 @@ use crate::identity;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
-use chrono::Local;
+use chrono::{Local, Utc};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -247,12 +247,73 @@ impl PromptSection for DateTimeSection {
     }
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        let now = Local::now();
-        Ok(format!(
-            "## Current Date & Time\n\n{} ({})",
-            now.format("%Y-%m-%d %H:%M:%S"),
-            now.format("%Z")
-        ))
+        let now_utc = Utc::now();
+        let now_local = Local::now();
+
+        // Device timezone (where MoA is installed/running)
+        let device_tz = crate::gateway::timesync::detect_device_timezone();
+
+        // Home timezone from config (user's base location)
+        // Read from env override first, then fall back to config default
+        let home_tz = std::env::var("ZEROCLAW_HOME_TIMEZONE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                // Try reading from the global config default: "Asia/Seoul"
+                crate::config::get_home_timezone().unwrap_or_else(|| "Asia/Seoul".to_string())
+            });
+
+        // Convert to home timezone for display
+        let home_tz_parsed: chrono_tz::Tz = home_tz
+            .parse()
+            .unwrap_or(chrono_tz::Asia::Seoul);
+        let home_dt = now_utc.with_timezone(&home_tz_parsed);
+
+        // Format day of week in a language-neutral way
+        let weekday_ko = match home_dt.format("%u").to_string().as_str() {
+            "1" => "월요일",
+            "2" => "화요일",
+            "3" => "수요일",
+            "4" => "목요일",
+            "5" => "금요일",
+            "6" => "토요일",
+            "7" => "일요일",
+            _ => "",
+        };
+
+        let mut out = format!(
+            "## Current Date & Time\n\n\
+             **Device time (MoA server):** {} ({}, {})\n\
+             **Home timezone:** {} {} ({}, {})\n\
+             **UTC:** {}",
+            now_local.format("%Y-%m-%d %H:%M:%S"),
+            now_local.format("%Z"),
+            device_tz,
+            home_dt.format("%Y년 %m월 %d일"),
+            weekday_ko,
+            home_dt.format("%H시 %M분"),
+            home_tz,
+            now_utc.format("%Y-%m-%d %H:%M:%S UTC"),
+        );
+
+        // If device timezone differs from home timezone, add a note
+        if device_tz != home_tz {
+            out.push_str(&format!(
+                "\n\n**Note:** Device is in a different timezone ({}) than user's home ({}).",
+                device_tz, home_tz
+            ));
+        }
+
+        out.push_str(
+            "\n\n**Time rules:**\n\
+             - Always use the **home timezone** when talking about time to the user.\n\
+             - If the user is connecting remotely and mentions their location or timezone, \
+               convert times to their local timezone and note both.\n\
+             - If the user has stored their timezone in memory (user_profile_identity), use that.\n\
+             - Format: natural language with day of week (e.g. \"3월 19일 (수요일) 오전 10시 30분\")",
+        );
+
+        Ok(out)
     }
 }
 
