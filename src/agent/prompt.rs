@@ -443,19 +443,32 @@ impl PromptSection for ToolUsageStrategySection {
                  When you encounter a file that cannot be read directly as text, use the \
                  `document_process` tool to convert it to readable format:\n\n\
                  **Auto-detected document types:**\n\
-                 - **HWP/HWPX** (한글 문서): Converted via Hancom DocsConverter API → HTML + Markdown\n\
-                 - **DOC/DOCX, XLS/XLSX, PPT/PPTX** (Office): Converted via Hancom DocsConverter → HTML + Markdown\n\
-                 - **Digital PDF** (text-based): Extracted locally via PyMuPDF/pdf-extract → Markdown\n\
-                 - **Image/Scanned PDF** (no selectable text): OCR via Upstage Document Parse API → HTML + Markdown\n\n\
+                 - **HWP/HWPX** (한글 문서): Hancom DocsConverter API → HTML + Markdown (무료)\n\
+                 - **DOC/DOCX, XLS/XLSX, PPT/PPTX** (Office): Hancom DocsConverter → HTML + Markdown (무료)\n\
+                 - **Digital PDF** (텍스트 선택 가능): pdf-extract 로컬 추출 → Markdown (무료)\n\
+                 - **Image/Scanned PDF** (텍스트 없음): Upstage Document Parse OCR → HTML + Markdown (**크레딧 차감**)\n\n\
                  **Workflow when user asks to read/summarize/analyze a document:**\n\n\
                  1. Check the file extension.\n\
                  2. If `.txt`, `.md`, `.json`, `.csv`, `.xml`, `.html` → use `file_read` directly.\n\
-                 3. If `.pdf`, `.hwp`, `.hwpx`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx` \
-                    → call `document_process(file_path=\"...\")` to get HTML + Markdown.\n\
-                 4. Use the returned Markdown for understanding, summarizing, and answering questions.\n\
-                 5. If the user wants to edit, use the returned HTML for WYSIWYG display.\n\n\
-                 **The conversion happens automatically** — just call `document_process` with the \
-                 file path and it will detect the type and use the right engine.\n\n",
+                 3. If `.pdf` → **ALWAYS call `document_process(file_path=\"...\", classify_only=true)` first** \
+                    to check the document type.\n\
+                 4. If classification result says `doc_type: \"image_pdf\"` and `requires_credits: true`:\n\
+                    - **STOP and ask the user for consent BEFORE processing.** Show this message:\n\
+                    ```\n\
+                    이번 작업에 이미지 PDF가 포함되어 있습니다.\n\
+                    이 문서에 대해서도 작업을 진행할까요?\n\
+                    이미지 PDF는 OCR이 필요하기 때문에 마크다운으로 변환하는 데 크레딧이 차감됩니다.\n\
+                    (예상 비용: 약 {estimated_credits} 크레딧)\n\n\
+                    👉 [동의] [부동의]\n\
+                    ```\n\
+                    - If user selects **동의** → call `document_process(file_path=\"...\")` to process.\n\
+                    - If user selects **부동의** → skip the image PDF and inform the user:\n\
+                      \"이미지 PDF는 건너뛰었습니다. 텍스트 기반 문서만 처리합니다.\"\n\
+                 5. If classification says `doc_type: \"digital_pdf\"` (free) → process immediately.\n\
+                 6. If `.hwp`, `.hwpx`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx` → process immediately (free).\n\
+                 7. Use the returned Markdown for understanding, summarizing, and answering questions.\n\n\
+                 **CRITICAL: Never process image PDFs without user consent.** Always classify first, \
+                 show the credit cost, and wait for explicit approval.\n\n",
             );
         }
 
