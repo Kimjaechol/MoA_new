@@ -128,6 +128,24 @@ function detectLanguage(text: string): string {
   let greek = 0, armenian = 0, georgian = 0;
   let ethiopic = 0, tibetan = 0, mongolian = 0;
   let latin = 0, vietnamese = 0;
+  // Additional Indic scripts
+  let meeteiMayek = 0, olChiki = 0, lepcha = 0, limbu = 0, chakma = 0;
+  // Additional CJK markers
+  let bopomofo = 0, yi = 0;
+  // Thaana (Dhivehi/Maldivian)
+  let thaana = 0;
+  // N'Ko (West African)
+  let nko = 0;
+  // Javanese
+  let javanese = 0;
+  // Balinese
+  let balinese = 0;
+  // Sundanese
+  let sundanese = 0;
+  // Tai Le / New Tai Lue / Tai Tham (Dai languages)
+  let taiLe = 0;
+  // Cherokee
+  let cherokee = 0;
 
   for (const ch of clean) {
     const cp = ch.codePointAt(0) ?? 0;
@@ -189,6 +207,35 @@ function detectLanguage(text: string): string {
     if (cp >= 0x0F00 && cp <= 0x0FFF) { tibetan++; continue; }
     // Mongolian
     if (cp >= 0x1800 && cp <= 0x18AF) { mongolian++; continue; }
+    // Bopomofo (Traditional Chinese phonetic — strong zh-TW signal)
+    if ((cp >= 0x3100 && cp <= 0x312F) || (cp >= 0x31A0 && cp <= 0x31BF)) { bopomofo++; continue; }
+    // Yi (Nuosu/彝族)
+    if ((cp >= 0xA000 && cp <= 0xA48F) || (cp >= 0xA490 && cp <= 0xA4CF)) { yi++; continue; }
+    // Meetei Mayek (Manipuri)
+    if ((cp >= 0xABC0 && cp <= 0xABFF) || (cp >= 0xAAE0 && cp <= 0xAAFF)) { meeteiMayek++; continue; }
+    // Ol Chiki (Santali)
+    if (cp >= 0x1C50 && cp <= 0x1C7F) { olChiki++; continue; }
+    // Lepcha (Sikkim)
+    if (cp >= 0x1C00 && cp <= 0x1C4F) { lepcha++; continue; }
+    // Limbu (Nepal/Sikkim)
+    if (cp >= 0x1900 && cp <= 0x194F) { limbu++; continue; }
+    // Chakma (Bangladesh/India)
+    if (cp >= 0x11100 && cp <= 0x1114F) { chakma++; continue; }
+    // Thaana (Dhivehi — Maldives)
+    if (cp >= 0x0780 && cp <= 0x07BF) { thaana++; continue; }
+    // N'Ko (Mandinka, Bambara — West Africa)
+    if (cp >= 0x07C0 && cp <= 0x07FF) { nko++; continue; }
+    // Javanese
+    if (cp >= 0xA980 && cp <= 0xA9DF) { javanese++; continue; }
+    // Balinese
+    if (cp >= 0x1B00 && cp <= 0x1B7F) { balinese++; continue; }
+    // Sundanese
+    if ((cp >= 0x1B80 && cp <= 0x1BBF) || (cp >= 0x1CC0 && cp <= 0x1CCF)) { sundanese++; continue; }
+    // Tai Le / New Tai Lue / Tai Tham (Dai languages in China/SE Asia)
+    if ((cp >= 0x1950 && cp <= 0x197F) || (cp >= 0x1980 && cp <= 0x19DF) ||
+        (cp >= 0x1A20 && cp <= 0x1AAF)) { taiLe++; continue; }
+    // Cherokee
+    if ((cp >= 0x13A0 && cp <= 0x13FF) || (cp >= 0xAB70 && cp <= 0xABBF)) { cherokee++; continue; }
     // Vietnamese diacritics
     if ('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ'
         .includes(ch.toLowerCase())) { vietnamese++; continue; }
@@ -196,26 +243,105 @@ function detectLanguage(text: string): string {
     if ((cp >= 0x0041 && cp <= 0x005A) || (cp >= 0x0061 && cp <= 0x007A)) { latin++; continue; }
   }
 
-  // CJK disambiguation: kana → Japanese, Hangul → Korean, else Chinese
+  // ── CJK disambiguation ──
+  // Kana present → Japanese; Hangul present → Korean
   if (ja > 0) ja += zh;
   else if (ko > 0 && zh > 0 && ja === 0) ko += zh;
+
+  // Chinese variant detection (Cantonese, Traditional, Mandarin, etc.)
+  let zhLang = 'zh-CN'; // default: Mandarin Simplified
+  if ((ja === 0 && ko === 0) && zh > 0) {
+    const lower = clean.toLowerCase();
+    // Bopomofo → Traditional Chinese (Taiwan)
+    if (bopomofo > 0) zhLang = 'zh-TW';
+    // Cantonese-specific particles and words (粵語)
+    else if (/[嘅咗喺嘢咁佢哋啲嗰冇啱噉嗮唔嘥喎嚟]/.test(clean)) zhLang = 'yue-HK';
+    // Traditional Chinese markers (commonly used only in Traditional)
+    else if (/[們這國與學對書時點後說開過頭長義間無來機隊連還進運達裡線門體員關實際際歡歲覺導體雜聯環線類點雙費設訊記]/.test(clean)) zhLang = 'zh-TW';
+    // Shanghainese / Wu dialect markers
+    else if (/[侬伊拉覅勿阿拉]/.test(clean) && /\b(侬好|覅|勿要|阿拉)\b/.test(lower)) zhLang = 'wuu';
+    // Min Nan / Hokkien (often uses specific characters)
+    else if (/[𪜶汝伊咱甲毋閣攏]/.test(clean)) zhLang = 'nan-TW';
+  }
+
+  // ── Devanagari disambiguation (India) ──
+  // Hindi vs Marathi vs Nepali vs Sanskrit vs Konkani vs Dogri vs Bodo vs Maithili
+  let devLang = 'hi-IN'; // default: Hindi
+  if (devanagari > 0) {
+    const lower = clean;
+    // Marathi-specific words and markers
+    if (/\b(आहे|आहेत|नाही|काय|आणि|पण|हे|ते|मी|तू|तुम्ही|आम्ही|त्यांचा|मराठी)\b/.test(lower))
+      devLang = 'mr-IN';
+    // Nepali-specific words
+    else if (/\b(छ|छन्|हुन्छ|गर्छ|भएको|गर्नु|तपाईं|हामी|उनीहरू|नेपाली|हुन्|भन्ने|गर्ने)\b/.test(lower))
+      devLang = 'ne-NP';
+    // Sanskrit markers
+    else if (/\b(अस्ति|भवति|तथा|एव|अपि|च|तु|हि|इति|यत्|तत्|नमः|संस्कृत)\b/.test(lower))
+      devLang = 'sa-IN';
+    // Konkani
+    else if (/\b(आसा|ना|हांव|तूं|तो|ती|आमी|कोंकणी)\b/.test(lower))
+      devLang = 'kok-IN';
+    // Dogri
+    else if (/\b(ऐ|है|दा|दी|दे|कन्नै|डोगरी)\b/.test(lower))
+      devLang = 'doi-IN';
+    // Maithili
+    else if (/\b(अछि|छथि|हम|अहाँ|ओ|मैथिली)\b/.test(lower))
+      devLang = 'mai-IN';
+    // Bodo
+    else if (/\b(बड़ो|मोन|बर)\b/.test(lower))
+      devLang = 'brx-IN';
+  }
+
+  // ── Bengali disambiguation: Bengali vs Assamese ──
+  let bnLang = 'bn-BD';
+  if (bengali > 0) {
+    // Assamese-specific characters: ৰ (ra) and ৱ (wa) unique to Assamese
+    if (/[ৰৱ]/.test(clean)) bnLang = 'as-IN';
+    // Assamese words
+    else if (/\b(আছে|নাই|হয়|এটা|অসমীয়া)\b/.test(clean)) bnLang = 'as-IN';
+  }
+
+  // ── Arabic disambiguation ──
+  // Arabic vs Urdu vs Persian vs Kurdish vs Pashto vs Sindhi vs Uyghur
+  let arLang = 'ar-SA';
+  if (arabic > 0) {
+    const lower = clean;
+    // Urdu-specific: uses Arabic script + specific words/chars
+    if (/[ٹڈڑںہھے]/.test(lower) || /\b(ہے|ہیں|کا|کی|کے|سے|نہیں|اور|لیکن|بھی|یہ|وہ|میں|ہم|تم|آپ)\b/.test(lower))
+      arLang = 'ur-PK';
+    // Persian (Farsi) — specific chars and words
+    else if (/[پچژگ]/.test(lower) && /\b(است|هست|نیست|این|آن|من|تو|او|ما|شما|آنها|اما|و|یا|که|با|از|به|در|برای)\b/.test(lower))
+      arLang = 'fa-IR';
+    // Pashto — specific chars
+    else if (/[ټډړ]/.test(lower) || /\b(دا|دی|دې|هغه|هغوی|زه|ته|مونږ|تاسو)\b/.test(lower))
+      arLang = 'ps-AF';
+    // Kurdish (Sorani — Arabic script)
+    else if (/[ڕڵ]/.test(lower) || /\b(ئەو|ئەم|لە|بۆ|کە|دا|نەخێر|بەڵێ)\b/.test(lower))
+      arLang = 'ckb-IQ';
+    // Sindhi
+    else if (/[ڄڃڦ]/.test(lower) || /\b(آهي|آهن|سنڌي|ڪري)\b/.test(lower))
+      arLang = 'sd-PK';
+    // Uyghur
+    else if (/[ئا-ي]/.test(lower) && /\b(بولسا|ئەمەس|مەن|سەن|بىز|سىلەر|ئۇيغۇر)\b/.test(lower))
+      arLang = 'ug-CN';
+  }
 
   // ── Script-based scoring ──
   const scriptScores: [string, number][] = [
     ['ko-KR', ko],
     ['ja-JP', ja],
-    ['zh-CN', (ja === 0 && ko === 0) ? zh : 0],
+    [zhLang, (ja === 0 && ko === 0) ? zh : 0],
     ['el-GR', greek],
     ['hy-AM', armenian],
     ['ka-GE', georgian],
     ['he-IL', hebrew],
-    ['ar-SA', arabic],
+    [arLang, arabic],
     ['th-TH', thai],
     ['lo-LA', lao],
     ['km-KH', khmer],
     ['my-MM', myanmar],
-    ['hi-IN', devanagari],
-    ['bn-BD', bengali],
+    [devLang, devanagari],
+    [bnLang, bengali],
     ['gu-IN', gujarati],
     ['pa-IN', gurmukhi],
     ['ta-IN', tamil],
@@ -228,9 +354,23 @@ function detectLanguage(text: string): string {
     ['bo-CN', tibetan],
     ['mn-MN', mongolian],
     ['vi-VN', vietnamese],
+    // Additional scripts
+    ['mni-IN', meeteiMayek],  // Manipuri (Meetei Mayek script)
+    ['sat-IN', olChiki],      // Santali (Ol Chiki script)
+    ['lep-IN', lepcha],       // Lepcha (Sikkim)
+    ['lif-NP', limbu],        // Limbu
+    ['ccp-BD', chakma],       // Chakma
+    ['dv-MV', thaana],        // Dhivehi (Maldivian)
+    ['nqo', nko],             // N'Ko (Mandinka/Bambara)
+    ['jv-ID', javanese],      // Javanese (Javanese script)
+    ['ban-ID', balinese],     // Balinese
+    ['su-ID', sundanese],     // Sundanese (Sundanese script)
+    ['ii-CN', yi],            // Yi/Nuosu (China)
+    ['khb-CN', taiLe],       // Tai Lü / Tai Le (Dai, China)
+    ['chr-US', cherokee],     // Cherokee
   ];
 
-  // Cyrillic needs word-level disambiguation (Russian vs Ukrainian vs others)
+  // Cyrillic needs word-level disambiguation
   if (cyrillic > 0) {
     const lower = clean.toLowerCase();
     if (/[іїєґ]/.test(lower) || /\b(і|та|це|що|як|але|не|від|або|ще|їх|ці)\b/.test(lower))
@@ -243,6 +383,12 @@ function detectLanguage(text: string): string {
       scriptScores.push(['sr-RS', cyrillic]);
     else if (/[ңғүұқәөһ]/.test(lower))
       scriptScores.push(['kk-KZ', cyrillic]);
+    else if (/[ӨҮ]/.test(clean) || /\b(бол|байна|энэ|тэр|бид|тэд|юу|яаж|хаана)\b/.test(lower))
+      scriptScores.push(['mn-MN', cyrillic]); // Mongolian Cyrillic
+    else if (/[ҷӣӯ]/.test(lower) || /\b(аст|нест|ман|ту|мо|шумо|онҳо|аммо|ва|ё|ки|бо|аз|ба|дар|барои)\b/.test(lower))
+      scriptScores.push(['tg-TJ', cyrillic]); // Tajik
+    else if (/[ңөү]/.test(lower) || /\b(бол|жок|бар|мен|сен|биз|алар|эмес|да|менен)\b/.test(lower))
+      scriptScores.push(['ky-KG', cyrillic]); // Kyrgyz
     else
       scriptScores.push(['ru-RU', cyrillic]);
   }
@@ -334,6 +480,42 @@ function detectLanguage(text: string): string {
     ['zu-ZA', /\b(ukuthi|futhi|kodwa|noma|kakhulu|manje|kanjani|kuphi|ubani|kuphela|yebo|cha)\b/],
     // Afrikaans
     ['af-ZA', /\b(die|en|van|in|is|dat|op|te|vir|met|nie|het|het|ook|maar|as|nog|hierdie|wat|na|hulle|ons)\b/],
+    // Kurdish (Kurmanji — Latin script)
+    ['ku-TR', /\b(ev|ew|û|li|bi|ji|de|e|ye|ne|ku|da|her|jî|yek|du|wek|dikare|dikim|divê)\b/],
+    // Albanian
+    ['sq-AL', /\b(është|janë|dhe|por|me|për|nga|në|ka|nuk|po|edhe|ose|ky|kjo|një|si|ku|kush|çfarë|shumë)\b/],
+    // Somali
+    ['so-SO', /\b(waa|iyo|oo|ama|laakiin|in|ka|ku|u|la|si|wuxuu|ayaa|tahay|yihiin|maaha|haa|maya|maxay|sidee)\b/],
+    // Amharic (Latin romanization) — typically uses Ethiopic but some type in Latin
+    ['am-ET', /\b(yehe|ena|gin|le|ke|new|aydelm|eshi|awo|betam|endet|yet|man|bcha)\b/],
+    // Igbo
+    ['ig-NG', /\b(na|bụ|nke|ma|ọ|ya|ha|anyị|gị|m|ndị|onye|ihe|dị|enweghị|ee|mba|gịnị|ebee)\b/],
+    // Xhosa
+    ['xh-ZA', /\b(ukuba|kunye|kodwa|okanye|kakhulu|ngoku|njani|phi|bani|kuphela|ewe|hayi)\b/],
+    // Sesotho
+    ['st-ZA', /\b(ke|le|ea|ka|ha|ho|ba|sa|tsa|hae|bona|rona|empa|hape|haholo|joale|jwang|kae|mang|feela)\b/],
+    // Setswana
+    ['tn-ZA', /\b(ke|le|ya|ka|ga|go|ba|sa|tsa|gagwe|bone|rona|mme|gape|thata|jaanong|jang|kae|mang|fela)\b/],
+    // Shona
+    ['sn-ZW', /\b(ndi|ne|ya|ka|ha|ku|va|sa|wake|vavo|wedu|asi|zvakare|kwazvo|zvino|sei|kupi|ani|chete)\b/],
+    // Kinyarwanda
+    ['rw-RW', /\b(ni|na|ya|mu|ku|ba|ntabwo|yego|oya|cyane|ubu|gute|hehe|nde|gusa)\b/],
+    // Luxembourgish
+    ['lb-LU', /\b(ass|an|op|mat|vun|fir|awer|och|nach|net|wéi|datt|ech|du|hien|si|mir|dir|si|wat|wou|wie)\b/],
+    // Romansh
+    ['rm-CH', /\b(è|ed|cun|per|da|en|il|la|els|ellas|in|ina|nus|vus|els|bun|grond|fitg|uss|co|nua|tgi|mo)\b/],
+    // Maori
+    ['mi-NZ', /\b(ko|te|he|i|ki|kei|me|ma|ka|e|nei|na|hoki|anō|tino|ināianei|pēhea|hea|wai|anake|ae|kāo)\b/],
+    // Samoan
+    ['sm-WS', /\b(o|le|i|ma|e|sa|ua|na|foi|ae|tele|nei|faapefea|fea|ai|naʻo|ioe|leai)\b/],
+    // Hawaiian
+    ['haw-US', /\b(ka|ke|o|i|ma|me|a|e|ua|he|nō|hoʻi|loa|kēia|pehea|hea|wai|wale|ʻae|ʻaʻole)\b/],
+    // Tongan
+    ['to-TO', /\b(ko|ʻa|ʻi|mo|ʻe|ne|kuo|na|foki|ka|lahi|ni|fēfē|fē|hai|pē|ʻio|ʻikai)\b/],
+    // Fijian
+    ['fj-FJ', /\b(na|ko|e|kei|mai|ki|sa|a|talega|ka|vakalevu|oqo|vakaevei|evei|cava|ga|io|sega)\b/],
+    // Tok Pisin (Papua New Guinea)
+    ['tpi-PG', /\b(em|long|bilong|na|ol|i|yu|mi|mipela|yupela|ol|tasol|tu|tru|nau|olsem|we|husat|tasol)\b/],
   ];
 
   for (const [lang, re] of latinRules) {
