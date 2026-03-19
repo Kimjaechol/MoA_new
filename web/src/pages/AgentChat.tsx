@@ -95,9 +95,9 @@ async function loadLangFromMemory(): Promise<string | null> {
     if (!entry) return null;
     // Extract lang code from content like "User's primary language: ko-KR"
     const match = entry.content.match(/:\s*([a-z]{2,3}(?:-[A-Za-z]{2,4})?)\s*$/);
-    if (match) {
+    if (match && match[1]) {
       try { localStorage.setItem(LANG_PREF_LOCAL_KEY, match[1]); } catch { /* ok */ }
-      return match[1];
+      return match[1] ?? null;
     }
   } catch { /* ok */ }
   return null;
@@ -394,7 +394,8 @@ function detectLanguage(text: string): string {
   }
 
   scriptScores.sort((a, b) => b[1] - a[1]);
-  if (scriptScores[0][1] > 0) return scriptScores[0][0];
+  const topScore = scriptScores[0];
+  if (topScore && topScore[1] > 0) return topScore[0];
 
   // ── Latin-script word-level heuristics ──
   if (latin === 0) return UNDETECTED_LANG;
@@ -529,10 +530,10 @@ function detectLanguage(text: string): string {
 }
 
 /** Create a SpeechRecognition instance (cross-browser) */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function createSpeechRecognition(lang: string) {
-  const SpeechRecognition =
-    (window as unknown as { SpeechRecognition?: new () => SpeechRecognition }).SpeechRecognition ??
-    (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognition }).webkitSpeechRecognition;
+  const W = window as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+  const SpeechRecognition = W.SpeechRecognition ?? W.webkitSpeechRecognition;
   if (!SpeechRecognition) return null;
   const recognition = new SpeechRecognition();
   recognition.lang = lang;
@@ -556,7 +557,6 @@ blockquote{border-left:4px solid #ddd;margin:0;padding:0 1em;color:#666}</style>
 
 /** Export content as a .doc (HTML-based) file */
 function exportToDoc(content: string) {
-  const html = markdownToHtmlDoc(content, 'Document Export');
   const blob = new Blob(
     [`<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
 <head><meta charset="utf-8"><title>Export</title></head><body>${renderMarkdown(content)}</body></html>`],
@@ -967,10 +967,13 @@ export default function AgentChat() {
       finalTranscript = '';
       for (let i = 0; i < event.results.length; i++) {
         const r = event.results[i];
+        if (!r) continue;
+        const alt = r[0];
+        if (!alt) continue;
         if (r.isFinal) {
-          finalTranscript += r[0].transcript;
+          finalTranscript += alt.transcript;
         } else {
-          interim += r[0].transcript;
+          interim += alt.transcript;
         }
       }
       // Show real-time transcription (final + interim)
@@ -1288,7 +1291,7 @@ export default function AgentChat() {
           </div>
           {voiceMode && (
             <span className="text-xs text-red-400 animate-pulse">
-              Voice mode ({chatLang.split('-')[0].toUpperCase()})
+              Voice mode ({((chatLang ?? 'en').split('-')[0] ?? 'en').toUpperCase()})
             </span>
           )}
         </div>

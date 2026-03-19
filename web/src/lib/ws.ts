@@ -119,7 +119,7 @@ export class WebSocketClient {
       globalThis.crypto?.randomUUID?.().replace(/-/g, '_') ??
       `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
     window.localStorage.setItem(WS_SESSION_STORAGE_KEY, newId);
-    (this as { sessionId: string }).sessionId = newId;
+    (this as unknown as { sessionId: string }).sessionId = newId;
     this.connect();
   }
 

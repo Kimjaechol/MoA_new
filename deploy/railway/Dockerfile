@@ -11,6 +11,14 @@
 #   For local testing:
 #     docker build -f deploy/railway/Dockerfile -t zeroclaw-railway .
 
+# ── Stage 0: Build Web Frontend ──────────────────────────────
+FROM node:22-alpine AS web-builder
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY web/ ./
+RUN npm run build
+
 # ── Stage 1: Builder ─────────────────────────────────────────
 FROM rust:1.87-slim-bookworm AS builder
 
@@ -38,6 +46,8 @@ RUN rm -rf src
 
 # Copy the full source tree and build the real binary.
 COPY . .
+# Use freshly built frontend assets from web-builder stage
+COPY --from=web-builder /web/dist/ web/dist/
 # Touch main.rs so cargo detects the source change and rebuilds.
 RUN touch src/main.rs
 RUN cargo build --release --locked -p zeroclaw \
