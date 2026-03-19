@@ -694,6 +694,153 @@ async fn try_relay_to_local_device(
     }
 }
 
+/// Resolve the operator's admin LLM API key from environment variables.
+///
+/// Railway always has these pre-configured by the operator.
+fn resolve_operator_llm_key(provider_name: &str) -> Option<String> {
+    let admin_env_var = match provider_name {
+        "anthropic" => "ADMIN_ANTHROPIC_API_KEY",
+        "openai" => "ADMIN_OPENAI_API_KEY",
+        "gemini" | "google" | "google-gemini" => "ADMIN_GEMINI_API_KEY",
+        "perplexity" => "ADMIN_PERPLEXITY_API_KEY",
+        _ => return None,
+    };
+    std::env::var(admin_env_var)
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+}
+
+/// Hybrid relay: send message to the local device WITH an operator LLM key.
+///
+/// This is used when the device is online but has no LLM API key.
+/// The local device will:
+///   - Use the injected operator LLM key for LLM calls only
+///   - Use its own local tool API keys for all tool execution
+///   - Apply its own local config/settings
+///
+/// The operator LLM key is sent as a `message_with_llm_key` type so the
+/// local device knows to temporarily use it for LLM calls in this session.
+async fn try_relay_to_local_device_with_key(
+    state: &AppState,
+    socket: &mut WebSocket,
+    user_id: Option<&str>,
+    content: &str,
+    _session_id: &str,
+    provider_name: &str,
+    operator_llm_key: &str,
+) -> DeviceRelayResult {
+    let (device_router, auth_store) =
+        match (state.device_router.as_ref(), state.auth_store.as_ref()) {
+            (Some(dr), Some(auth)) => (dr, auth),
+            _ => return DeviceRelayResult::NoDevice,
+        };
+
+    let user_id = match user_id {
+        Some(uid) => uid,
+        None => return DeviceRelayResult::NoDevice,
+    };
+
+    let devices = match auth_store.list_devices(user_id) {
+        Ok(devs) => devs,
+        Err(_) => return DeviceRelayResult::NoDevice,
+    };
+
+    let device = match devices
+        .iter()
+        .find(|d| device_router.is_device_online(&d.device_id))
+    {
+        Some(d) => d,
+        None => return DeviceRelayResult::NoDevice,
+    };
+
+    tracing::info!(
+        user_id = user_id,
+        device_id = device.device_id.as_str(),
+        device_name = device.device_name.as_str(),
+        provider = provider_name,
+        "Hybrid relay: sending message with operator LLM key to local device"
+    );
+
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let (resp_tx, mut resp_rx) =
+        tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(64);
+
+    {
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().insert(msg_id.clone(), resp_tx);
+    }
+
+    // Send message with the operator LLM key attached.
+    // The device-side handler recognizes "message_with_llm_key" type and
+    // uses the injected key for LLM calls while keeping local tool keys.
+    let routed_msg = super::remote::RoutedMessage {
+        id: msg_id.clone(),
+        direction: "to_device".to_string(),
+        content: serde_json::json!({
+            "content": content,
+            "provider": provider_name,
+            "injected_llm_key": operator_llm_key,
+        })
+        .to_string(),
+        msg_type: "message_with_llm_key".to_string(),
+    };
+
+    if let Err(e) = device_router.send_to_device(&device.device_id, routed_msg).await {
+        tracing::warn!(
+            error = e.as_str(),
+            "Failed to send hybrid relay message to device"
+        );
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+        return DeviceRelayResult::NoDevice;
+    }
+
+    // Stream responses from the device back to the web client
+    let mut got_response = false;
+    loop {
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(120),
+            resp_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(resp)) => {
+                got_response = true;
+                let ws_msg = serde_json::json!({
+                    "type": resp.msg_type,
+                    "content": resp.content,
+                });
+                let _ = socket.send(Message::Text(ws_msg.to_string().into())).await;
+                if resp.msg_type == "done" || resp.msg_type == "error" {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if !got_response {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "Local device did not respond in time (hybrid relay).",
+                    });
+                    let _ = socket.send(Message::Text(err.to_string().into())).await;
+                }
+                break;
+            }
+        }
+    }
+
+    {
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+    }
+
+    if got_response {
+        DeviceRelayResult::Relayed
+    } else {
+        DeviceRelayResult::NoDevice
+    }
+}
+
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
@@ -809,13 +956,62 @@ async fn handle_socket(
                 // No cost to user. Skip all server-side processing.
                 continue;
             }
-            DeviceRelayResult::NoLocalKey | DeviceRelayResult::NoDevice => {
-                // Local device is offline or has no valid key for this provider.
-                // Fall through to Step 2: use operator key on Railway.
+            DeviceRelayResult::NoLocalKey => {
+                // ── Step 1b: Hybrid relay — device online but no LLM key ──
+                // The local device has tools with their own API keys and settings,
+                // but lacks an LLM API key. We MUST still route processing through
+                // the local device so that:
+                //   - All local tool API keys (web search, browser, composio, etc.) are used
+                //   - All local settings/config are applied
+                //   - Only the LLM API key is supplied by Railway (operator key)
+                //
+                // We relay the message WITH the operator's LLM key attached so
+                // the local device can use it for LLM calls while keeping its own
+                // tool keys for everything else.
+                let operator_llm_key = resolve_operator_llm_key(&provider_name);
+                if let Some(llm_key) = operator_llm_key {
+                    tracing::info!(
+                        provider = provider_name.as_str(),
+                        "Hybrid relay: device online, injecting operator LLM key for local processing"
+                    );
+                    let hybrid_result = try_relay_to_local_device_with_key(
+                        &state,
+                        &mut socket,
+                        user_id.as_deref(),
+                        &content,
+                        &session_id,
+                        &provider_name,
+                        &llm_key,
+                    )
+                    .await;
+                    match hybrid_result {
+                        DeviceRelayResult::Relayed => {
+                            // ✅ Local device processed with operator LLM key + local tool keys.
+                            // Credits deducted at 2.2× for LLM usage.
+                            continue;
+                        }
+                        _ => {
+                            // Hybrid relay failed — fall through to full Railway processing
+                            tracing::warn!(
+                                "Hybrid relay failed, falling back to full Railway processing"
+                            );
+                        }
+                    }
+                }
+                // No operator key or hybrid relay failed — fall through to Railway
+            }
+            DeviceRelayResult::NoDevice => {
+                // Device offline — fall through to Step 2: use operator key on Railway.
             }
         }
 
-        // ── Step 2: Use operator key on Railway (paid path, 2.2×) ──
+        // ── Step 2: Full Railway processing (paid path, 2.2×) ──
+        // Only reached when:
+        //   - Device is completely offline, OR
+        //   - Hybrid relay failed
+        // In this case Railway handles BOTH LLM and tool execution.
+        // ⚠️  Local tool API keys and settings are NOT used in this path.
+        //
         // Resolve API key: client-provided > provider_api_keys > env > admin key.
         {
             let mut config_guard = state.config.lock();
@@ -857,28 +1053,10 @@ async fn handle_socket(
 
         if credential_missing {
             // Try ADMIN_*_API_KEY env vars (operator's pre-configured keys)
-            let admin_env_var = match provider_name.as_str() {
-                "anthropic" => "ADMIN_ANTHROPIC_API_KEY",
-                "openai" => "ADMIN_OPENAI_API_KEY",
-                "gemini" | "google" | "google-gemini" => "ADMIN_GEMINI_API_KEY",
-                "perplexity" => "ADMIN_PERPLEXITY_API_KEY",
-                _ => "",
-            };
-            let operator_key = if !admin_env_var.is_empty() {
-                std::env::var(admin_env_var).ok().filter(|k| !k.trim().is_empty())
-            } else {
-                None
-            };
-
-            if let Some(key) = operator_key {
+            if let Some(key) = resolve_operator_llm_key(&provider_name) {
                 tracing::info!(
                     provider = provider_name.as_str(),
-                    source = if matches!(relay_result, DeviceRelayResult::NoLocalKey) {
-                        "device_no_key"
-                    } else {
-                        "device_offline"
-                    },
-                    "Using operator API key (credits will be deducted at 2.2×)"
+                    "Full Railway processing: using operator API key (credits 2.2×)"
                 );
                 let mut config_guard = state.config.lock();
                 config_guard.api_key = Some(key);
