@@ -204,7 +204,7 @@ export function Sidebar({
   locale,
   currentPage,
   devices,
-  channels,
+  channels: _channels,
   channelsDetail,
   tools,
   onNewChat,
