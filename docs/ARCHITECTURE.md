@@ -43,6 +43,599 @@ This "mixture of agents" philosophy applies everywhere:
 
 ---
 
+## ★ MoA Core Workflow — Smart API Key Routing (MoA 핵심 워크플로우)
+
+> **이 섹션은 MoA가 ZeroClaw와 근본적으로 다른 핵심 차별점입니다.**
+>
+> ZeroClaw 오픈소스에는 없는 기능으로, MoA의 "컴맹도 쓸 수 있는 AI" 철학을
+> 구현하는 가장 중요한 아키텍처 결정입니다. 모든 코드 변경 시 이 흐름이
+> 깨지지 않는지 반드시 검증해야 합니다.
+
+### 핵심 설계 원칙
+
+> **Railway에는 운영자의 API key가 항상 설정되어 있습니다.**
+> 따라서 "key가 있느냐 없느냐"가 아니라,
+> **"사용자의 로컬 key를 먼저 쓸 수 있느냐"가 유일한 판단 기준입니다.**
+
+MoA는 **세 가지 채팅 방식**을 제공하며, 모든 방식에서 **사용자의 비용을
+최소화**하는 방향으로 API key를 자동 라우팅합니다:
+
+1. **항상 사용자의 로컬 디바이스를 먼저 확인** — 로컬 LLM key가 유효하면 무료
+2. **로컬 LLM key가 없어도 디바이스가 온라인이면 하이브리드 릴레이** — Railway의
+   운영자 LLM key를 디바이스에 주입하여, 로컬 도구 API key와 설정은 그대로 사용
+3. **디바이스가 오프라인일 때만 Railway에서 전체 처리** — 크레딧 2.2× 차감
+4. **운영자 key는 Railway에 항상 존재** — 정상 운영 상태에서 에러가 발생하지 않음
+
+#### ★ 핵심: 로컬 도구 API key는 항상 보존
+
+> 디바이스에 LLM API key가 없더라도, 디바이스가 온라인이기만 하면
+> **로컬에 설정된 도구 API key(웹검색, 브라우저, Composio 등)와
+> 로컬 설정(config)은 반드시 그대로 사용**됩니다.
+>
+> Railway의 운영자 key는 **LLM 호출에만** 사용되며, 도구 실행은
+> 항상 로컬 디바이스에서 로컬 key로 수행됩니다.
+
+### MoA 전체 API Key 라우팅 흐름도
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  ★ MoA Smart API Key Routing — 전체 의사결정 흐름도                        │
+│                                                                             │
+│  ⚠️  Railway에는 운영자의 ADMIN_*_API_KEY가 항상 설정되어 있음 (전제조건)   │
+│                                                                             │
+│  이용자가 MoA에 메시지를 보냄                                              │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌─────────────┐                                                            │
+│  │ 어떤 채팅    │                                                            │
+│  │ 방식인가?    │                                                            │
+│  └──┬──┬──┬────┘                                                            │
+│     │  │  │                                                                 │
+│     │  │  └──── ③ 웹채팅 (mymoa.app 브라우저) ──────────────┐              │
+│     │  │                                                      │              │
+│     │  └─────── ② 채널채팅 (카카오톡/텔레그램/디스코드 등) ──┤              │
+│     │                                                         │              │
+│     └────────── ① 앱채팅 (로컬 MoA 앱 GUI) ──┐              │              │
+│                                                │              │              │
+│                                                │              │              │
+│  ① 앱채팅 (로컬 디바이스에서 직접 실행)        │  ②③ Railway 서버 경유       │
+│  ──────────────────────────────────────        │  ──────────────────────────  │
+│                                                │                             │
+│  로컬 config에 API key가 있는가?               │  【최초 판단】               │
+│    │                                           │  사용자의 로컬 디바이스가    │
+│    ├─ YES ──▶ 로컬 key로 직접 LLM 호출         │  온라인인가? (DeviceRouter)  │
+│    │         ✅ 무료 (Railway 미경유)           │         │                    │
+│    │                                           │         ▼                    │
+│    └─ NO ───▶ Railway 서버로 요청 전달 ────────┼──┐  ┌──────┐               │
+│               (운영자 key 사용)                │  │  │ YES  │               │
+│               💰 크레딧 2.2× 차감              │  │  └──┬───┘               │
+│                                                │  │     ▼                    │
+│                                                │  │  "check_key" 프로브 전송 │
+│                                                │  │  (5초 타임아웃)           │
+│                                                │  │     │                    │
+│                                                │  │     ▼                    │
+│                                                │  │  로컬 디바이스에         │
+│                                                │  │  유효한 API key가        │
+│                                                │  │  있는가?                 │
+│                                                │  │     │                    │
+│                                                │  │     ├─ YES               │
+│                                                │  │     │  ▼                 │
+│                                                │  │     │  메시지를 로컬로    │
+│                                                │  │     │  릴레이             │
+│                                                │  │     │  로컬 key로         │
+│                                                │  │     │  LLM 호출           │
+│                                                │  │     │  ✅ 무료            │
+│                                                │  │     │                    │
+│                                                │  │     └─ NO (LLM key 없음) │
+│                                                │  │        ▼                 │
+│                                                │  │  ┌──────────────────┐   │
+│                                                │  │  │ 하이브리드 릴레이  │   │
+│                                                │  │  │ (★ 핵심 기능)     │   │
+│                                                │  │  └──┬───────────────┘   │
+│                                                │  │     │                    │
+│                                                │  │     ▼                    │
+│                                                │  │  단기 프록시 토큰 발급    │
+│                                                │  │  (15분 TTL, 세션 1회용)   │
+│                                                │  │  ★ API key 미전송!       │
+│                                                │  │     │                    │
+│                                                │  │     ▼                    │
+│                                                │  │  로컬 디바이스에서 처리:  │
+│                                                │  │  • LLM 호출: 프록시 토큰  │
+│                                                │  │    → Railway /api/llm/   │
+│                                                │  │      proxy 경유           │
+│                                                │  │    (key는 서버에서 주입)   │
+│                                                │  │  • 도구 실행: 로컬 key ✅ │
+│                                                │  │  • 설정/config: 로컬 ✅   │
+│                                                │  │  💰 크레딧 2.2× (LLM만)  │
+│                                                │  │                          │
+│                                                │  │  ※ 하이브리드 릴레이      │
+│                                                │  │    실패 시에만 ▼          │
+│                                                │  │                          │
+│                                                │  │                          │
+│  ┌──────┐                                      │  │                          │
+│  │ NO   │ (디바이스 오프라인)                   │  │                          │
+│  └──┬───┘                                      │  │                          │
+│     │                                          │  │◀─────────────────────── │
+│     └──────────────────────────────────────────┼──┘                          │
+│                                                ▼                             │
+│                                          Railway 서버에서                    │
+│                                          전체 처리 (LLM + 도구)             │
+│                                          운영자 key(ADMIN_*_API_KEY)로       │
+│                                          LLM 호출                            │
+│                                          ⚠️  로컬 도구 key 미사용           │
+│                                          💰 크레딧 2.2× 차감                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+요약: ① 로컬 디바이스 + 로컬 LLM key → 완전 무료
+      ② 로컬 디바이스 + 운영자 LLM key (하이브리드) → 로컬 도구 key 보존, LLM만 유료
+      ③ 디바이스 오프라인 → Railway 전체 처리 (로컬 도구 key 미사용, 유료)
+```
+
+### 세 가지 채팅 방식별 상세 흐름
+
+---
+
+#### ① 앱채팅 (App Chat — 로컬 MoA 앱)
+
+> **경로**: Tauri 앱 → `POST /api/chat` (로컬 gateway)
+> **코드**: `clients/tauri/src/lib/api.ts` → `src/gateway/openclaw_compat.rs`
+
+```
+사용자 (로컬 MoA 앱 — Tauri)
+    │
+    │ chat() 호출 (api.ts:646)
+    │
+    ▼
+로컬 config에 LLM API key가 있는가?
+    │
+    ├─ YES → POST /api/chat (로컬 gateway, 127.0.0.1:3000)
+    │        body: { message, provider, model, api_key }
+    │        │
+    │        ▼
+    │    로컬 gateway의 agent loop 실행 (process_message_with_session)
+    │        │
+    │        ├─ LLM 호출: 사용자의 로컬 API key로 직접 호출
+    │        │             (ProxyProvider 미사용 — 직접 Provider)
+    │        │
+    │        └─ 도구 실행: 로컬 도구 API key 사용
+    │                     (웹검색, 브라우저, Composio, shell 등)
+    │
+    │    → ✅ 완전 무료 (Railway 전혀 미경유)
+    │    → 도구도 LLM도 모두 로컬 key 사용
+    │
+    │
+    └─ NO (LLM key 없음) → POST /api/chat (로컬 gateway)
+             body: { message, provider, model,
+                     proxy_url: "https://railway.app/api/llm/proxy",
+                     proxy_token: session_token }
+             │
+             ▼
+         로컬 gateway에서 proxy_url + proxy_token 감지
+         (openclaw_compat.rs: "missing_api_key" 에러 건너뜀)
+             │
+             ▼
+         config.llm_proxy_url / llm_proxy_token 설정
+             │
+             ▼
+         agent loop → ProxyProvider 생성 (loop_.rs:3160)
+             │
+             ├─ LLM 호출: ProxyProvider → POST /api/llm/proxy (Railway)
+             │             Railway에서 운영자 key 주입 → LLM 호출
+             │             ⛔ 운영자 key는 서버에서만 사용됨
+             │             💰 크레딧 2.2× 차감 (서버 측)
+             │
+             └─ 도구 실행: 로컬 도구 API key 사용 ✅
+                          (웹검색, 브라우저, Composio, shell 등)
+                          로컬 설정/config 그대로 적용
+
+         → 💰 크레딧 2.2× 차감 (LLM 비용만)
+         → 도구는 여전히 로컬 key 사용 (무료)
+
+참고: 로컬 gateway가 아예 실행되지 않는 경우(오류 등)에만
+      Railway /api/chat으로 직접 폴백 (이 경우 도구도 Railway에서 실행)
+```
+
+**구현 파일**:
+
+| 단계 | 파일 | 핵심 함수 |
+|------|------|----------|
+| 클라이언트 요청 | `clients/tauri/src/lib/api.ts` | `chat()` — proxy_url/token 포함 |
+| API 수신 | `src/gateway/openclaw_compat.rs` | `handle_api_chat()` — proxy config 감지 |
+| Config 전달 | `src/gateway/openclaw_compat.rs` | `config.llm_proxy_url/token` 설정 |
+| Provider 분기 | `src/agent/loop_.rs` | `process_message_with_session()` — ProxyProvider vs 직접 |
+| 프록시 LLM 호출 | `src/providers/proxy.rs` | `ProxyProvider::proxy_chat()` |
+| 서버 측 key 주입 | `src/gateway/llm_proxy.rs` | `handle_llm_proxy()` — `/api/llm/proxy` |
+
+---
+
+#### ② 웹채팅 (Web Chat — mymoa.app 브라우저)
+
+> **경로**: 브라우저 → Railway `/ws/chat` WebSocket
+> **코드**: `src/gateway/ws.rs` → `src/gateway/remote.rs`
+>
+> **사용 시나리오**: 사용자가 MoA 앱이 설치되지 않은 PC(도서관, PC방, 회사)에서
+> 웹브라우저로 mymoa.app에 접속하여 채팅하는 경우.
+> 자신의 집 PC나 폰에 설치된 MoA 앱이 켜져 있으면 로컬 디바이스로 릴레이됨.
+
+```
+사용자 (공공 PC / 외출 중 — MoA 미설치)
+    │
+    │ mymoa.app 로그인 → Railway /ws/chat WebSocket 연결
+    │ (ws.rs:438 handle_ws_chat → handle_socket)
+    │
+    ▼
+메시지 전송: {"type":"message","content":"안녕하세요"}
+    │
+    │ provider/model 오버라이드 적용 (ws.rs:901)
+    │
+    ▼
+╔═══════════════════════════════════════════════════════════════╗
+║  【Step 1】 사용자의 로컬 디바이스 확인 (ws.rs:939)           ║
+╚═══════════════════════════════════════════════════════════════╝
+    │
+    │ try_relay_to_local_device() 호출
+    │   1. DeviceRouter에서 사용자의 등록 디바이스 목록 조회
+    │   2. 온라인 디바이스 탐색 (is_device_online)
+    │   3. "check_key" 프로브 전송 (5초 타임아웃)
+    │      → 디바이스가 해당 provider의 LLM key를 갖고 있는지 확인
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│  경우 A: 디바이스 온라인 + LLM key 있음 → Relayed            │
+│                                                              │
+│  메시지를 로컬 디바이스로 릴레이 (remote.rs device-link 경유)  │
+│  → 디바이스가 agent loop 실행:                                │
+│      • LLM 호출: 디바이스의 자체 LLM key                     │
+│      • 도구 실행: 디바이스의 로컬 도구 key ✅                  │
+│      • 설정/config: 디바이스의 로컬 설정 ✅                    │
+│  → 응답을 Railway 경유하여 브라우저로 스트리밍                 │
+│  → ✅ 완전 무료                                              │
+└──────────────────────────────────────────────────────────────┘
+    │
+    │ (LLM key 없는 경우)
+    ▼
+╔═══════════════════════════════════════════════════════════════╗
+║  【Step 1b】 하이브리드 릴레이 (ws.rs:1003)                   ║
+╚═══════════════════════════════════════════════════════════════╝
+    │
+    │ try_relay_to_local_device_with_proxy() 호출
+    │
+┌──────────────────────────────────────────────────────────────┐
+│  경우 B: 디바이스 온라인 + LLM key 없음 → 하이브리드 릴레이   │
+│                                                              │
+│  Railway가 단기 프록시 토큰 발급 (15분 TTL)                   │
+│  → "hybrid_relay" 메시지를 디바이스로 전송:                    │
+│    {                                                         │
+│      "content": "안녕하세요",                                 │
+│      "provider": "gemini",                                   │
+│      "proxy_token": "abc123...",    ← 단기 토큰 (15분)       │
+│      "proxy_url": "https://railway/api/llm/proxy"            │
+│    }                                                         │
+│  ⛔ 운영자 API key는 포함되지 않음!                           │
+│                                                              │
+│  → 디바이스가 agent loop 실행:                                │
+│      • LLM 호출: proxy_token으로 Railway /api/llm/proxy 경유  │
+│        (Railway 서버에서 운영자 key 주입 → LLM 호출)           │
+│      • 도구 실행: 디바이스의 로컬 도구 key ✅                  │
+│      • 설정/config: 디바이스의 로컬 설정 ✅                    │
+│  → 응답을 Railway 경유하여 브라우저로 스트리밍                 │
+│  → 💰 크레딧 2.2× 차감 (서버 측, LLM 호출 시마다)            │
+└──────────────────────────────────────────────────────────────┘
+    │
+    │ (디바이스 오프라인 또는 하이브리드 실패)
+    ▼
+╔═══════════════════════════════════════════════════════════════╗
+║  【Step 2】 Railway 전체 처리 (ws.rs:1052)                    ║
+╚═══════════════════════════════════════════════════════════════╝
+    │
+┌──────────────────────────────────────────────────────────────┐
+│  경우 C: 디바이스 오프라인 → Railway에서 전체 처리            │
+│                                                              │
+│  API key 해석 순서:                                          │
+│    1. 클라이언트가 보낸 api_key (parsed["api_key"])           │
+│    2. config.provider_api_keys (설정 파일)                    │
+│    3. ADMIN_*_API_KEY 환경변수 (운영자 사전 설정)             │
+│                                                              │
+│  → Railway의 agent loop 실행:                                 │
+│      • LLM 호출: 운영자의 ADMIN_*_API_KEY 사용                │
+│      • 도구 실행: Railway 서버의 도구 설정 사용 ⚠️            │
+│        (사용자의 로컬 도구 key는 사용되지 않음)                │
+│      • 설정/config: Railway 서버의 config 사용 ⚠️             │
+│  → 응답을 브라우저로 직접 전송                                │
+│  → 💰 크레딧 2.2× 차감                                      │
+└──────────────────────────────────────────────────────────────┘
+
+※ Railway에는 운영자의 ADMIN_*_API_KEY가 항상 설정되어 있으므로,
+  어떤 경우에도 서비스가 중단되지 않습니다.
+```
+
+**구현 파일**:
+
+| 단계 | 파일 | 핵심 함수 |
+|------|------|----------|
+| WebSocket 인증 | `src/gateway/ws.rs` | `handle_ws_chat()` — Bearer 토큰 검증 |
+| 디바이스 릴레이 | `src/gateway/ws.rs` | `try_relay_to_local_device()` — check_key 프로브 |
+| 하이브리드 릴레이 | `src/gateway/ws.rs` | `try_relay_to_local_device_with_proxy()` — proxy token 발급 |
+| 디바이스 라우팅 | `src/gateway/remote.rs` | `DeviceRouter::send_to_device()` |
+| 메시지 전달 | `src/gateway/remote.rs` | `handle_device_link_socket()` — wire type 보존 |
+| Railway 폴백 | `src/gateway/ws.rs` | `run_gateway_chat_with_tools()` |
+| 운영자 key 해석 | `src/gateway/ws.rs` | `resolve_operator_llm_key()` |
+
+**웹채팅의 핵심 차별점**:
+- 사용자가 **어디서든** 브라우저만 있으면 자신의 MoA에 접속 가능
+- 집/회사 PC에 설치된 MoA 앱이 켜져 있으면 **자동으로 로컬 디바이스 활용**
+- 로컬 디바이스의 도구 key, 설정, 파일 시스템 등에 원격 접근 가능
+- MoA 앱이 꺼져 있어도 Railway가 처리하므로 **항상 응답 가능**
+
+---
+
+#### ③ 채널채팅 (Channel Chat — 카카오톡/텔레그램/디스코드 등)
+
+> **경로**: 채널 플랫폼 → 웹훅 → Railway 게이트웨이 → **디바이스 릴레이 시도** → 채널 응답
+> **코드**: `src/gateway/mod.rs` (`process_channel_message()`, 각 채널별 핸들러)
+>
+> **핵심 원칙**: 채널 메시지도 **앱채팅/웹채팅과 동일하게 로컬 디바이스 우선**.
+> Railway는 "얇은 게이트웨이(thin proxy)"로서 웹훅 수신 + 디바이스 라우팅만 담당.
+> 에이전트 로직(LLM + 도구)은 가능한 한 로컬 디바이스에서 실행.
+>
+> **제약**: 카카오톡/WhatsApp 등은 공개 HTTPS 웹훅 엔드포인트를 요구하므로,
+> Railway 게이트웨이를 완전히 제거할 수는 없습니다. 하지만 게이트웨이는
+> 메시지 내용을 저장하지 않고 즉시 로컬로 포워딩합니다.
+
+```
+사용자 (카카오톡/WhatsApp/텔레그램/디스코드 등)
+    │
+    │ 메시지 전송 (예: "오늘 날씨 어때?")
+    │
+    ▼
+채널 플랫폼 서버 (카카오/WhatsApp/텔레그램)
+    │
+    │ 웹훅 POST 요청 (채널 플랫폼 → Railway)
+    │ (예: POST /whatsapp, /qq, /linq 등)
+    │
+    ▼
+╔═══════════════════════════════════════════════════════════════╗
+║  Railway 게이트웨이 — 얇은 프록시 (Thin Gateway)               ║
+║  메시지 내용을 저장하지 않음, 라우팅만 수행                     ║
+╚═══════════════════════════════════════════════════════════════╝
+    │
+    │ 1. 웹훅 서명 검증 (채널별 app_secret/signing_secret)
+    │ 2. 채널 메시지 파싱 → ChannelMessage 구조체
+    │ 3. sender(발신자 식별자) 추출
+    │
+    ▼
+╔═══════════════════════════════════════════════════════════════╗
+║  process_channel_message() — 디바이스 우선 라우팅               ║
+╚═══════════════════════════════════════════════════════════════╝
+    │
+    │ 【Step 1】 채널 사용자 → MoA 사용자 매핑
+    │   ChannelPairingStore.lookup_user_id(channel, sender)
+    │   → 사전에 "MoA 카카오 채널 추가 + 페어링 코드 입력"으로 연결됨
+    │
+    │ 【Step 2】 사용자의 디바이스가 온라인인가?
+    │   DeviceRouter.is_device_online(device_id)
+    │
+    ├─ YES (디바이스 온라인 + 페어링 완료)
+    │   │
+    │   │ "channel_relay" 메시지를 디바이스로 전송:
+    │   │ {
+    │   │   "content": "오늘 날씨 어때?",
+    │   │   "channel": "whatsapp",
+    │   │   "session_id": "whatsapp_+821012345678_thread1",
+    │   │   "proxy_token": "abc123...",  ← 15분 TTL
+    │   │   "proxy_url": "https://railway/api/llm/proxy"
+    │   │ }
+    │   │
+    │   ▼
+    │   로컬 디바이스에서 agent loop 실행:
+    │     • LLM 호출:
+    │       - 로컬 LLM key 있으면 → 직접 호출 (무료)
+    │       - 없으면 → proxy_token으로 /api/llm/proxy 경유 (2.2×)
+    │     • 도구 실행: 로컬 도구 API key 사용 ✅
+    │       (웹검색, 브라우저, Composio, shell 등)
+    │     • 설정/config: 로컬 설정 적용 ✅
+    │     • 메모리: 로컬 SQLite에 대화 저장
+    │   │
+    │   │ 응답을 device-link WebSocket으로 Railway에 반환
+    │   ▼
+    │
+    └─ NO (디바이스 오프라인 또는 미페어링)
+        │
+        ▼
+    Railway에서 폴백 처리:
+      • LLM 호출: ADMIN_*_API_KEY (운영자 key)
+      • 도구 실행: Railway config 사용 ⚠️
+      • 메모리: Railway SQLite에 저장
+    │
+    ▼
+╔═══════════════════════════════════════════════════════════════╗
+║  응답 전송 (Railway → 채널 API)                                ║
+║  channel.send(SendMessage::new(response, reply_target))       ║
+╚═══════════════════════════════════════════════════════════════╝
+    │
+    │ → 카카오톡/WhatsApp/텔레그램 API로 응답 전송
+    │ → 사용자의 채팅방에 응답 표시
+    │
+    ▼
+비용: 디바이스 처리 시 무료~2.2× / Railway 폴백 시 2.2×
+```
+
+**채널 사용자 페어링 흐름 (1회만 필요)**:
+
+```
+1. 사용자가 MoA 앱에서 "카카오톡 연결" 버튼 클릭
+2. 6자리 페어링 코드가 표시됨 (15분 유효)
+3. 사용자가 MoA 카카오 채널 (공용)을 친구 추가
+4. 카카오톡에서 MoA 채널에 "페어링 코드" 입력
+5. Railway가 (channel="kakao", platform_uid) → (user_id) 매핑 저장
+6. 이후 카카오톡 메시지는 자동으로 사용자의 로컬 MoA로 라우팅
+
+※ 고급 사용자: 자체 카카오 디벨로퍼 계정 + ngrok/Cloudflare Tunnel로
+  Railway 없이 완전 자가 호스팅도 가능 (개발자 모드)
+```
+
+**채널별 연결 방식**:
+
+| 채널 | 웹훅 필수 | 로컬 직접 연결 | MoA 권장 방식 |
+|------|----------|--------------|-------------|
+| **카카오톡** | ✅ (공개 HTTPS 필수) | ❌ 불가 | 공용 MoA 채널 + Railway 게이트웨이 |
+| **WhatsApp** | ✅ (Meta 웹훅) | ❌ 불가 | Railway 게이트웨이 → 디바이스 릴레이 |
+| **텔레그램** | 선택 (Local Bot API 가능) | ✅ 가능 | 로컬 Bot API 서버 권장 (고급자) |
+| **디스코드** | 선택 (Gateway/폴링) | ✅ 가능 | 로컬 봇 직접 연결 권장 |
+| **QQ** | ✅ (웹훅) | ❌ 불가 | Railway 게이트웨이 → 디바이스 릴레이 |
+| **Linq (iMessage)** | ✅ (웹훅) | ❌ 불가 | Railway 게이트웨이 → 디바이스 릴레이 |
+
+**구현 파일**:
+
+| 단계 | 파일 | 핵심 함수 |
+|------|------|----------|
+| 채널→디바이스 릴레이 | `src/gateway/mod.rs` | `try_relay_channel_to_device()` |
+| 디바이스 우선 라우팅 | `src/gateway/mod.rs` | `process_channel_message()` |
+| 채널 사용자 매핑 | `src/channels/pairing.rs` | `ChannelPairingStore::lookup_user_id()` |
+| 디바이스 라우팅 | `src/gateway/remote.rs` | `DeviceRouter`, `channel_relay` wire type |
+| Railway 폴백 | `src/gateway/mod.rs` | `run_gateway_chat_with_tools()` |
+| 응답 전송 | `src/channels/traits.rs` | `Channel::send()` |
+
+**채널채팅의 핵심 특성**:
+- **로컬 디바이스 우선** — 웹채팅과 동일한 원칙 적용
+- **Railway는 얇은 프록시** — 웹훅 수신 + 라우팅만, 메시지 미저장
+- **도구는 로컬 key 사용** — 디바이스 온라인 시 로컬 도구 API key 보존
+- **운영자가 채널 설정 사전 구성** — 사용자는 페어링만 하면 끝
+- **디바이스 오프라인 시 자동 폴백** — Railway에서 처리하므로 항상 응답 가능
+
+### 비용 결정 요약표
+
+| 채팅 방식 | 조건 | LLM 호출 | 도구 실행 | 비용 |
+|-----------|------|---------|----------|------|
+| **① 앱채팅** | 로컬 LLM key ✅ | 로컬 key → LLM 직접 | 로컬 key ✅ | **무료** |
+| **① 앱채팅** | 로컬 LLM key ❌ | ProxyProvider → `/api/llm/proxy` | 로컬 key ✅ | 💰 2.2× |
+| **② 웹채팅** | 디바이스 온라인 + LLM key ✅ | 디바이스 릴레이 → LLM 직접 | 로컬 key ✅ | **무료** |
+| **② 웹채팅** | 디바이스 온라인 + LLM key ❌ | 디바이스(proxy token) → `/api/llm/proxy` | 로컬 key ✅ | 💰 2.2× |
+| **② 웹채팅** | 디바이스 오프라인 | Railway → LLM (운영자 key) | Railway ⚠️ | 💰 2.2× |
+| **③ 채널채팅** | 디바이스 온라인 + LLM key ✅ | 디바이스 릴레이 → LLM 직접 | 로컬 key ✅ | **무료** |
+| **③ 채널채팅** | 디바이스 온라인 + LLM key ❌ | 디바이스(proxy token) → `/api/llm/proxy` | 로컬 key ✅ | 💰 2.2× |
+| **③ 채널채팅** | 디바이스 오프라인 / 미페어링 | Railway → LLM (운영자 key) | Railway ⚠️ | 💰 2.2× |
+
+> **3가지 채팅 방식 모두 동일한 원칙**: 로컬 디바이스 우선, 도구는 항상 로컬 key 사용.
+> Railway 폴백은 디바이스 오프라인일 때만 사용.
+
+### 크레딧 2.2× 산출 근거
+
+```
+실제 API 비용 (USD) × 2.0 (운영자 마진) × 1.1 (부가세 10%) = 2.2×
+
+예시: Claude Opus 4.6, input 1000 tokens + output 500 tokens
+  실제 비용: $0.015 + $0.075 = $0.09
+  차감 크레딧: $0.09 × 2.2 = $0.198 ≈ ₩280
+  (1 크레딧 ≈ ₩10 ≈ $0.007)
+```
+
+### ★ 하이브리드 릴레이 보안 설계 (Security Design)
+
+> **원칙: 운영자의 API key는 절대로 Railway 서버 밖으로 나가지 않는다.**
+
+#### 위협 분석 및 방어
+
+| 위협 | 위험도 | 공격 시나리오 | 방어 |
+|------|--------|-------------|------|
+| **로컬 앱 변조** | 🔴 치명적 | 앱 디컴파일하여 전송된 key 추출 | ⛔ key를 전송하지 않음 — 프록시 토큰만 전송 |
+| **WebSocket 감청** | 🔴 치명적 | 사용자 기기에서 복호화된 트래픽 캡처 | ⛔ 트래픽에 key 없음 — 프록시 토큰만 노출 |
+| **Key 무단 재사용** | 🔴 치명적 | 추출한 key로 직접 LLM API 호출 (과금 우회) | ⛔ 프록시 토큰은 `/api/llm/proxy`만 호출 가능, key 자체에 접근 불가 |
+| **프록시 토큰 탈취** | 🟡 보통 | 프록시 토큰 캡처 후 무제한 LLM 호출 | ✅ 15분 TTL 만료 + 서버 측 크레딧 잔액 확인 |
+| **메모리 덤프** | 🟡 보통 | Railway 프로세스 크래시 시 key 노출 | ✅ key는 환경변수에만 존재, 메시지에 포함 안 됨 |
+| **프록시 과다 호출** | 🟢 낮음 | 유효한 토큰으로 대량 LLM 호출 | ✅ 크레딧 잔액 부족 시 자동 차단 |
+
+#### 프록시 토큰 방식 vs API key 직접 전송
+
+```
+❌ 이전 (위험한 방식 — 사용하지 않음):
+  Railway → [운영자 API key 평문] → 디바이스
+  → 디바이스가 key로 직접 LLM 호출
+  → key 추출 가능 → 무제한 악용 위험
+
+✅ 현재 (안전한 방식):
+  Railway → [프록시 토큰, 15분 TTL] → 디바이스
+  → 디바이스가 프록시 토큰으로 Railway /api/llm/proxy 호출
+  → Railway가 서버에서 운영자 key 주입 → LLM 호출
+  → key는 서버 밖으로 절대 나가지 않음
+  → 프록시 토큰 만료 후 자동 무효화
+```
+
+#### 보안 경계 (Security Boundaries)
+
+```
+┌─ Railway 서버 (신뢰 경계) ─────────────────────────┐
+│                                                      │
+│  ADMIN_*_API_KEY (환경변수)                          │
+│       │                                              │
+│       ▼                                              │
+│  /api/llm/proxy 핸들러                               │
+│    1. 프록시 토큰 검증 (AuthStore)                    │
+│    2. 크레딧 잔액 확인 (PaymentManager)               │
+│    3. 운영자 key로 LLM 호출 (key 서버 내부에서만 사용) │
+│    4. 응답 반환 + 크레딧 차감                         │
+│                                                      │
+│  ★ 운영자 key는 이 경계를 절대 벗어나지 않음          │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+        ↕ HTTPS/WSS (프록시 토큰만 전송)
+┌─ 사용자 로컬 디바이스 ──────────────────────────────┐
+│                                                      │
+│  프록시 토큰 (15분 TTL)                              │
+│  로컬 도구 API key (웹검색, 브라우저, Composio 등)    │
+│  로컬 config/설정                                    │
+│                                                      │
+│  agent 루프:                                         │
+│    • LLM 호출 → POST /api/llm/proxy (프록시 토큰)    │
+│    • 도구 실행 → 로컬 key로 직접 실행                 │
+│                                                      │
+│  ★ 운영자 key에 접근 불가                            │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+#### 구현 파일
+
+| 보안 메커니즘 | 파일 | 함수/상수 |
+|-------------|------|----------|
+| 프록시 토큰 발급 (15분 TTL) | `src/gateway/ws.rs` | `HYBRID_PROXY_TOKEN_TTL_SECS`, `try_relay_to_local_device_with_proxy()` |
+| 프록시 토큰 검증 | `src/auth/store.rs` | `validate_session()` |
+| LLM 프록시 (key 서버 보관) | `src/gateway/llm_proxy.rs` | `handle_llm_proxy()` |
+| 크레딧 확인/차감 | `src/billing/payment.rs` | `get_balance()`, `deduct_credits()` |
+| 운영자 key 로딩 | `src/billing/llm_router.rs` | `AdminKeys::from_env()` |
+
+### ZeroClaw와의 차이 (왜 이것이 MoA의 핵심인가)
+
+| 항목 | ZeroClaw (원본) | MoA (개조) |
+|------|----------------|-----------|
+| **채팅 방식** | CLI (cmd 명령창) + 채널 | 앱채팅 GUI + 채널채팅 + 웹채팅 |
+| **서버** | 없음 (로컬 전용) | Railway (최소 역할) |
+| **API key** | 이용자가 직접 입력 필수 | 로컬 key 우선 → 운영자 key 자동 폴백 |
+| **컴맹 지원** | ❌ CLI 필요 | ✅ 앱 설치만 하면 바로 사용 |
+| **원격 접근** | 채널만 (직접 연결) | 채널 + 웹채팅 (Railway 경유) |
+| **과금** | 없음 (각자 API key) | 로컬 key 무료 + 운영자 key 시 크레딧 차감 |
+| **채널 설정** | 이용자가 직접 | 운영자가 사전 설정, 이용자는 메시지만 |
+
+### 구현 위치 (코드 참조)
+
+| 로직 | 파일 | 핵심 함수/구조체 |
+|------|------|-----------------|
+| 웹채팅 디바이스 릴레이 | `src/gateway/ws.rs` | `try_relay_to_local_device()`, `DeviceRelayResult` |
+| 하이브리드 릴레이 (프록시 토큰 방식) | `src/gateway/ws.rs` | `try_relay_to_local_device_with_proxy()` |
+| 운영자 LLM key 조회 | `src/gateway/ws.rs` | `resolve_operator_llm_key()` |
+| LLM 프록시 (key 서버 보관) | `src/gateway/llm_proxy.rs` | `handle_llm_proxy()` — `/api/llm/proxy` |
+| API key 해석 (Railway 폴백) | `src/gateway/ws.rs` | `handle_socket()` 내 "Step 2" 블록 |
+| REST API key 해석 | `src/gateway/openclaw_compat.rs` | `handle_api_chat()` 내 key resolution |
+| 디바이스 라우터 + 메시지 전달 | `src/gateway/remote.rs` | `DeviceRouter`, `handle_device_link_socket()` |
+| 디바이스 응답 라우팅 | `src/gateway/remote.rs` | `REMOTE_RESPONSE_CHANNELS`, `check_key_response` 핸들러 |
+| 운영자 key 관리 | `src/billing/llm_router.rs` | `AdminKeys::from_env()`, `resolve_key()` |
+| 크레딧 2.2× 차감 | `src/billing/llm_router.rs` | `record_usage()`, `OPERATOR_KEY_CREDIT_MULTIPLIER` |
+| 사용자 디바이스 목록 | `src/auth/store.rs` | `AuthStore::list_devices()` |
+
+---
+
 ## 2. Deployment Architecture
 
 ### Per-User, Per-Device, Independent App
@@ -199,8 +792,17 @@ system automatically routes to the most appropriate model per task type:
 │                                                                     │
 │  Important: Railway relay is ALWAYS used for:                       │
 │  ├─ Memory sync (E2E encrypted delta exchange) — regardless of key  │
-│  └─ Remote channel routing (KakaoTalk, Telegram, etc.)              │
-│  These are NOT LLM calls and do not consume credits.                │
+│  ├─ Remote channel routing (KakaoTalk, Telegram, etc.)              │
+│  └─ Web chat from mymoa.app (browser-based access)                  │
+│  Memory sync and channel routing are NOT LLM calls and do not       │
+│  consume credits. LLM calls via Railway do consume credits (2.2×).  │
+│                                                                     │
+│  Railway's role is MINIMAL:                                         │
+│  ├─ Hosts webhook endpoints for channel messages                    │
+│  ├─ Stores operator's ADMIN_*_API_KEY env vars (never exposed)      │
+│  ├─ Proxies LLM calls when user has no local API key                │
+│  ├─ Holds E2E encrypted sync deltas (5-min TTL, auto-deleted)       │
+│  └─ Does NOT persistently store any user data or conversation       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -235,13 +837,123 @@ Users send messages through these channels to their remote MoA device,
 which processes the request and sends back the response through the same
 channel.
 
-### Web Chat Access
+### Web Chat Access (웹채팅)
 
 A web-based chat interface on the MoA homepage allows users to:
 - Send commands to their remote MoA app instance
 - Receive responses in real-time
 - No MoA app installation required on the browsing device
 - Authenticated connection to the user's registered MoA devices
+
+### Three Chat Modes (3가지 채팅 방식)
+
+MoA provides three distinct ways to interact with the AI agent, each
+designed for different user scenarios:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Three Chat Modes Overview                                               │
+│                                                                         │
+│  ① App Chat (앱채팅) — Local GUI                                        │
+│     User: MoA app installed on their device                              │
+│     Interface: Desktop/Mobile Tauri app with rich GUI                    │
+│     API Key: Local key preferred → Operator key fallback                 │
+│     Route: Device → LLM Provider directly (local key)                    │
+│            Device → Railway → LLM Provider (operator key fallback)       │
+│     Features: Full GUI, markdown rendering, STT/TTS, voice mode,         │
+│               120+ language auto-detection, document editor,             │
+│               export (PDF/DOC/HTML/MD), file upload, all tools           │
+│                                                                         │
+│  ② Channel Chat (채널채팅) — Remote via Messaging Platforms              │
+│     User: No MoA app needed on the chatting device                       │
+│     Interface: KakaoTalk, Telegram, Discord, Slack, LINE messages        │
+│     API Key: Operator key on Railway server                              │
+│     Route: Channel → Railway webhook → MoA gateway → LLM Provider       │
+│     Setup: Operator pre-configures channel bot tokens/secrets on         │
+│            Railway. Users just message the bot — zero setup required.     │
+│     Credits: Deducted at 2.2× per usage (operator key)                   │
+│                                                                         │
+│  ③ Web Chat (웹채팅) — Browser-based, no app install                     │
+│     User: Public PC, library, internet café — MoA not installed          │
+│     Interface: mymoa.app website → web chat widget                       │
+│     API Key: Own key if provided → Operator key fallback                 │
+│     Route: Browser → Railway WebSocket → MoA gateway → LLM Provider     │
+│     Use case: Access MoA from any computer by logging into mymoa.app     │
+│     Credits: Only deducted when operator key is used                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### App Chat (앱채팅) — Local GUI
+
+The primary and richest chat experience. Users interact through the
+desktop/mobile MoA app installed on their device.
+
+- **API key resolution order**: Local key (in `~/.zeroclaw/config.toml`
+  or per-provider keys) → Operator key on Railway (fallback)
+- **When local key is used**: LLM calls go directly from the device to
+  the provider API. No Railway involvement. No credit deduction.
+- **When operator key is used**: LLM calls are proxied through Railway
+  server using the operator's `ADMIN_*_API_KEY` env vars. Credits are
+  deducted at 2.2× the actual API cost.
+- **Features**: Full rich GUI (markdown rendering in chat, 120+ language
+  auto-detection with dialects for China/India, STT voice input,
+  TTS voice output, document viewer/editor, export to PDF/DOC/HTML/MD,
+  file upload, all tool categories)
+
+#### Channel Chat (채널채팅) — Remote via Messaging Platforms
+
+Designed for non-technical users who want to interact with MoA through
+familiar messaging apps **without any setup on their end**.
+
+- **Zero user setup**: The operator (admin) pre-configures all channel
+  bot tokens, webhook secrets, and API keys as Railway environment
+  variables. Users simply message the bot in their messaging app.
+- **Railway's role (minimal)**: Railway only hosts the webhook endpoints
+  and channel configuration. The actual AI processing uses the operator's
+  API keys stored as `ADMIN_*_API_KEY` env vars on Railway.
+- **Supported channels**: KakaoTalk, Telegram, Discord, Slack, LINE
+- **Credits**: Always deducted at 2.2× (operator key used)
+
+##### KakaoTalk Direct Connection (카카오톡 직접 연결)
+
+KakaoTalk has a unique architecture compared to other channels:
+
+- **Webhook-based**: KakaoTalk uses a callback URL pattern where Kakao
+  servers send user messages to a registered webhook endpoint.
+- **Railway requirement**: Because KakaoTalk requires a publicly
+  accessible HTTPS endpoint for webhooks, Railway (or any public server)
+  is needed to receive the webhook callbacks.
+- **However**: If the user's local device has a public IP or uses a
+  tunnel (e.g., ngrok, Cloudflare Tunnel), KakaoTalk can connect
+  directly to the local MoA app without Railway, by registering the
+  local webhook URL in the Kakao Developer Console.
+- **Practical recommendation**: For most users, Railway hosting is
+  simpler and more reliable than maintaining a local tunnel.
+
+##### Channel Setup Simplification Strategy
+
+The goal is to make channel access as simple as possible for end users:
+
+| Channel | Operator Setup (one-time) | User Setup | User Experience |
+|---------|--------------------------|------------|-----------------|
+| **KakaoTalk** | Register Kakao Channel, set webhook URL on Railway, add `KAKAO_*` env vars | Add KakaoTalk Channel as friend | Send message → Get AI response |
+| **Telegram** | Create bot via @BotFather, add `TELEGRAM_BOT_TOKEN` to Railway | Search bot name, click Start | Send message → Get AI response |
+| **Discord** | Create Discord App/Bot, add `DISCORD_TOKEN` to Railway | Join server with bot or DM the bot | Send message → Get AI response |
+| **Slack** | Create Slack App, add `SLACK_*` tokens to Railway | Add app to workspace | Send message → Get AI response |
+| **LINE** | Create LINE Official Account, add `LINE_*` tokens to Railway | Add LINE friend | Send message → Get AI response |
+
+#### Web Chat (웹채팅) — Browser-based Access
+
+For situations where users cannot install MoA on the device they are
+using (public PCs, library computers, internet cafés, borrowed devices).
+
+- **How it works**: User visits `mymoa.app`, logs in with their MoA
+  account, and chats through the web interface.
+- **Route**: Browser → Railway server (WebSocket) → MoA gateway → LLM
+- **API key**: Can use own key if entered in web settings, otherwise
+  uses operator key with credit deduction at 2.2×.
+- **Limitations**: No local file access, no local tool execution —
+  tools run on the Railway-hosted gateway instance.
 
 ### Unified App Experience (MoA + ZeroClaw = One App)
 
@@ -855,7 +1567,15 @@ communication.
 web/
 ├── src/
 │   ├── pages/
-│   │   ├── AgentChat.tsx      # Primary chat interface
+│   │   ├── AgentChat.tsx      # Primary chat interface with:
+│   │   │                      #   - Markdown rendering (marked library)
+│   │   │                      #   - 120+ language auto-detection (Unicode + heuristics)
+│   │   │                      #   - Language preference persistence (memory + localStorage)
+│   │   │                      #   - STT voice input (Web Speech API, cross-browser)
+│   │   │                      #   - TTS voice output (speechSynthesis, auto voice selection)
+│   │   │                      #   - Export to DOC/MD/TXT
+│   │   │                      #   - Voice mode with language indicator
+│   │   │                      #   - Connection status indicator
 │   │   ├── Config.tsx         # Agent configuration
 │   │   ├── Cost.tsx           # Usage & billing dashboard
 │   │   ├── Cron.tsx           # Scheduled tasks
@@ -863,10 +1583,27 @@ web/
 │   │   ├── Devices.tsx        # Multi-device management & sync status
 │   │   └── ...
 │   ├── components/            # Shared React components
+│   ├── lib/
+│   │   ├── api.ts             # API client with Bearer token auth
+│   │   ├── auth.ts            # Token management (session/localStorage)
+│   │   └── ws.ts              # WebSocket client with session management
 │   └── App.tsx                # Route definitions
-├── vite.config.ts
-└── package.json
+├── dist/                      # Built frontend assets (tracked in git for rust-embed)
+│   ├── index.html             # SPA entry point with CSP headers
+│   └── assets/                # Vite-bundled JS/CSS with content hashes
+├── vite.config.ts             # base: "/_app/", proxy to localhost:8080
+└── package.json               # Build: tsc -b && vite build
 ```
+
+#### Frontend Build Pipeline
+
+The web frontend is embedded into the ZeroClaw Rust binary via
+`rust-embed` at compile time. Both Dockerfiles include a
+`node:22-alpine` web-builder stage that runs `npm ci && npm run build`
+automatically, ensuring frontend assets are always current in
+production builds. The built assets in `web/dist/` are also tracked
+in git (excluded from the generic `dist/` gitignore rule) so that
+local `cargo build` picks them up without requiring Node.js.
 
 ### Main Website (`site/`)
 
@@ -924,6 +1661,12 @@ the native app — the gateway handles WebSocket connections from any
 authenticated browser session. Memory, ontology state, and sync all work
 identically regardless of whether the client is the Tauri app or a web
 browser.
+
+**Primary use case**: Public PCs, library computers, internet cafés,
+or any device where the user cannot install MoA. Users visit
+`mymoa.app`, log in with their account, and chat through the web
+interface. The web chat connects to the Railway-hosted gateway instance
+via WebSocket.
 
 ---
 
@@ -1510,6 +2253,25 @@ These are **mandatory constraints**, not guidelines:
 - [x] Image/Video/Music generation tool integrations — `src/tools/media_gen.rs` ImageGenTool (DALL-E), VideoGenTool (Runway), MusicGenTool (Suno)
 - [x] iOS native bridge (Swift-Rust FFI) — Tauri 2 manages Rust↔Swift bridge transparently, `MoAApp.swift` entry point with WKWebView
 - [x] Android NDK sidecar build — Gradle multi-ABI (arm64-v8a, armeabi-v7a, x86, x86_64), ProGuard config, SDK 34
+
+### Recently Completed (2026-03-19)
+
+- [x] Markdown rendering in chat messages — `marked` library for real-time markdown-to-HTML conversion in `AgentChat.tsx`
+- [x] 120+ language auto-detection with China/India dialect support — Unicode script analysis + word-level heuristics in `detectLanguage()`
+  - China: Cantonese (yue-HK), Traditional Chinese (zh-TW), Wu/Shanghainese (wuu), Min Nan/Hokkien (nan-TW), Yi (ii-CN), Tai Lü (khb-CN), Uyghur (ug-CN), Tibetan (bo-CN)
+  - India: Hindi/Marathi/Nepali/Sanskrit/Konkani/Dogri/Maithili/Bodo disambiguation within Devanagari; Bengali vs Assamese; 12+ unique-script Indian languages including Manipuri, Santali, Lepcha, Limbu, Chakma
+  - Arabic script: Arabic/Urdu/Persian/Pashto/Kurdish Sorani/Sindhi/Uyghur
+  - Cyrillic additions: Tajik, Kyrgyz, Mongolian Cyrillic
+  - Additional scripts: Thaana, N'Ko, Javanese, Balinese, Sundanese, Cherokee
+- [x] Language preference persistence — auto-save to memory + localStorage, auto-restore on session start (`persistLangToMemory()` / `loadLangFromMemory()`)
+- [x] STT (Speech-to-Text) voice input — Web Speech API with cross-browser support, real-time transcription, language-aware recognition
+- [x] TTS (Text-to-Speech) voice output — `speechSynthesis` API with auto voice selection per detected language, voice mode toggle
+- [x] Chat export functionality — Export conversations to `.doc` (MS Word compatible), `.md` (Markdown), and `.txt` formats via `exportToDoc()`, `exportToMarkdown()`, `exportToText()`
+- [x] Chat UI enhancements — Voice mode indicator, connection status, new chat button, message copy, format toggle, bottom toolbar with STT/TTS/export controls
+- [x] Dockerfile npm build step — Both `Dockerfile` and `deploy/railway/Dockerfile` now include a `node:22-alpine` web-builder stage that runs `npm ci && npm run build` automatically, ensuring frontend assets are always fresh in Docker builds
+- [x] `.gitignore` updated to track `web/dist/` — Required for `rust-embed` to bundle frontend assets into the Rust binary
+- [x] TypeScript error fixes — Fixed type safety issues in `ws.ts` (sessionId cast), `AgentChat.tsx` (SpeechRecognition types, null checks, unused variables)
+- [x] Three Chat Modes documented in ARCHITECTURE.md — App Chat (앱채팅), Channel Chat (채널채팅), Web Chat (웹채팅) with clear API key routing and Railway role
 
 ---
 

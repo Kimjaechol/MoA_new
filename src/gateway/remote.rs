@@ -56,6 +56,9 @@ const DEVICE_CHANNEL_BUFFER: usize = 256;
 /// How long to wait for a device response before timing out.
 const DEVICE_RESPONSE_TIMEOUT_SECS: u64 = 120;
 
+/// Public alias for device relay timeout (used by ws.rs auto-relay).
+pub const DEVICE_RESPONSE_TIMEOUT_SECS_PUB: u64 = DEVICE_RESPONSE_TIMEOUT_SECS;
+
 /// Maximum login attempts per IP before lockout.
 const MAX_LOGIN_ATTEMPTS: u32 = 10;
 
@@ -976,10 +979,20 @@ async fn handle_device_link_socket(
     let device_id_clone = device_id.clone();
     let forward_task = tokio::spawn(async move {
         while let Some(routed_msg) = from_web_rx.recv().await {
+            // Preserve the original msg_type so the device can distinguish
+            // between regular messages, check_key probes, and hybrid relay
+            // messages (message_with_llm_key).
+            let wire_type = match routed_msg.msg_type.as_str() {
+                "check_key" => "check_key",
+                "hybrid_relay" => "hybrid_relay",
+                "channel_relay" => "channel_relay",
+                _ => "remote_message",
+            };
             let json = serde_json::json!({
-                "type": "remote_message",
+                "type": wire_type,
                 "id": routed_msg.id,
                 "content": routed_msg.content,
+                "msg_type": routed_msg.msg_type,
             });
             if ws_sender
                 .send(Message::Text(json.to_string().into()))
@@ -1013,6 +1026,28 @@ async fn handle_device_link_socket(
         match msg_type {
             "heartbeat" => {
                 // Device keepalive — no action needed
+            }
+            "check_key_response" => {
+                // Device responding to a check_key probe (has key / key missing).
+                let msg_id = parsed["id"].as_str().unwrap_or("").to_string();
+                let has_key = parsed["has_key"].as_bool().unwrap_or(false);
+                let response_type = if has_key { "key_ok" } else { "key_missing" };
+
+                let maybe_tx = {
+                    let guard = REMOTE_RESPONSE_CHANNELS.lock();
+                    guard.get(&msg_id).cloned()
+                };
+
+                if let Some(tx) = maybe_tx {
+                    let routed_response = RoutedMessage {
+                        id: msg_id.clone(),
+                        direction: "to_web".to_string(),
+                        content: String::new(),
+                        msg_type: response_type.to_string(),
+                    };
+                    let _ = tx.send(routed_response).await;
+                    REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+                }
             }
             "remote_response" | "remote_chunk" | "remote_error" => {
                 let msg_id = parsed["id"].as_str().unwrap_or("").to_string();
@@ -1072,7 +1107,7 @@ async fn handle_device_link_socket(
 ///
 /// This is a process-global registry because messages may cross
 /// multiple async task boundaries.
-static REMOTE_RESPONSE_CHANNELS: std::sync::LazyLock<
+pub static REMOTE_RESPONSE_CHANNELS: std::sync::LazyLock<
     Mutex<HashMap<String, mpsc::Sender<RoutedMessage>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 

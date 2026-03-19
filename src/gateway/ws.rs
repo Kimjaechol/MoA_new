@@ -443,27 +443,454 @@ pub async fn handle_ws_chat(
 ) -> impl IntoResponse {
     let query_params = parse_ws_query_params(query.as_deref());
     // Auth via Authorization header or websocket protocol token.
-    if state.pairing.require_pairing() {
-        let token =
-            extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
-        if !state.pairing.is_authenticated(&token) {
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token>, Sec-WebSocket-Protocol: bearer.<token>, or ?token=<token>",
-            )
-                .into_response();
-        }
+    let auth_token = extract_ws_bearer_token(&headers, query_params.token.as_deref())
+        .unwrap_or_default()
+        .to_string();
+    if state.pairing.require_pairing() && !state.pairing.is_authenticated(&auth_token) {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "Unauthorized — provide Authorization: Bearer <token>, Sec-WebSocket-Protocol: bearer.<token>, or ?token=<token>",
+        )
+            .into_response();
     }
+
+    // Resolve user_id from session token (for device routing).
+    let user_id = state
+        .auth_store
+        .as_ref()
+        .and_then(|store| store.validate_session(&auth_token))
+        .map(|session| session.user_id);
 
     let session_id = query_params
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, user_id))
         .into_response()
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: String) {
+/// Attempt to relay a chat message to the user's local MoA device.
+///
+/// Returns a `DeviceRelayResult` indicating the outcome:
+///   - `Relayed`: message was sent to local device and response streamed back
+///   - `NoDevice`: no local device online (caller should use operator key)
+///   - `NoLocalKey`: device is online but has no valid API key (caller should use operator key)
+///
+/// Full flow:
+///   1. Check if user's local device is online via DeviceRouter
+///   2. Send a "check_key" probe to verify the device has a valid API key
+///   3. If key exists: relay the actual message → device processes with local key (free)
+///   4. If no key: return NoLocalKey → caller falls back to operator key (2.2× credits)
+///   5. If no device online: return NoDevice → caller uses operator key (2.2× credits)
+enum DeviceRelayResult {
+    /// Message relayed to local device, response streamed back successfully.
+    Relayed,
+    /// No local device is online.
+    NoDevice,
+    /// Device is online but has no valid local API key for the requested provider.
+    NoLocalKey,
+}
+
+async fn try_relay_to_local_device(
+    state: &AppState,
+    socket: &mut WebSocket,
+    user_id: Option<&str>,
+    content: &str,
+    _session_id: &str,
+    provider_name: &str,
+) -> DeviceRelayResult {
+    // Need both device_router and auth_store to find user's devices
+    let (device_router, auth_store) =
+        match (state.device_router.as_ref(), state.auth_store.as_ref()) {
+            (Some(dr), Some(auth)) => (dr, auth),
+            _ => return DeviceRelayResult::NoDevice,
+        };
+
+    let user_id = match user_id {
+        Some(uid) => uid,
+        None => return DeviceRelayResult::NoDevice,
+    };
+
+    // Find user's devices and check if any are online
+    let devices = match auth_store.list_devices(user_id) {
+        Ok(devs) => devs,
+        Err(_) => return DeviceRelayResult::NoDevice,
+    };
+
+    // Find the first online device
+    let online_device = devices
+        .iter()
+        .find(|d| device_router.is_device_online(&d.device_id));
+
+    let device = match online_device {
+        Some(d) => d,
+        None => return DeviceRelayResult::NoDevice,
+    };
+
+    // ── Step 1: Probe device for API key availability ──
+    // Send a "check_key" message to verify the device has a valid API key
+    // for the requested provider before committing to the full relay.
+    {
+        let probe_id = uuid::Uuid::new_v4().to_string();
+        let (probe_tx, mut probe_rx) =
+            tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(4);
+
+        {
+            use super::remote::REMOTE_RESPONSE_CHANNELS;
+            REMOTE_RESPONSE_CHANNELS.lock().insert(probe_id.clone(), probe_tx);
+        }
+
+        let probe_msg = super::remote::RoutedMessage {
+            id: probe_id.clone(),
+            direction: "to_device".to_string(),
+            content: serde_json::json!({
+                "check_provider": provider_name,
+            })
+            .to_string(),
+            msg_type: "check_key".to_string(),
+        };
+
+        if let Err(_) = device_router.send_to_device(&device.device_id, probe_msg).await {
+            use super::remote::REMOTE_RESPONSE_CHANNELS;
+            REMOTE_RESPONSE_CHANNELS.lock().remove(&probe_id);
+            return DeviceRelayResult::NoDevice;
+        }
+
+        // Wait up to 5 seconds for the probe response
+        let probe_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), probe_rx.recv()).await;
+
+        // Clean up probe channel
+        {
+            use super::remote::REMOTE_RESPONSE_CHANNELS;
+            REMOTE_RESPONSE_CHANNELS.lock().remove(&probe_id);
+        }
+
+        match probe_result {
+            Ok(Some(resp)) => {
+                // Device responded — check if it has a valid key
+                if resp.msg_type == "key_missing" {
+                    tracing::info!(
+                        user_id = user_id,
+                        device_id = device.device_id.as_str(),
+                        provider = provider_name,
+                        "Local device online but no API key for provider — falling back to operator key"
+                    );
+                    return DeviceRelayResult::NoLocalKey;
+                }
+                // "key_ok" or any other response means proceed with relay
+            }
+            _ => {
+                // Timeout or channel closed — device may be busy, fall back
+                tracing::debug!(
+                    device_id = device.device_id.as_str(),
+                    "Device did not respond to key probe — falling back to operator key"
+                );
+                return DeviceRelayResult::NoLocalKey;
+            }
+        }
+    }
+
+    // ── Step 2: Relay the actual message ──
+    tracing::info!(
+        user_id = user_id,
+        device_id = device.device_id.as_str(),
+        device_name = device.device_name.as_str(),
+        "Relaying chat message to user's local device (local API key)"
+    );
+
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let (resp_tx, mut resp_rx) =
+        tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(64);
+
+    {
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().insert(msg_id.clone(), resp_tx);
+    }
+
+    let routed_msg = super::remote::RoutedMessage {
+        id: msg_id.clone(),
+        direction: "to_device".to_string(),
+        content: content.to_string(),
+        msg_type: "message".to_string(),
+    };
+
+    if let Err(e) = device_router.send_to_device(&device.device_id, routed_msg).await {
+        tracing::warn!(
+            error = e.as_str(),
+            device_id = device.device_id.as_str(),
+            "Failed to relay to local device"
+        );
+        {
+            use super::remote::REMOTE_RESPONSE_CHANNELS;
+            REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+        }
+        return DeviceRelayResult::NoDevice;
+    }
+
+    // Wait for device responses and forward to the web client
+    let timeout =
+        tokio::time::Duration::from_secs(super::remote::DEVICE_RESPONSE_TIMEOUT_SECS_PUB);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut got_response = false;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            if !got_response {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": "Local device did not respond in time. Please check that MoA is running on your device.",
+                });
+                let _ = socket.send(Message::Text(err.to_string().into())).await;
+            }
+            break;
+        }
+
+        match tokio::time::timeout(remaining, resp_rx.recv()).await {
+            Ok(Some(resp)) => {
+                got_response = true;
+                let frame = serde_json::json!({
+                    "type": resp.msg_type,
+                    "content": resp.content,
+                });
+                let _ = socket.send(Message::Text(frame.to_string().into())).await;
+                if resp.msg_type == "done" {
+                    break;
+                }
+            }
+            Ok(None) => {
+                if !got_response {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "Local device disconnected during processing.",
+                    });
+                    let _ = socket.send(Message::Text(err.to_string().into())).await;
+                }
+                break;
+            }
+            Err(_) => {
+                if !got_response {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "Local device did not respond in time.",
+                    });
+                    let _ = socket.send(Message::Text(err.to_string().into())).await;
+                }
+                break;
+            }
+        }
+    }
+
+    {
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+    }
+
+    if got_response {
+        DeviceRelayResult::Relayed
+    } else {
+        DeviceRelayResult::NoDevice
+    }
+}
+
+/// Resolve the operator's admin LLM API key from environment variables.
+///
+/// Railway always has these pre-configured by the operator.
+fn resolve_operator_llm_key(provider_name: &str) -> Option<String> {
+    let admin_env_var = match provider_name {
+        "anthropic" => "ADMIN_ANTHROPIC_API_KEY",
+        "openai" => "ADMIN_OPENAI_API_KEY",
+        "gemini" | "google" | "google-gemini" => "ADMIN_GEMINI_API_KEY",
+        "perplexity" => "ADMIN_PERPLEXITY_API_KEY",
+        _ => return None,
+    };
+    std::env::var(admin_env_var)
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+}
+
+/// Hybrid relay: send message to the local device with a short-lived proxy token.
+///
+/// **Security**: The operator's LLM API key NEVER leaves the Railway server.
+/// Instead, we issue a short-lived session token that the device uses to call
+/// Railway's `/api/llm/proxy` endpoint for LLM requests. Railway then adds
+/// the operator key server-side before forwarding to the LLM provider.
+///
+/// This ensures:
+///   - Operator API key stays on the server (cannot be extracted by device)
+///   - Local device uses its own tool API keys for all tool execution
+///   - Local device applies its own config/settings
+///   - LLM usage is tracked and credits deducted server-side (2.2×)
+///   - Proxy token expires in 15 minutes (single-conversation scope)
+///
+/// The device receives a `hybrid_relay` message containing:
+///   - `content`: the user's message
+///   - `provider`: which LLM provider to use
+///   - `proxy_token`: short-lived token for `/api/llm/proxy` calls
+///   - `proxy_url`: the Railway LLM proxy endpoint URL
+///
+/// The device-side agent loop uses this token to make LLM calls through
+/// the proxy while executing tools locally with its own API keys.
+const HYBRID_PROXY_TOKEN_TTL_SECS: u64 = 15 * 60; // 15 minutes
+
+async fn try_relay_to_local_device_with_proxy(
+    state: &AppState,
+    socket: &mut WebSocket,
+    user_id: Option<&str>,
+    content: &str,
+    _session_id: &str,
+    provider_name: &str,
+) -> DeviceRelayResult {
+    let (device_router, auth_store) =
+        match (state.device_router.as_ref(), state.auth_store.as_ref()) {
+            (Some(dr), Some(auth)) => (dr, auth),
+            _ => return DeviceRelayResult::NoDevice,
+        };
+
+    let user_id = match user_id {
+        Some(uid) => uid,
+        None => return DeviceRelayResult::NoDevice,
+    };
+
+    let devices = match auth_store.list_devices(user_id) {
+        Ok(devs) => devs,
+        Err(_) => return DeviceRelayResult::NoDevice,
+    };
+
+    let device = match devices
+        .iter()
+        .find(|d| device_router.is_device_online(&d.device_id))
+    {
+        Some(d) => d,
+        None => return DeviceRelayResult::NoDevice,
+    };
+
+    // Issue a short-lived proxy token (15 minutes) for LLM proxy calls.
+    // This token can ONLY be used to call /api/llm/proxy — it cannot
+    // extract the operator's API key.
+    let proxy_token = match auth_store.create_session_with_ttl(
+        user_id,
+        Some(&device.device_id),
+        Some(&device.device_name),
+        HYBRID_PROXY_TOKEN_TTL_SECS,
+    ) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create proxy token for hybrid relay");
+            return DeviceRelayResult::NoDevice;
+        }
+    };
+
+    // Determine the Railway gateway's public URL for the LLM proxy endpoint.
+    // Priority: RAILWAY_PUBLIC_DOMAIN env > gateway host:port fallback.
+    let proxy_url = {
+        let base = if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
+            format!("https://{}", domain.trim_end_matches('/'))
+        } else {
+            let config_guard = state.config.lock();
+            let host = &config_guard.gateway.host;
+            let port = config_guard.gateway.port;
+            format!("http://{}:{}", host, port)
+        };
+        format!("{}/api/llm/proxy", base.trim_end_matches('/'))
+    };
+
+    tracing::info!(
+        user_id = user_id,
+        device_id = device.device_id.as_str(),
+        device_name = device.device_name.as_str(),
+        provider = provider_name,
+        proxy_token_ttl_secs = HYBRID_PROXY_TOKEN_TTL_SECS,
+        "Hybrid relay: sending message with proxy token (operator key stays on server)"
+    );
+
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let (resp_tx, mut resp_rx) =
+        tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(64);
+
+    {
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().insert(msg_id.clone(), resp_tx);
+    }
+
+    // Send the hybrid relay message.
+    // ★ SECURITY: No API key in this message — only a short-lived proxy token.
+    let routed_msg = super::remote::RoutedMessage {
+        id: msg_id.clone(),
+        direction: "to_device".to_string(),
+        content: serde_json::json!({
+            "content": content,
+            "provider": provider_name,
+            "proxy_token": proxy_token,
+            "proxy_url": proxy_url,
+        })
+        .to_string(),
+        msg_type: "hybrid_relay".to_string(),
+    };
+
+    if let Err(e) = device_router.send_to_device(&device.device_id, routed_msg).await {
+        tracing::warn!(
+            error = e.as_str(),
+            "Failed to send hybrid relay message to device"
+        );
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+        return DeviceRelayResult::NoDevice;
+    }
+
+    // Stream responses from the device back to the web client
+    let mut got_response = false;
+    loop {
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(120),
+            resp_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(resp)) => {
+                got_response = true;
+                let ws_msg = serde_json::json!({
+                    "type": resp.msg_type,
+                    "content": resp.content,
+                });
+                let _ = socket.send(Message::Text(ws_msg.to_string().into())).await;
+                if resp.msg_type == "done" || resp.msg_type == "error" {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if !got_response {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "Local device did not respond in time (hybrid relay).",
+                    });
+                    let _ = socket.send(Message::Text(err.to_string().into())).await;
+                }
+                break;
+            }
+        }
+    }
+
+    {
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+    }
+
+    if got_response {
+        DeviceRelayResult::Relayed
+    } else {
+        DeviceRelayResult::NoDevice
+    }
+}
+
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    session_id: String,
+    user_id: Option<String>,
+) {
     let ws_session_id = format!("ws_{}", Uuid::new_v4());
 
     // Build system prompt once for the session
@@ -517,7 +944,6 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
         }
 
         // ── Apply client-provided overrides (provider, model) ──
-        // This mirrors the logic in openclaw_compat.rs for the HTTP /api/chat handler.
         {
             let mut config_guard = state.config.lock();
 
@@ -534,14 +960,105 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
             }
         }
 
-        // ── Resolve API key: client-provided > provider_api_keys > env ──
-        // Priority: client api_key > server-side provider_api_keys > env vars.
-        {
-            let mut config_guard = state.config.lock();
-            let provider_name = config_guard
+        // ── ★ MoA Smart API Key Routing ──
+        // Priority: LOCAL device key FIRST → operator key SECOND.
+        //
+        // 1. Always try user's local device first (free for user)
+        // 2. Only fall back to operator key if local device is offline
+        //    or has no valid key (credits deducted at 2.2×)
+        //
+        // Railway ALWAYS has operator API keys pre-configured, so
+        // "credential_missing" on Railway should never happen in normal
+        // operation. The key question is whether to use the FREE local
+        // key or the PAID operator key.
+
+        let provider_name = {
+            let config_guard = state.config.lock();
+            config_guard
                 .default_provider
                 .clone()
-                .unwrap_or_else(|| "gemini".to_string());
+                .unwrap_or_else(|| "gemini".to_string())
+        };
+
+        // ── Step 1: Try user's local device FIRST (free path) ──
+        // Check if user's local MoA device is online AND has a valid
+        // API key for the requested provider. If so, relay the message
+        // to the local device — the user pays nothing.
+        let relay_result = try_relay_to_local_device(
+            &state,
+            &mut socket,
+            user_id.as_deref(),
+            &content,
+            &session_id,
+            &provider_name,
+        )
+        .await;
+
+        match relay_result {
+            DeviceRelayResult::Relayed => {
+                // ✅ Response streamed from local device using local key.
+                // No cost to user. Skip all server-side processing.
+                continue;
+            }
+            DeviceRelayResult::NoLocalKey => {
+                // ── Step 1b: Hybrid relay — device online but no LLM key ──
+                // The local device has tools with their own API keys and settings,
+                // but lacks an LLM API key. We MUST still route processing through
+                // the local device so that:
+                //   - All local tool API keys (web search, browser, composio, etc.) are used
+                //   - All local settings/config are applied
+                //   - Only LLM calls go through Railway's /api/llm/proxy endpoint
+                //
+                // ★ SECURITY: We do NOT send the operator's API key to the device.
+                // Instead, we issue a short-lived proxy token (15 min) that the
+                // device uses to call Railway's /api/llm/proxy. Railway adds the
+                // operator key server-side — the key never leaves the server.
+                let has_operator_key = resolve_operator_llm_key(&provider_name).is_some();
+                if has_operator_key {
+                    tracing::info!(
+                        provider = provider_name.as_str(),
+                        "Hybrid relay: device online, issuing proxy token (key stays on server)"
+                    );
+                    let hybrid_result = try_relay_to_local_device_with_proxy(
+                        &state,
+                        &mut socket,
+                        user_id.as_deref(),
+                        &content,
+                        &session_id,
+                        &provider_name,
+                    )
+                    .await;
+                    match hybrid_result {
+                        DeviceRelayResult::Relayed => {
+                            // ✅ Local device processed with proxy token + local tool keys.
+                            // Credits deducted at 2.2× server-side via /api/llm/proxy.
+                            continue;
+                        }
+                        _ => {
+                            // Hybrid relay failed — fall through to full Railway processing
+                            tracing::warn!(
+                                "Hybrid relay failed, falling back to full Railway processing"
+                            );
+                        }
+                    }
+                }
+                // No operator key or hybrid relay failed — fall through to Railway
+            }
+            DeviceRelayResult::NoDevice => {
+                // Device offline — fall through to Step 2: use operator key on Railway.
+            }
+        }
+
+        // ── Step 2: Full Railway processing (paid path, 2.2×) ──
+        // Only reached when:
+        //   - Device is completely offline, OR
+        //   - Hybrid relay failed
+        // In this case Railway handles BOTH LLM and tool execution.
+        // ⚠️  Local tool API keys and settings are NOT used in this path.
+        //
+        // Resolve API key: client-provided > provider_api_keys > env > admin key.
+        {
+            let mut config_guard = state.config.lock();
 
             let client_key = parsed["api_key"]
                 .as_str()
@@ -549,6 +1066,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
                 .filter(|k| !k.is_empty());
 
             if let Some(key) = client_key {
+                // Client explicitly provided a key in the message
                 config_guard.api_key = Some(key.to_string());
             } else if let Some(stored_key) =
                 config_guard.provider_api_keys.get(&provider_name).cloned()
@@ -556,58 +1074,56 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
                 if !stored_key.trim().is_empty() {
                     config_guard.api_key = Some(stored_key);
                 } else {
-                    // Clear stale key from a different provider
                     config_guard.api_key = None;
                 }
             } else {
-                // No key found for this provider — clear any previous
-                // provider's key so we don't send a mismatched key.
-                // The provider factory will check env vars as fallback.
                 config_guard.api_key = None;
             }
         }
 
-        // ── Validate API key for cloud providers ──
+        // Validate that we have a credential for the provider
         let credential_missing = {
             let config_guard = state.config.lock();
-            let provider_name = config_guard
-                .default_provider
-                .as_deref()
-                .unwrap_or("gemini")
-                .to_string();
-
             if crate::providers::provider_requires_credential(&provider_name) {
                 let has_key = crate::providers::has_provider_credential(
                     &provider_name,
                     config_guard.api_key.as_deref(),
                 );
-                if !has_key {
-                    Some(provider_name)
-                } else {
-                    None
-                }
+                !has_key
             } else {
-                None
+                false
             }
         };
-        if let Some(provider_name) = credential_missing {
-            let env_hint = match provider_name.as_str() {
-                "anthropic" => "ANTHROPIC_API_KEY",
-                "openai" => "OPENAI_API_KEY",
-                "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
-                _ => "<PROVIDER>_API_KEY",
-            };
-            let err = serde_json::json!({
-                "type": "error",
-                "code": "missing_api_key",
-                "message": format!(
-                    "No API key configured for provider '{}'. Please add your API key in Settings or set {} env var.",
-                    provider_name, env_hint
-                ),
-                "fallback_to_relay": true,
-            });
-            let _ = socket.send(Message::Text(err.to_string().into())).await;
-            continue;
+
+        if credential_missing {
+            // Try ADMIN_*_API_KEY env vars (operator's pre-configured keys)
+            if let Some(key) = resolve_operator_llm_key(&provider_name) {
+                tracing::info!(
+                    provider = provider_name.as_str(),
+                    "Full Railway processing: using operator API key (credits 2.2×)"
+                );
+                let mut config_guard = state.config.lock();
+                config_guard.api_key = Some(key);
+                // Fall through to normal LLM processing below
+            } else {
+                // No key at all — shouldn't happen if operator set up Railway
+                let env_hint = match provider_name.as_str() {
+                    "anthropic" => "ANTHROPIC_API_KEY",
+                    "openai" => "OPENAI_API_KEY",
+                    "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
+                    _ => "<PROVIDER>_API_KEY",
+                };
+                let err = serde_json::json!({
+                    "type": "error",
+                    "code": "missing_api_key",
+                    "message": format!(
+                        "No API key configured for provider '{}'. Please add your API key in Settings or set {} env var.",
+                        provider_name, env_hint
+                    ),
+                });
+                let _ = socket.send(Message::Text(err.to_string().into())).await;
+                continue;
+            }
         }
 
         let perplexity_cfg = { state.config.lock().security.perplexity_filter.clone() };

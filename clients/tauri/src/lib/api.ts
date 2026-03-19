@@ -657,6 +657,10 @@ export class MoAClient {
     const hasSelectedProviderKey = !!apiKey && apiKey.trim().length > 0;
 
     // Build request body — include API key only when available
+    // ★ Hybrid relay: when no local LLM key, send proxy_url + proxy_token
+    // to the LOCAL gateway so it uses ProxyProvider for LLM calls while
+    // keeping all local tool API keys and settings. This ensures the
+    // operator's API key never leaves the Railway server.
     const body: Record<string, unknown> = {
       message,
       context,
@@ -664,13 +668,21 @@ export class MoAClient {
       model,
       ...(hasSelectedProviderKey ? { api_key: apiKey } : {}),
       ...(this.workspaceConnected ? { workspace_connected: true } : {}),
+      ...(!hasSelectedProviderKey && this.token
+        ? {
+            proxy_url: `${this.relayUrl}/api/llm/proxy`,
+            proxy_token: this.token,
+          }
+        : {}),
     };
 
     // ── Determine routing order with fallback ──
-    // Primary: local gateway if we have a key, relay otherwise
-    // Fallback: the other server if primary fails
-    const primaryUrl = hasSelectedProviderKey ? this.serverUrl : this.relayUrl;
-    const fallbackUrl = hasSelectedProviderKey ? this.relayUrl : this.serverUrl;
+    // ★ ALWAYS try local gateway first (even without LLM key).
+    // When proxy_url + proxy_token are provided, the local gateway uses
+    // ProxyProvider for LLM calls → local tool keys are preserved.
+    // Fallback to relay only if local gateway is completely unreachable.
+    const primaryUrl = this.serverUrl;
+    const fallbackUrl = this.relayUrl;
 
     // ── Try primary ──
     let res = await this.tryChatRequest(primaryUrl, body);
@@ -1014,29 +1026,87 @@ export class MoAClient {
     this.workspacePath = null;
   }
 
-  // ── Operator Key Fallback (via relay server) ────────────────
-  // When user has no API key, fetch operator's key from relay for use
-  // with 2x credit deduction per API call
+  // ── LLM Proxy (via Railway relay server) ──────────────────────
+  // When user has no LLM API key, use Railway's /api/llm/proxy endpoint.
+  // ★ SECURITY: Operator API key NEVER leaves the server.
+  // The session token is used to authenticate proxy requests.
+  // Credits are deducted at 2.2× per LLM call, server-side.
 
-  async getOperatorKeyProxy(provider: string): Promise<string | null> {
+  /**
+   * Get the LLM proxy URL for operator-key-backed LLM calls.
+   * Returns the proxy endpoint URL if available, null if not authenticated.
+   */
+  getLlmProxyUrl(): string | null {
     if (!this.token) return null;
+    return `${this.relayUrl}/api/llm/proxy`;
+  }
 
-    try {
-      const res = await fetch(`${this.relayUrl}/api/operator/key-proxy`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.token}`,
-        },
-        body: JSON.stringify({ provider, device_id: this.deviceId }),
-      });
+  /**
+   * Get the proxy authorization token (same as session token).
+   * The token is validated server-side and has a limited TTL.
+   */
+  getLlmProxyToken(): string | null {
+    return this.token;
+  }
 
-      if (!res.ok) return null;
-      const data = await res.json();
-      return data.proxied_key ?? null;
-    } catch {
-      return null;
+  /**
+   * Make an LLM call through Railway's proxy endpoint.
+   * The operator's API key is injected server-side — never exposed to client.
+   *
+   * @param provider - LLM provider name (e.g., "anthropic", "gemini")
+   * @param model - Model identifier (e.g., "claude-sonnet-4")
+   * @param messages - Chat messages in {role, content} format
+   * @param options - Optional: temperature, max_tokens, system_prompt, tools
+   * @returns LLM response with content, tool_calls, and usage info
+   */
+  async llmProxyChat(
+    provider: string,
+    model: string,
+    messages: Array<{ role: string; content: string }>,
+    options?: {
+      temperature?: number;
+      max_tokens?: number;
+      system_prompt?: string;
+      tools?: unknown[];
     }
+  ): Promise<{
+    content: string;
+    tool_calls: Array<{ id: string; name: string; arguments: string }>;
+    usage: { input_tokens: number; output_tokens: number; credits_deducted: number };
+  }> {
+    if (!this.token) {
+      throw new Error("Not authenticated. Please login first.");
+    }
+
+    const res = await fetch(`${this.relayUrl}/api/llm/proxy`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        provider,
+        model,
+        messages,
+        ...(options?.temperature !== undefined ? { temperature: options.temperature } : {}),
+        ...(options?.max_tokens !== undefined ? { max_tokens: options.max_tokens } : {}),
+        ...(options?.system_prompt ? { system_prompt: options.system_prompt } : {}),
+        ...(options?.tools ? { tools: options.tools } : {}),
+      }),
+    });
+
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      if (res.status === 401) {
+        throw new Error("Session expired. Please login again.");
+      }
+      if (res.status === 402) {
+        throw new Error("Insufficient credits. Please add credits to continue.");
+      }
+      throw new Error(errorData.error || `Proxy request failed (${res.status})`);
+    }
+
+    return res.json();
   }
 
   // ── Helpers ────────────────────────────────────────────────────

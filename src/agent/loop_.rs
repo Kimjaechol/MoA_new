@@ -3156,27 +3156,48 @@ pub async fn process_message_with_session(
         config.default_model.as_deref(),
         Some(provider_name),
     );
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
-        provider_transport: config.effective_provider_transport(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        reasoning_level: config.effective_provider_reasoning_level(),
-        custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
-        max_tokens_override: None,
-        model_support_vision: config.model_support_vision,
+
+    // ── Provider creation: direct vs proxy ──
+    // When llm_proxy_url + llm_proxy_token are set (hybrid relay mode),
+    // use ProxyProvider which routes LLM calls through the Railway proxy.
+    // The operator's API key stays on the proxy server — never on this device.
+    // Local tool API keys and settings are used as-is.
+    let provider: Box<dyn Provider> = if let (Some(proxy_url), Some(proxy_token)) =
+        (&config.llm_proxy_url, &config.llm_proxy_token)
+    {
+        tracing::info!(
+            provider = provider_name,
+            proxy_url = proxy_url.as_str(),
+            "Using ProxyProvider for LLM calls (hybrid relay mode)"
+        );
+        Box::new(providers::proxy::ProxyProvider::new(
+            proxy_url.clone(),
+            proxy_token.clone(),
+            provider_name.to_string(),
+        ))
+    } else {
+        let provider_runtime_options = providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: config.api_url.clone(),
+            provider_transport: config.effective_provider_transport(),
+            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            secrets_encrypt: config.secrets.encrypt,
+            reasoning_enabled: config.runtime.reasoning_enabled,
+            reasoning_level: config.effective_provider_reasoning_level(),
+            custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+            max_tokens_override: None,
+            model_support_vision: config.model_support_vision,
+        };
+        providers::create_routed_provider_with_options(
+            provider_name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?
     };
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
-        provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &config.model_routes,
-        &model_name,
-        &provider_runtime_options,
-    )?;
 
     // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup).
     if let Err(e) = provider.warmup().await {

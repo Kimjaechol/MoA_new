@@ -40,6 +40,8 @@ node_modules/
 
 # Build artifacts
 dist/
+# But track web frontend build output (embedded into Rust binary via rust-embed)
+!web/dist/
 
 # Secret keys and credentials
 .secret_key
