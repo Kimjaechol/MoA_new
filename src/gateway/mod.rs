@@ -1237,6 +1237,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── R2-based document upload (secure image PDF flow) ──
         .route("/api/document/upload-url", post(llm_proxy::handle_document_upload_url))
         .route("/api/document/process-r2", post(llm_proxy::handle_document_process_r2))
+        // ── Channel pairing API ──
+        .route("/api/channel-pairing/create", post(handle_channel_pairing_create))
+        .route("/api/channel-pairing/status", get(handle_channel_pairing_status))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
@@ -1505,6 +1508,101 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
         .await
 }
 
+/// Try to consume a pairing code from a channel message.
+///
+/// When a user sends a message that looks like a pairing code (UUID token
+/// or short alphanumeric code), we check if it matches an active pairing
+/// token in the ChannelPairingStore. If so, we consume the token, mark
+/// the channel identity as paired, and return a success message.
+///
+/// This enables seamless channel pairing:
+///   1. User opens MoA app → "Connect KakaoTalk" → gets pairing code
+///   2. User sends the code in the KakaoTalk channel chat
+///   3. This function detects the code, pairs the channel, and confirms
+///   4. Subsequent messages are routed to the user's local device
+fn try_consume_pairing_code(
+    state: &AppState,
+    channel_name: &str,
+    sender_platform_uid: &str,
+    content: &str,
+) -> Option<String> {
+    let channel_pairing = state.channel_pairing.as_ref()?;
+
+    // Already paired? Skip pairing code check.
+    if channel_pairing.is_paired(channel_name, sender_platform_uid) {
+        return None;
+    }
+
+    // Check if the message looks like a pairing code.
+    // Accept: UUID tokens (36 chars) or short codes (4-64 alphanumeric + dash).
+    let trimmed = content.trim();
+    let looks_like_code = (trimmed.len() >= 4 && trimmed.len() <= 64)
+        && trimmed
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-');
+
+    if !looks_like_code {
+        return None;
+    }
+
+    // Try to consume the token
+    let token_entry = channel_pairing.consume_token(trimmed)?;
+
+    // Verify this token was created for this channel
+    if token_entry.channel != channel_name {
+        tracing::warn!(
+            expected_channel = token_entry.channel.as_str(),
+            actual_channel = channel_name,
+            "Pairing token channel mismatch"
+        );
+        return Some(format!(
+            "이 페어링 코드는 {} 채널용입니다. {} 채널에서 다시 시도해 주세요.",
+            token_entry.channel, channel_name
+        ));
+    }
+
+    // Find the user_id associated with this token.
+    // The token was created when the user clicked "Connect Channel" in MoA app,
+    // so the user_id comes from auth_store via the token's session context.
+    // For now, we use the platform_uid from the token entry to look up or create
+    // the association.
+    let user_id = if let Some(auth_store) = &state.auth_store {
+        // Try to find existing user linked to this token's platform_uid
+        auth_store
+            .find_channel_link(&token_entry.channel, &token_entry.platform_uid)
+            .ok()
+            .flatten()
+            .map(|user| user.id)
+            .unwrap_or_else(|| {
+                // Use the platform_uid from the token as a fallback user_id
+                // (This means the user initiated pairing from the MoA app, so
+                // the token's platform_uid was set to the logged-in user_id)
+                token_entry.platform_uid.clone()
+            })
+    } else {
+        token_entry.platform_uid.clone()
+    };
+
+    // Mark as paired
+    channel_pairing.mark_paired(channel_name, sender_platform_uid, &user_id);
+
+    // Also persist to channel allowlist for gateway restarts
+    let _ = crate::channels::pairing::persist_channel_allowlist(channel_name, sender_platform_uid);
+
+    tracing::info!(
+        channel = channel_name,
+        sender = sender_platform_uid,
+        user_id = user_id.as_str(),
+        "Channel pairing completed via code"
+    );
+
+    Some(format!(
+        "✅ 페어링 완료! 이제 {} 채널에서 MoA와 대화할 수 있습니다.\n\
+         메시지를 보내면 자동으로 로컬 MoA 앱에서 처리됩니다.",
+        channel_name
+    ))
+}
+
 /// Try to relay a channel message to the user's local device for processing.
 ///
 /// **Channel-to-Device Relay Architecture**:
@@ -1677,6 +1775,18 @@ pub(super) async fn process_channel_message(
     content: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
+    // ── Step 0: Check for pairing code ──
+    // If the user sends a message that looks like a pairing code (4-64 char
+    // alphanumeric/dash, including UUID tokens), try to consume it and pair.
+    // This enables one-click channel pairing: user sends the code in the
+    // channel chat, and we automatically link their channel identity to
+    // their MoA account.
+    if let Some(pairing_response) =
+        try_consume_pairing_code(state, channel_name, sender_platform_uid, content)
+    {
+        return Ok(pairing_response);
+    }
+
     let sid = session_id.unwrap_or("");
 
     // Step 1: Try device relay (preserves local tool keys)
@@ -1774,6 +1884,132 @@ pub struct NodeControlRequest {
     pub capability: Option<String>,
     #[serde(default)]
     pub arguments: serde_json::Value,
+}
+
+// ── Channel Pairing API ──────────────────────────────────────────
+
+/// POST /api/channel-pairing/create — Generate a pairing code for a channel.
+///
+/// The MoA app calls this to get a code that the user sends in the
+/// channel chat to link their channel identity to their MoA account.
+async fn handle_channel_pairing_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    // Authenticate
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    let user_id = match &state.auth_store {
+        Some(store) => match store.validate_session(token) {
+            Some(session) => session.user_id,
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "Invalid or expired token"})),
+                );
+            }
+        },
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Auth not enabled"})),
+            );
+        }
+    };
+
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON"})),
+            );
+        }
+    };
+
+    let channel = body["channel"].as_str().unwrap_or("").trim();
+    if channel.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing 'channel' field"})),
+        );
+    }
+
+    let channel_pairing = match &state.channel_pairing {
+        Some(cp) => cp,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Channel pairing not enabled"})),
+            );
+        }
+    };
+
+    // Create a pairing token. The platform_uid is set to the user_id so
+    // that when the code is consumed, we know which MoA user to pair.
+    let code = channel_pairing.create_token(channel, &user_id);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "code": code,
+            "channel": channel,
+            "expires_in_seconds": 600,
+            "instructions": format!(
+                "{}에서 MoA 채널에 이 코드를 보내세요: {}",
+                channel, code
+            ),
+        })),
+    )
+}
+
+/// GET /api/channel-pairing/status — Get pairing status for all channels.
+async fn handle_channel_pairing_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    let _user_id = match &state.auth_store {
+        Some(store) => match store.validate_session(token) {
+            Some(session) => session.user_id,
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "Invalid token"})),
+                );
+            }
+        },
+        None => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"channels": []})),
+            );
+        }
+    };
+
+    let channels = vec![
+        serde_json::json!({"name": "kakao", "display_name": "카카오톡", "webhook_required": true}),
+        serde_json::json!({"name": "whatsapp", "display_name": "WhatsApp", "webhook_required": true}),
+        serde_json::json!({"name": "telegram", "display_name": "Telegram", "webhook_required": false}),
+        serde_json::json!({"name": "discord", "display_name": "Discord", "webhook_required": false}),
+        serde_json::json!({"name": "qq", "display_name": "QQ", "webhook_required": true}),
+        serde_json::json!({"name": "linq", "display_name": "Linq (iMessage)", "webhook_required": true}),
+    ];
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"channels": channels})),
+    )
 }
 
 fn node_id_allowed(node_id: &str, allowed_node_ids: &[String]) -> bool {
