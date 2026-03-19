@@ -984,7 +984,7 @@ async fn handle_device_link_socket(
             // messages (message_with_llm_key).
             let wire_type = match routed_msg.msg_type.as_str() {
                 "check_key" => "check_key",
-                "message_with_llm_key" => "message_with_llm_key",
+                "hybrid_relay" => "hybrid_relay",
                 _ => "remote_message",
             };
             let json = serde_json::json!({

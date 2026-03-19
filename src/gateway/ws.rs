@@ -710,24 +710,37 @@ fn resolve_operator_llm_key(provider_name: &str) -> Option<String> {
         .filter(|k| !k.trim().is_empty())
 }
 
-/// Hybrid relay: send message to the local device WITH an operator LLM key.
+/// Hybrid relay: send message to the local device with a short-lived proxy token.
 ///
-/// This is used when the device is online but has no LLM API key.
-/// The local device will:
-///   - Use the injected operator LLM key for LLM calls only
-///   - Use its own local tool API keys for all tool execution
-///   - Apply its own local config/settings
+/// **Security**: The operator's LLM API key NEVER leaves the Railway server.
+/// Instead, we issue a short-lived session token that the device uses to call
+/// Railway's `/api/llm/proxy` endpoint for LLM requests. Railway then adds
+/// the operator key server-side before forwarding to the LLM provider.
 ///
-/// The operator LLM key is sent as a `message_with_llm_key` type so the
-/// local device knows to temporarily use it for LLM calls in this session.
-async fn try_relay_to_local_device_with_key(
+/// This ensures:
+///   - Operator API key stays on the server (cannot be extracted by device)
+///   - Local device uses its own tool API keys for all tool execution
+///   - Local device applies its own config/settings
+///   - LLM usage is tracked and credits deducted server-side (2.2×)
+///   - Proxy token expires in 15 minutes (single-conversation scope)
+///
+/// The device receives a `hybrid_relay` message containing:
+///   - `content`: the user's message
+///   - `provider`: which LLM provider to use
+///   - `proxy_token`: short-lived token for `/api/llm/proxy` calls
+///   - `proxy_url`: the Railway LLM proxy endpoint URL
+///
+/// The device-side agent loop uses this token to make LLM calls through
+/// the proxy while executing tools locally with its own API keys.
+const HYBRID_PROXY_TOKEN_TTL_SECS: u64 = 15 * 60; // 15 minutes
+
+async fn try_relay_to_local_device_with_proxy(
     state: &AppState,
     socket: &mut WebSocket,
     user_id: Option<&str>,
     content: &str,
     _session_id: &str,
     provider_name: &str,
-    operator_llm_key: &str,
 ) -> DeviceRelayResult {
     let (device_router, auth_store) =
         match (state.device_router.as_ref(), state.auth_store.as_ref()) {
@@ -753,12 +766,43 @@ async fn try_relay_to_local_device_with_key(
         None => return DeviceRelayResult::NoDevice,
     };
 
+    // Issue a short-lived proxy token (15 minutes) for LLM proxy calls.
+    // This token can ONLY be used to call /api/llm/proxy — it cannot
+    // extract the operator's API key.
+    let proxy_token = match auth_store.create_session_with_ttl(
+        user_id,
+        Some(&device.device_id),
+        Some(&device.device_name),
+        HYBRID_PROXY_TOKEN_TTL_SECS,
+    ) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create proxy token for hybrid relay");
+            return DeviceRelayResult::NoDevice;
+        }
+    };
+
+    // Determine the Railway gateway's public URL for the LLM proxy endpoint.
+    // Priority: RAILWAY_PUBLIC_DOMAIN env > gateway host:port fallback.
+    let proxy_url = {
+        let base = if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
+            format!("https://{}", domain.trim_end_matches('/'))
+        } else {
+            let config_guard = state.config.lock();
+            let host = &config_guard.gateway.host;
+            let port = config_guard.gateway.port;
+            format!("http://{}:{}", host, port)
+        };
+        format!("{}/api/llm/proxy", base.trim_end_matches('/'))
+    };
+
     tracing::info!(
         user_id = user_id,
         device_id = device.device_id.as_str(),
         device_name = device.device_name.as_str(),
         provider = provider_name,
-        "Hybrid relay: sending message with operator LLM key to local device"
+        proxy_token_ttl_secs = HYBRID_PROXY_TOKEN_TTL_SECS,
+        "Hybrid relay: sending message with proxy token (operator key stays on server)"
     );
 
     let msg_id = uuid::Uuid::new_v4().to_string();
@@ -770,19 +814,19 @@ async fn try_relay_to_local_device_with_key(
         REMOTE_RESPONSE_CHANNELS.lock().insert(msg_id.clone(), resp_tx);
     }
 
-    // Send message with the operator LLM key attached.
-    // The device-side handler recognizes "message_with_llm_key" type and
-    // uses the injected key for LLM calls while keeping local tool keys.
+    // Send the hybrid relay message.
+    // ★ SECURITY: No API key in this message — only a short-lived proxy token.
     let routed_msg = super::remote::RoutedMessage {
         id: msg_id.clone(),
         direction: "to_device".to_string(),
         content: serde_json::json!({
             "content": content,
             "provider": provider_name,
-            "injected_llm_key": operator_llm_key,
+            "proxy_token": proxy_token,
+            "proxy_url": proxy_url,
         })
         .to_string(),
-        msg_type: "message_with_llm_key".to_string(),
+        msg_type: "hybrid_relay".to_string(),
     };
 
     if let Err(e) = device_router.send_to_device(&device.device_id, routed_msg).await {
@@ -963,31 +1007,31 @@ async fn handle_socket(
                 // the local device so that:
                 //   - All local tool API keys (web search, browser, composio, etc.) are used
                 //   - All local settings/config are applied
-                //   - Only the LLM API key is supplied by Railway (operator key)
+                //   - Only LLM calls go through Railway's /api/llm/proxy endpoint
                 //
-                // We relay the message WITH the operator's LLM key attached so
-                // the local device can use it for LLM calls while keeping its own
-                // tool keys for everything else.
-                let operator_llm_key = resolve_operator_llm_key(&provider_name);
-                if let Some(llm_key) = operator_llm_key {
+                // ★ SECURITY: We do NOT send the operator's API key to the device.
+                // Instead, we issue a short-lived proxy token (15 min) that the
+                // device uses to call Railway's /api/llm/proxy. Railway adds the
+                // operator key server-side — the key never leaves the server.
+                let has_operator_key = resolve_operator_llm_key(&provider_name).is_some();
+                if has_operator_key {
                     tracing::info!(
                         provider = provider_name.as_str(),
-                        "Hybrid relay: device online, injecting operator LLM key for local processing"
+                        "Hybrid relay: device online, issuing proxy token (key stays on server)"
                     );
-                    let hybrid_result = try_relay_to_local_device_with_key(
+                    let hybrid_result = try_relay_to_local_device_with_proxy(
                         &state,
                         &mut socket,
                         user_id.as_deref(),
                         &content,
                         &session_id,
                         &provider_name,
-                        &llm_key,
                     )
                     .await;
                     match hybrid_result {
                         DeviceRelayResult::Relayed => {
-                            // ✅ Local device processed with operator LLM key + local tool keys.
-                            // Credits deducted at 2.2× for LLM usage.
+                            // ✅ Local device processed with proxy token + local tool keys.
+                            // Credits deducted at 2.2× server-side via /api/llm/proxy.
                             continue;
                         }
                         _ => {
