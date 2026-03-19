@@ -498,6 +498,18 @@ pub struct Config {
     #[serde(default)]
     pub model_support_vision: Option<bool>,
 
+    /// LLM proxy URL for hybrid relay mode (runtime-only, not serialized).
+    /// When set, the agent loop creates a ProxyProvider that routes LLM calls
+    /// through this endpoint instead of calling the LLM API directly.
+    /// The operator's API key stays on the proxy server.
+    #[serde(skip)]
+    pub llm_proxy_url: Option<String>,
+
+    /// LLM proxy authorization token (runtime-only, not serialized).
+    /// Short-lived token used to authenticate with the LLM proxy endpoint.
+    #[serde(skip)]
+    pub llm_proxy_token: Option<String>,
+
     /// WASM plugin engine configuration (`[wasm]` section).
     #[serde(default)]
     pub wasm: WasmConfig,
@@ -6830,6 +6842,8 @@ impl Default for Config {
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
+            llm_proxy_url: None,
+            llm_proxy_token: None,
             wasm: WasmConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             telemetry: TelemetryConfig::default(),
@@ -11033,6 +11047,8 @@ ws_url = "ws://127.0.0.1:3002"
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
+            llm_proxy_url: None,
+            llm_proxy_token: None,
             wasm: WasmConfig::default(),
             platform_routing: PlatformRoutingConfig::default(),
             stripe_secret_key: None,
@@ -11420,6 +11436,8 @@ tool_dispatcher = "xml"
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
+            llm_proxy_url: None,
+            llm_proxy_token: None,
             wasm: WasmConfig::default(),
             platform_routing: PlatformRoutingConfig::default(),
             stripe_secret_key: None,

@@ -84,6 +84,18 @@ pub struct ApiChatBody {
     /// to proactively use file tools (file_read, file_write, glob_search, etc.).
     #[serde(default)]
     pub workspace_connected: bool,
+
+    /// LLM proxy URL for hybrid relay mode.
+    /// When provided (together with `proxy_token`), the agent loop routes
+    /// LLM calls through this proxy endpoint instead of calling the LLM API
+    /// directly. This keeps the operator's API key on the server.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+
+    /// Short-lived proxy token for authenticating with the LLM proxy endpoint.
+    /// Used together with `proxy_url` for hybrid relay mode.
+    #[serde(default)]
+    pub proxy_token: Option<String>,
 }
 
 fn api_chat_memory_key() -> String {
@@ -296,12 +308,17 @@ pub async fn handle_api_chat(
     // provider-specific env vars (e.g. GEMINI_API_KEY, ANTHROPIC_API_KEY).
     // The provider factory uses resolve_provider_credential() which checks
     // env vars as fallback, so we mirror that logic here.
+    //
+    // ★ Hybrid relay: if proxy_url + proxy_token are provided, the agent loop
+    // will use ProxyProvider for LLM calls instead of direct API — so we
+    // don't need a local LLM key. Set the proxy config and continue.
+    let use_proxy = chat_body.proxy_url.is_some() && chat_body.proxy_token.is_some();
     if providers::provider_requires_credential(provider_name) {
         let has_key = providers::has_provider_credential(
             provider_name,
             config.api_key.as_deref(),
         );
-        if !has_key {
+        if !has_key && !use_proxy {
             let env_hint = match provider_name {
                 "anthropic" => "ANTHROPIC_API_KEY",
                 "openai" => "OPENAI_API_KEY",
@@ -318,6 +335,12 @@ pub async fn handle_api_chat(
             });
             return (StatusCode::BAD_REQUEST, Json(err));
         }
+    }
+
+    // Store proxy config for agent loop (if provided)
+    if use_proxy {
+        config.llm_proxy_url = chat_body.proxy_url.clone();
+        config.llm_proxy_token = chat_body.proxy_token.clone();
     }
 
     // ── Observability ──

@@ -38,6 +38,12 @@ pub struct LlmProxyRequest {
     /// Optional max tokens
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Optional system prompt (merged into messages if provided)
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Optional tool schemas for native tool calling
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -120,7 +126,7 @@ pub async fn handle_llm_proxy(
     }
 
     // 4. Create provider and make the LLM call
-    let messages: Vec<crate::providers::ChatMessage> = req
+    let mut messages: Vec<crate::providers::ChatMessage> = req
         .messages
         .iter()
         .map(|m| crate::providers::ChatMessage {
@@ -129,8 +135,19 @@ pub async fn handle_llm_proxy(
         })
         .collect();
 
+    // Inject system_prompt into messages if provided and not already present
+    if let Some(ref sys) = req.system_prompt {
+        if !sys.is_empty() {
+            let has_system = messages.iter().any(|m| m.role == "system");
+            if !has_system {
+                messages.insert(0, crate::providers::ChatMessage::system(sys.as_str()));
+            }
+        }
+    }
+
     let temperature = req.temperature.unwrap_or(0.7);
     let model = req.model.clone();
+    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
 
     let provider = match crate::providers::create_provider(&req.provider, Some(&resolved)) {
         Ok(p) => p,
@@ -142,11 +159,38 @@ pub async fn handle_llm_proxy(
         }
     };
 
-    match provider.chat_with_history(&messages, &model, temperature).await {
-        Ok(response_text) => {
+    // Use chat_with_tools when tools are provided, otherwise chat_with_history
+    let llm_result = if has_tools {
+        let tools = req.tools.as_ref().unwrap();
+        provider
+            .chat_with_tools(&messages, tools, &model, temperature)
+            .await
+    } else {
+        // Use the structured chat() API which returns ChatResponse
+        let request = crate::providers::ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        provider.chat(request, &model, temperature).await
+    };
+
+    match llm_result {
+        Ok(chat_response) => {
+            let response_text = chat_response.text.as_deref().unwrap_or("");
+
             // 5. Estimate usage and deduct credits
-            let input_tokens = messages.iter().map(|m| m.content.len() as i64 / 4).sum::<i64>();
-            let output_tokens = response_text.len() as i64 / 4;
+            let (input_tokens, output_tokens) =
+                if let Some(ref usage) = chat_response.usage {
+                    (
+                        usage.input_tokens.unwrap_or(0) as i64,
+                        usage.output_tokens.unwrap_or(0) as i64,
+                    )
+                } else {
+                    // Fallback: estimate from text length
+                    let est_in = messages.iter().map(|m| m.content.len() as i64 / 4).sum::<i64>();
+                    let est_out = response_text.len() as i64 / 4;
+                    (est_in, est_out)
+                };
 
             let cost_usd =
                 crate::billing::tracker::CostTracker::estimate_cost(&model, input_tokens, output_tokens);
@@ -170,12 +214,26 @@ pub async fn handle_llm_proxy(
                 let _ = tracker.record_usage(usage);
             }
 
+            // Serialize tool_calls if present
+            let tool_calls_json: Vec<serde_json::Value> = chat_response
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    })
+                })
+                .collect();
+
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "content": response_text,
                     "model": model,
                     "provider": req.provider,
+                    "tool_calls": tool_calls_json,
                     "usage": {
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
@@ -184,10 +242,13 @@ pub async fn handle_llm_proxy(
                 })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("LLM request failed: {e}")})),
-        ),
+        Err(e) => {
+            let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("LLM request failed: {sanitized}")})),
+            )
+        }
     }
 }
 
