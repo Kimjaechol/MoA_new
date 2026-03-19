@@ -471,36 +471,50 @@ pub async fn handle_ws_chat(
 
 /// Attempt to relay a chat message to the user's local MoA device.
 ///
-/// Returns `true` if the message was successfully relayed and the response
-/// has been forwarded back to the web client. Returns `false` if no local
-/// device is available (caller should fall back to server-side processing).
+/// Returns a `DeviceRelayResult` indicating the outcome:
+///   - `Relayed`: message was sent to local device and response streamed back
+///   - `NoDevice`: no local device online (caller should use operator key)
+///   - `NoLocalKey`: device is online but has no valid API key (caller should use operator key)
 ///
-/// This implements the "local API key first" design:
-///   App Chat flow: Browser → Railway → user's local device (uses local API key) → response
-///   Fallback:      Browser → Railway processes directly (uses operator key, 2.2× credits)
+/// Full flow:
+///   1. Check if user's local device is online via DeviceRouter
+///   2. Send a "check_key" probe to verify the device has a valid API key
+///   3. If key exists: relay the actual message → device processes with local key (free)
+///   4. If no key: return NoLocalKey → caller falls back to operator key (2.2× credits)
+///   5. If no device online: return NoDevice → caller uses operator key (2.2× credits)
+enum DeviceRelayResult {
+    /// Message relayed to local device, response streamed back successfully.
+    Relayed,
+    /// No local device is online.
+    NoDevice,
+    /// Device is online but has no valid local API key for the requested provider.
+    NoLocalKey,
+}
+
 async fn try_relay_to_local_device(
     state: &AppState,
     socket: &mut WebSocket,
     user_id: Option<&str>,
     content: &str,
     _session_id: &str,
-) -> bool {
+    provider_name: &str,
+) -> DeviceRelayResult {
     // Need both device_router and auth_store to find user's devices
     let (device_router, auth_store) =
         match (state.device_router.as_ref(), state.auth_store.as_ref()) {
             (Some(dr), Some(auth)) => (dr, auth),
-            _ => return false,
+            _ => return DeviceRelayResult::NoDevice,
         };
 
     let user_id = match user_id {
         Some(uid) => uid,
-        None => return false,
+        None => return DeviceRelayResult::NoDevice,
     };
 
     // Find user's devices and check if any are online
     let devices = match auth_store.list_devices(user_id) {
         Ok(devs) => devs,
-        Err(_) => return false,
+        Err(_) => return DeviceRelayResult::NoDevice,
     };
 
     // Find the first online device
@@ -510,9 +524,74 @@ async fn try_relay_to_local_device(
 
     let device = match online_device {
         Some(d) => d,
-        None => return false, // No local device online — fall back to server
+        None => return DeviceRelayResult::NoDevice,
     };
 
+    // ── Step 1: Probe device for API key availability ──
+    // Send a "check_key" message to verify the device has a valid API key
+    // for the requested provider before committing to the full relay.
+    {
+        let probe_id = uuid::Uuid::new_v4().to_string();
+        let (probe_tx, mut probe_rx) =
+            tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(4);
+
+        {
+            use super::remote::REMOTE_RESPONSE_CHANNELS;
+            REMOTE_RESPONSE_CHANNELS.lock().insert(probe_id.clone(), probe_tx);
+        }
+
+        let probe_msg = super::remote::RoutedMessage {
+            id: probe_id.clone(),
+            direction: "to_device".to_string(),
+            content: serde_json::json!({
+                "check_provider": provider_name,
+            })
+            .to_string(),
+            msg_type: "check_key".to_string(),
+        };
+
+        if let Err(_) = device_router.send_to_device(&device.device_id, probe_msg).await {
+            use super::remote::REMOTE_RESPONSE_CHANNELS;
+            REMOTE_RESPONSE_CHANNELS.lock().remove(&probe_id);
+            return DeviceRelayResult::NoDevice;
+        }
+
+        // Wait up to 5 seconds for the probe response
+        let probe_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), probe_rx.recv()).await;
+
+        // Clean up probe channel
+        {
+            use super::remote::REMOTE_RESPONSE_CHANNELS;
+            REMOTE_RESPONSE_CHANNELS.lock().remove(&probe_id);
+        }
+
+        match probe_result {
+            Ok(Some(resp)) => {
+                // Device responded — check if it has a valid key
+                if resp.msg_type == "key_missing" {
+                    tracing::info!(
+                        user_id = user_id,
+                        device_id = device.device_id.as_str(),
+                        provider = provider_name,
+                        "Local device online but no API key for provider — falling back to operator key"
+                    );
+                    return DeviceRelayResult::NoLocalKey;
+                }
+                // "key_ok" or any other response means proceed with relay
+            }
+            _ => {
+                // Timeout or channel closed — device may be busy, fall back
+                tracing::debug!(
+                    device_id = device.device_id.as_str(),
+                    "Device did not respond to key probe — falling back to operator key"
+                );
+                return DeviceRelayResult::NoLocalKey;
+            }
+        }
+    }
+
+    // ── Step 2: Relay the actual message ──
     tracing::info!(
         user_id = user_id,
         device_id = device.device_id.as_str(),
@@ -520,18 +599,15 @@ async fn try_relay_to_local_device(
         "Relaying chat message to user's local device (local API key)"
     );
 
-    // Create a response channel for this message
     let msg_id = uuid::Uuid::new_v4().to_string();
     let (resp_tx, mut resp_rx) =
         tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(64);
 
-    // Register in the global response channel map
     {
         use super::remote::REMOTE_RESPONSE_CHANNELS;
         REMOTE_RESPONSE_CHANNELS.lock().insert(msg_id.clone(), resp_tx);
     }
 
-    // Send message to the device
     let routed_msg = super::remote::RoutedMessage {
         id: msg_id.clone(),
         direction: "to_device".to_string(),
@@ -545,12 +621,11 @@ async fn try_relay_to_local_device(
             device_id = device.device_id.as_str(),
             "Failed to relay to local device"
         );
-        // Clean up response channel
         {
             use super::remote::REMOTE_RESPONSE_CHANNELS;
             REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
         }
-        return false;
+        return DeviceRelayResult::NoDevice;
     }
 
     // Wait for device responses and forward to the web client
@@ -575,19 +650,16 @@ async fn try_relay_to_local_device(
         match tokio::time::timeout(remaining, resp_rx.recv()).await {
             Ok(Some(resp)) => {
                 got_response = true;
-                // Forward device response to the web client as-is
                 let frame = serde_json::json!({
                     "type": resp.msg_type,
                     "content": resp.content,
                 });
                 let _ = socket.send(Message::Text(frame.to_string().into())).await;
-                // If this is a "done" message, relay is complete
                 if resp.msg_type == "done" {
                     break;
                 }
             }
             Ok(None) => {
-                // Channel closed — device disconnected
                 if !got_response {
                     let err = serde_json::json!({
                         "type": "error",
@@ -598,7 +670,6 @@ async fn try_relay_to_local_device(
                 break;
             }
             Err(_) => {
-                // Timeout
                 if !got_response {
                     let err = serde_json::json!({
                         "type": "error",
@@ -611,13 +682,16 @@ async fn try_relay_to_local_device(
         }
     }
 
-    // Clean up
     {
         use super::remote::REMOTE_RESPONSE_CHANNELS;
         REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
     }
 
-    got_response
+    if got_response {
+        DeviceRelayResult::Relayed
+    } else {
+        DeviceRelayResult::NoDevice
+    }
 }
 
 async fn handle_socket(
@@ -754,40 +828,78 @@ async fn handle_socket(
         };
         if let Some(provider_name) = credential_missing {
             // ── Try to relay to user's local device if online ──
-            // This implements the "local key first" design: if the user has a
-            // MoA device running locally with its own API key, route the request
-            // there instead of using the operator's key on Railway.
-            let relayed = try_relay_to_local_device(
+            // Flow:
+            //   1. Device online + has local API key → relay to device (free)
+            //   2. Device online + no local key → fall through to operator key (2.2×)
+            //   3. Device offline → fall through to operator key (2.2×)
+            let relay_result = try_relay_to_local_device(
                 &state,
                 &mut socket,
                 user_id.as_deref(),
                 &content,
                 &session_id,
+                &provider_name,
             )
             .await;
-            if relayed {
-                continue; // Response already sent via device relay
-            }
 
-            // No local device available — report missing API key
-            let env_hint = match provider_name.as_str() {
-                "anthropic" => "ANTHROPIC_API_KEY",
-                "openai" => "OPENAI_API_KEY",
-                "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
-                _ => "<PROVIDER>_API_KEY",
-            };
-            let err = serde_json::json!({
-                "type": "error",
-                "code": "missing_api_key",
-                "message": format!(
-                    "No API key configured for provider '{}'. Please add your API key in Settings or set {} env var.",
-                    provider_name, env_hint
-                ),
-                "fallback_to_relay": true,
-                "device_online": false,
-            });
-            let _ = socket.send(Message::Text(err.to_string().into())).await;
-            continue;
+            match relay_result {
+                DeviceRelayResult::Relayed => {
+                    // Response already streamed from local device (local key, free)
+                    continue;
+                }
+                DeviceRelayResult::NoLocalKey | DeviceRelayResult::NoDevice => {
+                    // Device has no key or is offline — try operator key on Railway.
+                    // Check if operator admin keys are available in env vars.
+                    let admin_env_var = match provider_name.as_str() {
+                        "anthropic" => "ADMIN_ANTHROPIC_API_KEY",
+                        "openai" => "ADMIN_OPENAI_API_KEY",
+                        "gemini" | "google" | "google-gemini" => "ADMIN_GEMINI_API_KEY",
+                        "perplexity" => "ADMIN_PERPLEXITY_API_KEY",
+                        _ => "",
+                    };
+                    let operator_key = if !admin_env_var.is_empty() {
+                        std::env::var(admin_env_var).ok().filter(|k| !k.trim().is_empty())
+                    } else {
+                        None
+                    };
+
+                    if let Some(key) = operator_key {
+                        // Use operator key — credits will be deducted at 2.2×
+                        tracing::info!(
+                            provider = provider_name.as_str(),
+                            source = if matches!(relay_result, DeviceRelayResult::NoLocalKey) {
+                                "device_no_key"
+                            } else {
+                                "device_offline"
+                            },
+                            "Using operator API key (credits will be deducted at 2.2×)"
+                        );
+                        let mut config_guard = state.config.lock();
+                        config_guard.api_key = Some(key);
+                        // Fall through to normal processing below
+                    } else {
+                        // No operator key either — truly no key available
+                        let env_hint = match provider_name.as_str() {
+                            "anthropic" => "ANTHROPIC_API_KEY",
+                            "openai" => "OPENAI_API_KEY",
+                            "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
+                            _ => "<PROVIDER>_API_KEY",
+                        };
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "code": "missing_api_key",
+                            "message": format!(
+                                "No API key configured for provider '{}'. Please add your API key in Settings or set {} env var.",
+                                provider_name, env_hint
+                            ),
+                            "fallback_to_relay": true,
+                            "device_online": matches!(relay_result, DeviceRelayResult::NoLocalKey),
+                        });
+                        let _ = socket.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                }
+            }
         }
 
         let perplexity_cfg = { state.config.lock().security.perplexity_filter.clone() };
