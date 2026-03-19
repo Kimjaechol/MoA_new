@@ -6,6 +6,8 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use rusqlite::Connection;
 
+mod device_link;
+
 // ── State ────────────────────────────────────────────────────────
 
 /// Shared application state for Tauri commands.
@@ -563,6 +565,92 @@ async fn on_app_resume(state: tauri::State<'_, AppState>) -> Result<serde_json::
         "is_online": is_online,
         "has_token": state.token.lock().map_err(|e| e.to_string())?.is_some(),
     }))
+}
+
+// ── Channel Pairing ─────────────────────────────────────────────
+
+/// Generate a channel pairing code for linking a messaging channel
+/// (KakaoTalk, WhatsApp, Telegram, etc.) to this MoA account.
+///
+/// The user sends this code in the channel chat to complete pairing.
+/// After pairing, channel messages are automatically routed to this device.
+#[tauri::command]
+async fn generate_channel_pairing_code(
+    channel: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let relay_url = state
+        .relay_url
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let token = state
+        .token
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or("Not authenticated. Please login first.")?;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{}/api/channel-pairing/create", relay_url))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "channel": channel,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let error = res.text().await.unwrap_or_default();
+        return Err(format!("Server error ({}): {}", status, error));
+    }
+
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {e}"))?;
+
+    Ok(data)
+}
+
+/// Get the list of supported channels and their pairing status.
+#[tauri::command]
+async fn get_channel_pairing_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let relay_url = state
+        .relay_url
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let token = state
+        .token
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or("Not authenticated.")?;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!("{}/api/channel-pairing/status", relay_url))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !res.status().is_success() {
+        return Ok(serde_json::json!({ "channels": [] }));
+    }
+
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {e}"))?;
+
+    Ok(data)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -2056,6 +2144,8 @@ pub fn run() {
             search_documents_sqlite,
             delete_document_sqlite,
             save_document_to_disk,
+            generate_channel_pairing_code,
+            get_channel_pairing_status,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path
@@ -2097,6 +2187,41 @@ pub fn run() {
             // local AI assistant running. Everything else (UI, sync,
             // operator keys) is built around this.
             spawn_zeroclaw_gateway(app);
+
+            // ── Start Device-Link Client ─────────────────────────────
+            // Connects to Railway /ws/device-link so this device can
+            // receive relayed messages from web chat and channel chat.
+            // Runs in background with auto-reconnect.
+            if let Some(state) = app.try_state::<AppState>() {
+                let relay_url = state.relay_url.lock().map(|g| g.clone()).unwrap_or_default();
+                let token = state.token.lock().map(|g| g.clone().unwrap_or_default()).unwrap_or_default();
+                let device_id = get_device_id(&app_data_dir);
+                let local_gateway_url = state.server_url.lock().map(|g| g.clone()).unwrap_or_default();
+                let connected_flag = Arc::new(AtomicBool::new(false));
+                let stop_flag = Arc::new(AtomicBool::new(false));
+
+                // Store flags for later access (sync_connected/sync_stop)
+                state.sync_connected.store(false, Ordering::Relaxed);
+                state.sync_stop.store(false, Ordering::Relaxed);
+
+                let connected = connected_flag.clone();
+                let stop = stop_flag.clone();
+
+                tauri::async_runtime::spawn(async move {
+                    // Wait for gateway to start before connecting device-link
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                    device_link::run_device_link_client(
+                        relay_url,
+                        token,
+                        device_id,
+                        local_gateway_url,
+                        connected,
+                        stop,
+                    )
+                    .await;
+                });
+            }
 
             #[cfg(debug_assertions)]
             {
