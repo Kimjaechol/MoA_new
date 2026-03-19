@@ -38,7 +38,7 @@ const AUTO_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
 // Lazy-load Tauri invoke for document pre-processing
 let tauriInvoke: ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null = null;
 try {
-  const tauri = (window as Record<string, unknown>).__TAURI__;
+  const tauri = (window as unknown as Record<string, unknown>).__TAURI__;
   if (tauri && typeof tauri === "object") {
     tauriInvoke = (tauri as Record<string, (cmd: string, args?: Record<string, unknown>) => Promise<unknown>>).invoke;
   }
