@@ -12,6 +12,62 @@ import {
   SUPPORTED_CHAT_EXTENSIONS,
   type AttachmentFile,
 } from "../lib/chat-attachments";
+import { apiClient } from "../lib/api";
+import { isTauri } from "../lib/tauri-bridge";
+
+// ---------------------------------------------------------------------------
+// Free browser-native STT / TTS helpers (Web Speech API — zero cost)
+// ---------------------------------------------------------------------------
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function createSpeechRecognition(lang: string) {
+  const W = window as any;
+  const SR = W.SpeechRecognition ?? W.webkitSpeechRecognition;
+  if (!SR) return null;
+  const r = new SR();
+  r.lang = lang;
+  r.interimResults = true;
+  r.continuous = true;
+  r.maxAlternatives = 1;
+  return r;
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+function speakText(text: string, lang: string, onEnd?: () => void) {
+  const plain = text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/#{1,6}\s*/g, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[-*_]{3,}/g, "")
+    .trim();
+  if (!plain) { onEnd?.(); return; }
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(plain);
+  u.lang = lang;
+  u.rate = 1.0;
+  if (onEnd) { u.onend = onEnd; u.onerror = onEnd; }
+  window.speechSynthesis.speak(u);
+}
+
+/** Detect BCP-47 tag from text (simplified — covers CJK + Latin top languages). */
+function detectLang(text: string): string {
+  let ko = 0, ja = 0, zh = 0, latin = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if ((cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x1100 && cp <= 0x11FF)) { ko++; continue; }
+    if ((cp >= 0x3040 && cp <= 0x309F) || (cp >= 0x30A0 && cp <= 0x30FF)) { ja++; continue; }
+    if ((cp >= 0x4E00 && cp <= 0x9FFF)) { zh++; continue; }
+    if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A)) latin++;
+  }
+  if (ko > 0) return "ko-KR";
+  if (ja > 0) return "ja-JP";
+  if (zh > 0) return "zh-CN";
+  if (latin > 0) return "en-US";
+  return navigator.language || "en-US";
+}
 
 interface ChatProps {
   chat: ChatSession | null;
@@ -20,6 +76,7 @@ interface ChatProps {
   onSendMessage: (content: string, attachments?: AttachmentFile[]) => Promise<void>;
   onRetry: (messages: ChatMessage[]) => void;
   onOpenSettings: () => void;
+  onOpenInterpreter?: () => void;
   onToggleSidebar: () => void;
   sidebarOpen: boolean;
 }
@@ -31,6 +88,7 @@ export function Chat({
   onSendMessage,
   onRetry,
   onOpenSettings,
+  onOpenInterpreter: _onOpenInterpreter,
   onToggleSidebar,
   sidebarOpen,
 }: ChatProps) {
@@ -42,6 +100,30 @@ export function Chat({
     show: boolean;
     pendingFiles: AttachmentFile[];
   }>({ show: false, pendingFiles: [] });
+
+  // ── Free browser-native STT/TTS state ──
+  const [listening, setListening] = useState(false);
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [chatLang, setChatLang] = useState(() => navigator.language || "en-US");
+  const recognitionRef = useRef<ReturnType<typeof createSpeechRecognition> | null>(null);
+  const voiceModeRef = useRef(false);
+  const chatLangRef = useRef(chatLang);
+  useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
+  useEffect(() => { chatLangRef.current = chatLang; }, [chatLang]);
+
+  // Cleanup STT + TTS on unmount
+  useEffect(() => {
+    return () => { recognitionRef.current?.stop(); window.speechSynthesis.cancel(); };
+  }, []);
+
+  // Workspace connect state (moved from Sidebar)
+  const [showGitHubInput, setShowGitHubInput] = useState(false);
+  const [gitHubUrl, setGitHubUrl] = useState("");
+  const [workspaceStatus, setWorkspaceStatus] = useState<string | null>(null);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [connectedWorkspace, setConnectedWorkspace] = useState<string | null>(
+    () => apiClient.getWorkspacePath(),
+  );
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -139,8 +221,83 @@ export function Chat({
     [input, isLoading, attachments],
   );
 
+  // ── STT: start listening (internal helper) ──
+  const startListening = useCallback((lang: string) => {
+    const recognition = createSpeechRecognition(lang);
+    if (!recognition) return;
+    let finalTranscript = "";
+    recognition.onresult = (event: { results: SpeechRecognitionResultList }) => {
+      let interim = "";
+      finalTranscript = "";
+      for (let i = 0; i < event.results.length; i++) {
+        const r = event.results[i];
+        if (!r?.[0]) continue;
+        if (r.isFinal) finalTranscript += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+      setInput(finalTranscript + interim);
+    };
+    recognition.onerror = (e: { error?: string }) => {
+      if (e.error === "no-speech" || e.error === "aborted") return;
+      setListening(false);
+      setVoiceMode(false);
+    };
+    recognition.onend = () => {
+      if (voiceModeRef.current && finalTranscript.trim()) {
+        setInput(finalTranscript.trim());
+        // Auto-send on next tick
+        setTimeout(() => {
+          const btn = document.querySelector("[data-voice-send]") as HTMLButtonElement | null;
+          btn?.click();
+        }, 50);
+      } else if (voiceModeRef.current) {
+        setTimeout(() => {
+          if (voiceModeRef.current) startListening(chatLangRef.current);
+        }, 300);
+      } else {
+        setListening(false);
+      }
+    };
+    recognitionRef.current = recognition;
+    recognition.start();
+    setListening(true);
+  }, []);
+
+  // Toggle voice mode on/off
+  const toggleVoiceMode = useCallback(() => {
+    if (listening || voiceMode) {
+      recognitionRef.current?.stop();
+      window.speechSynthesis.cancel();
+      setListening(false);
+      setVoiceMode(false);
+      return;
+    }
+    setVoiceMode(true);
+    startListening(chatLang);
+  }, [listening, voiceMode, chatLang, startListening]);
+
+  // ── Auto-TTS: when voice mode is on, read the latest agent response aloud ──
+  const prevMsgCountRef = useRef(messages.length);
+  useEffect(() => {
+    if (!voiceModeRef.current) { prevMsgCountRef.current = messages.length; return; }
+    if (messages.length > prevMsgCountRef.current) {
+      const last = messages[messages.length - 1];
+      if (last && last.role === "assistant") {
+        recognitionRef.current?.stop();
+        speakText(last.content, chatLangRef.current, () => {
+          if (voiceModeRef.current) startListening(chatLangRef.current);
+        });
+      }
+    }
+    prevMsgCountRef.current = messages.length;
+  }, [messages.length, startListening]);
+
   const doSend = useCallback(
     async (text: string, files: AttachmentFile[]) => {
+      // Detect language from user input for TTS
+      const detected = detectLang(text);
+      if (detected !== chatLang) setChatLang(detected);
+
       setInput("");
       setAttachments([]);
       setDocInfoDismissed(false);
@@ -185,6 +342,57 @@ export function Chat({
       el.style.height = "auto";
       el.style.height = Math.min(el.scrollHeight, 120) + "px";
     }
+  }, []);
+
+  // ── Workspace handlers (moved from Sidebar) ──────────────────
+
+  const handleConnectFolder = useCallback(async () => {
+    if (workspaceLoading) return;
+    try {
+      if (isTauri()) {
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const selected = await open({ directory: true, multiple: false });
+        if (!selected) return;
+        const dirPath = typeof selected === "string" ? selected : selected[0];
+        if (!dirPath) return;
+        setWorkspaceLoading(true);
+        const resolved = await apiClient.setWorkspaceDir(dirPath);
+        setConnectedWorkspace(resolved);
+        setWorkspaceStatus(locale === "ko" ? "폴더가 연결되었습니다" : "Folder connected");
+        setTimeout(() => setWorkspaceStatus(null), 3000);
+      }
+    } catch (err) {
+      setWorkspaceStatus(err instanceof Error ? err.message : "Error");
+      setTimeout(() => setWorkspaceStatus(null), 4000);
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }, [workspaceLoading, locale]);
+
+  const handleConnectGitHub = useCallback(async () => {
+    const url = gitHubUrl.trim();
+    if (!url || workspaceLoading) return;
+    setWorkspaceLoading(true);
+    setWorkspaceStatus(null);
+    try {
+      const resolved = await apiClient.connectGitHubRepo(url);
+      setConnectedWorkspace(resolved);
+      setWorkspaceStatus(locale === "ko" ? "저장소가 연결되었습니다" : "Repository connected");
+      setGitHubUrl("");
+      setShowGitHubInput(false);
+      setTimeout(() => setWorkspaceStatus(null), 3000);
+    } catch (err) {
+      setWorkspaceStatus(err instanceof Error ? err.message : "Error");
+      setTimeout(() => setWorkspaceStatus(null), 4000);
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }, [gitHubUrl, workspaceLoading, locale]);
+
+  const handleDisconnectWorkspace = useCallback(() => {
+    apiClient.disconnectWorkspace();
+    setConnectedWorkspace(null);
+    setWorkspaceStatus(null);
   }, []);
 
   const canSend =
@@ -340,6 +548,57 @@ export function Chat({
           </div>
         )}
 
+        {/* Connected workspace indicator */}
+        {connectedWorkspace && (
+          <div className="chat-workspace-indicator">
+            <div className="chat-workspace-dot" />
+            <span className="chat-workspace-path" title={connectedWorkspace}>
+              {connectedWorkspace.split("/").pop() || connectedWorkspace}
+            </span>
+            <button
+              className="chat-workspace-disconnect"
+              onClick={handleDisconnectWorkspace}
+              title={locale === "ko" ? "연결 해제" : "Disconnect"}
+            >
+              {"\u2715"}
+            </button>
+          </div>
+        )}
+
+        {/* GitHub URL input (expandable) */}
+        {showGitHubInput && (
+          <div className="chat-github-input-row">
+            <input
+              className="chat-github-input"
+              type="text"
+              value={gitHubUrl}
+              onChange={(e) => setGitHubUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleConnectGitHub(); }}
+              placeholder={t("connect_github_placeholder", locale)}
+            />
+            <button
+              className="chat-github-ok-btn"
+              disabled={!gitHubUrl.trim() || workspaceLoading}
+              onClick={handleConnectGitHub}
+            >
+              {workspaceLoading ? "..." : "OK"}
+            </button>
+            <button
+              className="chat-github-cancel-btn"
+              onClick={() => { setShowGitHubInput(false); setGitHubUrl(""); }}
+            >
+              {"\u2715"}
+            </button>
+          </div>
+        )}
+
+        {/* Workspace status message */}
+        {workspaceStatus && (
+          <div className={`chat-workspace-status ${workspaceStatus.includes("Error") || workspaceStatus.includes("failed") ? "error" : "success"}`}>
+            {workspaceStatus}
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="chat-input-wrapper">
           {/* File attachment button */}
           <button
@@ -382,6 +641,7 @@ export function Chat({
           />
           <button
             type="submit"
+            data-voice-send
             className="chat-send-btn"
             disabled={!canSend}
             aria-label={t("send", locale)}
@@ -392,6 +652,65 @@ export function Chat({
             </svg>
           </button>
         </form>
+
+        {/* Action buttons row: folder, github, microphone */}
+        <div className="chat-action-buttons">
+          <button
+            type="button"
+            className="chat-action-btn"
+            onClick={handleConnectFolder}
+            disabled={workspaceLoading || !isConnected}
+            title={locale === "ko" ? "폴더 연결" : "Connect folder"}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+            </svg>
+            <span>{locale === "ko" ? "폴더 연결" : "Folder"}</span>
+          </button>
+          <button
+            type="button"
+            className="chat-action-btn"
+            onClick={() => setShowGitHubInput((prev) => !prev)}
+            disabled={workspaceLoading || !isConnected}
+            title={locale === "ko" ? "GitHub 연결" : "Connect GitHub"}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22" />
+            </svg>
+            <span>GitHub</span>
+          </button>
+          <button
+            type="button"
+            className={`chat-action-btn chat-mic-btn${voiceMode ? " chat-mic-active" : ""}`}
+            onClick={toggleVoiceMode}
+            disabled={!isConnected}
+            title={locale === "ko"
+              ? (voiceMode ? "음성 모드 중지" : "음성 모드 (무료 STT/TTS)")
+              : (voiceMode ? "Stop voice mode" : "Voice mode (free STT/TTS)")}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              {voiceMode || listening ? (
+                <>{/* MicOff icon */}
+                  <line x1="1" y1="1" x2="23" y2="23" />
+                  <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
+                  <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2c0 .76-.13 1.49-.35 2.17" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </>
+              ) : (
+                <>{/* Mic icon */}
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </>
+              )}
+            </svg>
+            <span>{voiceMode
+              ? (locale === "ko" ? "중지" : "Stop")
+              : (locale === "ko" ? "음성" : "Voice")}</span>
+          </button>
+        </div>
       </div>
     </div>
   );
