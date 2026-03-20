@@ -5,7 +5,6 @@ import { deriveChatTitle } from "../lib/storage";
 import type { DeviceInfo, ToolInfo, ChannelInfo } from "../lib/api";
 import { apiClient } from "../lib/api";
 import { ChannelGuide } from "./ChannelGuide";
-import { isTauri } from "../lib/tauri-bridge";
 
 interface SidebarProps {
   chats: ChatSession[];
@@ -276,65 +275,7 @@ export function Sidebar({
   // Channel guide modal state
   const [guideChannel, setGuideChannel] = useState<string | null>(null);
 
-  // Workspace connect state
-  const [showGitHubInput, setShowGitHubInput] = useState(false);
-  const [gitHubUrl, setGitHubUrl] = useState("");
-  const [workspaceStatus, setWorkspaceStatus] = useState<string | null>(null);
-  const [workspaceLoading, setWorkspaceLoading] = useState(false);
-
-  // Track persistent workspace connection state
-  const [connectedWorkspace, setConnectedWorkspace] = useState<string | null>(
-    () => apiClient.getWorkspacePath(),
-  );
-
-  const handleConnectFolder = useCallback(async () => {
-    if (workspaceLoading) return;
-    try {
-      if (isTauri()) {
-        const { open } = await import("@tauri-apps/plugin-dialog");
-        const selected = await open({ directory: true, multiple: false });
-        if (!selected) return;
-        const dirPath = typeof selected === "string" ? selected : selected[0];
-        if (!dirPath) return;
-        setWorkspaceLoading(true);
-        const resolved = await apiClient.setWorkspaceDir(dirPath);
-        setConnectedWorkspace(resolved);
-        setWorkspaceStatus(locale === "ko" ? "폴더가 연결되었습니다" : "Folder connected");
-        setTimeout(() => setWorkspaceStatus(null), 3000);
-      }
-    } catch (err) {
-      setWorkspaceStatus(err instanceof Error ? err.message : "Error");
-      setTimeout(() => setWorkspaceStatus(null), 4000);
-    } finally {
-      setWorkspaceLoading(false);
-    }
-  }, [workspaceLoading, locale]);
-
-  const handleConnectGitHub = useCallback(async () => {
-    const url = gitHubUrl.trim();
-    if (!url || workspaceLoading) return;
-    setWorkspaceLoading(true);
-    setWorkspaceStatus(null);
-    try {
-      const resolved = await apiClient.connectGitHubRepo(url);
-      setConnectedWorkspace(resolved);
-      setWorkspaceStatus(locale === "ko" ? "저장소가 연결되었습니다" : "Repository connected");
-      setGitHubUrl("");
-      setShowGitHubInput(false);
-      setTimeout(() => setWorkspaceStatus(null), 3000);
-    } catch (err) {
-      setWorkspaceStatus(err instanceof Error ? err.message : "Error");
-      setTimeout(() => setWorkspaceStatus(null), 4000);
-    } finally {
-      setWorkspaceLoading(false);
-    }
-  }, [gitHubUrl, workspaceLoading, locale]);
-
-  const handleDisconnectWorkspace = useCallback(() => {
-    apiClient.disconnectWorkspace();
-    setConnectedWorkspace(null);
-    setWorkspaceStatus(null);
-  }, []);
+  // Workspace connect state moved to Chat.tsx (action buttons row)
 
   // Merge API-key-requiring tools that aren't in the backend list, then sort A-Z
   const sortedTools = useMemo(() => {
