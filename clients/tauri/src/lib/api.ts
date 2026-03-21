@@ -503,7 +503,7 @@ export class MoAClient {
    * Assert that the local gateway is reachable.
    * Retries once after a short delay to handle transient failures
    * (e.g. gateway still starting up, brief network hiccup).
-   * Throws a user-friendly error if not.
+   * Does NOT throw — chat() will fall back to relay if gateway is down.
    */
   private async requireGateway(): Promise<void> {
     if (this.gatewayAlive) return; // fast path — last check was ok
@@ -511,10 +511,8 @@ export class MoAClient {
     if (alive) return;
     // Retry once after 1s — handles gateway startup race
     await new Promise((r) => setTimeout(r, 1000));
-    const retryAlive = await this.checkGatewayHealth();
-    if (!retryAlive) {
-      throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
-    }
+    await this.checkGatewayHealth();
+    // No throw — chat() handles relay fallback
   }
 
   // ── Heartbeat ──────────────────────────────────────────────────
@@ -697,72 +695,67 @@ export class MoAClient {
     };
 
     // ── Determine routing ──
-    // ★ Local-first: when user has their own API key, ALL chat goes through
-    // the local gateway only — never fall back to Railway relay.
-    // This ensures the user's key is used directly and chat stays local.
-    // Fallback to relay is only allowed when NO local key is available
-    // (proxy mode: local gateway routes LLM calls through Railway proxy).
-    const primaryUrl = this.serverUrl;
+    // ★ Local-first with relay fallback:
+    // 1. If local gateway is alive → try local first, relay as fallback
+    // 2. If local gateway is NOT alive → try relay directly (skip local timeout)
+    // 3. When user has their own API key → include it in both local and relay requests
+    const localAlive = this.gatewayAlive;
 
-    // ── Try local gateway ──
-    let res = await this.tryChatRequest(primaryUrl, body);
+    if (localAlive) {
+      // ── Try local gateway first ──
+      let res = await this.tryChatRequest(this.serverUrl, body);
 
-    if (res !== null) {
-      // Local gateway connected — check for fallback-eligible errors.
-      // ★ Only fall back to relay when user has NO local API key.
-      // When user has their own key, errors are shown directly (no relay detour).
-      if (!res.ok && (res.status === 400 || res.status === 500) && !hasSelectedProviderKey) {
-        const errorText = await res.text().catch(() => "");
-        let shouldFallback = false;
-        let errorJson: Record<string, unknown> = {};
-        try {
-          errorJson = JSON.parse(errorText);
-          shouldFallback = errorJson.fallback_to_relay === true
-            || errorJson.code === "missing_api_key"
-            || errorJson.code === "provider_auth_error";
-          if (!shouldFallback) {
-            const errMsg = (errorJson.error as string) || "";
-            shouldFallback = errMsg.includes("401")
-              || errMsg.includes("Unauthorized")
-              || errMsg.includes("authentication")
-              || errMsg.includes("API key");
+      if (res !== null) {
+        // Local gateway connected — check for fallback-eligible errors
+        if (!res.ok && (res.status === 400 || res.status === 500) && !hasSelectedProviderKey) {
+          const errorText = await res.text().catch(() => "");
+          let shouldFallback = false;
+          let errorJson: Record<string, unknown> = {};
+          try {
+            errorJson = JSON.parse(errorText);
+            shouldFallback = errorJson.fallback_to_relay === true
+              || errorJson.code === "missing_api_key"
+              || errorJson.code === "provider_auth_error";
+            if (!shouldFallback) {
+              const errMsg = (errorJson.error as string) || "";
+              shouldFallback = errMsg.includes("401")
+                || errMsg.includes("Unauthorized")
+                || errMsg.includes("authentication")
+                || errMsg.includes("API key");
+            }
+          } catch {
+            shouldFallback = errorText.includes("API key")
+              || errorText.includes("Unauthorized")
+              || errorText.includes("authentication");
           }
-        } catch {
-          shouldFallback = errorText.includes("API key")
-            || errorText.includes("Unauthorized")
-            || errorText.includes("authentication");
+
+          if (shouldFallback) {
+            const fallbackBody = { ...body, api_key: undefined };
+            const fallbackRes = await this.tryChatRequest(this.relayUrl, fallbackBody);
+            if (fallbackRes !== null && fallbackRes.ok) {
+              return this.parseChatResponse(fallbackRes);
+            }
+          }
+
+          const rawError = (errorJson.error as string) || errorText || "";
+          const errorMessage = this.sanitizeErrorForDisplay(rawError)
+            || `Chat request failed (${res.status})`;
+          throw new Error(errorMessage);
         }
 
-        if (shouldFallback) {
-          const fallbackBody = { ...body, api_key: undefined };
-          const fallbackRes = await this.tryChatRequest(this.relayUrl, fallbackBody);
-          if (fallbackRes !== null && fallbackRes.ok) {
-            return this.parseChatResponse(fallbackRes);
-          }
-        }
-
-        // Fallback didn't work — sanitize error for user-friendly display
-        const rawError = (errorJson.error as string) || errorText || "";
-        const errorMessage = this.sanitizeErrorForDisplay(rawError)
-          || `Chat request failed (${res.status})`;
-        throw new Error(errorMessage);
+        return this.parseChatResponse(res);
       }
 
-      return this.parseChatResponse(res);
+      // Local gateway unreachable — mark as down and fall through to relay
+      this.gatewayAlive = false;
     }
 
-    // ── Local gateway unreachable (network error) ──
-    // ★ When user has their own API key, do NOT fall back to relay.
-    // The user explicitly wants local-only chat.
-    if (hasSelectedProviderKey) {
-      throw new Error(
-        "Cannot connect to local MoA server. Please check that the local server is running.",
-      );
-    }
-
-    // No local key — try relay server as fallback
-    const fallbackBody = { ...body, api_key: undefined };
-    res = await this.tryChatRequest(this.relayUrl, fallbackBody);
+    // ── Try relay server (local gateway is down or unreachable) ──
+    // Include API key in relay request if user has one, so relay can use it
+    const relayBody = hasSelectedProviderKey
+      ? body
+      : { ...body, api_key: undefined };
+    const res = await this.tryChatRequest(this.relayUrl, relayBody);
 
     if (res !== null) {
       return this.parseChatResponse(res);
