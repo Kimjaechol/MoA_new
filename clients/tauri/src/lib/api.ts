@@ -3,6 +3,7 @@ import {
   getSyncStatus,
   triggerFullSync,
   getPlatformInfo,
+  getDeviceFingerprint,
   disconnectBackend,
   setServerUrl as setBackendServerUrl,
   type SyncStatus,
@@ -177,6 +178,7 @@ export class MoAClient {
 
   async login(username: string, password: string): Promise<LoginResponse> {
     const deviceName = await this.getDeviceName();
+    const fingerprint = await getDeviceFingerprint();
     const res = await fetch(`${this.relayUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -185,6 +187,7 @@ export class MoAClient {
         password,
         device_id: this.deviceId,
         device_name: deviceName,
+        fingerprint,
       }),
     });
 
@@ -193,7 +196,13 @@ export class MoAClient {
       throw new Error(data.error || `Login failed (${res.status})`);
     }
 
-    const data: LoginResponse = await res.json();
+    const data: LoginResponse & { resolved_device_id?: string } = await res.json();
+
+    // If server matched an existing device by fingerprint, adopt that device_id
+    if (data.resolved_device_id) {
+      this.deviceId = data.resolved_device_id;
+      localStorage.setItem(STORAGE_KEY_DEVICE_ID, data.resolved_device_id);
+    }
 
     // Save auth state
     this.token = data.token;
@@ -295,7 +304,8 @@ export class MoAClient {
   async registerDevice(deviceName: string, platform?: string): Promise<void> {
     if (!this.token) return;
 
-    await fetch(`${this.relayUrl}/api/auth/devices`, {
+    const fingerprint = await getDeviceFingerprint();
+    const res = await fetch(`${this.relayUrl}/api/auth/devices`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -305,8 +315,18 @@ export class MoAClient {
         device_id: this.deviceId,
         device_name: deviceName,
         platform,
+        fingerprint,
       }),
     });
+
+    if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      // If server matched an existing device by fingerprint, adopt that device_id
+      if (data.resolved_device_id) {
+        this.deviceId = data.resolved_device_id;
+        localStorage.setItem(STORAGE_KEY_DEVICE_ID, data.resolved_device_id);
+      }
+    }
   }
 
   async setDevicePairingCode(deviceId: string, code: string | null): Promise<void> {
