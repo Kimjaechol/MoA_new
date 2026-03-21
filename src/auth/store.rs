@@ -114,8 +114,7 @@ impl AuthStore {
                 fingerprint TEXT,
                 last_seen INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
-            CREATE INDEX IF NOT EXISTS idx_devices_fingerprint ON devices(fingerprint);",
+            CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);",
         )?;
 
         // Migration: add pairing_code_hash column if missing
@@ -131,11 +130,13 @@ impl AuthStore {
             .prepare("SELECT fingerprint FROM devices LIMIT 0")
             .is_ok();
         if !has_fingerprint {
-            let _ = conn.execute_batch(
-                "ALTER TABLE devices ADD COLUMN fingerprint TEXT;
-                 CREATE INDEX IF NOT EXISTS idx_devices_fingerprint ON devices(fingerprint);",
-            );
+            let _ = conn.execute_batch("ALTER TABLE devices ADD COLUMN fingerprint TEXT;");
         }
+
+        // Create fingerprint index after ensuring column exists (both fresh and migrated DBs)
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_devices_fingerprint ON devices(fingerprint);",
+        );
 
         // Migration: add email column to users table if missing
         let has_email: bool = conn.prepare("SELECT email FROM users LIMIT 0").is_ok();
