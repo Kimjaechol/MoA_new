@@ -304,6 +304,13 @@ export class MoAClient {
     return data.devices || [];
   }
 
+  /** Register this device with its real platform name (e.g. "MoA windows Desktop"). */
+  async registerCurrentDevice(): Promise<void> {
+    const name = await this.getDeviceName();
+    const info = await getPlatformInfo();
+    return this.registerDevice(name, info?.os);
+  }
+
   async registerDevice(deviceName: string, platform?: string): Promise<void> {
     if (!this.token) return;
 
@@ -1076,15 +1083,20 @@ export class MoAClient {
     return this.workspacePath;
   }
 
-  /** Set the workspace directory on the local gateway. */
+  /** Set the workspace directory on the local gateway.
+   *  Also grants folder access (SecurityPolicy allowed_roots) automatically,
+   *  so all file tools (file_read, file_write, file_edit, etc.) work immediately. */
   async setWorkspaceDir(dirPath: string): Promise<string> {
     await this.requireGateway();
+    const headers = {
+      "Content-Type": "application/json",
+      ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+    };
+
+    // 1. Set workspace_dir in config
     const res = await fetch(`${this.serverUrl}/api/workspace`, {
       method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
+      headers,
       body: JSON.stringify({ path: dirPath }),
     });
     if (!res.ok) {
@@ -1094,18 +1106,34 @@ export class MoAClient {
     const data = await res.json();
     this.workspaceConnected = true;
     this.workspacePath = data.workspace_dir ?? dirPath;
+
+    // 2. Also grant folder access (SecurityPolicy allowed_roots)
+    //    This enables file_read/file_write/file_edit/glob_search etc.
+    //    The user clicking "폴더 연결" is implicit consent for folder access.
+    try {
+      await fetch(`${this.serverUrl}/api/workspace/folder`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ path: this.workspacePath }),
+      });
+    } catch {
+      // Non-critical — workspace is set, tools may still work within workspace_dir
+    }
+
     return this.workspacePath!;
   }
 
-  /** Clone a GitHub repo and set it as workspace. */
+  /** Clone a GitHub repo and set it as workspace.
+   *  Also grants folder access automatically after clone. */
   async connectGitHubRepo(repoUrl: string): Promise<string> {
     await this.requireGateway();
+    const headers = {
+      "Content-Type": "application/json",
+      ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+    };
     const res = await fetch(`${this.serverUrl}/api/workspace`, {
       method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
+      headers,
       body: JSON.stringify({ git_url: repoUrl }),
     });
     if (!res.ok) {
@@ -1115,6 +1143,18 @@ export class MoAClient {
     const data = await res.json();
     this.workspaceConnected = true;
     this.workspacePath = data.workspace_dir ?? repoUrl;
+
+    // Grant folder access for cloned repo
+    try {
+      await fetch(`${this.serverUrl}/api/workspace/folder`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ path: this.workspacePath }),
+      });
+    } catch {
+      // Non-critical
+    }
+
     return this.workspacePath!;
   }
 

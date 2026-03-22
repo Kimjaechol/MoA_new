@@ -402,7 +402,7 @@ function App() {
     if (devices.length <= 1) {
       // 0 or 1 device → auto-connect
       if (devices.length === 0) {
-        apiClient.registerDevice("MoA Device").catch(() => {});
+        apiClient.registerCurrentDevice().catch(() => {});
       }
       proceedToChat();
     } else {
