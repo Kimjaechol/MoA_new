@@ -588,7 +588,11 @@ export class MoAClient {
 
   private async sendHeartbeat(): Promise<void> {
     if (!this.token) return;
-    const heartbeatBody = JSON.stringify({ device_id: this.deviceId });
+    const fingerprint = await getDeviceFingerprint();
+    const heartbeatBody = JSON.stringify({
+      device_id: this.deviceId,
+      fingerprint: fingerprint || undefined,
+    });
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${this.token}`,
@@ -596,13 +600,14 @@ export class MoAClient {
 
     // Try local gateway first
     try {
-      await fetch(`${this.serverUrl}/api/auth/heartbeat`, {
+      const res = await fetch(`${this.serverUrl}/api/auth/heartbeat`, {
         method: "POST",
         headers,
         body: heartbeatBody,
       });
       this.gatewayAlive = true;
       this.heartbeatFailCount = 0;
+      await this.handleHeartbeatDeviceResolution(res);
       return;
     } catch {
       // Local failed — try relay
@@ -610,11 +615,12 @@ export class MoAClient {
 
     // Local unreachable — try relay heartbeat
     try {
-      await fetch(`${this.relayUrl}/api/auth/heartbeat`, {
+      const res = await fetch(`${this.relayUrl}/api/auth/heartbeat`, {
         method: "POST",
         headers,
         body: heartbeatBody,
       });
+      await this.handleHeartbeatDeviceResolution(res);
       // Relay works but local is down
       this.heartbeatFailCount += 1;
       if (this.heartbeatFailCount >= 2) {
@@ -625,6 +631,19 @@ export class MoAClient {
       if (this.heartbeatFailCount >= 2) {
         this.gatewayAlive = false;
       }
+    }
+  }
+
+  /** If heartbeat response resolves a different device_id via fingerprint, adopt it. */
+  private async handleHeartbeatDeviceResolution(res: Response): Promise<void> {
+    try {
+      const data = await res.json();
+      if (data.resolved_device_id && data.resolved_device_id !== this.deviceId) {
+        this.deviceId = data.resolved_device_id;
+        localStorage.setItem(STORAGE_KEY_DEVICE_ID, data.resolved_device_id);
+      }
+    } catch {
+      // Non-JSON or parse error — ignore
     }
   }
 
