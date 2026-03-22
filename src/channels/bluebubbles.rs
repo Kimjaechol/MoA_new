@@ -519,6 +519,7 @@ impl BlueBubblesChannel {
             channel: "bluebubbles".to_string(),
             timestamp,
             thread_ts: None,
+            silent: false,
         });
 
         messages

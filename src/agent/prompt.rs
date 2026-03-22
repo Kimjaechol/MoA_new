@@ -330,12 +330,23 @@ impl PromptSection for OntologySection {
 
         // Load user preferences from ontology to inject into the prompt.
         let mut out = String::from(
-            "## Ontology\n\n\
+            "## Ontology (Long-Term Structured Memory)\n\n\
              A structured knowledge graph models the user's world as Objects, Links, and Actions.\n\
              Types: User, Contact, Device, Channel, Task, Project, Document, Meeting, Context, Preference\n\n\
              Tools: `ontology_get_context` (world state), `ontology_search_objects` (find), \
              `ontology_execute_action` (act — auto-logs + updates graph).\n\
-             Preferences persist across sessions; check before decisions.\n",
+             Preferences persist across sessions; check before decisions.\n\n\
+             ### Conversation-to-Ontology Consolidation (CRITICAL)\n\n\
+             You MUST actively consolidate important conversation content into the ontology:\n\
+             - When the user mentions a **person** → create/update a Contact object with their details.\n\
+             - When the user mentions an **event/meeting/deadline** → create a Meeting/Task object.\n\
+             - When the user states a **preference** → create/update a Preference object.\n\
+             - When a **relationship** between entities is revealed → create appropriate Links.\n\
+             - When the user shares **professional context** → update their User profile properties.\n\
+             - After tool use or significant actions → log via execute_action for audit trail.\n\n\
+             Do this **during every conversation turn** where new information is revealed — \
+             do not wait for an explicit request to remember. The ontology is your long-term \
+             structured brain that persists and syncs across all devices.\n",
         );
 
         // Attempt to load preferences from workspace ontology DB.

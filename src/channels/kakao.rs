@@ -561,6 +561,7 @@ async fn handle_webhook(
                 channel: "kakao".to_string(),
                 timestamp: current_epoch_secs(),
                 thread_ts: None,
+                silent: false,
             };
 
             if state.tx.send(channel_msg).await.is_err() {
@@ -601,6 +602,7 @@ async fn handle_webhook(
             channel: "kakao".to_string(),
             timestamp: current_epoch_secs(),
             thread_ts: None,
+            silent: false,
         };
 
         if state.tx.send(channel_msg).await.is_err() {
@@ -656,6 +658,7 @@ async fn handle_webhook(
             channel: "kakao".to_string(),
             timestamp: current_epoch_secs(),
             thread_ts: None,
+            silent: false,
         };
 
         if state.tx.send(channel_msg).await.is_err() {
