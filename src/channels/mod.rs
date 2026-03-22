@@ -3791,12 +3791,6 @@ or tune thresholds in config.",
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let had_prior_history = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .is_some_and(|turns| !turns.is_empty());
 
     // Inject per-message timestamp so the LLM always knows the current time,
     // even in multi-turn conversations where the system prompt may be stale.
@@ -3831,10 +3825,11 @@ or tune thresholds in config.",
                 last_turn.content = timestamped_content.clone();
             }
 
-            // Only enrich with memory context when there is no prior
-            // conversation history. Follow-up turns already include context
-            // from previous messages.
-            if !had_prior_history {
+            // Enrich every user turn with relevant memory context so the LLM
+            // can reference long-term knowledge even in follow-up messages.
+            // Memory recall is cheap (cached FTS5 + vector) and prevents
+            // context loss when conversation history is compacted or trimmed.
+            {
                 let memory_context = build_memory_context(
                     ctx.memory.as_ref(),
                     &msg.content,
@@ -4237,17 +4232,50 @@ or tune thresholds in config.",
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
-            if ctx.auto_save_memory
-                && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            {
-                let assistant_key = assistant_memory_key(&msg);
+
+            // Persist conversation history to session backend (SQLite/memory)
+            // so context survives restarts and is available for future turns.
+            if let Some(ref sess) = session {
+                let snapshot: Vec<ChatMessage> = ctx
+                    .conversation_histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&history_key)
+                    .cloned()
+                    .unwrap_or_default();
+                if !snapshot.is_empty() {
+                    if let Err(err) = sess.update_history(snapshot).await {
+                        tracing::warn!("Failed to persist session history: {err}");
+                    }
+                }
+            }
+
+            // Save structured conversation turn (Q&A pair) to long-term memory.
+            // This enables recall of full conversation context (who asked what,
+            // what was answered) even after session compaction or restart.
+            if ctx.auto_save_memory {
+                let now_ts = chrono::Local::now();
+                let turn_key = format!(
+                    "conv_turn_{}_{}_{}",
+                    msg.channel,
+                    msg.sender,
+                    now_ts.format("%Y%m%d_%H%M%S")
+                );
+                let structured_turn = format!(
+                    "[{}] Channel: {} | Sender: {}\nQ: {}\nA: {}",
+                    now_ts.format("%Y-%m-%d %H:%M:%S"),
+                    msg.channel,
+                    msg.sender,
+                    truncate_with_ellipsis(&msg.content, 500),
+                    truncate_with_ellipsis(&delivered_response, 1000),
+                );
                 let _ = ctx
                     .memory
                     .store(
-                        &assistant_key,
-                        &delivered_response,
-                        crate::memory::MemoryCategory::Conversation,
-                        None,
+                        &turn_key,
+                        &structured_turn,
+                        crate::memory::MemoryCategory::Core,
+                        Some(&history_key),
                     )
                     .await;
             }

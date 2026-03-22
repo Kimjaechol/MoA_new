@@ -1106,7 +1106,7 @@ pub enum AgentSessionStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentSessionConfig {
     /// Session backend to use. Options: "memory", "sqlite", "none".
-    /// Default: "none" (no persistence).
+    /// Default: "sqlite" (persists conversation history across restarts).
     /// Set to "none" to disable session persistence entirely.
     #[serde(default = "default_agent_session_backend")]
     pub backend: AgentSessionBackend,
@@ -1140,7 +1140,7 @@ fn default_agent_tool_dispatcher() -> String {
 }
 
 fn default_agent_session_backend() -> AgentSessionBackend {
-    AgentSessionBackend::None
+    AgentSessionBackend::Sqlite
 }
 
 fn default_agent_session_strategy() -> AgentSessionStrategy {
