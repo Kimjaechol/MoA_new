@@ -645,9 +645,15 @@ impl WebSearchTool {
         }
 
         // Extract citations if available.
-        let mut out = format!("Search results for: {} (via Perplexity Sonar)\n\n{}", query, answer);
+        let mut out = format!(
+            "Search results for: {} (via Perplexity Sonar)\n\n{}",
+            query, answer
+        );
 
-        if let Some(citations) = parsed.get("citations").and_then(serde_json::Value::as_array) {
+        if let Some(citations) = parsed
+            .get("citations")
+            .and_then(serde_json::Value::as_array)
+        {
             if !citations.is_empty() {
                 out.push_str("\n\nSources:");
                 for (i, cite) in citations.iter().enumerate() {
@@ -1137,7 +1143,10 @@ mod tests {
         );
         let result = tool.execute(json!({"query": "test"})).await.unwrap();
         assert!(!result.success);
-        assert!(result.output.contains("API key") || result.error.as_deref().unwrap_or("").contains("failed"));
+        assert!(
+            result.output.contains("API key")
+                || result.error.as_deref().unwrap_or("").contains("failed")
+        );
     }
 
     #[tokio::test]
@@ -1174,7 +1183,11 @@ mod tests {
         );
         let result = tool.execute(json!({"query": "test"})).await.unwrap();
         assert!(!result.success);
-        assert!(result.output.contains("api_key") || result.output.contains("API key") || result.error.as_deref().unwrap_or("").contains("failed"));
+        assert!(
+            result.output.contains("api_key")
+                || result.output.contains("API key")
+                || result.error.as_deref().unwrap_or("").contains("failed")
+        );
     }
 
     #[test]

@@ -342,7 +342,7 @@ impl KakaoTalkChannel {
 
         let parts: Vec<&str> = trimmed[1..].splitn(2, ' ').collect();
         let command = parts.first()?.to_lowercase();
-        let args = parts.get(1).unwrap_or(&"").to_string();
+        let args = (*parts.get(1).unwrap_or(&"")).to_string();
 
         match command.as_str() {
             "status" => Some(RemoteCommand::Status),

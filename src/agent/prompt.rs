@@ -264,9 +264,7 @@ impl PromptSection for DateTimeSection {
             });
 
         // Convert to home timezone for display
-        let home_tz_parsed: chrono_tz::Tz = home_tz
-            .parse()
-            .unwrap_or(chrono_tz::Asia::Seoul);
+        let home_tz_parsed: chrono_tz::Tz = home_tz.parse().unwrap_or(chrono_tz::Asia::Seoul);
         let home_dt = now_utc.with_timezone(&home_tz_parsed);
 
         // Format day of week in a language-neutral way
@@ -375,13 +373,10 @@ impl PromptSection for OntologySection {
                         "SELECT o.title, o.properties FROM ontology_objects o
                          JOIN ontology_object_types t ON o.type_id = t.id
                          WHERE t.name = 'Preference' AND o.owner_user_id = ?1
-                         ORDER BY o.updated_at DESC LIMIT 20"
+                         ORDER BY o.updated_at DESC LIMIT 20",
                     )?;
                     let rows = stmt.query_map(rusqlite::params![owner_user_id], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                        ))
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                     })?;
                     rows.collect::<Result<Vec<_>, _>>()
                 })();
@@ -485,9 +480,9 @@ impl PromptSection for ToolUsageStrategySection {
         );
 
         // ── Folder access + document pipeline ──
-        let has_file_read = tool_names.iter().any(|n| *n == "file_read");
-        let has_workspace_folder = tool_names.iter().any(|n| *n == "workspace_folder");
-        let has_document_process = tool_names.iter().any(|n| *n == "document_process");
+        let has_file_read = tool_names.contains(&"file_read");
+        let has_workspace_folder = tool_names.contains(&"workspace_folder");
+        let has_document_process = tool_names.contains(&"document_process");
 
         if has_workspace_folder || has_file_read {
             out.push_str(
@@ -545,7 +540,7 @@ impl PromptSection for ToolUsageStrategySection {
         }
 
         // ── 3-tier web search strategy ──
-        let has_web_search = tool_names.iter().any(|n| *n == "web_search");
+        let has_web_search = tool_names.contains(&"web_search");
         if has_web_search {
             out.push_str(
                 "### 3-Tier Web Search & Action Strategy\n\n\
@@ -611,7 +606,7 @@ impl PromptSection for ToolUsageStrategySection {
         }
 
         // Paid tool guidance — only include if relevant tools exist
-        let has_composio = tool_names.iter().any(|n| *n == "composio");
+        let has_composio = tool_names.contains(&"composio");
 
         if has_web_search || has_composio {
             out.push_str(
@@ -744,10 +739,10 @@ impl PromptSection for ToolUsageStrategySection {
         );
 
         // ── All-in-one orchestration: browser + file + shell combined workflows ──
-        let has_browser = tool_names.iter().any(|n| *n == "browser");
-        let has_shell = tool_names.iter().any(|n| *n == "shell");
-        let has_file_write = tool_names.iter().any(|n| *n == "file_write");
-        let has_cron = tool_names.iter().any(|n| *n == "cron_add");
+        let has_browser = tool_names.contains(&"browser");
+        let has_shell = tool_names.contains(&"shell");
+        let has_file_write = tool_names.contains(&"file_write");
+        let has_cron = tool_names.contains(&"cron_add");
 
         if has_browser || has_shell || has_file_write {
             out.push_str(

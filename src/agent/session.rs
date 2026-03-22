@@ -370,7 +370,7 @@ impl SqliteSessionManager {
                 ticker.tick().await;
                 let _ = mgr.cleanup_expired().await;
                 // Also purge old conversation turns (30-day default retention)
-                let _ = mgr.purge_old_turns(30 * 24 * 3600);
+                let _ = mgr.purge_old_turns(30 * 24 * 3600).await;
             }
         });
     }
@@ -480,14 +480,19 @@ impl SqliteSessionManager {
     }
 
     /// Purge turns older than `max_age_secs`. Called periodically by cleanup task.
-    pub fn purge_old_turns(&self, max_age_secs: i64) -> Result<usize> {
+    pub async fn purge_old_turns(&self, max_age_secs: i64) -> Result<usize> {
         let cutoff = unix_seconds_now() - max_age_secs;
-        let conn = self.conn.lock();
-        let removed = conn.execute(
-            "DELETE FROM conversation_turns WHERE created_at < ?1",
-            params![cutoff],
-        )?;
-        Ok(removed)
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let removed = conn.execute(
+                "DELETE FROM conversation_turns WHERE created_at < ?1",
+                params![cutoff],
+            )?;
+            Ok(removed)
+        })
+        .await
+        .context("SQLite blocking task panicked")?
     }
 
     /// Count total tokens stored in conversation_turns (approximate: chars/3).
@@ -557,8 +562,8 @@ impl SessionManager for SqliteSessionManager {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
-            let mut stmt =
-                conn.prepare_cached("SELECT history_json FROM agent_sessions WHERE session_id = ?1")?;
+            let mut stmt = conn
+                .prepare_cached("SELECT history_json FROM agent_sessions WHERE session_id = ?1")?;
             let mut rows = stmt.query(params![session_id])?;
             if let Some(row) = rows.next()? {
                 let json: String = row.get(0)?;

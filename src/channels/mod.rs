@@ -1028,7 +1028,7 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
         "change provider to ",
     ] {
         if let Some(rest) = lower.strip_prefix(prefix) {
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             if is_runtime_token(token) {
                 return resolve_provider_alias(token).or_else(|| Some(token.to_string()));
             }
@@ -1037,7 +1037,7 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
 
     // "use <provider>" — only if it matches a known provider alias
     if let Some(rest) = lower.strip_prefix("use ") {
-        let token = rest.trim().split_whitespace().next()?;
+        let token = rest.split_whitespace().next()?;
         if resolve_provider_alias(token).is_some() {
             return resolve_provider_alias(token);
         }
@@ -1073,7 +1073,7 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
         "sử dụng ",
     ] {
         if let Some(rest) = lower.strip_prefix(prefix) {
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             if is_runtime_token(token) {
                 return resolve_provider_alias(token).or_else(|| Some(token.to_string()));
             }
@@ -1092,11 +1092,10 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
         "प्रदाता बदलें ",
     ] {
         if let Some(rest) = original.strip_prefix(prefix) {
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             let token_lower = token.to_ascii_lowercase();
             if is_runtime_token(&token_lower) {
-                return resolve_provider_alias(&token_lower)
-                    .or_else(|| Some(token_lower));
+                return resolve_provider_alias(&token_lower).or_else(|| Some(token_lower));
             }
         }
     }
@@ -1107,15 +1106,25 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
     // Chinese: "切换", (handled above as prefix)
     for suffix in &[
         // Korean
-        "로 변경", "로 바꿔줘", "로 바꿔", "로 전환",
-        "으로 변경", "으로 바꿔줘", "으로 바꿔", "으로 전환",
+        "로 변경",
+        "로 바꿔줘",
+        "로 바꿔",
+        "로 전환",
+        "으로 변경",
+        "으로 바꿔줘",
+        "으로 바꿔",
+        "으로 전환",
         // Japanese
-        "に変更", "に切り替えて", "に切替", "を使って",
+        "に変更",
+        "に切り替えて",
+        "に切替",
+        "を使って",
         // Hindi
-        " पर स्विच करें", " में बदलें",
+        " पर स्विच करें",
+        " में बदलें",
     ] {
         if let Some(rest) = original.strip_suffix(suffix) {
-            let token = rest.trim().split_whitespace().last()?;
+            let token = rest.split_whitespace().last()?;
             let token_lower = token.to_ascii_lowercase();
             if resolve_provider_alias(&token_lower).is_some() {
                 return resolve_provider_alias(&token_lower);
@@ -1161,7 +1170,7 @@ fn parse_natural_language_switch_model(lower: &str, original: &str) -> Option<St
         "dùng model ",
     ] {
         if let Some(rest) = lower.strip_prefix(prefix) {
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             if is_runtime_token(token) {
                 return Some(token.to_string());
             }
@@ -1171,19 +1180,30 @@ fn parse_natural_language_switch_model(lower: &str, original: &str) -> Option<St
     // Multi-language prefix patterns (original/Unicode)
     for prefix in &[
         // Korean
-        "모델을 ", "모델 ",
+        "모델을 ",
+        "모델 ",
         // Chinese
-        "模型切换到", "模型换成", "切换模型到", "换模型为",
+        "模型切换到",
+        "模型换成",
+        "切换模型到",
+        "换模型为",
         // Japanese
-        "モデルを", "モデル変更 ",
+        "モデルを",
+        "モデル変更 ",
         // Hindi
         "मॉडल बदलें ",
     ] {
         if let Some(rest) = original.strip_prefix(prefix) {
             // Try suffix-based extraction first (Korean/Japanese)
             for suffix in &[
-                "로 변경해줘", "로 변경", "로 바꿔줘", "로 바꿔", "로 전환",
-                "に変更", "に切り替え", "に変更して",
+                "로 변경해줘",
+                "로 변경",
+                "로 바꿔줘",
+                "로 바꿔",
+                "로 전환",
+                "に変更",
+                "に切り替え",
+                "に変更して",
             ] {
                 if let Some(model_part) = rest.strip_suffix(suffix) {
                     let token = model_part.trim();
@@ -1193,7 +1213,7 @@ fn parse_natural_language_switch_model(lower: &str, original: &str) -> Option<St
                 }
             }
             // Fallback: first token
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             let token_lower = token.to_ascii_lowercase();
             if is_runtime_token(&token_lower) {
                 return Some(token_lower);
@@ -2383,11 +2403,7 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
             ""
         };
         if provider.aliases.is_empty() {
-            let _ = writeln!(
-                response,
-                "- {}{active}{key_badge}",
-                provider.display_name
-            );
+            let _ = writeln!(response, "- {}{active}{key_badge}", provider.display_name);
         } else {
             let _ = writeln!(
                 response,
@@ -3794,7 +3810,6 @@ or tune thresholds in config.",
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-
     // Inject per-message timestamp so the LLM always knows the current time,
     // even in multi-turn conversations where the system prompt may be stale.
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -3810,14 +3825,17 @@ or tune thresholds in config.",
 
     // Save user turn to short-term conversation store (individual row, not JSON blob).
     if let Some(ref sess) = session {
-        let _ = sess
+        if let Err(err) = sess
             .append_turn(
                 "user",
                 &persisted_user_content,
                 Some(msg.channel.as_str()),
                 Some(msg.sender.as_str()),
             )
-            .await;
+            .await
+        {
+            tracing::warn!("Failed to persist user turn: {err}");
+        }
     }
 
     // Build history from per-sender conversation cache.
@@ -3891,8 +3909,8 @@ or tune thresholds in config.",
             match sess
                 .recent_turns_for_sender(
                     msg.sender.as_str(),
-                    300,         // up to 300 recent turns from past sessions
-                    30 * 86400,  // within last 30 days
+                    300,        // up to 300 recent turns from past sessions
+                    30 * 86400, // within last 30 days
                 )
                 .await
             {
@@ -3901,7 +3919,9 @@ or tune thresholds in config.",
                     // knows these are from prior conversations, not the current one.
                     let summary: String = recent_turns
                         .iter()
-                        .map(|t| format!("[{}]: {}", t.role, truncate_with_ellipsis(&t.content, 500)))
+                        .map(|t| {
+                            format!("[{}]: {}", t.role, truncate_with_ellipsis(&t.content, 500))
+                        })
                         .collect::<Vec<_>>()
                         .join("\n");
                     let context_msg = format!(
@@ -4306,14 +4326,17 @@ or tune thresholds in config.",
                     }
                 }
                 // Save assistant turn to short-term conversation store.
-                let _ = sess
+                if let Err(err) = sess
                     .append_turn(
                         "assistant",
                         &delivered_response,
                         Some(msg.channel.as_str()),
                         Some(msg.sender.as_str()),
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!("Failed to persist assistant turn: {err}");
+                }
             }
 
             // Save structured conversation turn (Q&A pair) to long-term memory.
@@ -5789,7 +5812,11 @@ fn collect_configured_channels(
     if let Some(ref kakao) = config.channels_config.kakao {
         channels.push(ConfiguredChannel {
             display_name: "KakaoTalk",
-            channel: Arc::new(KakaoTalkChannel::from_config(kakao, pairing_store.clone(), gateway_url.clone())),
+            channel: Arc::new(KakaoTalkChannel::from_config(
+                kakao,
+                pairing_store.clone(),
+                gateway_url.clone(),
+            )),
         });
     }
 
@@ -6166,15 +6193,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Determine the gateway URL for channel auto-pair links.
     let channel_gateway_url = std::env::var("ZEROCLAW_PUBLIC_URL")
         .ok()
-        .or_else(|| {
-            Some(format!(
-                "http://localhost:{}",
-                config.gateway.port
-            ))
-        });
+        .or_else(|| Some(format!("http://localhost:{}", config.gateway.port)));
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
-    let mut configured_channels = collect_configured_channels(&config, "runtime startup", channel_pairing_store, channel_gateway_url);
+    let mut configured_channels = collect_configured_channels(
+        &config,
+        "runtime startup",
+        channel_pairing_store,
+        channel_gateway_url,
+    );
     let mut init_failures = Vec::new();
     if let Some(reason) =
         append_nostr_channel_if_available(&config, &mut configured_channels, "runtime startup")
@@ -6365,7 +6392,7 @@ mod tests {
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
-    use crate::security::AutonomyLevel;
+
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
