@@ -305,7 +305,12 @@ async fn persist_ws_history(state: &AppState, session_id: &str, history: &[ChatM
 /// Includes the last N user/assistant turns (excluding system messages)
 /// so the agent loop has conversation continuity even though it creates
 /// a fresh history per request.
-const MAX_CONTEXT_TURNS: usize = 10;
+/// Maximum number of recent conversation turns to include as context.
+/// Covers ~20 messages (10 user + 10 assistant exchanges) for continuity.
+const MAX_CONTEXT_TURNS: usize = 20;
+
+/// Maximum total bytes for conversation context to avoid context window bloat.
+const MAX_CONVERSATION_CONTEXT_BYTES: usize = 15_000;
 
 fn build_recent_conversation_context(history: &[ChatMessage]) -> String {
     // Collect non-system turns (skip the system prompt at index 0)
@@ -333,19 +338,25 @@ fn build_recent_conversation_context(history: &[ChatMessage]) -> String {
     }
 
     let mut context = String::from("Recent conversation context:\n");
+    let mut total_bytes = context.len();
     for turn in context_turns {
         let role_label = match turn.role.as_str() {
             "user" => "User",
             "assistant" => "Assistant",
             _ => continue,
         };
-        // Truncate very long messages to avoid context bloat
-        let content = if turn.content.len() > 500 {
-            format!("{}...", &turn.content[..500])
+        // Truncate very long messages to keep context bounded
+        let content = if turn.content.len() > 1000 {
+            format!("{}...", &turn.content[..1000])
         } else {
             turn.content.clone()
         };
-        context.push_str(&format!("{role_label}: {content}\n"));
+        let line = format!("{role_label}: {content}\n");
+        if total_bytes + line.len() > MAX_CONVERSATION_CONTEXT_BYTES {
+            break;
+        }
+        total_bytes += line.len();
+        context.push_str(&line);
     }
     context.push('\n');
     context

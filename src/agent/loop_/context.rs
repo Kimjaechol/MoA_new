@@ -1,6 +1,13 @@
 use crate::memory::{self, Memory};
 use std::fmt::Write;
 
+/// Maximum number of long-term memory entries to recall per message.
+const MAX_RECALL_ENTRIES: usize = 50;
+
+/// Maximum total context bytes from long-term memory recall.
+/// Prevents excessively large context from consuming the LLM context window.
+const MAX_CONTEXT_BYTES: usize = 20_000;
+
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
@@ -12,8 +19,8 @@ pub(super) async fn build_context(
 ) -> String {
     let mut context = String::new();
 
-    // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
+    // Pull relevant memories for this message (up to MAX_RECALL_ENTRIES)
+    if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| match e.score {
@@ -24,11 +31,17 @@ pub(super) async fn build_context(
 
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
+            let mut total_bytes = context.len();
             for entry in &relevant {
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+                let line = format!("- {}: {}\n", entry.key, entry.content);
+                if total_bytes + line.len() > MAX_CONTEXT_BYTES {
+                    break;
+                }
+                total_bytes += line.len();
+                context.push_str(&line);
             }
             if context == "[Memory context]\n" {
                 context.clear();
