@@ -1164,7 +1164,7 @@ fn default_loop_detection_ping_pong_cycles() -> usize {
 }
 
 fn default_loop_detection_failure_streak() -> usize {
-    5
+    3
 }
 
 fn default_safety_heartbeat_interval() -> usize {
@@ -12772,6 +12772,7 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
+        // Browser is now enabled by default; missing [browser] section inherits the default
         assert!(parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
     }

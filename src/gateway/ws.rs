@@ -301,6 +301,56 @@ async fn persist_ws_history(state: &AppState, session_id: &str, history: &[ChatM
     }
 }
 
+/// Build a recent conversation context string from the chat history.
+/// Includes the last N user/assistant turns (excluding system messages)
+/// so the agent loop has conversation continuity even though it creates
+/// a fresh history per request.
+const MAX_CONTEXT_TURNS: usize = 10;
+
+fn build_recent_conversation_context(history: &[ChatMessage]) -> String {
+    // Collect non-system turns (skip the system prompt at index 0)
+    let turns: Vec<&ChatMessage> = history
+        .iter()
+        .filter(|m| m.role != "system")
+        .collect();
+
+    if turns.is_empty() {
+        return String::new();
+    }
+
+    // Take only the most recent turns (leaving out the very last user message
+    // which is the current one we're about to send)
+    let context_turns = if turns.len() > 1 {
+        let end = turns.len() - 1; // exclude the last (current) user message
+        let start = end.saturating_sub(MAX_CONTEXT_TURNS);
+        &turns[start..end]
+    } else {
+        return String::new();
+    };
+
+    if context_turns.is_empty() {
+        return String::new();
+    }
+
+    let mut context = String::from("Recent conversation context:\n");
+    for turn in context_turns {
+        let role_label = match turn.role.as_str() {
+            "user" => "User",
+            "assistant" => "Assistant",
+            _ => continue,
+        };
+        // Truncate very long messages to avoid context bloat
+        let content = if turn.content.len() > 500 {
+            format!("{}...", &turn.content[..500])
+        } else {
+            turn.content.clone()
+        };
+        context.push_str(&format!("{role_label}: {content}\n"));
+    }
+    context.push('\n');
+    context
+}
+
 fn sanitize_ws_response(
     response: &str,
     tools: &[Box<dyn crate::tools::Tool>],
@@ -1200,10 +1250,20 @@ async fn handle_socket(
             "model": state.model,
         }));
 
+        // Build recent conversation context so the agent loop has continuity.
+        // The agent creates a fresh LLM history per request, so without this
+        // context the model has no knowledge of prior turns in this session.
+        let recent_context = build_recent_conversation_context(&history);
+        let enriched_content = if recent_context.is_empty() {
+            content.clone()
+        } else {
+            format!("{recent_context}Current message:\n{content}")
+        };
+
         // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
         match Box::pin(super::run_gateway_chat_with_tools(
             &state,
-            &content,
+            &enriched_content,
             Some(&ws_session_id),
         ))
         .await

@@ -230,6 +230,13 @@ impl WebSearchTool {
             }
         }
 
+        // Always ensure DuckDuckGo (free, no API key) is available as the
+        // last-resort fallback so searches never fail solely due to missing
+        // or expired API keys on paid providers.
+        if seen.insert("duckduckgo") {
+            chain.push("duckduckgo");
+        }
+
         Ok(chain)
     }
 

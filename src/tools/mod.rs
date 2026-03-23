@@ -724,7 +724,8 @@ pub fn all_tools_with_runtime(
             })
             .unwrap_or_else(|| "default_user".to_string());
 
-        if let Ok(mut onto_repo) = OntologyRepo::open(workspace_dir) {
+        match OntologyRepo::open(workspace_dir) {
+        Ok(mut onto_repo) => {
             // Wire sync engine into OntologyRepo so every CUD operation
             // automatically records a delta for cross-device replication.
             // occurred_at is the primary temporal anchor for sync ordering.
@@ -756,8 +757,14 @@ pub fn all_tools_with_runtime(
                 dispatcher,
                 owner_user_id,
             )));
-        } else {
-            tracing::warn!("ontology: failed to open repo; ontology tools disabled");
+        }
+        Err(e) => {
+            tracing::warn!(
+                workspace = %workspace_dir.display(),
+                error = %e,
+                "ontology: failed to open repo; ontology tools disabled"
+            );
+        }
         }
     }
 
@@ -788,8 +795,10 @@ mod tests {
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
+        // shell + file_read + file_write + file_edit + apply_patch + glob_search + content_search + workspace_folder
         assert_eq!(tools.len(), 8);
         assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
+        assert!(tools.iter().any(|tool| tool.name() == "workspace_folder"));
     }
 
     #[test]

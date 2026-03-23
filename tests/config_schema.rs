@@ -288,6 +288,7 @@ fn config_nested_optional_sections_default_when_absent() {
     assert!(parsed.channels_config.telegram.is_none());
     assert!(!parsed.composio.enabled);
     assert!(parsed.composio.api_key.is_none());
+    // Browser is now enabled by default
     assert!(parsed.browser.enabled);
 }
 
