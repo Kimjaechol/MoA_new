@@ -36,7 +36,7 @@ impl Default for LoopDetectionConfig {
         Self {
             no_progress_threshold: 3,
             ping_pong_cycles: 2,
-            failure_streak_threshold: 5,
+            failure_streak_threshold: 3,
         }
     }
 }
@@ -358,11 +358,9 @@ mod tests {
         det.record_call("shell", r#"{"cmd":"bad1"}"#, "error: not found 1", false);
         det.record_call("shell", r#"{"cmd":"bad2"}"#, "error: not found 2", false);
         det.record_call("shell", r#"{"cmd":"bad3"}"#, "error: not found 3", false);
-        det.record_call("shell", r#"{"cmd":"bad4"}"#, "error: not found 4", false);
-        det.record_call("shell", r#"{"cmd":"bad5"}"#, "error: not found 5", false);
         match det.check() {
             DetectionVerdict::InjectWarning(msg) => {
-                assert!(msg.contains("failed 5 consecutive"), "msg: {msg}");
+                assert!(msg.contains("failed 3 consecutive"), "msg: {msg}");
             }
             other => panic!("expected InjectWarning, got {other:?}"),
         }
@@ -374,13 +372,9 @@ mod tests {
         let mut det = LoopDetector::new(default_config());
         det.record_call("shell", r#"{"cmd":"bad1"}"#, "err1", false);
         det.record_call("shell", r#"{"cmd":"bad2"}"#, "err2", false);
+        det.record_call("shell", r#"{"cmd":"good"}"#, "ok", true); // resets
         det.record_call("shell", r#"{"cmd":"bad3"}"#, "err3", false);
         det.record_call("shell", r#"{"cmd":"bad4"}"#, "err4", false);
-        det.record_call("shell", r#"{"cmd":"good"}"#, "ok", true); // resets
-        det.record_call("shell", r#"{"cmd":"bad5"}"#, "err5", false);
-        det.record_call("shell", r#"{"cmd":"bad6"}"#, "err6", false);
-        det.record_call("shell", r#"{"cmd":"bad7"}"#, "err7", false);
-        det.record_call("shell", r#"{"cmd":"bad8"}"#, "err8", false);
         assert_eq!(det.check(), DetectionVerdict::Continue);
     }
 

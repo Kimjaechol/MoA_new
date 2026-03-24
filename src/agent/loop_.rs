@@ -3297,7 +3297,60 @@ pub async fn process_message_with_session(
         .as_ref()
         .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
         .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
+
+    // ── Cross-session short-term memory ─────────────────────────────
+    // Load recent conversation turns from the SQLite session store so the
+    // model has continuity even across WebSocket reconnections and page
+    // reloads.  Uses a "gateway" sender identity since the gateway path
+    // does not have per-user sender IDs.
+    let sender_id = session_id.unwrap_or("gateway_user");
+    let session_for_turns = match super::session::shared_session_manager(
+        &config.agent.session,
+        &config.workspace_dir,
+    ) {
+        Ok(Some(mgr)) => mgr.get_or_create(sender_id).await.ok(),
+        _ => None,
+    };
+    let cross_session_context = if let Some(ref session) = session_for_turns {
+        // Save the current user turn
+        let _ = session
+            .append_turn("user", message, Some("gateway"), Some(sender_id))
+            .await;
+        // Load recent cross-session turns (30 days, up to 30 turns)
+        match session.recent_turns_for_sender(sender_id, 30, 30 * 86400).await {
+            Ok(turns) if !turns.is_empty() => {
+                let mut ctx = String::from("[Recent conversation history]\n");
+                let mut total = ctx.len();
+                // Skip the last entry (the current message we just saved)
+                let skip_last = turns.len().saturating_sub(1);
+                for turn in turns.iter().take(skip_last) {
+                    let label = if turn.role == "user" { "User" } else { "Assistant" };
+                    let content = if turn.content.len() > 800 {
+                        format!("{}...", &turn.content[..800])
+                    } else {
+                        turn.content.clone()
+                    };
+                    let line = format!("{label}: {content}\n");
+                    if total + line.len() > 12_000 {
+                        break;
+                    }
+                    total += line.len();
+                    ctx.push_str(&line);
+                }
+                if ctx == "[Recent conversation history]\n" {
+                    String::new()
+                } else {
+                    ctx.push('\n');
+                    ctx
+                }
+            }
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    let context = format!("{mem_context}{cross_session_context}{hw_context}");
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
     let enriched = if context.is_empty() {
         format!("[{now}] {message}")
@@ -3320,7 +3373,7 @@ pub async fn process_message_with_session(
     } else {
         None
     };
-    scope_cost_enforcement_context(
+    let result = scope_cost_enforcement_context(
         cost_enforcement_context,
         SAFETY_HEARTBEAT_CONFIG.scope(
             hb_cfg,
@@ -3338,7 +3391,20 @@ pub async fn process_message_with_session(
             ),
         ),
     )
-    .await
+    .await;
+
+    // Save assistant response to cross-session turn store for future context
+    if let Ok(ref response) = result {
+        if !response.trim().is_empty() {
+            if let Some(ref session) = session_for_turns {
+                let _ = session
+                    .append_turn("assistant", response, Some("gateway"), Some(sender_id))
+                    .await;
+            }
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
