@@ -116,6 +116,17 @@ impl PerplexitySearchTool {
     }
 
     /// Call the Perplexity Search API and return formatted results.
+    /// Build an HTTP client with proxy support and configured timeouts.
+    fn build_http_client(&self) -> anyhow::Result<reqwest::Client> {
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
+            .user_agent("Mozilla/5.0 (compatible; ZeroClaw/1.0)");
+        let builder =
+            crate::config::apply_runtime_proxy_to_builder(builder, "tool.perplexity_search");
+        Ok(builder.build()?)
+    }
+
     async fn search(&self, query: &str, num_results: usize) -> anyhow::Result<String> {
         let api_key = self.get_next_api_key().ok_or_else(|| {
             anyhow::anyhow!(
@@ -125,9 +136,7 @@ impl PerplexitySearchTool {
         })?;
 
         let endpoint = format!("{}/search", self.api_url);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .build()?;
+        let client = self.build_http_client()?;
 
         let mut body = json!({
             "query": query,
@@ -192,9 +201,7 @@ impl PerplexitySearchTool {
         _num_results: usize,
     ) -> anyhow::Result<String> {
         let endpoint = format!("{}/chat/completions", self.api_url);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .build()?;
+        let client = self.build_http_client()?;
 
         let mut body = json!({
             "model": "sonar",
@@ -288,10 +295,7 @@ impl PerplexitySearchTool {
         let encoded_query = urlencoding::encode(query);
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("Mozilla/5.0 (compatible; ZeroClaw/1.0)")
-            .build()?;
+        let client = self.build_http_client()?;
 
         let response = client
             .get(&search_url)
