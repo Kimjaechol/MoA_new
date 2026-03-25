@@ -443,6 +443,24 @@ impl AuthStore {
         Ok(deleted > 0)
     }
 
+    /// Remove stale devices that have been offline for longer than `max_offline_secs`.
+    /// Returns the number of devices removed.
+    pub fn cleanup_stale_devices(&self, user_id: &str, max_offline_secs: u64) -> Result<usize> {
+        let now = epoch_secs() as i64;
+        let cutoff = now - max_offline_secs as i64;
+        let conn = self.conn.lock();
+        let deleted = conn.execute(
+            "DELETE FROM devices WHERE user_id = ?1 AND last_seen < ?2",
+            rusqlite::params![user_id, cutoff],
+        )?;
+        if deleted > 0 {
+            tracing::info!(
+                "Cleaned up {deleted} stale device(s) for user {user_id} (offline > {max_offline_secs}s)"
+            );
+        }
+        Ok(deleted)
+    }
+
     /// Update last_seen timestamp for a device.
     pub fn touch_device(&self, device_id: &str) -> Result<()> {
         let now = epoch_secs() as i64;

@@ -2816,8 +2816,9 @@ impl Default for WebFetchConfig {
 /// Web search tool configuration (`[web_search]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebSearchConfig {
-    /// Enable `web_search_tool` for web searches
-    #[serde(default)]
+    /// Enable `web_search` tool for web searches (enabled by default;
+    /// uses DuckDuckGo which requires no API key).
+    #[serde(default = "default_web_search_enabled")]
     pub enabled: bool,
     /// Search provider: "duckduckgo"/"ddg" (free, no API key), "brave", "firecrawl",
     /// "tavily", "perplexity", "exa", or "jina"
@@ -2888,6 +2889,10 @@ pub struct WebSearchConfig {
     /// User-Agent string sent with search requests (env: ZEROCLAW_WEB_SEARCH_USER_AGENT)
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
+}
+
+fn default_web_search_enabled() -> bool {
+    true
 }
 
 fn default_web_search_provider() -> String {

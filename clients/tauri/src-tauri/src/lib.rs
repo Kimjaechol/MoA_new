@@ -1280,7 +1280,7 @@ async fn web_search(
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "message": message,
-            "tool_hint": "web_search_tool"
+            "tool_hint": "web_search"
         }));
 
     if let Some(ref t) = token {

@@ -1271,6 +1271,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             post(auth_api::handle_auth_devices_register),
         )
         .route(
+            "/api/auth/devices/{device_id}",
+            delete(auth_api::handle_auth_device_delete),
+        )
+        .route(
             "/api/auth/devices/{device_id}/pairing-code",
             put(auth_api::handle_auth_device_set_pairing_code),
         )

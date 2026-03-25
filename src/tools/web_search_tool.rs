@@ -850,7 +850,7 @@ fn strip_tags(content: &str) -> String {
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
-        "web_search_tool"
+        "web_search"
     }
 
     fn description(&self) -> &str {
@@ -978,7 +978,7 @@ mod tests {
             15,
             "test".to_string(),
         );
-        assert_eq!(tool.name(), "web_search_tool");
+        assert_eq!(tool.name(), "web_search");
     }
 
     #[test]

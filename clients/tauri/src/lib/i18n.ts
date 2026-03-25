@@ -120,6 +120,9 @@ type TranslationKey =
   | "set_pairing_code"
   | "change_pairing_code"
   | "remove_pairing_code"
+  | "remove_device"
+  | "confirm_remove_device"
+  | "device_removed"
   | "pairing_code_set"
   | "pairing_code_removed"
   | "new_pairing_code"
@@ -291,6 +294,9 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     set_pairing_code: "Set Pairing Code",
     change_pairing_code: "Change Pairing Code",
     remove_pairing_code: "Remove Pairing Code",
+    remove_device: "Remove Device",
+    confirm_remove_device: "Are you sure you want to remove this device?",
+    device_removed: "Device removed",
     pairing_code_set: "Pairing code updated",
     pairing_code_removed: "Pairing code removed",
     new_pairing_code: "New pairing code",
@@ -460,6 +466,9 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     set_pairing_code: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC \uC124\uC815",
     change_pairing_code: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC \uBCC0\uACBD",
     remove_pairing_code: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC \uC81C\uAC70",
+    remove_device: "\uB514\uBC14\uC774\uC2A4 \uC0AD\uC81C",
+    confirm_remove_device: "\uC774 \uB514\uBC14\uC774\uC2A4\uB97C \uC0AD\uC81C\uD558\uC2DC\uACA0\uC2B5\uB2C8\uAE4C?",
+    device_removed: "\uB514\uBC14\uC774\uC2A4\uAC00 \uC0AD\uC81C\uB418\uC5C8\uC2B5\uB2C8\uB2E4",
     pairing_code_set: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC\uAC00 \uC5C5\uB370\uC774\uD2B8\uB418\uC5C8\uC2B5\uB2C8\uB2E4",
     pairing_code_removed: "\uD398\uC5B4\uB9C1 \uCF54\uB4DC\uAC00 \uC81C\uAC70\uB418\uC5C8\uC2B5\uB2C8\uB2E4",
     new_pairing_code: "\uC0C8 \uD398\uC5B4\uB9C1 \uCF54\uB4DC",
