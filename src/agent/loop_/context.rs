@@ -1,4 +1,5 @@
 use crate::memory::{self, Memory};
+use crate::providers::ChatMessage;
 use std::fmt::Write;
 
 /// Maximum number of long-term memory entries to recall per message.
@@ -92,4 +93,126 @@ pub(super) fn build_hardware_context(
     }
     context.push('\n');
     context
+}
+
+/// Truncate a string to at most `max_chars` characters, appending "…" if truncated.
+/// This is UTF-8 safe — it counts Unicode scalar values, not bytes.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// Build cross-session recent conversation context from stored turns.
+///
+/// Formats the most recent turns as `[Recent conversation history]` for injection
+/// into the LLM context, providing conversational continuity across sessions.
+///
+/// # Parameters
+/// - `turns`: recent conversation turns (oldest-first, chronological order)
+/// - `skip_current`: number of trailing turns to skip (e.g. 1 to skip the
+///   current user message that was just appended)
+/// - `max_bytes`: maximum total bytes for the context block
+/// - `turn_max_chars`: maximum characters per individual turn content
+pub(super) fn build_cross_session_context(
+    turns: &[ChatMessage],
+    skip_current: usize,
+    max_bytes: usize,
+    turn_max_chars: usize,
+) -> String {
+    if turns.is_empty() {
+        return String::new();
+    }
+
+    let take_count = turns.len().saturating_sub(skip_current);
+    if take_count == 0 {
+        return String::new();
+    }
+
+    let mut ctx = String::from("[Recent conversation history]\n");
+    let mut total = ctx.len();
+
+    for turn in turns.iter().take(take_count) {
+        let label = if turn.role == "user" { "User" } else { "Assistant" };
+        let content = truncate_chars(&turn.content, turn_max_chars);
+        let line = format!("{label}: {content}\n");
+        if total + line.len() > max_bytes {
+            break;
+        }
+        total += line.len();
+        ctx.push_str(&line);
+    }
+
+    if ctx == "[Recent conversation history]\n" {
+        String::new()
+    } else {
+        ctx.push('\n');
+        ctx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_chars_ascii() {
+        assert_eq!(truncate_chars("hello world", 5), "hello…");
+        assert_eq!(truncate_chars("hello", 5), "hello");
+        assert_eq!(truncate_chars("hi", 5), "hi");
+    }
+
+    #[test]
+    fn truncate_chars_multibyte() {
+        // Korean text: each character is 3 bytes in UTF-8
+        let korean = "안녕하세요 반갑습니다";
+        let result = truncate_chars(korean, 5);
+        assert_eq!(result, "안녕하세요…");
+        // Ensure no panic on multi-byte boundaries
+        assert_eq!(truncate_chars(korean, 1), "안…");
+    }
+
+    #[test]
+    fn build_cross_session_empty() {
+        assert_eq!(build_cross_session_context(&[], 0, 16000, 600), "");
+    }
+
+    #[test]
+    fn build_cross_session_skips_current() {
+        let turns = vec![
+            ChatMessage { role: "user".into(), content: "hello".into() },
+            ChatMessage { role: "assistant".into(), content: "hi there".into() },
+            ChatMessage { role: "user".into(), content: "current msg".into() },
+        ];
+        let ctx = build_cross_session_context(&turns, 1, 16000, 600);
+        assert!(ctx.contains("User: hello"));
+        assert!(ctx.contains("Assistant: hi there"));
+        assert!(!ctx.contains("current msg"));
+    }
+
+    #[test]
+    fn build_cross_session_respects_byte_limit() {
+        let turns: Vec<ChatMessage> = (0..100)
+            .map(|i| ChatMessage {
+                role: "user".into(),
+                content: format!("message number {i} with some content padding"),
+            })
+            .collect();
+        let ctx = build_cross_session_context(&turns, 0, 500, 600);
+        assert!(ctx.len() <= 500 + 100); // small overshoot from last line is ok
+    }
+
+    #[test]
+    fn build_cross_session_truncates_long_turns() {
+        let turns = vec![ChatMessage {
+            role: "user".into(),
+            content: "a".repeat(1000),
+        }];
+        let ctx = build_cross_session_context(&turns, 0, 16000, 10);
+        assert!(ctx.contains(&format!("User: {}…", "a".repeat(10))));
+    }
 }

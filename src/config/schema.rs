@@ -1125,6 +1125,29 @@ pub struct AgentSessionConfig {
     /// Default: 50.
     #[serde(default = "default_agent_session_max_messages")]
     pub max_messages: usize,
+
+    /// Maximum recent conversation turns to load for cross-session context.
+    /// These turns are injected as `[Recent conversation history]` to maintain
+    /// conversational continuity across reconnections and page reloads.
+    /// Default: 20 (approximately 10 user-assistant exchanges).
+    #[serde(default = "default_cross_session_max_turns")]
+    pub cross_session_max_turns: usize,
+
+    /// Maximum age (in seconds) of cross-session turns to load.
+    /// Default: 604800 (7 days).
+    #[serde(default = "default_cross_session_max_age_secs")]
+    pub cross_session_max_age_secs: i64,
+
+    /// Maximum total bytes for the cross-session conversation context block.
+    /// Default: 16000.
+    #[serde(default = "default_cross_session_max_bytes")]
+    pub cross_session_max_bytes: usize,
+
+    /// Maximum characters per individual turn in cross-session context.
+    /// Longer turns are truncated with "…".
+    /// Default: 600.
+    #[serde(default = "default_cross_session_turn_max_chars")]
+    pub cross_session_turn_max_chars: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1153,6 +1176,22 @@ fn default_agent_session_ttl_seconds() -> u64 {
 
 fn default_agent_session_max_messages() -> usize {
     default_agent_max_history_messages()
+}
+
+fn default_cross_session_max_turns() -> usize {
+    20
+}
+
+fn default_cross_session_max_age_secs() -> i64 {
+    604_800 // 7 days
+}
+
+fn default_cross_session_max_bytes() -> usize {
+    16_000
+}
+
+fn default_cross_session_turn_max_chars() -> usize {
+    600
 }
 
 fn default_loop_detection_no_progress_threshold() -> usize {
@@ -1201,6 +1240,10 @@ impl Default for AgentSessionConfig {
             strategy: default_agent_session_strategy(),
             ttl_seconds: default_agent_session_ttl_seconds(),
             max_messages: default_agent_session_max_messages(),
+            cross_session_max_turns: default_cross_session_max_turns(),
+            cross_session_max_age_secs: default_cross_session_max_age_secs(),
+            cross_session_max_bytes: default_cross_session_max_bytes(),
+            cross_session_turn_max_chars: default_cross_session_turn_max_chars(),
         }
     }
 }

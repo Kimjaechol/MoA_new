@@ -40,7 +40,7 @@ mod history;
 mod parsing;
 mod promotion;
 
-use context::{build_context, build_hardware_context};
+use context::{build_context, build_cross_session_context, build_hardware_context};
 use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use execution::{
     execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
@@ -2728,7 +2728,7 @@ pub async fn run(
             let _ = mem.store(&user_key, &msg, MemoryCategory::Core, None).await;
         }
 
-        // Inject memory + hardware RAG context into user message
+        // Inject memory + short-term conversation + hardware RAG context
         let mem_context =
             build_context(mem.as_ref(), &msg, config.memory.min_relevance_score, None).await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2736,7 +2736,31 @@ pub async fn run(
             .as_ref()
             .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
             .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+
+        // Cross-session short-term memory for interactive mode
+        let cross_session_context = if let Some(ref sess) = session {
+            let sess_cfg = &config.agent.session;
+            let sender_id = "cli_interactive";
+            match sess
+                .recent_turns_for_sender(
+                    sender_id,
+                    sess_cfg.cross_session_max_turns,
+                    sess_cfg.cross_session_max_age_secs,
+                )
+                .await
+            {
+                Ok(turns) if !turns.is_empty() => build_cross_session_context(
+                    &turns,
+                    1, // skip the current message we just appended above
+                    sess_cfg.cross_session_max_bytes,
+                    sess_cfg.cross_session_turn_max_chars,
+                ),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        let context = format!("{mem_context}{cross_session_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
             format!("[{now}] {msg}")
@@ -3422,34 +3446,22 @@ pub async fn process_message_with_session(
         let _ = session
             .append_turn("user", message, Some("gateway"), Some(sender_id))
             .await;
-        // Load recent cross-session turns (30 days, up to 30 turns)
-        match session.recent_turns_for_sender(sender_id, 30, 30 * 86400).await {
-            Ok(turns) if !turns.is_empty() => {
-                let mut ctx = String::from("[Recent conversation history]\n");
-                let mut total = ctx.len();
-                // Skip the last entry (the current message we just saved)
-                let skip_last = turns.len().saturating_sub(1);
-                for turn in turns.iter().take(skip_last) {
-                    let label = if turn.role == "user" { "User" } else { "Assistant" };
-                    let content = if turn.content.len() > 800 {
-                        format!("{}...", &turn.content[..800])
-                    } else {
-                        turn.content.clone()
-                    };
-                    let line = format!("{label}: {content}\n");
-                    if total + line.len() > 12_000 {
-                        break;
-                    }
-                    total += line.len();
-                    ctx.push_str(&line);
-                }
-                if ctx == "[Recent conversation history]\n" {
-                    String::new()
-                } else {
-                    ctx.push('\n');
-                    ctx
-                }
-            }
+        // Load recent cross-session turns using configurable limits
+        let sess_cfg = &config.agent.session;
+        match session
+            .recent_turns_for_sender(
+                sender_id,
+                sess_cfg.cross_session_max_turns,
+                sess_cfg.cross_session_max_age_secs,
+            )
+            .await
+        {
+            Ok(turns) if !turns.is_empty() => build_cross_session_context(
+                &turns,
+                1, // skip the current message we just saved
+                sess_cfg.cross_session_max_bytes,
+                sess_cfg.cross_session_turn_max_chars,
+            ),
             _ => String::new(),
         }
     } else {
