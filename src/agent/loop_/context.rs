@@ -1,15 +1,18 @@
 use crate::memory::{self, Memory};
+use crate::ontology::OntologyRepo;
 use crate::providers::ChatMessage;
 use std::fmt::Write;
 
 /// Maximum number of long-term memory entries to recall per message.
 const MAX_RECALL_ENTRIES: usize = 50;
 
-/// Maximum total context bytes from long-term memory recall.
-/// Prevents excessively large context from consuming the LLM context window.
-const MAX_CONTEXT_BYTES: usize = 20_000;
+/// Maximum number of ontology objects to search per message.
+const MAX_ONTOLOGY_ENTRIES: usize = 50;
 
-/// Build context preamble by searching memory for relevant entries.
+/// Build context preamble by searching both long-term memory and ontology
+/// for relevant entries.  No byte-size cap is applied because memory entries
+/// are already summarised and a high hit-count signals importance.
+///
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
 pub(super) async fn build_context(
@@ -17,10 +20,11 @@ pub(super) async fn build_context(
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
+    ontology: Option<&OntologyRepo>,
 ) -> String {
     let mut context = String::new();
 
-    // Pull relevant memories for this message (up to MAX_RECALL_ENTRIES)
+    // ── Long-term memory recall ──────────────────────────────────
     if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
         let relevant: Vec<_> = entries
             .iter()
@@ -32,21 +36,44 @@ pub(super) async fn build_context(
 
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
-            let mut total_bytes = context.len();
             for entry in &relevant {
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
                 let line = format!("- {}: {}\n", entry.key, entry.content);
-                if total_bytes + line.len() > MAX_CONTEXT_BYTES {
-                    break;
-                }
-                total_bytes += line.len();
                 context.push_str(&line);
             }
             if context == "[Memory context]\n" {
                 context.clear();
             } else {
+                context.push('\n');
+            }
+        }
+    }
+
+    // ── Ontology knowledge search ────────────────────────────────
+    if let Some(repo) = ontology {
+        // Use a generic owner id for CLI context; channel-based flows will
+        // supply their own owner scoping at a higher layer.
+        let owner = session_id.unwrap_or("cli_interactive");
+        if let Ok(objects) =
+            repo.search_objects(owner, None, user_msg, MAX_ONTOLOGY_ENTRIES)
+        {
+            if !objects.is_empty() {
+                context.push_str("[Ontology context]\n");
+                for obj in &objects {
+                    let title = obj.title.as_deref().unwrap_or("(untitled)");
+                    let props = if obj.properties.is_null() || obj.properties.as_object().is_some_and(|m| m.is_empty()) {
+                        String::new()
+                    } else {
+                        obj.properties.to_string()
+                    };
+                    if props.is_empty() {
+                        let _ = writeln!(context, "- {title}");
+                    } else {
+                        let _ = writeln!(context, "- {title}: {props}");
+                    }
+                }
                 context.push('\n');
             }
         }

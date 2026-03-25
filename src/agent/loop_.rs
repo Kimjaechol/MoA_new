@@ -2728,9 +2728,9 @@ pub async fn run(
             let _ = mem.store(&user_key, &msg, MemoryCategory::Core, None).await;
         }
 
-        // Inject memory + short-term conversation + hardware RAG context
+        // Inject memory + ontology + short-term conversation + hardware RAG context
         let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score, None).await;
+            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score, None, ontology_repo.as_ref()).await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -2969,12 +2969,13 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
+            // Inject memory + ontology + hardware RAG context into user message
             let mem_context = build_context(
                 mem.as_ref(),
                 &user_input,
                 config.memory.min_relevance_score,
                 None,
+                ontology_repo.as_ref(),
             )
             .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -3415,11 +3416,13 @@ pub async fn process_message_with_session(
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
+    let ontology_repo = crate::ontology::OntologyRepo::open(&config.workspace_dir).ok();
     let mem_context = build_context(
         mem.as_ref(),
         message,
         config.memory.min_relevance_score,
         session_id,
+        ontology_repo.as_ref(),
     )
     .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -5634,7 +5637,7 @@ Tail"#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0, None).await;
+        let context = build_context(&mem, "status updates", 0.0, None, None).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));

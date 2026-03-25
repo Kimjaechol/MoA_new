@@ -1129,7 +1129,7 @@ pub struct AgentSessionConfig {
     /// Maximum recent conversation turns to load for cross-session context.
     /// These turns are injected as `[Recent conversation history]` to maintain
     /// conversational continuity across reconnections and page reloads.
-    /// Default: 20 (approximately 10 user-assistant exchanges).
+    /// Default: 60 (approximately 30 user-assistant exchanges).
     #[serde(default = "default_cross_session_max_turns")]
     pub cross_session_max_turns: usize,
 
@@ -1139,7 +1139,7 @@ pub struct AgentSessionConfig {
     pub cross_session_max_age_secs: i64,
 
     /// Maximum total bytes for the cross-session conversation context block.
-    /// Default: 16000.
+    /// Default: 36000.
     #[serde(default = "default_cross_session_max_bytes")]
     pub cross_session_max_bytes: usize,
 
@@ -1179,7 +1179,7 @@ fn default_agent_session_max_messages() -> usize {
 }
 
 fn default_cross_session_max_turns() -> usize {
-    20
+    60
 }
 
 fn default_cross_session_max_age_secs() -> i64 {
@@ -1187,7 +1187,7 @@ fn default_cross_session_max_age_secs() -> i64 {
 }
 
 fn default_cross_session_max_bytes() -> usize {
-    16_000
+    36_000
 }
 
 fn default_cross_session_turn_max_chars() -> usize {

@@ -500,7 +500,11 @@ impl SqliteSessionManager {
 
     /// Load recent conversation turns across all sessions for a given sender.
     /// Returns turns ordered oldest-first (chronological) for context injection.
-    /// `max_turns` limits the result count; `max_age_secs` limits how far back to look.
+    /// `max_turns` limits the result count; `max_age_secs` limits how far back
+    /// to look **relative to the sender's most recent turn** (not the current
+    /// wall-clock time).  This ensures that users who have been inactive for
+    /// longer than `max_age_secs` (e.g. travelling) still receive relevant
+    /// recent context instead of an empty result set.
     pub async fn recent_turns_for_sender(
         &self,
         sender: &str,
@@ -509,11 +513,32 @@ impl SqliteSessionManager {
     ) -> Result<Vec<ChatMessage>> {
         let conn = self.conn.clone();
         let sender = sender.to_string();
-        let cutoff = unix_seconds_now() - max_age_secs;
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
-            // Subquery to get newest N turns, then reverse for chronological order.
+
+            // 1. Find the most recent turn timestamp for this sender.
+            let latest_ts: Option<i64> = conn.query_row(
+                "SELECT MAX(created_at) FROM conversation_turns WHERE sender = ?1",
+                params![sender],
+                |row| row.get(0),
+            )?;
+
+            // If there are no turns at all, return early.
+            let anchor = match latest_ts {
+                Some(ts) => ts,
+                None => return Ok(Vec::new()),
+            };
+
+            // 2. Compute cutoff relative to the anchor (latest turn), but
+            //    never look further back than `now - max_age_secs` to avoid
+            //    surfacing arbitrarily old data when the gap is very large.
+            let now = unix_seconds_now();
+            let cutoff_from_anchor = anchor - max_age_secs;
+            let cutoff_from_now = now - max_age_secs;
+            let cutoff = cutoff_from_anchor.min(cutoff_from_now);
+
+            // 3. Subquery to get newest N turns, then reverse for chronological order.
             let mut stmt = conn.prepare_cached(
                 "SELECT role, content FROM (
                     SELECT role, content, created_at
