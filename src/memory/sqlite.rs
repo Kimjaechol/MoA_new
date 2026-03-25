@@ -569,7 +569,7 @@ impl Memory for SqliteMemory {
 
             // Fetch full entries for merged results in a single query
             // instead of N round-trips (N+1 pattern).
-            let mut results = Vec::new();
+            let mut results = Vec::with_capacity(merged.len());
             if !merged.is_empty() {
                 let placeholders: String = (1..=merged.len())
                     .map(|i| format!("?{i}"))

@@ -22,7 +22,8 @@ pub(super) async fn build_context(
     session_id: Option<&str>,
     ontology: Option<&OntologyRepo>,
 ) -> String {
-    let mut context = String::new();
+    // Pre-allocate a reasonable buffer for the combined context output.
+    let mut context = String::with_capacity(4096);
 
     // ── Long-term memory recall ──────────────────────────────────
     if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
@@ -160,21 +161,49 @@ pub(super) fn build_cross_session_context(
         return String::new();
     }
 
-    let mut ctx = String::from("[Recent conversation history]\n");
-    let mut total = ctx.len();
+    const HEADER: &str = "[Recent conversation history]\n";
+
+    // Pre-allocate: estimate ~80 bytes per turn to reduce reallocations for
+    // large turn counts (up to 600).
+    let estimated = HEADER.len() + take_count.min(600) * 80;
+    let mut ctx = String::with_capacity(estimated.min(max_bytes + 256));
+    ctx.push_str(HEADER);
+    let mut total = HEADER.len();
 
     for turn in turns.iter().take(take_count) {
         let label = if turn.role == "user" { "User" } else { "Assistant" };
-        let content = truncate_chars(&turn.content, turn_max_chars);
-        let line = format!("{label}: {content}\n");
-        if total + line.len() > max_bytes {
-            break;
+        let content = &turn.content;
+
+        // Calculate line length without allocating a temporary String when
+        // the turn content fits within the character limit.
+        let char_count = content.chars().count();
+        if char_count <= turn_max_chars {
+            // Fast path: content fits — write directly into ctx.
+            let line_len = label.len() + 2 + content.len() + 1; // "Label: content\n"
+            if total + line_len > max_bytes {
+                break;
+            }
+            total += line_len;
+            ctx.push_str(label);
+            ctx.push_str(": ");
+            ctx.push_str(content);
+            ctx.push('\n');
+        } else {
+            // Slow path: content needs truncation.
+            let truncated = truncate_chars(content, turn_max_chars);
+            let line_len = label.len() + 2 + truncated.len() + 1;
+            if total + line_len > max_bytes {
+                break;
+            }
+            total += line_len;
+            ctx.push_str(label);
+            ctx.push_str(": ");
+            ctx.push_str(&truncated);
+            ctx.push('\n');
         }
-        total += line.len();
-        ctx.push_str(&line);
     }
 
-    if ctx == "[Recent conversation history]\n" {
+    if ctx.len() == HEADER.len() {
         String::new()
     } else {
         ctx.push('\n');

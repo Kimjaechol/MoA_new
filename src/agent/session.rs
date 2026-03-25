@@ -548,13 +548,18 @@ impl SqliteSessionManager {
                     LIMIT ?3
                  ) sub ORDER BY created_at ASC",
             )?;
-            let turns = stmt
+            let rows = stmt
                 .query_map(params![sender, cutoff, max_turns as i64], |row| {
                     let role: String = row.get(0)?;
                     let content: String = row.get(1)?;
                     Ok(ChatMessage { role, content })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
+                })?;
+            // Pre-allocate for expected turn count to avoid repeated reallocs
+            // when fetching up to 600 turns.
+            let mut turns = Vec::with_capacity(max_turns.min(600));
+            for row in rows {
+                turns.push(row?);
+            }
             Ok(turns)
         })
         .await
@@ -581,13 +586,16 @@ impl SqliteSessionManager {
                     LIMIT ?2
                  ) sub ORDER BY created_at ASC",
             )?;
-            let turns = stmt
+            let rows = stmt
                 .query_map(params![session_id, max_turns as i64], |row| {
                     let role: String = row.get(0)?;
                     let content: String = row.get(1)?;
                     Ok(ChatMessage { role, content })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
+                })?;
+            let mut turns = Vec::with_capacity(max_turns.min(600));
+            for row in rows {
+                turns.push(row?);
+            }
             Ok(turns)
         })
         .await
