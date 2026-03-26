@@ -305,7 +305,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     new_pairing_code: "New pairing code",
     save_pairing_code: "Save",
     switch_to_relay: "Switch to Server Relay",
-    confirm_switch_to_relay: "Remove all LLM API keys and switch to server relay mode? (Credits will be charged at 2.2x)",
+    confirm_switch_to_relay: "Remove all LLM API keys and switch to server relay mode? (Credits will be charged)",
     switched_to_relay: "Switched to server relay mode. Credits will be used for LLM calls.",
     account_info: "Account",
     // API Keys & Credits
@@ -480,7 +480,7 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     new_pairing_code: "\uC0C8 \uD398\uC5B4\uB9C1 \uCF54\uB4DC",
     save_pairing_code: "\uC800\uC7A5",
     switch_to_relay: "\uC11C\uBC84 \uACBD\uC720\uB85C \uBCC0\uACBD",
-    confirm_switch_to_relay: "LLM API key\uB97C \uBAA8\uB450 \uC81C\uAC70\uD558\uACE0 \uC11C\uBC84 \uACBD\uC720 \uBAA8\uB4DC\uB85C \uC804\uD658\uD558\uC2DC\uACA0\uC2B5\uB2C8\uAE4C? (\uD06C\uB808\uB527 2.2\uBC30 \uCC28\uAC10)",
+    confirm_switch_to_relay: "LLM API key\uB97C \uBAA8\uB450 \uC81C\uAC70\uD558\uACE0 \uC11C\uBC84 \uACBD\uC720 \uBAA8\uB4DC\uB85C \uC804\uD658\uD558\uC2DC\uACA0\uC2B5\uB2C8\uAE4C? (\uD06C\uB808\uB527 \uCC28\uAC10)",
     switched_to_relay: "\uC11C\uBC84 \uACBD\uC720 \uBAA8\uB4DC\uB85C \uC804\uD658\uB418\uC5C8\uC2B5\uB2C8\uB2E4. LLM \uD638\uCD9C \uC2DC \uD06C\uB808\uB527\uC774 \uCC28\uAC10\uB429\uB2C8\uB2E4.",
     account_info: "\uACC4\uC815 \uC815\uBCF4",
     // API Keys & Credits
