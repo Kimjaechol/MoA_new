@@ -845,8 +845,10 @@ export class MoAClient {
       // Local gateway unreachable — do NOT fall back to relay
       this.gatewayAlive = false;
       throw new Error(
-        "로컬 MoA 서버에 연결할 수 없습니다. 로컬 서버가 실행 중인지 확인해 주세요.\n" +
-          "Cannot connect to local MoA server. Please check that the local server is running.",
+        "로컬에 저장하신 LLM 모델의 API key가 유효한 key인지 확인해 주세요.\n" +
+          "만약 key를 수정해도 다시 접속에 실패하면 API key를 제거하시고 " +
+          "'서버 경유'로 변경해 주세요.\n" +
+          "(서버 경유 시 운영자의 API key를 빌려서 사용하실 수 있습니다)",
       );
     }
 
