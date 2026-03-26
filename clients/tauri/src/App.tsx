@@ -161,6 +161,12 @@ function App() {
       return;
     }
 
+    // Ref to track previous sidebar data — only setState when data actually changes
+    // to avoid unnecessary re-renders that cause screen flickering.
+    let prevDevicesJson = "";
+    let prevChannelsJson = "";
+    let prevToolsJson = "";
+
     const fetchSidebarData = async () => {
       const [devices, agentInfo] = await Promise.all([
         apiClient.getDevices().catch(() => [] as DeviceInfo[]),
@@ -168,18 +174,33 @@ function App() {
         // Pre-fetch available tools so LLM knows what it can use
         apiClient.fetchAvailableTools().catch(() => []),
       ]);
-      setSidebarDevices(devices);
-      setSidebarChannels(agentInfo.channels);
-      setSidebarChannelsDetail(agentInfo.channels_detail);
-      setSidebarTools(agentInfo.tools);
+
+      // Only update state if data actually changed to prevent UI flicker
+      const devicesJson = JSON.stringify(devices);
+      const channelsJson = JSON.stringify(agentInfo.channels_detail);
+      const toolsJson = JSON.stringify(agentInfo.tools);
+
+      if (devicesJson !== prevDevicesJson) {
+        prevDevicesJson = devicesJson;
+        setSidebarDevices(devices);
+      }
+      if (channelsJson !== prevChannelsJson) {
+        prevChannelsJson = channelsJson;
+        setSidebarChannels(agentInfo.channels);
+        setSidebarChannelsDetail(agentInfo.channels_detail);
+      }
+      if (toolsJson !== prevToolsJson) {
+        prevToolsJson = toolsJson;
+        setSidebarTools(agentInfo.tools);
+      }
     };
 
     fetchSidebarData();
 
-    // Refresh sidebar data periodically (every 30s) to pick up tool/channel updates
+    // Refresh sidebar data periodically (every 60s) to pick up tool/channel updates
     const interval = setInterval(() => {
       fetchSidebarData();
-    }, 30_000);
+    }, 60_000);
 
     return () => clearInterval(interval);
   }, [isConnected]);

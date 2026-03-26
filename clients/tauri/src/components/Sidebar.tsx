@@ -295,8 +295,13 @@ export function Sidebar({
       if (localStorage.getItem("zeroclaw_api_key_anthropic")) providers.add("anthropic");
       if (localStorage.getItem("zeroclaw_api_key_openai")) providers.add("openai");
       if (localStorage.getItem("zeroclaw_api_key_gemini")) providers.add("gemini");
-      setAvailableProviders(providers);
-    }, 3000);
+      // Only update state if the provider set actually changed to avoid unnecessary re-renders
+      setAvailableProviders((prev) => {
+        const prevArr = [...prev].sort().join(",");
+        const newArr = [...providers].sort().join(",");
+        return prevArr === newArr ? prev : providers;
+      });
+    }, 10_000);
     return () => clearInterval(interval);
   }, []);
 

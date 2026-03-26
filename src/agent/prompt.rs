@@ -589,8 +589,47 @@ impl PromptSection for ToolUsageStrategySection {
                     - \"내일 날씨\" → `서울+2026-03-27+내일+날씨+예보`\n\
                  3. **Add domain qualifiers**: Weather→`예보,기온`, Stock→`주가,시세`, News→`뉴스,속보`\n\
                  4. **Be specific**: BAD: `날씨` / GOOD: `서울+강남구+내일+날씨+기온+강수확률`\n\
-                 5. **Use user's location from memory** if known.\n\
-                 6. **Multi-query for complex requests**: split into 2-3 focused queries.\n\n",
+                 5. **Use user's location from memory** if known.\n\n",
+            );
+
+            // ── Multi-Keyword Parallel Search Strategy ──
+            out.push_str(
+                "### Multi-Keyword Parallel Search Strategy\n\n\
+                 **For any non-trivial search request, generate multiple search queries \
+                 to maximize coverage and accuracy.**\n\n\
+                 **Protocol:**\n\n\
+                 1. **Extract 3-5 optimized keyword combinations** from the user's request.\n\
+                    Each query should approach the topic from a different angle:\n\
+                    - Query 1: Direct, most obvious keywords\n\
+                    - Query 2: Synonym/alternative terms\n\
+                    - Query 3: More specific/narrowed scope\n\
+                    - Query 4: Broader context or related aspect\n\
+                    - Query 5: English version (if user asked in Korean, or vice versa)\n\n\
+                 2. **Execute searches sequentially** with the generated queries.\n\
+                    Call `web_search` for each query one by one.\n\n\
+                 3. **Deduplicate results**: Remove URLs that appear in multiple search results.\n\
+                    Keep only the first occurrence of each URL.\n\n\
+                 4. **Select top 3-5 most relevant unique URLs** from combined results.\n\n\
+                 5. **Fetch and synthesize**: Call `web_fetch` on the selected URLs, \n\
+                    then synthesize a comprehensive answer from all sources.\n\n\
+                 **Example — User asks: \"내일 서울 날씨 알려줘\"**\n\
+                 → Generate these queries:\n\
+                 1. `서울+내일+날씨+예보+기온`\n\
+                 2. `서울+내일+강수확률+미세먼지`\n\
+                 3. `Seoul+tomorrow+weather+forecast`\n\
+                 → Search each, deduplicate, fetch top results, combine into answer.\n\n\
+                 **Example — User asks: \"삼성전자 최근 실적과 전망\"**\n\
+                 → Generate these queries:\n\
+                 1. `삼성전자+2026년+1분기+실적+영업이익`\n\
+                 2. `삼성전자+주가+전망+애널리스트+목표가`\n\
+                 3. `삼성전자+반도체+실적+전망+2026`\n\
+                 4. `Samsung+Electronics+earnings+2026+outlook`\n\
+                 → Search each, combine unique results, synthesize comprehensive answer.\n\n\
+                 **When to use multi-query vs single query:**\n\
+                 - Simple factual lookup (\"비트코인 현재 가격\") → 1 query is enough\n\
+                 - Weather for a specific day → 2-3 queries\n\
+                 - Research/analysis topics → 3-5 queries\n\
+                 - Complex multi-aspect questions → 4-5 queries\n\n",
             );
 
             // ── Automatic fallback chain ──
