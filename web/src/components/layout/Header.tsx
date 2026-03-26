@@ -41,14 +41,14 @@ export default function Header({ onToggleSidebar }: HeaderProps) {
       })
       .catch(() => { /* billing not available */ });
 
-    // Refresh balance every 30 seconds
+    // Refresh balance every 60 seconds — only update if changed
     const interval = setInterval(() => {
       getCreditBalance()
         .then((data) => {
-          if (data.enabled) setCreditBalance(data.balance);
+          if (data.enabled) setCreditBalance((prev) => prev === data.balance ? prev : data.balance);
         })
         .catch(() => {});
-    }, 30_000);
+    }, 60_000);
     return () => clearInterval(interval);
   }, []);
 

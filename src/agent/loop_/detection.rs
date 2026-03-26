@@ -239,7 +239,7 @@ fn format_warning(reason: &str) -> String {
         "IMPORTANT: A loop pattern has been detected in your tool usage. {reason}. \
          You MUST change your approach — do NOT repeat the same failing tool. Try these alternatives:\n\
          (1) Use a DIFFERENT tool for the same goal:\n\
-             - web_search_tool failed? → try 'web_fetch' with a known URL, 'shell' with curl, or 'browser' tool.\n\
+             - web_search failed? → try 'web_fetch' with a known URL, 'shell' with curl, or 'browser' tool.\n\
              - For weather: try 'web_fetch' with https://wttr.in/{{city}}?format=j1 or 'shell' curl.\n\
              - For news/info: try 'web_fetch' with a specific news site URL.\n\
          (2) Try a DIFFERENT source or website for the same information.\n\

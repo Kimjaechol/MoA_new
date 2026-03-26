@@ -200,7 +200,8 @@ pub async fn handle_llm_proxy(
                 output_tokens,
             );
             let base_credits = ((cost_usd / 0.007) * 1.0).ceil() as u32;
-            let credits_to_deduct = base_credits.saturating_mul(2).max(1);
+            // Operator markup: 2.2× the base cost for relay-mode LLM usage
+            let credits_to_deduct = ((base_credits as f64 * 2.2).ceil() as u32).max(1);
 
             if let Some(pm) = &state.payment_manager {
                 let pm = pm.lock();

@@ -122,7 +122,7 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   browser_open: "Browser Open",
   http_request: "HTTP Request",
   web_fetch: "Web Fetch",
-  web_search_tool: "Web Search",
+  web_search: "Web Search",
   memory_store: "Memory Store",
   memory_recall: "Memory Recall",
   memory_observe: "Memory Observe",
@@ -187,7 +187,7 @@ interface ToolApiKeyInfo {
 
 const TOOLS_REQUIRING_API_KEY: ToolApiKeyInfo[] = [
   { toolId: "composio", displayName: "Composio", placeholder: "Composio API Key" },
-  { toolId: "web_search_tool", displayName: "Web Search (Firecrawl/Tavily)", placeholder: "Firecrawl or Tavily API Key" },
+  { toolId: "web_search", displayName: "Web Search (Firecrawl/Tavily)", placeholder: "Firecrawl or Tavily API Key" },
   { toolId: "web_search_brave", displayName: "Web Search (Brave)", placeholder: "Brave Search API Key" },
   { toolId: "web_search_perplexity", displayName: "Web Search (Perplexity)", placeholder: "Perplexity API Key" },
   { toolId: "web_search_exa", displayName: "Web Search (Exa)", placeholder: "Exa API Key" },
