@@ -240,14 +240,25 @@ impl WebSearchTool {
         Ok(chain)
     }
 
+    /// Build an HTTP client with proxy support and configured timeouts.
+    fn build_http_client(&self, service_key: &str) -> anyhow::Result<reqwest::Client> {
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
+            .user_agent(self.user_agent.as_str());
+        let builder =
+            crate::config::apply_runtime_proxy_to_builder(builder, service_key);
+        Ok(builder.build()?)
+    }
+
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
-        let encoded_query = urlencoding::encode(query);
+        // Normalize query: if LLM sent `+` as word separators, convert to spaces first,
+        // then use proper URL encoding where spaces become `+` (application/x-www-form-urlencoded).
+        let normalized_query = query.replace('+', " ");
+        let encoded_query = urlencoding::encode(&normalized_query).replace("%20", "+");
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+        let client = self.build_http_client("tool.web_search")?;
 
         let response = client.get(&search_url).send().await.map_err(|e| {
             anyhow::anyhow!(
@@ -327,10 +338,7 @@ impl WebSearchTool {
             encoded_query, self.max_results
         );
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+        let client = self.build_http_client("tool.web_search")?;
 
         let response = client
             .get(&search_url)
@@ -396,10 +404,7 @@ impl WebSearchTool {
             .filter(|s| !s.is_empty())
             .unwrap_or("https://api.firecrawl.dev");
         let endpoint = format!("{}/v1/search", api_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+        let client = self.build_http_client("tool.web_search")?;
 
         let response = client
             .post(endpoint)
@@ -496,10 +501,7 @@ impl WebSearchTool {
             .unwrap_or("https://api.tavily.com");
         let endpoint = format!("{}/search", api_url.trim_end_matches('/'));
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+        let client = self.build_http_client("tool.web_search")?;
         let response = client
             .post(&endpoint)
             .json(&json!({
@@ -582,10 +584,7 @@ impl WebSearchTool {
             .filter(|s| !s.is_empty())
             .unwrap_or("https://api.perplexity.ai");
         let endpoint = format!("{}/chat/completions", api_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+        let client = self.build_http_client("tool.web_search")?;
 
         let mut body = json!({
             "model": "sonar",
@@ -688,10 +687,7 @@ impl WebSearchTool {
             .filter(|s| !s.is_empty())
             .unwrap_or("https://api.exa.ai");
         let endpoint = format!("{}/search", api_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+        let client = self.build_http_client("tool.web_search")?;
 
         let mut body = json!({
             "query": query,
@@ -778,10 +774,7 @@ impl WebSearchTool {
             url = format!("{url}?{site_query}");
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
+        let client = self.build_http_client("tool.web_search")?;
 
         let mut request = client.get(url).header("Accept", "text/plain");
         if let Some(api_key) = self.get_next_jina_api_key() {
@@ -850,7 +843,7 @@ fn strip_tags(content: &str) -> String {
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
-        "web_search_tool"
+        "web_search"
     }
 
     fn description(&self) -> &str {
@@ -978,7 +971,7 @@ mod tests {
             15,
             "test".to_string(),
         );
-        assert_eq!(tool.name(), "web_search_tool");
+        assert_eq!(tool.name(), "web_search");
     }
 
     #[test]

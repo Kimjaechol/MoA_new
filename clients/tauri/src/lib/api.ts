@@ -357,6 +357,24 @@ export class MoAClient {
     }
   }
 
+  async removeDevice(deviceId: string): Promise<boolean> {
+    if (!this.token) throw new Error("Not authenticated");
+
+    const res = await fetch(`${this.relayUrl}/api/auth/devices/${deviceId}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+      },
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Failed" }));
+      throw new Error(data.error || "Failed to remove device");
+    }
+    const data = await res.json();
+    return data.deleted === true;
+  }
+
   async verifyDevicePairing(deviceId: string, code: string): Promise<boolean> {
     if (!this.token) throw new Error("Not authenticated");
 

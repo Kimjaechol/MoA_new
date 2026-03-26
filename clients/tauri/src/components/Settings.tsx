@@ -261,6 +261,21 @@ export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout
     clearMessage();
   }, [locale, clearMessage]);
 
+  const handleRemoveDevice = useCallback(async (deviceId: string) => {
+    try {
+      await apiClient.removeDevice(deviceId);
+      setMessage({ type: "success", text: t("device_removed", locale) });
+      const updated = await apiClient.getDevices();
+      setDevices(updated);
+    } catch (err) {
+      setMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "Failed",
+      });
+    }
+    clearMessage();
+  }, [locale, clearMessage]);
+
   const hasApiKey = apiClient.hasAnyLocalApiKey();
   const models = MODEL_OPTIONS[selectedProvider] || [];
 
@@ -383,6 +398,22 @@ export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout
                           </div>
                         )}
                       </div>
+
+                      {/* Remove device button — only for non-local offline devices */}
+                      {!isLocal && !device.is_online && (
+                        <div className="settings-device-remove" style={{ marginTop: 8 }}>
+                          <button
+                            className="settings-btn settings-btn-danger settings-btn-sm"
+                            onClick={() => {
+                              if (window.confirm(t("confirm_remove_device", locale))) {
+                                handleRemoveDevice(device.device_id);
+                              }
+                            }}
+                          >
+                            {t("remove_device", locale)}
+                          </button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}

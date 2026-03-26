@@ -6,6 +6,7 @@
 //! - POST /api/auth/logout
 //! - GET  /api/auth/devices
 //! - POST /api/auth/devices
+//! - DELETE /api/auth/devices/{device_id}
 //! - PUT  /api/auth/devices/{device_id}/pairing-code
 //! - POST /api/auth/devices/{device_id}/verify-pairing
 //! - POST /api/auth/heartbeat
@@ -243,6 +244,10 @@ pub async fn handle_auth_devices_list(
         )
             .into_response();
     };
+    // Auto-cleanup: remove devices offline > 30 days to prevent stale records accumulating.
+    const STALE_DEVICE_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60;
+    let _ = auth_store.cleanup_stale_devices(&user_id, STALE_DEVICE_THRESHOLD_SECS);
+
     let devices = auth_store
         .list_devices_with_status(&user_id, 300)
         .unwrap_or_default()
@@ -260,6 +265,47 @@ pub async fn handle_auth_devices_list(
         .collect::<Vec<_>>();
 
     Json(serde_json::json!({ "devices": devices })).into_response()
+}
+
+// ── DELETE /api/auth/devices/{device_id} ────────────────────────
+
+pub async fn handle_auth_device_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> impl IntoResponse {
+    let user_id = match extract_session_user(&state, &headers) {
+        Ok(id) => id,
+        Err(resp) => return resp.into_response(),
+    };
+
+    let Some(auth_store) = state.auth_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Auth not configured"})),
+        )
+            .into_response();
+    };
+
+    match auth_store.remove_device(&user_id, &device_id) {
+        Ok(true) => {
+            tracing::info!("Device {device_id} removed by user {user_id}");
+            Json(serde_json::json!({"status": "ok", "deleted": true})).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Device not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to remove device {device_id}: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to remove device"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ── POST /api/auth/devices ──────────────────────────────────────

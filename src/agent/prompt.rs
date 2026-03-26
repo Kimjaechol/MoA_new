@@ -541,67 +541,139 @@ impl PromptSection for ToolUsageStrategySection {
 
         // ── 3-tier web search strategy ──
         let has_web_search = tool_names.contains(&"web_search");
-        if has_web_search {
+        let has_perplexity_search = tool_names.contains(&"perplexity_search");
+        let has_any_search = has_web_search || has_perplexity_search;
+        if has_any_search {
+            // ── MANDATORY execution rules ──
             out.push_str(
-                "### 3-Tier Web Search & Action Strategy\n\n\
-                 Follow these tiers **in order**. Only escalate when the current tier is insufficient.\n\n\
-                 ---\n\n\
-                 **Tier 0 — Premium Fast Search (Perplexity / Brave API — if API key configured):**\n\n\
-                 If the user has configured a Perplexity or Brave API key, use it **first** for ALL \
-                 information/search queries instead of DuckDuckGo. These services return comprehensive, \
-                 well-organized answers in 2-3 seconds.\n\n\
-                 - Call `web_search` with provider `perplexity` or `brave`.\n\
-                 - **Show the returned result AS-IS to the user** — do not rewrite, summarize, or \
-                   re-process the response. The result is already high-quality and organized.\n\
-                 - Do NOT chain `web_fetch` or `browser` after a successful Perplexity/Brave result.\n\
-                 - If the Perplexity/Brave call fails, fall through to Tier 1.\n\n\
-                 ---\n\n\
-                 **Tier 1 — Free Search + Page Fetch (DuckDuckGo + web_fetch — default, no API key):**\n\n\
-                 When no premium API key is available, or Tier 0 failed:\n\n\
-                 1. **First**, output a progress message to the user:\n\
-                    \"🔍 검색 중입니다. 잠시만 기다려 주세요...\" (adapt to the user's language)\n\
-                 2. Call `web_search` (DuckDuckGo) to get search result URLs and snippets.\n\
-                 3. From the results, select the 1-3 most relevant URLs.\n\
-                 4. Call `web_fetch` on those URLs to get the full page content.\n\
-                    (web_fetch timeout is 5 minutes — it will wait for slow pages.)\n\
-                 5. Compile the fetched content and present a clear answer with source URLs.\n\n\
-                 **Important for Tier 1:**\n\
-                 - Always call `web_fetch` after `web_search` — snippets alone are rarely sufficient \
-                   for a complete answer.\n\
-                 - If `web_fetch` fails on one URL (timeout/blocked), try the next URL from search results.\n\
-                 - After presenting the answer, suggest to the user:\n\
-                   \"💡 웹검색을 더 빠르고 정밀하게 하시려면 Perplexity API key 또는 Brave AI API key를 \
-                   설정해 주세요. Settings → Provider API Keys에서 입력하실 수 있습니다.\"\n\
-                   (Adapt language to match the user's language.)\n\n\
-                 ---\n\n\
-                 **Tier 2 — Browser Automation with Playwright (active interaction required):**\n\n\
-                 Use the `browser` tool (Playwright) ONLY when the user's request requires **active \
-                 interaction** that `web_search` + `web_fetch` cannot accomplish:\n\n\
-                 - **Scrolling** through paginated/infinite-scroll content\n\
-                 - **Clicking** buttons, links, tabs, or navigation elements\n\
-                 - **Filling forms** (login, search boxes, checkout)\n\
-                 - **Multi-page navigation** (going from search → product page → cart)\n\
-                 - **JavaScript-rendered content** that `web_fetch` returned empty/broken\n\
-                 - **Screenshots** of visual content\n\
-                 - **File downloads** from authenticated or interactive pages\n\n\
-                 **Examples — when to use Tier 2:**\n\
-                 - \"쿠팡에서 아이패드 검색해서 가격 비교\" → needs click, scroll, multi-page\n\
-                 - \"네이버 로그인해서 메일 확인\" → needs form fill, login, navigation\n\
-                 - \"이 사이트에서 PDF 다운받아줘\" → needs click, download\n\
-                 - \"유튜브에서 최신 영상 목록 스크래핑\" → needs scroll, JS rendering\n\n\
-                 **Examples — when NOT to use Tier 2 (use Tier 0 or 1 instead):**\n\
-                 - \"서울 날씨\" → simple search, no interaction needed\n\
-                 - \"애플 주가\" → simple search\n\
-                 - \"이 기사 요약해줘 [URL]\" → web_fetch can get the article text\n\
-                 - \"최근 뉴스 알려줘\" → simple search\n\n\
-                 ---\n\n\
-                 **Decision flowchart:**\n\
+                "### MANDATORY Web Search Execution Rules\n\n\
+                 **CRITICAL: When the user asks ANY question that requires current/real-time information \
+                 (weather, news, stock prices, events, facts you're unsure about), you MUST immediately \
+                 call a search tool. NEVER say \"I can't search\" or ask the user \"should I search?\". \
+                 NEVER explain which tools are available or unavailable. Just execute the search.**\n\n\
+                 **NEVER ask the user for permission to use a search tool. Just use it immediately.**\n\n",
+            );
+
+            // ── DuckDuckGo URL format guide ──
+            out.push_str(
+                "### DuckDuckGo Search URL Format\n\n\
+                 The `web_search` tool uses DuckDuckGo internally with this URL format:\n\
                  ```\n\
-                 User asks a question/search request\n\
-                   └─ Perplexity/Brave API key available? → YES → Tier 0 (show result as-is)\n\
-                   └─ NO → Tier 1 (DuckDuckGo + web_fetch, show progress message)\n\
-                   └─ User needs click/scroll/login/multi-page? → YES → Tier 2 (Playwright browser)\n\
-                 ```\n\n",
+                 https://duckduckgo.com/?q=keyword1+keyword2+keyword3\n\
+                 ```\n\n\
+                 **CRITICAL: When constructing search queries for DuckDuckGo, replace all spaces \
+                 between keywords with `+` (plus sign).** This is the standard DuckDuckGo query format.\n\n\
+                 **Examples:**\n\
+                 - \"서울 내일 날씨\" → query: `서울+내일+날씨+예보`\n\
+                 - \"python requests tutorial\" → query: `python+requests+tutorial`\n\
+                 - \"삼성전자 주가 실시간\" → query: `삼성전자+주가+실시간+시세`\n\
+                 - \"서울 강남구 맛집 추천\" → query: `서울+강남구+맛집+추천`\n\n\
+                 **Additional DuckDuckGo parameters (append with &):**\n\
+                 - `&kl=kr-kr` — Korean region results\n\
+                 - `&kl=us-en` — US English results\n\
+                 - `&df=d` — past day only\n\
+                 - `&df=w` — past week only\n\
+                 - `&df=m` — past month only\n\n\
+                 **Always use `+` between words in the query, not spaces.**\n\n",
+            );
+
+            // ── Smart Search Query Construction ──
+            out.push_str(
+                "### Smart Search Query Construction\n\n\
+                 **CRITICAL: Do NOT pass the user's raw message as the search query.** \
+                 Construct a precise, optimized query with `+` between words.\n\n\
+                 **Rules:**\n\
+                 1. **Add location context**: weather/restaurants/events → include full location.\n\
+                    - \"내일 날씨\" → `서울+강남구+내일+날씨+예보`\n\
+                 2. **Add time context**: convert relative to specific.\n\
+                    - \"내일 날씨\" → `서울+2026-03-27+내일+날씨+예보`\n\
+                 3. **Add domain qualifiers**: Weather→`예보,기온`, Stock→`주가,시세`, News→`뉴스,속보`\n\
+                 4. **Be specific**: BAD: `날씨` / GOOD: `서울+강남구+내일+날씨+기온+강수확률`\n\
+                 5. **Use user's location from memory** if known.\n\n",
+            );
+
+            // ── Multi-Keyword Parallel Search Strategy ──
+            out.push_str(
+                "### Multi-Keyword Parallel Search Strategy\n\n\
+                 **For any non-trivial search request, generate multiple search queries \
+                 to maximize coverage and accuracy.**\n\n\
+                 **Protocol:**\n\n\
+                 1. **Extract 3-5 optimized keyword combinations** from the user's request.\n\
+                    Each query should approach the topic from a different angle:\n\
+                    - Query 1: Direct, most obvious keywords\n\
+                    - Query 2: Synonym/alternative terms\n\
+                    - Query 3: More specific/narrowed scope\n\
+                    - Query 4: Broader context or related aspect\n\
+                    - Query 5: English version (if user asked in Korean, or vice versa)\n\n\
+                 2. **Execute searches sequentially** with the generated queries.\n\
+                    Call `web_search` for each query one by one.\n\n\
+                 3. **Deduplicate results**: Remove URLs that appear in multiple search results.\n\
+                    Keep only the first occurrence of each URL.\n\n\
+                 4. **Select top 3-5 most relevant unique URLs** from combined results.\n\n\
+                 5. **Fetch and synthesize**: Call `web_fetch` on the selected URLs, \n\
+                    then synthesize a comprehensive answer from all sources.\n\n\
+                 **Example — User asks: \"내일 서울 날씨 알려줘\"**\n\
+                 → Generate these queries:\n\
+                 1. `서울+내일+날씨+예보+기온`\n\
+                 2. `서울+내일+강수확률+미세먼지`\n\
+                 3. `Seoul+tomorrow+weather+forecast`\n\
+                 → Search each, deduplicate, fetch top results, combine into answer.\n\n\
+                 **Example — User asks: \"삼성전자 최근 실적과 전망\"**\n\
+                 → Generate these queries:\n\
+                 1. `삼성전자+2026년+1분기+실적+영업이익`\n\
+                 2. `삼성전자+주가+전망+애널리스트+목표가`\n\
+                 3. `삼성전자+반도체+실적+전망+2026`\n\
+                 4. `Samsung+Electronics+earnings+2026+outlook`\n\
+                 → Search each, combine unique results, synthesize comprehensive answer.\n\n\
+                 **When to use multi-query vs single query:**\n\
+                 - Simple factual lookup (\"비트코인 현재 가격\") → 1 query is enough\n\
+                 - Weather for a specific day → 2-3 queries\n\
+                 - Research/analysis topics → 3-5 queries\n\
+                 - Complex multi-aspect questions → 4-5 queries\n\n",
+            );
+
+            // ── Automatic fallback chain ──
+            out.push_str(
+                "### Automatic Search Fallback Chain\n\n\
+                 Execute tools in this order. If one fails, **silently** try the next:\n\n",
+            );
+
+            if has_perplexity_search {
+                out.push_str(
+                    "**Step 1 — `perplexity_search`** (fast, comprehensive):\n\
+                     - Call `perplexity_search(query=\"...\")` first.\n\
+                     - If it succeeds, show the result and stop.\n\
+                     - If it fails, silently move to Step 2.\n\n",
+                );
+            }
+
+            if has_web_search {
+                let step_num = if has_perplexity_search { "2" } else { "1" };
+                out.push_str(&format!(
+                    "**Step {step_num} — `web_search`** (DuckDuckGo, free):\n\
+                     - Call `web_search(query=\"...\")` with `+` between words.\n\
+                     - Select 1-3 most relevant URLs from results.\n\
+                     - Call `web_fetch` on those URLs for full content.\n\
+                     - If `web_search` fails, silently move to next step.\n\n",
+                ));
+            }
+
+            out.push_str(
+                "**Last Resort — `web_fetch` direct URL:**\n\
+                 - For weather: `web_fetch(url=\"https://wttr.in/Seoul?format=3\")`\n\
+                 - For news: `web_fetch(url=\"https://news.google.com\")`\n\
+                 - ONLY after ALL attempts fail, briefly inform the user.\n\n",
+            );
+
+            // ── Tier 2 — Browser ──
+            out.push_str(
+                "### Tier 2 — Browser Automation (active interaction only)\n\n\
+                 Use `browser` tool ONLY when the request requires click/scroll/login/multi-page:\n\
+                 - \"쿠팡에서 아이패드 검색해서 가격 비교\" → browser\n\
+                 - \"네이버 로그인해서 메일 확인\" → browser\n\n\
+                 Do NOT use browser for simple searches:\n\
+                 - \"서울 날씨\" → `web_search` or `perplexity_search`\n\
+                 - \"애플 주가\" → `web_search` or `perplexity_search`\n\n",
             );
         }
 
