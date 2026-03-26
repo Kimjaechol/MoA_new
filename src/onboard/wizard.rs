@@ -3532,7 +3532,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
     // ── Web Search ──────────────────────────────────────────────
     let mut web_search_config = WebSearchConfig::default();
     let enable_web_search = Confirm::new()
-        .with_prompt("  Enable web_search_tool?")
+        .with_prompt("  Enable web_search?")
         .default(false)
         .interact()?;
 
@@ -3592,7 +3592,7 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         );
     } else {
         println!(
-            "  {} web_search_tool: {}",
+            "  {} web_search: {}",
             style("✓").green().bold(),
             style("disabled").dim()
         );

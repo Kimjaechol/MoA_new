@@ -627,9 +627,18 @@ impl PromptSection for ToolUsageStrategySection {
                  → Search each, combine unique results, synthesize comprehensive answer.\n\n\
                  **When to use multi-query vs single query:**\n\
                  - Simple factual lookup (\"비트코인 현재 가격\") → 1 query is enough\n\
-                 - Weather for a specific day → 2-3 queries\n\
-                 - Research/analysis topics → 3-5 queries\n\
-                 - Complex multi-aspect questions → 4-5 queries\n\n",
+                 - Weather for a specific day → 2-3 queries MAX\n\
+                 - Research/analysis topics → 3-4 queries MAX\n\
+                 - Complex multi-aspect questions → 4-5 queries MAX\n\n\
+                 **HARD LIMITS (CRITICAL — do not exceed):**\n\
+                 - **Maximum `web_search` calls per user request: 5** (absolute ceiling)\n\
+                 - **Maximum `web_fetch` calls per user request: 3**\n\
+                 - **Maximum total tool calls per user request: 10**\n\
+                 - If early search results already contain a good answer, STOP searching \
+                   immediately. Do NOT exhaust all planned queries if you already have enough info.\n\
+                 - If `web_search` returns no useful results after 3 attempts, switch to `web_fetch` \
+                   on a known URL directly instead of retrying more search queries.\n\
+                 - **NEVER repeat a search with the same or very similar query.**\n\n",
             );
 
             // ── Automatic fallback chain ──

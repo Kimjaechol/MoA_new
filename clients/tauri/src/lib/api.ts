@@ -441,7 +441,7 @@ export class MoAClient {
       { name: "browser_open", description: "Open an approved HTTPS URL in a browser" },
       { name: "http_request", description: "Make HTTP requests (GET, POST, PUT, DELETE)" },
       { name: "web_fetch", description: "Fetch content from a URL" },
-      { name: "web_search_tool", description: "Search the web for information" },
+      { name: "web_search", description: "Search the web for information" },
       { name: "memory_store", description: "Store a fact or note in long-term memory" },
       { name: "memory_recall", description: "Search long-term memory for relevant facts" },
       { name: "memory_observe", description: "Observe and record context for memory" },
@@ -819,38 +819,62 @@ export class MoAClient {
     };
 
     // ── Determine routing ──
-    // ★ Local-first with relay fallback:
-    // 1. If local gateway is alive → try local first, relay as fallback
-    // 2. If local gateway is NOT alive → try relay directly (skip local timeout)
-    // 3. When user has their own API key → include it in both local and relay requests
+    // ★ Two distinct modes based on whether user has a local API key:
+    //
+    // MODE 1 — LOCAL (user has own LLM API key):
+    //   ALL conversations happen locally. Server is NEVER involved.
+    //   Local MoA gateway calls LLM directly with user's API key.
+    //   If local gateway is unreachable → error (do NOT fall back to relay).
+    //
+    // MODE 2 — RELAY (no local LLM API key):
+    //   Conversations go through Railway server using operator's API key.
+    //   Credits are deducted at 2.2× the base LLM cost.
+    //   Local gateway is tried first (with proxy_url pointing to relay),
+    //   then relay directly if local gateway is down.
+
+    if (hasSelectedProviderKey) {
+      // ════════════════════════════════════════════════════════════
+      // MODE 1 — LOCAL: User has their own API key → local only
+      // ════════════════════════════════════════════════════════════
+      const res = await this.tryChatRequest(this.serverUrl, body);
+
+      if (res !== null) {
+        return this.parseChatResponse(res);
+      }
+
+      // Local gateway unreachable — do NOT fall back to relay
+      this.gatewayAlive = false;
+      throw new Error(
+        "로컬에 저장하신 LLM 모델의 API key가 유효한 key인지 확인해 주세요.\n" +
+          "만약 key를 수정해도 다시 접속에 실패하면 API key를 제거하시고 " +
+          "'서버 경유'로 변경해 주세요.\n" +
+          "(서버 경유 시 운영자의 API key를 빌려서 사용하실 수 있습니다)",
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // MODE 2 — RELAY: No local API key → use server (credits 2.2×)
+    // ════════════════════════════════════════════════════════════
+    // Try local gateway first (it will use proxy_url to relay LLM calls
+    // through Railway while keeping local tool keys and settings).
     const localAlive = this.gatewayAlive;
 
     if (localAlive) {
-      // ── Try local gateway first ──
-      let res = await this.tryChatRequest(this.serverUrl, body);
+      const res = await this.tryChatRequest(this.serverUrl, body);
 
       if (res !== null) {
-        // Local gateway connected — check for fallback-eligible errors
-        if (!res.ok && (res.status === 400 || res.status === 500) && !hasSelectedProviderKey) {
+        // Local gateway connected — check for relay-fallback errors
+        if (!res.ok && (res.status === 400 || res.status === 500)) {
           const errorText = await res.text().catch(() => "");
           let shouldFallback = false;
-          let errorJson: Record<string, unknown> = {};
           try {
-            errorJson = JSON.parse(errorText);
+            const errorJson = JSON.parse(errorText);
             shouldFallback = errorJson.fallback_to_relay === true
               || errorJson.code === "missing_api_key"
               || errorJson.code === "provider_auth_error";
-            if (!shouldFallback) {
-              const errMsg = (errorJson.error as string) || "";
-              shouldFallback = errMsg.includes("401")
-                || errMsg.includes("Unauthorized")
-                || errMsg.includes("authentication")
-                || errMsg.includes("API key");
-            }
           } catch {
             shouldFallback = errorText.includes("API key")
-              || errorText.includes("Unauthorized")
-              || errorText.includes("authentication");
+              || errorText.includes("Unauthorized");
           }
 
           if (shouldFallback) {
@@ -861,8 +885,7 @@ export class MoAClient {
             }
           }
 
-          const rawError = (errorJson.error as string) || errorText || "";
-          const errorMessage = this.sanitizeErrorForDisplay(rawError)
+          const errorMessage = this.sanitizeErrorForDisplay(errorText)
             || `Chat request failed (${res.status})`;
           throw new Error(errorMessage);
         }
@@ -870,15 +893,12 @@ export class MoAClient {
         return this.parseChatResponse(res);
       }
 
-      // Local gateway unreachable — mark as down and fall through to relay
+      // Local gateway unreachable — mark as down
       this.gatewayAlive = false;
     }
 
-    // ── Try relay server (local gateway is down or unreachable) ──
-    // Include API key in relay request if user has one, so relay can use it
-    const relayBody = hasSelectedProviderKey
-      ? body
-      : { ...body, api_key: undefined };
+    // Local gateway is down — try relay server directly (credits 2.2×)
+    const relayBody = { ...body, api_key: undefined };
     const res = await this.tryChatRequest(this.relayUrl, relayBody);
 
     if (res !== null) {
@@ -887,8 +907,8 @@ export class MoAClient {
 
     // Both failed
     throw new Error(
-      "Cannot connect to MoA server. Both local gateway and relay server are unreachable. " +
-        "Please check that either the local server is running or you have network access.",
+      "MoA 서버에 연결할 수 없습니다. 네트워크 연결을 확인해 주세요.\n" +
+        "Cannot connect to MoA server. Please check your network connection.",
     );
   }
 

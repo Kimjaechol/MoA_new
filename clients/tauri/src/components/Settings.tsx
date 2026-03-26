@@ -440,14 +440,34 @@ export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout
                       ? t("connection_mode_local_hint", locale)
                       : t("connection_mode_relay_hint", locale)}
                   </p>
-                  <button
-                    className="settings-btn settings-btn-secondary settings-btn-sm"
-                    onClick={handleHealthCheck}
-                    disabled={isHealthChecking}
-                    style={{ marginTop: 8 }}
-                  >
-                    {isHealthChecking ? t("checking", locale) : t("health_check", locale)}
-                  </button>
+                  <div className="settings-device-pairing-btns" style={{ marginTop: 8, gap: 8, display: "flex", flexWrap: "wrap" }}>
+                    <button
+                      className="settings-btn settings-btn-secondary settings-btn-sm"
+                      onClick={handleHealthCheck}
+                      disabled={isHealthChecking}
+                    >
+                      {isHealthChecking ? t("checking", locale) : t("health_check", locale)}
+                    </button>
+                    {hasApiKey && (
+                      <button
+                        className="settings-btn settings-btn-danger settings-btn-sm"
+                        onClick={() => {
+                          if (window.confirm(t("confirm_switch_to_relay", locale))) {
+                            // Remove all LLM API keys to switch to relay mode
+                            localStorage.removeItem("zeroclaw_api_key_anthropic");
+                            localStorage.removeItem("zeroclaw_api_key_openai");
+                            localStorage.removeItem("zeroclaw_api_key_gemini");
+                            setMessage({ type: "success", text: t("switched_to_relay", locale) });
+                            clearMessage();
+                            // Force re-render by reloading the page
+                            window.location.reload();
+                          }
+                        }}
+                      >
+                        {t("switch_to_relay", locale)}
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
