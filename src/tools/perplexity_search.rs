@@ -115,7 +115,6 @@ impl PerplexitySearchTool {
         Some(self.api_keys[idx].clone())
     }
 
-    /// Call the Perplexity Search API and return formatted results.
     /// Build an HTTP client with proxy support and configured timeouts.
     fn build_http_client(&self) -> anyhow::Result<reqwest::Client> {
         let builder = reqwest::Client::builder()
@@ -127,6 +126,7 @@ impl PerplexitySearchTool {
         Ok(builder.build()?)
     }
 
+    /// Call the Perplexity Search API and return formatted results.
     async fn search(&self, query: &str, num_results: usize) -> anyhow::Result<String> {
         let api_key = self.get_next_api_key().ok_or_else(|| {
             anyhow::anyhow!(
@@ -292,7 +292,8 @@ impl PerplexitySearchTool {
         query: &str,
         num_results: usize,
     ) -> anyhow::Result<String> {
-        let encoded_query = urlencoding::encode(query);
+        let normalized_query = query.replace('+', " ");
+        let encoded_query = urlencoding::encode(&normalized_query).replace("%20", "+");
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
         let client = self.build_http_client()?;

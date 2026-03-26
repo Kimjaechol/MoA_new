@@ -244,9 +244,8 @@ pub async fn handle_auth_devices_list(
         )
             .into_response();
     };
-    // Auto-cleanup: remove devices that have been offline for more than 30 days.
-    // This prevents stale device records from accumulating after app reinstalls.
-    const STALE_DEVICE_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60; // 30 days
+    // Auto-cleanup: remove devices offline > 30 days to prevent stale records accumulating.
+    const STALE_DEVICE_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60;
     let _ = auth_store.cleanup_stale_devices(&user_id, STALE_DEVICE_THRESHOLD_SECS);
 
     let devices = auth_store

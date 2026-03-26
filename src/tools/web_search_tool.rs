@@ -252,7 +252,10 @@ impl WebSearchTool {
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
-        let encoded_query = urlencoding::encode(query);
+        // Normalize query: if LLM sent `+` as word separators, convert to spaces first,
+        // then use proper URL encoding where spaces become `+` (application/x-www-form-urlencoded).
+        let normalized_query = query.replace('+', " ");
+        let encoded_query = urlencoding::encode(&normalized_query).replace("%20", "+");
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
         let client = self.build_http_client("tool.web_search")?;
