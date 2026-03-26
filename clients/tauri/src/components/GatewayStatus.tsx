@@ -43,8 +43,9 @@ export function GatewayStatus({ onReady }: GatewayStatusProps) {
     // Listen for status events from backend
     const unlistenPromise = onGatewayStatus((event) => {
       if (cancelled) return;
-      setStatus(event.status);
-      setMessage(event.message);
+      // Only update state when values actually change to prevent re-renders
+      setStatus((prev) => (prev === event.status ? prev : event.status));
+      setMessage((prev) => (prev === event.message ? prev : event.message));
       if (event.status === "ready") {
         onReady();
       }
