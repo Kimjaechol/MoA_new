@@ -432,21 +432,29 @@ fn get_platform_info() -> serde_json::Value {
 ///
 /// Components: hostname + OS + arch + machine-id (platform-specific hardware identifier).
 /// The machine-id provides true per-device uniqueness even when hostname/OS/arch overlap.
+/// Cached device fingerprint — computed once and reused.
+/// On Windows, `read_machine_id()` spawns `reg query` which causes a brief
+/// UI freeze every time it runs. Caching eliminates repeated process spawns.
+static DEVICE_FINGERPRINT_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 #[tauri::command]
 fn get_device_fingerprint() -> String {
-    use sha2::{Digest, Sha256};
+    DEVICE_FINGERPRINT_CACHE
+        .get_or_init(|| {
+            use sha2::{Digest, Sha256};
 
-    let hostname = hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let machine_id = read_machine_id();
+            let hostname = hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let os = std::env::consts::OS;
+            let arch = std::env::consts::ARCH;
+            let machine_id = read_machine_id();
 
-    // Combine stable machine attributes into a single fingerprint
-    let raw = format!("zeroclaw-fp:{}:{}:{}:{}", hostname, os, arch, machine_id);
-    let hash = Sha256::digest(raw.as_bytes());
-    format!("{:x}", hash)
+            let raw = format!("zeroclaw-fp:{}:{}:{}:{}", hostname, os, arch, machine_id);
+            let hash = Sha256::digest(raw.as_bytes());
+            format!("{:x}", hash)
+        })
+        .clone()
 }
 
 /// Read a platform-specific persistent machine identifier.
@@ -767,7 +775,7 @@ const MAX_SIDECAR_RETRIES: u32 = 3;
 const GATEWAY_READY_TIMEOUT_MS: u64 = 30_000;
 
 /// Interval for the watchdog health check (15 seconds).
-const WATCHDOG_INTERVAL_SECS: u64 = 15;
+const WATCHDOG_INTERVAL_SECS: u64 = 30;
 
 /// Emit a gateway status event to the frontend so it can display progress.
 fn emit_gateway_status(app_handle: &tauri::AppHandle, status: &str, message: &str) {
