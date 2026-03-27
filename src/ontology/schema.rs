@@ -126,21 +126,6 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             ON ontology_actions(created_at);
         CREATE INDEX IF NOT EXISTS idx_onto_actions_status
             ON ontology_actions(status);
-        -- UTC time is the PRIMARY sort key for cross-device timeline.
-        CREATE INDEX IF NOT EXISTS idx_onto_actions_utc
-            ON ontology_actions(occurred_at_utc);
-        -- Home timezone time for display-oriented queries.
-        CREATE INDEX IF NOT EXISTS idx_onto_actions_home
-            ON ontology_actions(occurred_at_home);
-        -- Location index for place-based grouping.
-        CREATE INDEX IF NOT EXISTS idx_onto_actions_location
-            ON ontology_actions(location);
-        -- Composite: UTC time + location (primary categorization axis).
-        CREATE INDEX IF NOT EXISTS idx_onto_actions_when_where
-            ON ontology_actions(occurred_at_utc, location);
-        -- Composite: location + UTC time (place-first queries).
-        CREATE INDEX IF NOT EXISTS idx_onto_actions_where_when
-            ON ontology_actions(location, occurred_at_utc);
 
         -- ================================================================
         -- 4. FTS5 indexes for ontology search
@@ -191,6 +176,22 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
         "UPDATE ontology_actions
          SET occurred_at_utc = occurred_at
          WHERE occurred_at IS NOT NULL AND occurred_at_utc IS NULL",
+    );
+
+    // Create indexes on migrated columns AFTER migration ensures they exist.
+    // These were previously in execute_batch but caused failures on old DBs
+    // that lacked these columns (CREATE INDEX ran before ALTER TABLE).
+    let _ = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_onto_actions_utc
+             ON ontology_actions(occurred_at_utc);
+         CREATE INDEX IF NOT EXISTS idx_onto_actions_home
+             ON ontology_actions(occurred_at_home);
+         CREATE INDEX IF NOT EXISTS idx_onto_actions_location
+             ON ontology_actions(location);
+         CREATE INDEX IF NOT EXISTS idx_onto_actions_when_where
+             ON ontology_actions(occurred_at_utc, location);
+         CREATE INDEX IF NOT EXISTS idx_onto_actions_where_when
+             ON ontology_actions(location, occurred_at_utc);",
     );
 
     Ok(())
