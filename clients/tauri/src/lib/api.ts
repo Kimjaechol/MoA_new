@@ -791,8 +791,19 @@ export class MoAClient {
     }
 
     // Include user's selected provider/model preference
-    const provider = localStorage.getItem("zeroclaw_llm_provider") || "gemini";
-    const model = localStorage.getItem("zeroclaw_llm_model") || "gemini-2.5-flash";
+    // Priority: user's explicit choice > Anthropic (if key exists) > OpenAI > Gemini
+    let provider = localStorage.getItem("zeroclaw_llm_provider") || "";
+    if (!provider) {
+      if (localStorage.getItem("zeroclaw_api_key_anthropic")) provider = "claude";
+      else if (localStorage.getItem("zeroclaw_api_key_openai")) provider = "openai";
+      else provider = "gemini";
+    }
+    const providerDefaults: Record<string, string> = {
+      claude: "claude-opus-4-6",
+      openai: "gpt-5.4",
+      gemini: "gemini-3.1-pro-preview",
+    };
+    const model = localStorage.getItem("zeroclaw_llm_model") || providerDefaults[provider] || "gemini-3.1-pro-preview";
 
     const keyStorageName = MoAClient.PROVIDER_KEY_MAP[provider] || provider;
     const apiKey = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`) || "";
