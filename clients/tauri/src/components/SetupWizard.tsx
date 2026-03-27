@@ -120,7 +120,7 @@ interface SetupWizardProps {
 // Map wizard provider IDs → Settings/API provider IDs and default models.
 // Wizard uses "anthropic"/"google" but Settings/chat API uses "claude"/"gemini".
 const WIZARD_TO_SETTINGS: Record<string, { provider: string; model: string; keyName: string }> = {
-  anthropic: { provider: "claude", model: "claude-sonnet-4-20250514", keyName: "anthropic" },
+  anthropic: { provider: "claude", model: "claude-opus-4-6", keyName: "anthropic" },
   openai:    { provider: "openai", model: "gpt-4.1", keyName: "openai" },
   google:    { provider: "gemini", model: "gemini-2.5-flash", keyName: "gemini" },
   openrouter:{ provider: "openrouter", model: "openrouter/auto", keyName: "openrouter" },

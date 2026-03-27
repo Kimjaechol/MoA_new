@@ -63,7 +63,7 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
     };
 
     match canonical_provider.as_str() {
-        "anthropic" => "claude-sonnet-4-5-20250929",
+        "anthropic" => "claude-opus-4-6",
         "openai" => "gpt-5.2",
         "openai-codex" => "gpt-5-codex",
         "venice" => "zai-org-glm-5",
