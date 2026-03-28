@@ -1,6 +1,7 @@
 use crate::memory::{self, Memory};
 use crate::ontology::OntologyRepo;
 use crate::providers::ChatMessage;
+use std::collections::HashSet;
 use std::fmt::Write;
 
 /// Maximum number of long-term memory entries to recall per message.
@@ -9,12 +10,18 @@ const MAX_RECALL_ENTRIES: usize = 100;
 /// Maximum number of ontology objects to search per message.
 const MAX_ONTOLOGY_ENTRIES: usize = 100;
 
+/// Maximum cross-search enrichment entries (prevents runaway queries).
+const MAX_CROSS_SEARCH_ENTRIES: usize = 20;
+
 /// Build context preamble by searching both long-term memory and ontology
-/// for relevant entries.  No byte-size cap is applied because memory entries
-/// are already summarised and a high hit-count signals importance.
+/// for relevant entries, with **bidirectional cross-referencing**.
 ///
-/// Entries with a hybrid score below `min_relevance_score` are dropped to
-/// prevent unrelated memories from bleeding into the conversation.
+/// Cross-search protocol:
+/// 1. Search memory (vector+keyword) → extract time/place/person keywords
+/// 2. Search ontology (FTS5) → extract time/place/person keywords
+/// 3. Use ontology keywords to enrich memory search → find related conversations
+/// 4. Use memory keywords to enrich ontology search → find related relationships
+/// 5. Combine all results with deduplication
 pub(super) async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
@@ -22,10 +29,11 @@ pub(super) async fn build_context(
     session_id: Option<&str>,
     ontology: Option<&OntologyRepo>,
 ) -> String {
-    // Pre-allocate a reasonable buffer for the combined context output.
-    let mut context = String::with_capacity(4096);
+    let mut context = String::with_capacity(8192);
+    let mut seen_memory_keys = HashSet::new();
+    let mut cross_search_keywords = Vec::new();
 
-    // ── Long-term memory recall ──────────────────────────────────
+    // ── Phase 1: Primary memory recall ──────────────────────────
     if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
         let relevant: Vec<_> = entries
             .iter()
@@ -41,8 +49,13 @@ pub(super) async fn build_context(
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
+                seen_memory_keys.insert(entry.key.clone());
                 let line = format!("- {}: {}\n", entry.key, entry.content);
                 context.push_str(&line);
+
+                // Extract time/place/person keywords from memory content
+                // for cross-searching into ontology.
+                extract_cross_search_keywords(&entry.content, &mut cross_search_keywords);
             }
             if context == "[Memory context]\n" {
                 context.clear();
@@ -52,10 +65,9 @@ pub(super) async fn build_context(
         }
     }
 
-    // ── Ontology knowledge search ────────────────────────────────
+    // ── Phase 2: Primary ontology search ────────────────────────
+    let mut ontology_cross_keywords = Vec::new();
     if let Some(repo) = ontology {
-        // Use a generic owner id for CLI context; channel-based flows will
-        // supply their own owner scoping at a higher layer.
         let owner = session_id.unwrap_or("cli_interactive");
         if let Ok(objects) =
             repo.search_objects(owner, None, user_msg, MAX_ONTOLOGY_ENTRIES)
@@ -74,13 +86,143 @@ pub(super) async fn build_context(
                     } else {
                         let _ = writeln!(context, "- {title}: {props}");
                     }
+
+                    // Extract keywords from ontology objects for cross-searching memory
+                    if let Some(t) = obj.title.as_deref() {
+                        ontology_cross_keywords.push(t.to_string());
+                    }
+                    extract_cross_search_keywords_from_json(&obj.properties, &mut ontology_cross_keywords);
                 }
                 context.push('\n');
+            }
+        }
+
+        // ── Phase 3: Cross-search — ontology → memory enrichment ──
+        // Use keywords from ontology results to find related conversations in memory
+        if !ontology_cross_keywords.is_empty() {
+            let cross_query = ontology_cross_keywords
+                .iter()
+                .take(5) // Limit to top 5 keywords
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if let Ok(enriched) = mem.recall(&cross_query, MAX_CROSS_SEARCH_ENTRIES, session_id).await {
+                let new_entries: Vec<_> = enriched
+                    .iter()
+                    .filter(|e| {
+                        e.score.unwrap_or(1.0) >= min_relevance_score
+                            && !memory::is_assistant_autosave_key(&e.key)
+                            && !seen_memory_keys.contains(&e.key)
+                    })
+                    .collect();
+
+                if !new_entries.is_empty() {
+                    context.push_str("[Cross-referenced memories (from ontology context)]\n");
+                    for entry in &new_entries {
+                        seen_memory_keys.insert(entry.key.clone());
+                        let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+                    }
+                    context.push('\n');
+                }
+            }
+        }
+
+        // ── Phase 4: Cross-search — memory → ontology enrichment ──
+        // Use keywords from memory results to find related relationships in ontology
+        if !cross_search_keywords.is_empty() {
+            let cross_query = cross_search_keywords
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if let Ok(enriched_objects) =
+                repo.search_objects(owner, None, &cross_query, MAX_CROSS_SEARCH_ENTRIES)
+            {
+                // Filter out objects already shown in primary ontology results
+                let new_objects: Vec<_> = enriched_objects
+                    .iter()
+                    .filter(|o| {
+                        let title = o.title.as_deref().unwrap_or("");
+                        !ontology_cross_keywords.contains(&title.to_string())
+                    })
+                    .collect();
+
+                if !new_objects.is_empty() {
+                    context.push_str("[Cross-referenced relationships (from memory context)]\n");
+                    for obj in &new_objects {
+                        let title = obj.title.as_deref().unwrap_or("(untitled)");
+                        let props = if obj.properties.is_null() || obj.properties.as_object().is_some_and(|m| m.is_empty()) {
+                            String::new()
+                        } else {
+                            obj.properties.to_string()
+                        };
+                        if props.is_empty() {
+                            let _ = writeln!(context, "- {title}");
+                        } else {
+                            let _ = writeln!(context, "- {title}: {props}");
+                        }
+                    }
+                    context.push('\n');
+                }
             }
         }
     }
 
     context
+}
+
+/// Extract time, place, and person keywords from memory content
+/// for cross-referencing with ontology.
+fn extract_cross_search_keywords(content: &str, keywords: &mut Vec<String>) {
+    // Look for structured metadata patterns in promoted memories:
+    // [category] 시간: ... | 장소: ... | 상대방: ... | 행위: ...
+    for line in content.lines() {
+        let line = line.trim();
+
+        // Extract Korean metadata fields
+        for prefix in &["시간:", "장소:", "상대방:", "행위:"] {
+            if let Some(pos) = line.find(prefix) {
+                let after = &line[pos + prefix.len()..];
+                let value = after.split('|').next().unwrap_or(after).trim();
+                if !value.is_empty() && value != "unknown" && value != "user" {
+                    keywords.push(value.to_string());
+                }
+            }
+        }
+
+        // Extract English metadata fields (for non-Korean content)
+        for prefix in &["time:", "location:", "counterpart:", "action:"] {
+            if let Some(pos) = line.find(prefix) {
+                let after = &line[pos + prefix.len()..];
+                let value = after.split('|').next().unwrap_or(after).trim();
+                if !value.is_empty() && value != "unknown" && value != "user" {
+                    keywords.push(value.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Extract keywords from ontology object JSON properties.
+fn extract_cross_search_keywords_from_json(props: &serde_json::Value, keywords: &mut Vec<String>) {
+    if let Some(obj) = props.as_object() {
+        for (key, value) in obj {
+            // Focus on identity/temporal/spatial fields
+            if matches!(key.as_str(),
+                "name" | "location" | "time" | "date" | "counterpart"
+                | "channel" | "category" | "topic" | "subject"
+            ) {
+                if let Some(s) = value.as_str() {
+                    if !s.is_empty() && s.len() < 100 {
+                        keywords.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Build hardware datasheet context from RAG when peripherals are enabled.
