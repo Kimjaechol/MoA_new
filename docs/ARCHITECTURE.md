@@ -1357,6 +1357,149 @@ registration, NOT by cross-module rewrites.
 
 ---
 
+## 6★. Browser Daemon & @Ref System (gstack-Inspired)
+
+### Background
+
+MoA's browser automation previously spawned a new process per command
+(~2-5 seconds each). For a 20-command QA session, this added 40+ seconds
+of overhead. After adopting [gstack](https://github.com/garrytan/gstack)'s
+browser architecture, the system now uses a **persistent Chromium daemon**
+with sub-second latency.
+
+### Architecture: Three-Tier Communication
+
+```
+Agent Loop (Rust) → HTTP POST → Playwright Daemon (Node.js) ↔ Chromium (CDP)
+```
+
+| Component | Technology | Role |
+|-----------|-----------|------|
+| Agent Loop | Rust (browser.rs) | Sends commands via HTTP, auto-starts daemon |
+| Daemon | Node.js (`scripts/playwright-daemon.js`) | Long-lived HTTP server, maintains browser state |
+| Browser | Chromium (Playwright CDP) | Persistent tabs, cookies, login sessions |
+
+### Performance
+
+| Metric | Before (per-process) | After (daemon) |
+|--------|---------------------|----------------|
+| First command | ~3-5s | ~3s (startup) |
+| Subsequent commands | ~2-5s each | **~100-200ms** each |
+| 20-command session | ~60-100s | **~7s** |
+| Cookie persistence | None (reset each call) | **Persistent** across all commands |
+| Login sessions | Re-authenticate each time | **Maintained** until browser close |
+
+### @Ref System (Accessibility Tree References)
+
+Instead of fragile CSS selectors, MoA uses **@refs** — stable element
+references derived from Chromium's accessibility tree:
+
+```
+1. Agent calls browser(action="snapshot")
+2. Daemon calls page.accessibility.snapshot()
+3. Parser assigns @e1, @e2... to interactive elements
+4. For each ref, builds Playwright Locator via getByRole(role, {name})
+5. Agent uses: browser(action="click", selector="@e3")
+```
+
+**Why @refs beat CSS selectors:**
+
+| Problem | CSS/XPath | @Ref System |
+|---------|-----------|-------------|
+| Content Security Policy | DOM injection blocked | No DOM mutation needed |
+| React/Vue hydration | Injected attributes stripped | External accessibility tree |
+| Shadow DOM | Can't reach inside | Chromium's internal tree |
+| DOM structure changes | Selectors break | Role-based, structure-independent |
+
+**Staleness detection:** When SPAs mutate the DOM, refs may become stale.
+Before using any ref, the system performs an async `count()` check (~5ms).
+If the element vanishes, it fails with guidance: *"@e3 is stale. Run
+snapshot to get fresh refs."* Refs auto-clear on page navigation.
+
+### Daemon Lifecycle
+
+```
+App starts → First browser command → Daemon auto-starts on port 9500
+                                     ↓
+                              Chromium launched (headless)
+                                     ↓
+                              State file written:
+                              ~/.zeroclaw/browser-daemon.json
+                              {pid, port, token, startedAt}
+                                     ↓
+                              Serves commands via HTTP POST
+                                     ↓
+                              30-minute idle → auto-shutdown
+```
+
+**Crash recovery:** If Chromium crashes, daemon exits immediately.
+Next command auto-restarts — simpler and more reliable than reconnection.
+
+### Command Categories
+
+| Category | Commands | Characteristics |
+|----------|----------|-----------------|
+| **Navigate** | open, back, forward, reload | Page traversal |
+| **Snapshot** | snapshot | Build @ref map from accessibility tree |
+| **Interact** | click, fill, type, press, hover, scroll, select | Mutate page state |
+| **Read** | text, html, links, forms, cookies, url | Extract data, no mutations |
+| **Visual** | screenshot | Capture PNG (full page, viewport, or element) |
+| **Tabs** | tabs, newtab, tab, closetab | Multi-page workflows |
+| **Script** | js, eval | Execute JavaScript |
+| **Lifecycle** | close | Shutdown browser |
+
+### Task Category Integration
+
+Every MoA task category benefits from the persistent browser:
+
+| Category | Browser Use Case |
+|----------|-----------------|
+| **WebGeneral** | Web search result verification, page content extraction, real-time info |
+| **Document** | PDF/document rendering verification in browser |
+| **Coding** | Test results in real browser, screenshot comparison, QA automation |
+| **Image** | Generated image preview and validation |
+| **Music/Video** | Media playback testing |
+| **Translation** | Real-time translation result verification on web pages |
+
+### Development Methodology: gstack Sprint Cycle
+
+MoA development follows gstack's structured workflow:
+
+```
+Think → Plan → Build → Review → Test → Ship → Reflect
+```
+
+| Phase | Tool | What It Does |
+|-------|------|-------------|
+| Plan | `/autoplan` | CEO → Design → Eng review automatically |
+| Review | `/review` | Staff-level code review, auto-fix |
+| Test | `/qa` | Real Chromium browser testing + regression tests |
+| Security | `/cso` | OWASP Top 10 + STRIDE threat modeling |
+| Ship | `/ship` | Sync main, test, PR |
+| Reflect | `/retro` | Weekly retrospective |
+
+### Plan-Execute-Verify Protocol
+
+Every user request follows a structured 4-phase protocol:
+
+1. **Phase 1 — Analyze & Plan**: Classify request, scan available tools,
+   select optimal tool(s), design step-by-step execution plan, set success
+   criteria, register plan via `task_plan` tool
+
+2. **Phase 2 — Execute**: Execute plan step by step using selected tools.
+   After each step, evaluate result and update `task_plan` status.
+   For web searches: `perplexity_search` → `web_search` → `web_fetch`
+   fallback chain (silently, without telling user about failures)
+
+3. **Phase 3 — Verify**: Self-check loop (max 2 retries) —
+   completeness, accuracy, freshness, sufficiency checks.
+   If insufficient, return to Phase 2 with refined keywords.
+
+4. **Phase 4 — Present**: Direct answer first → supporting details →
+   source URLs → 2-3 follow-up suggestions. Language-matched formatting.
+
+---
+
 ## 6A. Structured Relational Memory — Digital Twin Graph Layer
 
 ### Goal
