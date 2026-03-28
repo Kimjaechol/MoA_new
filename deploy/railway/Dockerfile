@@ -4,8 +4,8 @@
 # Multi-stage build optimized for Railway hosting.
 #
 # Build time optimizations:
-#   - BuildKit cache mounts for cargo registry + target dir (incremental builds)
 #   - `profile.railway` with thin LTO + parallel codegen (~3-5x faster than release)
+#   - Proper workspace member stubs for complete dependency caching
 #   - Parallel multi-stage builds (web + rust deps build concurrently)
 #
 # Usage:
@@ -42,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # A dummy main.rs triggers a dependency-only build so source changes
 # do not invalidate the (slow) dependency download/compile layer.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+
 # Workspace members need stub lib.rs to satisfy cargo workspace resolution.
 RUN mkdir -p src \
     && echo "fn main() {}" > src/main.rs \
@@ -54,23 +55,19 @@ COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
 COPY clients/android-bridge/Cargo.toml clients/android-bridge/Cargo.toml
 COPY clients/ios-bridge/Cargo.toml clients/ios-bridge/Cargo.toml
 
-# Build dependencies only (cached across source changes).
-# BuildKit cache mounts persist cargo registry and target dir across builds.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --profile railway --locked -p zeroclaw 2>/dev/null || true
+# Build dependencies only (cached across source changes via Docker layers).
+# Uses railway profile: thin LTO + parallel codegen (~3-5x faster than release).
+RUN cargo build --profile railway --locked -p zeroclaw 2>/dev/null || true
+RUN rm -rf src
 
-# Copy the full source tree and build the real binary.
+# Copy only source files needed for the final build.
 COPY src/ src/
-COPY build.rs* ./
 # Use freshly built frontend assets from web-builder stage.
 COPY --from=web-builder /web/dist/ web/dist/
 
 # Build with railway profile (thin LTO + parallel codegen).
-# Cache mounts make incremental rebuilds fast (~2-4 min vs 15-20 min).
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    touch src/main.rs \
+# Touch main.rs so cargo detects the source change and rebuilds.
+RUN touch src/main.rs \
     && cargo build --profile railway --locked -p zeroclaw \
     && cp target/railway/zeroclaw /build/zeroclaw \
     && strip /build/zeroclaw
