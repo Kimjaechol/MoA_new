@@ -1220,6 +1220,102 @@ This includes:
   - Claim 13: Computer-readable recording medium
 - **요약서**: Summary with representative diagram (Figure 6: 3-tier decision flow)
 
+### Patent 2: Bidirectional Cross-Referenced Dual-Store AI Memory System
+
+#### 발명의 명칭
+
+**에피소드 기억과 구조적 온톨로지 간 양방향 교차 참조를 통한 AI 에이전트 기억 시스템 및 방법**
+
+(Bidirectional Cross-Referenced Dual-Store Memory System and Method
+for AI Agents Using Episodic Memory and Structural Ontology)
+
+#### 기술분야
+
+인공지능 에이전트의 장기 기억 관리 시스템에 관한 것으로, 특히 에피소드
+기억(대화, 문서, 코드 등 비정형 데이터)과 구조적 온톨로지(인물, 장소,
+시간, 관계 등 정형 데이터) 간의 양방향 교차 검색을 통해 AI 에이전트의
+문맥 이해력과 회상 정확도를 획기적으로 향상시키는 기술에 관한 것이다.
+
+#### 배경기술 (종래 기술의 문제점)
+
+종래의 AI 비서 시스템은 기억 체계에 있어 다음과 같은 한계를 갖는다:
+
+1. **단일 저장소 방식**: 대화 이력을 텍스트로만 저장하여, "누구와 언제
+   어디서 무엇을 했는가"라는 맥락적 질문에 답할 수 없음
+2. **독립 검색 방식**: 벡터 검색과 키워드 검색을 결합하더라도, 구조적
+   관계(인물 간 관계, 프로젝트 소속 등)를 파악하지 못함
+3. **온톨로지 단독 방식**: 관계 그래프만으로는 실제 대화 내용과 작업
+   결과물을 회상할 수 없음
+4. **병렬 검색 후 단순 결합**: 두 저장소를 각각 검색한 후 결과를
+   단순히 이어붙이면, 두 결과 사이의 숨겨진 연관 정보를 놓침
+
+#### 발명의 내용
+
+본 발명은 **에피소드 기억 저장소**와 **구조적 온톨로지 저장소**를
+동일 데이터베이스 내에 공존시키되, **4단계 양방향 교차 검색 프로토콜**을
+통해 두 저장소의 결과를 상호 보강하는 시스템을 제안한다.
+
+**핵심 구성요소:**
+
+1. **에피소드 기억 저장소**: SQLite + FTS5 전문검색 + 벡터 임베딩
+   (코사인 유사도). 하이브리드 검색(벡터 70% + 키워드 30% 가중 융합).
+
+2. **구조적 온톨로지 저장소**: 객체(Objects), 관계(Links),
+   행위(Actions)로 구성된 지식 그래프. 각 행위는 5W1H 메타데이터
+   (Who/What/When/Where/How)를 필수 포함.
+
+3. **3단계 기억 파이프라인**:
+   - 1단계(CAPTURE): 대화 즉시 단기 기억에 저장, 메타데이터 추출
+   - 2단계(PROMOTE): 매 턴 자동으로 장기 기억 + 온톨로지에 동시 승격
+   - 3단계(RECALL): 4단계 교차 검색 프로토콜로 회상
+
+4. **4단계 양방향 교차 검색 프로토콜**:
+
+   **Phase 1** — 에피소드 기억 검색 (벡터+키워드 하이브리드)
+   사용자 질의에 대해 의미적 유사도 검색과 키워드 매칭을 동시 수행.
+   결과에서 시간, 장소, 인물, 행위 키워드를 추출.
+
+   **Phase 2** — 온톨로지 검색 (전문검색)
+   사용자 질의에 대해 객체 제목/속성에서 전문 검색 수행.
+   결과에서 객체명, 속성값(이름, 소속, 주제 등) 키워드를 추출.
+
+   **Phase 3** — 온톨로지→에피소드 교차 보강
+   Phase 2에서 추출한 키워드(예: "영업팀", "Q1 리뷰")를 사용하여
+   에피소드 기억을 재검색. 원래 질의만으로는 매칭되지 않았던
+   관련 대화와 작업 결과물을 발견.
+
+   **Phase 4** — 에피소드→온톨로지 교차 보강
+   Phase 1에서 추출한 키워드(예: "2026-03-15", "사무실", "프로젝트")를
+   사용하여 온톨로지를 재검색. 원래 질의만으로는 매칭되지 않았던
+   관련 인물 관계, 프로젝트 구조, 미팅 맥락을 발견.
+
+   **중복 제거**: 교차 검색 결과에서 이미 표시된 항목은 제외하여
+   동일 정보의 중복 표시를 방지.
+
+#### 청구범위 (추가)
+
+- **청구항 14**: 에피소드 기억 저장소와 구조적 온톨로지 저장소를 동일
+  데이터베이스에 구성하고, 사용자 질의 시 양 저장소의 검색 결과에서
+  추출한 키워드로 상대 저장소를 재검색하여 교차 보강된 통합 문맥을
+  AI 모델에 제공하는 것을 특징으로 하는 AI 에이전트 기억 시스템.
+
+- **청구항 15**: 청구항 14에 있어서, 상기 에피소드 기억 저장소의 검색은
+  벡터 임베딩 코사인 유사도 검색과 FTS5 BM25 키워드 검색의 가중 융합
+  (기본값: 벡터 70%, 키워드 30%)으로 수행되는 것을 특징으로 하는 시스템.
+
+- **청구항 16**: 청구항 14에 있어서, 상기 온톨로지 저장소의 각 행위
+  기록은 행위자(who), 행위내용(what), 대상(whom), 시각(when, UTC 기준
+  + 기기 로컬 시간 + 사용자 홈 시간대 3중 기록), 장소(where), 방법(how)의
+  5W1H 메타데이터를 필수 포함하는 것을 특징으로 하는 시스템.
+
+- **청구항 17**: 청구항 14에 있어서, 상기 교차 검색은 최대 반복 횟수
+  제한(기본값: 각 방향 1회)을 두어 무한 루프를 방지하고, 각 방향의
+  추가 검색 결과 수를 제한(기본값: 20건)하는 것을 특징으로 하는 시스템.
+
+- **청구항 18**: 청구항 14에 있어서, 상기 에피소드 기억에서 추출하는
+  교차 검색 키워드는 승격된 기억 항목의 구조화된 메타데이터 필드
+  (시간, 장소, 상대방, 행위)에서 파싱하는 것을 특징으로 하는 시스템.
+
 ---
 
 ## 4. Target Users
@@ -1497,6 +1593,243 @@ Every user request follows a structured 4-phase protocol:
 
 4. **Phase 4 — Present**: Direct answer first → supporting details →
    source URLs → 2-3 follow-up suggestions. Language-matched formatting.
+
+---
+
+## 6★★. MoA Unified Memory Architecture — Cross-Referenced Dual-Store System
+
+### Overview
+
+MoA implements a **dual-store memory system** where episodic memory
+(conversations, documents, code) and structured ontology (relationships,
+context graph) are **tightly cross-referenced** — not merely concatenated.
+This is a patent-pending innovation that enables the AI agent to recall
+not just "what was said" but "who, when, where, why, and in what context."
+
+### Memory Layer Stack
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  LLM Agent (brain)                                          │
+│                                                              │
+│  Receives unified context from 4-phase cross-search:        │
+│  [Memory context] + [Ontology context]                      │
+│  + [Cross-referenced memories from ontology]                │
+│  + [Cross-referenced relationships from memory]             │
+│                                                              │
+├──────────────────┬──────────────────────────────────────────┤
+│  Cross-Search    │  build_context() — 4-phase protocol      │
+│  Engine          │  Bidirectional enrichment loop            │
+├──────────────────┼──────────────────────────────────────────┤
+│                  │                                           │
+│  ┌───────────────▼────────┐  ┌──────────────────────────┐  │
+│  │  Episodic Memory       │  │  Ontology Graph          │  │
+│  │  (Long-term Store)     │  │  (Relational Store)      │  │
+│  │                        │  │                           │  │
+│  │  SQLite + FTS5         │  │  Objects (nouns)          │  │
+│  │  + Vector Embeddings   │  │  Links (relationships)   │  │
+│  │  + Hybrid Search       │  │  Actions (5W1H verbs)    │  │
+│  │    (70% vector         │  │                           │  │
+│  │     30% keyword)       │  │  FTS5 on titles/props    │  │
+│  └───────────┬────────────┘  └─────────────┬────────────┘  │
+│              │                              │               │
+│  ┌───────────▼──────────────────────────────▼────────────┐  │
+│  │  Shared SQLite Database (brain.db)                    │  │
+│  │  Single file, atomic transactions, FK constraints     │  │
+│  └───────────────────────────┬───────────────────────────┘  │
+│                              │                              │
+│  ┌───────────────────────────▼───────────────────────────┐  │
+│  │  Sync Engine — E2E encrypted delta replication        │  │
+│  │  ChaCha20-Poly1305 · Version vectors · TTL 5min relay │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3-Stage Memory Pipeline
+
+```
+Stage 1: CAPTURE (즉시 저장)
+  User message arrives
+    → SessionManager.append_turn() — short-term storage
+    → Metadata extraction: timestamp, location, counterpart, category
+    → 7 interaction categories: Chat, Document, Coding, Image, Music, Video, Translation
+
+Stage 2: PROMOTE (단기→장기 승격, 매 턴 자동)
+  After LLM response:
+    → promote_to_core_memory() — structured entry to long-term store
+      Key: promoted_{category}_{uuid}
+      Content: [category] 시간: {time} | 장소: {location} | 상대방: {counterpart} | 행위: {action}
+               사용자: {message_preview}
+               응답: {response_preview}
+    → reflect_to_ontology() — parallel structured graph entry
+      Create: Context object, Contact object, category-specific objects
+      Link: Context→Contact, Context→Document/Task
+      Action: 5W1H (who/what/when/where/how) with UTC+local+home timezone
+
+Stage 3: RECALL (교차 검색, 매 대화 시 자동)
+  See "4-Phase Cross-Search Protocol" below
+```
+
+### 4-Phase Cross-Search Protocol (교차 검색 프로토콜)
+
+This is the core innovation. When the user asks a question, the system
+performs **bidirectional enrichment** between the two knowledge stores:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  User asks: "김대리가 지난번에 뭐라고 했지?"               │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+          ┌────────────▼────────────┐
+          │  Phase 1: Memory Search │
+          │  (Vector + Keyword)     │
+          │  Query: "김대리"        │
+          └────────┬───────────────┘
+                   │
+                   ▼
+          Found: "promoted_chat_abc123"
+          Content: [Chat] 시간: 2026-03-15 14:30
+                   장소: 사무실 | 상대방: 김대리
+                   행위: 프로젝트 진행상황 논의
+          ┌────────┴───────────────┐
+          │ Extract keywords:      │
+          │ time=2026-03-15        │
+          │ place=사무실            │
+          │ person=김대리           │
+          │ action=프로젝트 진행상황 │
+          └────────┬───────────────┘
+                   │
+          ┌────────▼───────────────┐
+          │  Phase 2: Ontology     │
+          │  Search (FTS5)         │
+          │  Query: "김대리"        │
+          └────────┬───────────────┘
+                   │
+                   ▼
+          Found: Contact{name:"김대리", dept:"영업팀"}
+                 Context{topic:"Q1 리뷰 미팅"}
+          ┌────────┴───────────────┐
+          │ Extract keywords:      │
+          │ "김대리", "영업팀"      │
+          │ "Q1 리뷰 미팅"          │
+          └────────┬───────────────┘
+                   │
+     ┌─────────────┴─────────────────┐
+     │                               │
+     ▼                               ▼
+┌────────────────────┐    ┌─────────────────────┐
+│ Phase 3:           │    │ Phase 4:            │
+│ Ontology→Memory    │    │ Memory→Ontology     │
+│ Cross-Search       │    │ Cross-Search        │
+│                    │    │                     │
+│ Query: "영업팀     │    │ Query: "2026-03-15  │
+│  Q1 리뷰 미팅"     │    │  사무실 프로젝트"    │
+│                    │    │                     │
+│ Found additional:  │    │ Found additional:   │
+│ "영업팀 주간회의"  │    │ Project{name:"Q1"}  │
+│ "Q1 실적 보고"     │    │ Meeting{date:3/15}  │
+└────────┬───────────┘    └────────┬────────────┘
+         │                         │
+         └────────────┬────────────┘
+                      │
+                      ▼
+         ┌────────────────────────────┐
+         │  Unified Context to LLM:   │
+         │                            │
+         │  [Memory context]          │
+         │  - 김대리와 프로젝트 논의   │
+         │                            │
+         │  [Ontology context]        │
+         │  - 김대리: 영업팀 소속      │
+         │  - Q1 리뷰 미팅 컨텍스트    │
+         │                            │
+         │  [Cross-ref memories]      │
+         │  - 영업팀 주간회의 내용     │
+         │  - Q1 실적 보고 내용        │
+         │                            │
+         │  [Cross-ref relationships] │
+         │  - Q1 프로젝트 구조         │
+         │  - 3/15 미팅 참석자 관계    │
+         └────────────────────────────┘
+```
+
+### Why Cross-Search Matters
+
+| 검색 방식 | 한계 | 교차 검색 효과 |
+|----------|------|---------------|
+| 메모리만 검색 | "김대리"라는 이름만 매칭, 관계/맥락 모름 | + 온톨로지에서 소속/역할/관계 보강 |
+| 온톨로지만 검색 | 객체/관계만 매칭, 실제 대화 내용 모름 | + 메모리에서 전체 대화/작업결과 보강 |
+| 독립 검색 후 이어붙이기 | 두 결과 사이 연관성 없음 | **교차 키워드로 숨겨진 관련 정보 발견** |
+
+### Hybrid Search Engine (하이브리드 검색 엔진)
+
+Memory recall uses a **weighted fusion** of two search methods:
+
+```
+┌─────────────────────────────────────────────┐
+│  Query: "김대리 프로젝트 진행상황"          │
+└──────────────────┬──────────────────────────┘
+                   │
+     ┌─────────────┴─────────────┐
+     │                           │
+     ▼                           ▼
+┌──────────────────┐  ┌────────────────────┐
+│ Vector Search    │  │ Keyword Search     │
+│ (Cosine Sim)     │  │ (FTS5 BM25)        │
+│                  │  │                    │
+│ Semantic meaning │  │ Exact term match   │
+│ "similar ideas"  │  │ "exact words"      │
+│                  │  │                    │
+│ Weight: 0.7      │  │ Weight: 0.3        │
+└────────┬─────────┘  └────────┬───────────┘
+         │                      │
+         └──────────┬───────────┘
+                    │
+                    ▼
+         ┌──────────────────────┐
+         │ Hybrid Merge         │
+         │ score = 0.7×vector   │
+         │       + 0.3×keyword  │
+         │ Deduplicate by ID    │
+         │ Rank by final score  │
+         └──────────────────────┘
+                    │
+                    ▼
+         ┌──────────────────────┐
+         │ Fallback: LIKE       │
+         │ (if hybrid empty)    │
+         │ Per-keyword %match%  │
+         └──────────────────────┘
+```
+
+### Ontology Action 5W1H Model
+
+Every user interaction is recorded as a structured action:
+
+```
+OntologyAction {
+  WHO:   actor_user_id + ActorKind (User/Agent/System)
+  WHAT:  action_type (SendMessage, ReadDocument, RunCommand, WebSearch, ...)
+  WHOM:  primary_object_id → Context, Contact, Document, Task
+  WHEN:  occurred_at_utc   (canonical sort key, cross-device)
+         occurred_at_local (device timezone with offset)
+         occurred_at_home  (user's home timezone for display)
+  WHERE: location (free-form text)
+  HOW:   params (JSON: category, user_message, tools_used, etc.)
+         result (JSON: assistant_response, tool_outputs, etc.)
+}
+```
+
+### Cross-Device Sync
+
+All memory and ontology data syncs across devices via the
+**Server-Non-Storage E2E Encrypted Sync** system (Section 3):
+
+- Memory deltas: Store/Forget operations
+- Ontology deltas: ObjectUpsert, LinkCreate, ActionLog operations
+- Each delta encrypted with ChaCha20-Poly1305
+- Server holds encrypted data **maximum 5 minutes**, then permanently deletes
+- Offline reconciliation via version vectors
 
 ---
 
