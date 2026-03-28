@@ -10266,7 +10266,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .expect("runtime defaults");
         assert_eq!(defaults.default_provider, "openai");
-        assert_eq!(defaults.model, "gpt-5.2");
+        assert_eq!(defaults.model, "gpt-5.4");
     }
 
     #[tokio::test]

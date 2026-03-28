@@ -378,8 +378,9 @@ impl Provider for OpenAiProvider {
         })?;
 
         let tools = Self::convert_tools(request.tools);
+        let clean_model = super::strip_provider_prefix(model);
         let native_request = NativeChatRequest {
-            model: model.to_string(),
+            model: clean_model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
             max_tokens: self.max_tokens_override,
@@ -447,8 +448,9 @@ impl Provider for OpenAiProvider {
             )
         };
 
+        let clean_model = super::strip_provider_prefix(model);
         let native_request = NativeChatRequest {
-            model: model.to_string(),
+            model: clean_model.to_string(),
             messages: Self::convert_messages(messages),
             temperature,
             max_tokens: self.max_tokens_override,

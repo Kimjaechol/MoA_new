@@ -13726,7 +13726,7 @@ provider_api = "not-a-real-mode"
     #[test]
     async fn resolve_default_model_id_uses_provider_specific_fallback() {
         let openai = resolve_default_model_id(None, Some("openai"));
-        assert_eq!(openai, "gpt-5.2");
+        assert_eq!(openai, "gpt-5.4");
 
         let bedrock = resolve_default_model_id(None, Some("aws-bedrock"));
         assert_eq!(bedrock, "anthropic.claude-sonnet-4-5-20250929-v1:0");
@@ -13738,7 +13738,7 @@ provider_api = "not-a-real-mode"
         assert_eq!(qwen_coding_plan, "qwen3-coder-plus");
 
         let google_alias = resolve_default_model_id(None, Some("google-gemini"));
-        assert_eq!(google_alias, "gemini-3.1-flash-lite-preview");
+        assert_eq!(google_alias, "gemini-3.1-pro-preview");
     }
 
     #[test]
