@@ -62,6 +62,7 @@ RUN rm -rf src
 
 # Copy only source files needed for the final build.
 COPY src/ src/
+COPY benches/ benches/
 # Use freshly built frontend assets from web-builder stage.
 COPY --from=web-builder /web/dist/ web/dist/
 
