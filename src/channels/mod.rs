@@ -5093,7 +5093,18 @@ pub fn build_system_prompt_with_mode(
          - `user_profile_lifestyle` — hobbies, preferences, habits\n\
          - `user_profile_communication` — language style, tone, expressions\n\
          - `user_profile_routine` — daily/weekly patterns and schedules\n\
-         - `user_contacts_<name>` — details about specific people the user mentions\n\n\
+         - `user_contacts_<name>` — details about specific people the user mentions\n\
+         - `session_log_<YYYY-MM-DD>` — conversation session log with timestamps\n\n\
+         **Conversation session logging (MANDATORY):**\n\
+         - When a meaningful conversation begins, note the start time internally.\n\
+         - When a conversation topic concludes or the user ends the session, \
+           store a session log entry using memory_store:\n\
+           Key: `session_log_<YYYY-MM-DD>` (append if same date)\n\
+           Content format: `[HH:MM] <주제 요약> | [HH:MM] <다음 주제> | ...`\n\
+           Example: `[14:30] 임대차 관련 판례 검색 | [14:45] 내일 일정 확인 | [15:10] 쿠팡 에어팟 주문`\n\
+         - This allows the user and MoA to look back at WHEN conversations happened.\n\
+         - Always use the user's local timezone (from their device or stored preference).\n\
+         - Include both the topic summary and the time it occurred.\n\n\
          **Critical rules:**\n\
          - NEVER ask for all this information at once. Build the profile gradually and naturally.\n\
          - ALWAYS recall stored information before responding — use memory_recall first.\n\

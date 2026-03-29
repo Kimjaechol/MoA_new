@@ -50,7 +50,19 @@ pub(super) async fn build_context(
                     continue;
                 }
                 seen_memory_keys.insert(entry.key.clone());
-                let line = format!("- {}: {}\n", entry.key, entry.content);
+                // Include timestamp so the LLM knows WHEN this memory was recorded
+                let ts_hint = if entry.timestamp.is_empty() {
+                    String::new()
+                } else {
+                    // Truncate to date+time (no timezone suffix) for readability
+                    let short_ts = if entry.timestamp.len() > 19 {
+                        &entry.timestamp[..19]
+                    } else {
+                        &entry.timestamp
+                    };
+                    format!(" [{}]", short_ts)
+                };
+                let line = format!("- {}:{} {}\n", entry.key, ts_hint, entry.content);
                 context.push_str(&line);
 
                 // Extract time/place/person keywords from memory content
