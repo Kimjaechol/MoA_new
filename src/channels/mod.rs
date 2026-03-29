@@ -4864,27 +4864,62 @@ pub fn build_system_prompt_with_mode(
         );
     }
 
-    // ── 1d. Web Search Query Planning ────────────────────────────
+    // ── 1d. Web Search & Deep Research Workflow ─────────────────────
     prompt.push_str(
-        "## Web Search Query Planning (CRITICAL)\n\n\
-         When you need to search the web, NEVER search the user's raw message verbatim.\n\
-         Instead, plan the optimal search query by following these steps:\n\n\
-         1. **Resolve implicit context** — Use memory_recall FIRST to fill in missing details:\n\
-            - Location: recall user_profile_identity for city/address, office location, home location\n\
-            - Time: convert relative time words (\"내일\", \"다음 주\", \"이번 금요일\") to actual dates using the current timestamp\n\
-            - Person: if the user mentions someone by name, recall who that person is\n\n\
-         2. **Construct a specific search query** with resolved context:\n\
-            - BAD: \"내일 날씨\" (raw user input — too vague, no location)\n\
-            - GOOD: \"서울 강남구 2026년 3월 29일 날씨 예보\" (resolved location + date)\n\
-            - BAD: \"맛집 추천\" (no location context)\n\
-            - GOOD: \"서울 서초구 반포동 점심 맛집 추천 2026\" (resolved area + purpose)\n\n\
-         3. **Include the user's language in the query** — If the user speaks Korean, search in Korean.\n\
-            If the topic requires English results (e.g., technical docs), search in English.\n\n\
-         4. **For weather/time-sensitive queries**, always include:\n\
-            - The specific city/district (구/동) from user's stored location\n\
-            - The resolved date (YYYY-MM-DD or \"오늘\"/\"내일\" + actual date)\n\
-            - The keyword \"날씨 예보\" or \"weather forecast\" (not just \"날씨\")\n\n\
-         This planning step is MANDATORY for every web_search call. Do not skip it.\n\n",
+        "## Web Search & Deep Research Workflow (CRITICAL)\n\n\
+         When the user's question requires or benefits from web information — even if they \
+         don't explicitly ask for a search — you MUST proactively search the web.\n\
+         Examples that ALWAYS trigger search: weather, news, prices, schedules, recent events, \
+         legal rulings, regulations, stock data, sports scores, restaurant info, travel info.\n\n\
+         ### Phase 1: Query Planning\n\
+         Before calling web_search, resolve ALL implicit context:\n\
+         1. **memory_recall** FIRST — get user's location (city/district), routines, preferences\n\
+         2. **Resolve relative time** — convert \"내일\", \"다음 주\", \"이번 금요일\" to actual dates (YYYY-MM-DD)\n\
+         3. **Construct optimized query** — NEVER pass the raw user message as the query\n\
+            - BAD: \"내일 날씨\" → GOOD: \"서울 강남구 2026년 3월 30일 날씨 예보\"\n\
+            - BAD: \"맛집 추천\" → GOOD: \"서울 서초구 반포동 점심 맛집 추천 2026\"\n\
+         4. **Language match** — Korean questions → Korean query, technical topics → English query\n\n\
+         ### Phase 2: Parallel Browser Search (web_search tool)\n\
+         web_search now opens a real Chromium browser and searches 3 engines simultaneously \
+         (Naver + Google + DuckDuckGo). Results from all 3 are merged and returned.\n\
+         This is fast (~2 seconds), free, and never gets blocked.\n\n\
+         ### Phase 3: Smart Link Selection & Deep Dive\n\
+         After receiving search results, do NOT simply summarize the snippets. Instead:\n\n\
+         1. **Select up to 5 most relevant links** from the search results that are most likely \
+            to contain the answer. Prioritize:\n\
+            - Official/authoritative sources (government, news agencies, official sites)\n\
+            - Recent/fresh content matching the time context\n\
+            - Sources in the user's language\n\
+            - Pages that appear to have detailed rather than summary content\n\n\
+         2. **Visit each selected link** using the browser tool:\n\
+            - `browser open <url>` → navigate to the page\n\
+            - `browser text` → extract the full page content\n\
+            - Scan the content for the specific answer to the user's question\n\n\
+         3. **Depth-first exploration (up to 3 levels)** — if a page links to more detailed \
+            information needed to answer the question:\n\
+            - Level 1: Search results page → click top 5 links\n\
+            - Level 2: If a detail page has a \"more info\" or \"full article\" link → follow it\n\
+            - Level 3: If still not enough → follow one more link\n\
+            - STOP at 3 levels maximum to conserve tokens\n\n\
+         4. **Synthesize the answer** from all gathered content. Cite sources with URLs.\n\n\
+         ### Token Efficiency Rules\n\
+         - Do NOT scrape all links — only the top 5 most relevant\n\
+         - Do NOT dump raw page text into the response — extract only relevant facts\n\
+         - Truncate page content mentally; focus on paragraphs containing the answer\n\
+         - If the search result snippets already contain a clear, complete answer, \
+           skip the deep dive and respond directly\n\n\
+         ### Example Complete Flow\n\
+         User: \"내일 날씨 알려줘\"\n\
+         → memory_recall: user lives in 서울 강남구, works in 서초구\n\
+         → web_search query: \"서울 강남구 2026년 3월 30일 날씨 예보\"\n\
+         → Results: Naver weather card shows forecast directly in snippets\n\
+         → Answer immediately from snippets (no deep dive needed)\n\n\
+         User: \"최근 대법원 임대차 관련 판례 알려줘\"\n\
+         → web_search query: \"대법원 임대차 판례 2026년\"\n\
+         → Results: 5 candidate links from law sites\n\
+         → browser open each link → extract ruling details\n\
+         → If ruling references another case → follow link (level 2)\n\
+         → Synthesize and respond with case numbers, dates, key holdings\n\n",
     );
 
     // ── 1e. Personal Assistant Persona ──────────────────────────
