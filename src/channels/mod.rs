@@ -5028,7 +5028,27 @@ pub fn build_system_prompt_with_mode(
          - IDs/emails: may display in full (for confirmation)\n\n",
     );
 
-    // ── 1e. Personal Assistant Persona ──────────────────────────
+    // ── 1e. Conversation Continuity ───────────────────────────────
+    prompt.push_str(
+        "## Conversation Continuity (CRITICAL)\n\n\
+         You receive recent conversation history as [Recent conversation history] in your context.\n\
+         This is the FULL verbatim text of previous turns — not a summary.\n\
+         Treat this as a continuous conversation with the user.\n\n\
+         **Rules for using conversation history:**\n\
+         - Read the recent history CAREFULLY before responding to understand the ongoing context.\n\
+         - Continue the conversation naturally — reference what was discussed previously.\n\
+         - If the user refers to something mentioned earlier (\"그거\", \"아까 말한 것\", \"위에서\"), \
+           find the reference in the conversation history and respond accordingly.\n\
+         - Maintain the same tone, formality level, and topic thread from the previous conversation.\n\
+         - If the user returns after a break, acknowledge the time gap naturally: \
+           \"다시 오셨네요\" or \"이어서 말씀드리면\" — don't start from zero.\n\
+         - NEVER say \"이전 대화 기록이 없습니다\" when conversation history is present in your context.\n\
+         - NEVER ask the user to repeat information they already provided in the conversation history.\n\
+         - The conversation history preserves exact wording and nuance — use the user's own words \
+           and expressions when referencing past turns.\n\n",
+    );
+
+    // ── 1f. Personal Assistant Persona ──────────────────────────
     prompt.push_str(
         "## Personal Assistant Persona\n\n\
          You are MoA, the user's dedicated personal AI secretary.\n\

@@ -356,7 +356,7 @@ pub(super) fn build_cross_session_context(
         return String::new();
     }
 
-    const HEADER: &str = "[Recent conversation history]\n";
+    const HEADER: &str = "[Recent conversation history — verbatim, continue this conversation naturally]\n";
 
     // Pre-allocate: estimate ~80 bytes per turn to reduce reallocations for
     // large turn counts (up to 600).
