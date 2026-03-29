@@ -420,61 +420,184 @@ pub(super) fn build_cross_session_context(
     }
 }
 
-/// Generate a compact memo (~200 chars) from a long conversation turn.
+/// Generate a proportional memo from a long conversation turn.
 ///
-/// Extracts the key information: topic, 6W (who/what/when/where/why/how),
-/// and any trailing questions or action items.
+/// Memo size = 10% of the original content length (not a fixed 200 chars).
+/// For multi-topic content, each topic/item is summarized separately
+/// following the 6W principle (who/what/when/where/why/how).
+///
+/// Examples:
+/// - 2,000 char turn → ~200 char memo
+/// - 10,000 char turn → ~1,000 char memo
+/// - 100,000 char turn → ~10,000 char memo
 fn generate_turn_memo(content: &str, char_count: usize) -> String {
+    // Memo budget: 10% of original, minimum 100 chars, maximum 10,000 chars
+    let memo_budget = (char_count / 10).clamp(100, 10_000);
+
     let mut memo_parts: Vec<String> = Vec::new();
 
-    // 1. Extract first meaningful sentence as topic indicator
-    let first_line = content
-        .lines()
-        .find(|l| l.trim().len() > 10)
-        .unwrap_or("")
-        .trim();
-    if !first_line.is_empty() {
-        let topic: String = first_line.chars().take(80).collect();
-        memo_parts.push(format!("주제: {topic}"));
-    }
-
-    // 2. Detect content type
+    // 1. Content type detection
+    let mut content_types = Vec::new();
     if content.contains("```") || content.contains("fn ") || content.contains("function ") {
-        memo_parts.push("코드 포함".to_string());
+        content_types.push("코드");
     }
     if content.contains("http://") || content.contains("https://") {
-        memo_parts.push("URL 포함".to_string());
+        content_types.push("URL");
     }
     if content.contains("검색 결과") || content.contains("Search results") {
-        memo_parts.push("검색결과".to_string());
+        content_types.push("검색결과");
+    }
+    if !content_types.is_empty() {
+        memo_parts.push(format!("[{}]", content_types.join(", ")));
     }
 
-    // 3. Extract trailing question or action item (last 2 non-empty lines)
+    // 2. Extract section-level summaries for multi-topic content
+    //    Split by blank lines, headers (##, ###), or numbered items (1., 2.)
+    let sections = split_into_sections(content);
+    let chars_per_section = if sections.is_empty() {
+        memo_budget
+    } else {
+        (memo_budget / sections.len()).max(50)
+    };
+
+    for section in &sections {
+        let summary = summarize_section(section, chars_per_section);
+        if !summary.is_empty() {
+            memo_parts.push(summary);
+        }
+    }
+
+    // 3. Extract trailing question or action item
     let last_lines: Vec<&str> = content
         .lines()
         .rev()
         .filter(|l| l.trim().len() > 5)
-        .take(2)
+        .take(3)
         .collect();
     for line in last_lines.iter().rev() {
         let trimmed = line.trim();
         if trimmed.contains('?') || trimmed.contains("할까") || trimmed.contains("드릴까")
             || trimmed.contains("하시겠") || trimmed.contains("해줘") || trimmed.contains("알려")
+            || trimmed.contains("확인") || trimmed.contains("제안")
         {
-            let question: String = trimmed.chars().take(80).collect();
-            memo_parts.push(format!("질문/요청: {question}"));
+            let question: String = trimmed.chars().take(chars_per_section).collect();
+            memo_parts.push(format!("▸ 질문/요청: {question}"));
             break;
         }
     }
 
-    let memo = memo_parts.join(" | ");
+    let memo = memo_parts.join("\n");
     if memo.is_empty() {
-        format!("{char_count}자 장문 내용 — 필요 시 memory_recall로 검색 가능")
+        format!("{char_count}자 장문 — 필요 시 memory_recall로 검색 가능")
     } else {
-        // Cap at ~200 chars
-        let result: String = memo.chars().take(200).collect();
+        // Final cap at memo_budget
+        let result: String = memo.chars().take(memo_budget).collect();
         result
     }
+}
+
+/// Split content into logical sections by blank lines, headers, or numbered lists.
+fn split_into_sections(content: &str) -> Vec<String> {
+    let mut sections: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Section break: blank line, markdown header, or numbered item start
+        let is_break = trimmed.is_empty()
+            || trimmed.starts_with("## ")
+            || trimmed.starts_with("### ")
+            || trimmed.starts_with("---")
+            || (trimmed.len() > 2
+                && trimmed.chars().next().map_or(false, |c| c.is_ascii_digit())
+                && (trimmed.contains(". ") || trimmed.contains(") ")));
+
+        if is_break && !current.trim().is_empty() {
+            sections.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        sections.push(current);
+    }
+
+    // Merge very small sections (< 50 chars) into previous
+    let mut merged: Vec<String> = Vec::new();
+    for section in sections {
+        if section.trim().chars().count() < 50 {
+            if let Some(last) = merged.last_mut() {
+                last.push_str(&section);
+            } else {
+                merged.push(section);
+            }
+        } else {
+            merged.push(section);
+        }
+    }
+
+    merged
+}
+
+/// Summarize a single section to fit within `budget` characters.
+/// Extracts the 6W essence: who did what, when, where, why, how.
+fn summarize_section(section: &str, budget: usize) -> String {
+    let trimmed = section.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // If section fits within budget, return as-is
+    let char_count = trimmed.chars().count();
+    if char_count <= budget {
+        return trimmed.to_string();
+    }
+
+    // Extract first meaningful line as topic
+    let first_line = trimmed
+        .lines()
+        .find(|l| l.trim().len() > 5)
+        .unwrap_or("")
+        .trim();
+
+    let topic: String = first_line.chars().take(budget.min(120)).collect();
+
+    // If budget allows, add more context from the section
+    if budget > 150 {
+        let remaining_budget = budget - topic.chars().count() - 10;
+        // Extract key sentences (lines containing important markers)
+        let key_sentences: Vec<&str> = trimmed
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                let t = l.trim();
+                t.len() > 10
+                    && (t.contains("결과") || t.contains("결론") || t.contains("요약")
+                        || t.contains("중요") || t.contains("핵심") || t.contains("따라서")
+                        || t.contains("때문") || t.contains("위해") || t.contains("Result")
+                        || t.contains("Summary") || t.contains("because") || t.contains("therefore")
+                        || t.starts_with("- ") || t.starts_with("* "))
+            })
+            .collect();
+
+        if !key_sentences.is_empty() {
+            let mut extra = String::new();
+            for sentence in key_sentences {
+                let s = sentence.trim();
+                if extra.chars().count() + s.chars().count() > remaining_budget {
+                    break;
+                }
+                extra.push_str(" | ");
+                extra.push_str(s);
+            }
+            if !extra.is_empty() {
+                return format!("{topic}{extra}");
+            }
+        }
+    }
+
+    topic
 }
 
 #[cfg(test)]
