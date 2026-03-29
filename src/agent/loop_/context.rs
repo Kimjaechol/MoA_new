@@ -33,6 +33,47 @@ pub(super) async fn build_context(
     let mut seen_memory_keys = HashSet::new();
     let mut cross_search_keywords = Vec::new();
 
+    // ── Phase 0: Essential profile recall (ALWAYS loaded) ──────
+    // These keys are loaded regardless of the user's message content.
+    // Without this, greeting messages like "안녕" would not retrieve
+    // the user's name, occupation, or preferred form of address.
+    const ESSENTIAL_PROFILE_KEYS: &[&str] = &[
+        "user_profile_identity",
+        "user_profile_family",
+        "user_profile_work",
+        "user_profile_lifestyle",
+        "user_profile_communication",
+        "user_profile_routine",
+        "user_moa_preferences",
+    ];
+
+    let mut essential_loaded = false;
+    for key in ESSENTIAL_PROFILE_KEYS {
+        if let Ok(Some(entry)) = mem.get(key).await {
+            if !essential_loaded {
+                context.push_str("[User profile — always loaded]\n");
+                essential_loaded = true;
+            }
+            seen_memory_keys.insert(entry.key.clone());
+            let ts_hint = if entry.timestamp.is_empty() {
+                String::new()
+            } else {
+                let short_ts = if entry.timestamp.len() > 19 {
+                    &entry.timestamp[..19]
+                } else {
+                    &entry.timestamp
+                };
+                format!(" [{}]", short_ts)
+            };
+            let line = format!("- {}:{} {}\n", entry.key, ts_hint, entry.content);
+            context.push_str(&line);
+            extract_cross_search_keywords(&entry.content, &mut cross_search_keywords);
+        }
+    }
+    if essential_loaded {
+        context.push('\n');
+    }
+
     // ── Phase 1: Primary memory recall ──────────────────────────
     if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
         let relevant: Vec<_> = entries
