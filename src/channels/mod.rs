@@ -4939,11 +4939,15 @@ pub fn build_system_prompt_with_mode(
             - After receiving ID: \"비밀번호를 알려주세요.\"\n\
             - After login succeeds, ask: \"다음에도 사용할 수 있도록 로그인 정보를 이 기기에 암호화하여 저장할까요?\"\n\
             - If yes: use `credential_store` to save (encrypted locally, never plaintext).\n\
-         4. **Use browser to fill the login form**:\n\
+         4. **Use browser to fill the login form with credential references**:\n\
+            - `credential_recall get site=example.com label=id` → returns `{{CRED:example.com:id}}`\n\
+            - `credential_recall get site=example.com label=password` → returns `{{CRED:example.com:password}}`\n\
             - `browser open <login_url>`\n\
             - `browser snapshot` → find fields (@refs)\n\
-            - `browser fill @e1 <user_id>` → `browser fill @e2 <password>`\n\
+            - `browser fill @e1 {{CRED:example.com:id}}` → gateway resolves locally\n\
+            - `browser fill @e2 {{CRED:example.com:password}}` → gateway resolves locally\n\
             - `browser click @e3` (login button)\n\
+            - **The actual password NEVER appears in your conversation.** You only handle reference tokens.\n\
          5. **After login**, confirm: \"로그인 성공했습니다. 검색을 시작하겠습니다.\"\n\n\
          ### CAPTCHA / 2FA Verification\n\
          If the site shows a CAPTCHA, robot check, or 2FA:\n\
@@ -4982,12 +4986,23 @@ pub fn build_system_prompt_with_mode(
          - Plaintext storage is FORBIDDEN — all data is encrypted via ChaCha20-Poly1305\n\
          - Decryption happens only at the moment of use (browser form fill), \
            inside the MoA gateway process — decrypted values are never logged or persisted\n\n\
+         **Credential reference architecture (how it works):**\n\
+         - `credential_recall get` returns `{{CRED:site:label}}` — a REFERENCE TOKEN, not the actual value\n\
+         - You pass this reference token to `browser fill` as-is\n\
+         - The MoA gateway intercepts the token and resolves it locally to the actual decrypted value\n\
+         - The decrypted value goes directly to the browser form — you (the LLM) NEVER see it\n\
+         - This means the actual password/card number NEVER enters the LLM conversation history\n\n\
+         **When user provides credentials in chat (first-time login):**\n\
+         - Receive the value, immediately call `credential_store` to encrypt and save it\n\
+         - Then use `credential_recall get` to get the reference token for browser fill\n\
+         - Do NOT hold the plaintext value — use the reference token for all subsequent operations\n\
+         - Acknowledge receipt with \"확인했습니다\" without echoing the credential\n\n\
          **External transmission (forbidden):**\n\
          - **NEVER** transmit credentials to Railway relay server\n\
-         - **NEVER** include credentials in LLM conversation history sent to external APIs\n\
          - **NEVER** store credentials in memory_store or memory_observe (those may sync externally)\n\
          - **NEVER** include credentials in system prompts or context sent to external LLMs\n\
-         - When sending conversation to the LLM, replace credential values with [REDACTED]\n\n\
+         - Credential values should only exist as encrypted vault entries or reference tokens\n\
+         - Instruct the external LLM: \"Do not memorize or store any credential values from this conversation.\"\n\n\
          **User consent (always required):**\n\
          - **ALWAYS** ask before using stored credentials — even if previously saved\n\
          - Show WHAT action will be performed (login to which site, pay how much)\n\

@@ -4,9 +4,14 @@
 //! using ChaCha20-Poly1305 via the existing SecretStore infrastructure.
 //! Credentials are NEVER stored in plaintext and NEVER transmitted externally.
 //!
-//! Two tools:
-//! - `credential_store`: encrypt and save a credential
-//! - `credential_recall`: retrieve and decrypt a credential for browser automation
+//! Security architecture:
+//! - `credential_store`: encrypt and save a credential locally
+//! - `credential_recall get`: returns a REFERENCE TOKEN `{{CRED:site:label}}`
+//!   (the actual value is NEVER sent to the LLM)
+//! - `resolve_credential_ref()`: called by the browser tool at fill time
+//!   to resolve the reference token to the actual value locally
+//! - The decrypted credential only exists briefly in gateway memory during
+//!   browser form fill, then is dropped
 
 use crate::security::SecretStore;
 use crate::tools::traits::{Tool, ToolResult, ToolSpec};
@@ -187,7 +192,7 @@ impl Tool for CredentialRecallTool {
     }
 
     fn description(&self) -> &str {
-        "Retrieve a stored credential from the LOCAL encrypted vault. Returns the decrypted value for browser form filling. Use 'list' action to see stored credentials (masked). Use 'get' action to decrypt a specific credential."
+        "Retrieve a stored credential from the LOCAL encrypted vault. Use 'list' to see stored credentials (masked). Use 'get' to obtain a secure reference token ({{CRED:site:label}}) — pass this token directly to `browser fill` and the gateway will resolve it locally. The actual credential is NEVER returned to you."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -278,10 +283,16 @@ impl Tool for CredentialRecallTool {
 
                 match entry {
                     Some(e) => {
-                        let decrypted = store.decrypt(&e.encrypted_value)?;
+                        // Return a REFERENCE TOKEN, not the decrypted value.
+                        // The actual credential never leaves the local gateway.
+                        // The browser tool resolves this token locally at fill time.
+                        let ref_token = format!("{{{{CRED:{}:{}}}}}", site, label);
                         Ok(ToolResult {
                             success: true,
-                            output: decrypted,
+                            output: format!(
+                                "Credential reference: {} (hint: {}). Pass this token directly to `browser fill` — the gateway will resolve it locally. The actual value is NOT exposed to the LLM.",
+                                ref_token, e.display_hint
+                            ),
                             error: None,
                         })
                     }
@@ -324,4 +335,68 @@ impl Tool for CredentialRecallTool {
             }),
         }
     }
+}
+
+// ── Public credential reference resolver ────────────────────────
+
+/// Pattern for credential reference tokens: `{{CRED:site:label}}`
+const CRED_REF_PREFIX: &str = "{{CRED:";
+const CRED_REF_SUFFIX: &str = "}}";
+
+/// Check if a string contains a credential reference token.
+pub fn contains_credential_ref(s: &str) -> bool {
+    s.contains(CRED_REF_PREFIX) && s.contains(CRED_REF_SUFFIX)
+}
+
+/// Resolve all `{{CRED:site:label}}` tokens in a string by decrypting
+/// the corresponding credentials from the local vault.
+///
+/// Called by the browser tool at form-fill time. The decrypted values
+/// exist only in the returned String and should be used immediately
+/// for the browser command, then dropped.
+///
+/// Returns the input string with all references replaced by decrypted values.
+/// Unresolvable references are left as-is (the browser will likely error,
+/// which is better than silently swallowing a missing credential).
+pub fn resolve_credential_refs(input: &str, workspace_dir: &Path) -> String {
+    if !contains_credential_ref(input) {
+        return input.to_string();
+    }
+
+    let store = SecretStore::new(workspace_dir, true);
+    let path = vault_path(workspace_dir);
+    let vault = load_vault(&path, &store);
+
+    let mut result = input.to_string();
+
+    // Find and replace all {{CRED:site:label}} patterns
+    while let Some(start) = result.find(CRED_REF_PREFIX) {
+        let after_prefix = start + CRED_REF_PREFIX.len();
+        let Some(end) = result[after_prefix..].find(CRED_REF_SUFFIX) else {
+            break; // malformed — stop
+        };
+        let inner = &result[after_prefix..after_prefix + end]; // "site:label"
+        let full_token = &result[start..after_prefix + end + CRED_REF_SUFFIX.len()];
+
+        let parts: Vec<&str> = inner.splitn(2, ':').collect();
+        if parts.len() == 2 {
+            let site = parts[0];
+            let label = parts[1];
+
+            if let Some(entry) = vault
+                .credentials
+                .iter()
+                .find(|c| c.site == site && c.label == label)
+            {
+                if let Ok(decrypted) = store.decrypt(&entry.encrypted_value) {
+                    result = result.replacen(full_token, &decrypted, 1);
+                    continue;
+                }
+            }
+        }
+        // Could not resolve — skip past this token to avoid infinite loop
+        break;
+    }
+
+    result
 }
