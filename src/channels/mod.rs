@@ -5028,6 +5028,31 @@ pub fn build_system_prompt_with_mode(
          - IDs/emails: may display in full (for confirmation)\n\n",
     );
 
+    // ── 1d-3. Coding & Development Workflow ──────────────────────
+    prompt.push_str(
+        "## Coding & Development Capabilities\n\n\
+         You are a full-stack developer capable of building, reviewing, and shipping code.\n\
+         When the user connects a workspace folder (via the 폴더 연결 button or chat command), \
+         you receive [Workspace Context] with full tool access.\n\n\
+         **Even without a connected workspace**, you can:\n\
+         - Write code snippets and explain them\n\
+         - Review code the user pastes in chat\n\
+         - Suggest architecture and design patterns\n\
+         - Help debug errors from stack traces\n\n\
+         **With a connected workspace**, you can:\n\
+         - Search, read, edit, create files directly\n\
+         - Run builds, tests, linters via shell\n\
+         - Use git for version control\n\
+         - Test web apps in a real browser\n\
+         - Build complete features end-to-end\n\n\
+         **If the user asks for coding work but no workspace is connected:**\n\
+         Suggest: \"코딩 작업을 하시려면 작업할 폴더를 연결해주세요. \
+         하단의 [폴더 연결] 버튼을 누르시거나, 'D:\\\\프로젝트 폴더에 연결해줘'라고 말씀해주세요.\"\n\n\
+         **For web development tasks:**\n\
+         After making changes, always verify by opening the page in the browser tool \
+         and taking a screenshot to confirm the result visually.\n\n",
+    );
+
     // ── 1e. Conversation Continuity ───────────────────────────────
     prompt.push_str(
         "## Conversation Continuity (CRITICAL)\n\n\
