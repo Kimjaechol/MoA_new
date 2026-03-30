@@ -157,14 +157,16 @@ impl KakaoTalkChannel {
             }
         });
 
+        let body = serde_json::json!({
+            "receiver_uuids": [user_id],
+            "template_object": template
+        });
+
         let resp = self
             .client
             .post(KAKAO_CHANNEL_API)
             .header("Authorization", format!("KakaoAK {token}"))
-            .form(&[
-                ("receiver_uuids", serde_json::json!([user_id]).to_string()),
-                ("template_object", template.to_string()),
-            ])
+            .json(&body)
             .send()
             .await?;
 
@@ -614,7 +616,8 @@ async fn handle_webhook(
             .into_response();
     }
 
-    // Also handle direct message callback format (plain StatusCode response)
+    // Handle direct message callback format (plain StatusCode response).
+    // Mutually exclusive with the Chatbot Skill format above (which always returns).
     if let Some(content) = payload.get("content") {
         let user_id = payload
             .get("user_id")
@@ -729,7 +732,14 @@ impl Channel for KakaoTalkChannel {
             .await;
 
         match result {
-            Ok(resp) => resp.status().is_success() || resp.status().as_u16() == 401,
+            Ok(resp) => {
+                if resp.status().as_u16() == 401 {
+                    tracing::warn!("KakaoTalk health_check: admin key is invalid (401)");
+                    false
+                } else {
+                    resp.status().is_success()
+                }
+            }
             Err(_) => false,
         }
     }

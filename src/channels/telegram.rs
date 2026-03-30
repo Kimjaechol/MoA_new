@@ -459,7 +459,7 @@ pub struct TelegramChannel {
     allowed_users: Arc<RwLock<Vec<String>>>,
     pairing: Option<PairingGuard>,
     client: reqwest::Client,
-    typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    typing_handles: Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
@@ -504,7 +504,7 @@ impl TelegramChannel {
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
-            typing_handle: Mutex::new(None),
+            typing_handles: Mutex::new(std::collections::HashMap::new()),
             mention_only,
             group_reply_allowed_sender_ids: Vec::new(),
             bot_username: Mutex::new(None),
@@ -2844,15 +2844,18 @@ impl Channel for TelegramChannel {
             }
         }
 
-        // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
-        let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+        // Truncate to Telegram limit for mid-stream edits (UTF-8 safe).
+        // Compare char count (not byte length) against the 4096-char limit.
+        let char_count = text.chars().count();
+        let display_text = if char_count > TELEGRAM_MAX_MESSAGE_LENGTH {
             let mut end = 0;
+            let mut count = 0;
             for (idx, ch) in text.char_indices() {
-                let next = idx + ch.len_utf8();
-                if next > TELEGRAM_MAX_MESSAGE_LENGTH {
+                if count >= TELEGRAM_MAX_MESSAGE_LENGTH {
                     break;
                 }
-                end = next;
+                end = idx + ch.len_utf8();
+                count += 1;
             }
             &text[..end]
         } else {
@@ -2949,8 +2952,9 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        // If text exceeds limit, delete draft and send as chunked messages
-        if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+        // If text exceeds limit, delete draft and send as chunked messages.
+        // Compare char count (not byte length) against the 4096-char limit.
+        if text.chars().count() > TELEGRAM_MAX_MESSAGE_LENGTH {
             if let Some(id) = msg_id {
                 let _ = self
                     .client
@@ -3439,11 +3443,13 @@ Ensure only one `zeroclaw` process is using this bot token."
     }
 
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        // Stop any existing typing indicator for this specific chat
         self.stop_typing(recipient).await?;
 
         let client = self.http_client();
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
+        let chat_id_key = recipient.to_string();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -3457,15 +3463,15 @@ Ensure only one `zeroclaw` process is using this bot token."
             }
         });
 
-        let mut guard = self.typing_handle.lock();
-        *guard = Some(handle);
+        let mut guard = self.typing_handles.lock();
+        guard.insert(chat_id_key, handle);
 
         Ok(())
     }
 
-    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        let mut guard = self.typing_handle.lock();
-        if let Some(handle) = guard.take() {
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let mut guard = self.typing_handles.lock();
+        if let Some(handle) = guard.remove(recipient) {
             handle.abort();
         }
         Ok(())
@@ -3535,39 +3541,39 @@ mod tests {
     }
 
     #[test]
-    fn typing_handle_starts_as_none() {
+    fn typing_handles_starts_empty() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_none());
+        let guard = ch.typing_handles.lock();
+        assert!(guard.is_empty());
     }
 
     #[tokio::test]
-    async fn stop_typing_clears_handle() {
+    async fn stop_typing_clears_handle_per_chat() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
 
-        // Manually insert a dummy handle
+        // Manually insert a dummy handle for chat "123"
         {
-            let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
+            let mut guard = ch.typing_handles.lock();
+            guard.insert("123".to_string(), tokio::spawn(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }));
         }
 
-        // stop_typing should abort and clear
+        // stop_typing should abort and remove handle for chat "123"
         ch.stop_typing("123").await.unwrap();
 
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_none());
+        let guard = ch.typing_handles.lock();
+        assert!(!guard.contains_key("123"));
     }
 
     #[tokio::test]
     async fn start_typing_replaces_previous_handle() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
 
-        // Insert a dummy handle first
+        // Insert a dummy handle for chat "123"
         {
-            let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
+            let mut guard = ch.typing_handles.lock();
+            guard.insert("123".to_string(), tokio::spawn(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }));
         }
@@ -3575,8 +3581,31 @@ mod tests {
         // start_typing should abort the old handle and set a new one
         let _ = ch.start_typing("123").await;
 
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_some());
+        let guard = ch.typing_handles.lock();
+        assert!(guard.contains_key("123"));
+    }
+
+    #[tokio::test]
+    async fn typing_handles_are_per_chat() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
+
+        // Insert handles for two different chats
+        {
+            let mut guard = ch.typing_handles.lock();
+            guard.insert("chat_a".to_string(), tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }));
+            guard.insert("chat_b".to_string(), tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }));
+        }
+
+        // Stopping typing for chat_a should NOT affect chat_b
+        ch.stop_typing("chat_a").await.unwrap();
+
+        let guard = ch.typing_handles.lock();
+        assert!(!guard.contains_key("chat_a"));
+        assert!(guard.contains_key("chat_b"));
     }
 
     #[test]
