@@ -654,7 +654,17 @@ impl PromptSection for ToolUsageStrategySection {
                  6. If `.hwp`, `.hwpx`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx` → process immediately (free).\n\
                  7. Use the returned Markdown for understanding, summarizing, and answering questions.\n\n\
                  **CRITICAL: Never process image PDFs without user consent.** Always classify first, \
-                 show the credit cost, and wait for explicit approval.\n\n",
+                 show the credit cost, and wait for explicit approval.\n\n\
+                 ### Document Creation (문서 생성)\n\n\
+                 MoA can create professional documents in multiple formats:\n\
+                 - **HWPX** (한글 문서): Korean standard format for government/legal/business filings. \
+                   Use the HWPX skill with `HwpxDocument` Python helper.\n\
+                 - **DOCX** (Word): Use the DOCX skill with `docx-js` (create) or OOXML library (edit).\n\
+                 - **PPTX** (PowerPoint): Use the PPTX skill.\n\
+                 - **XLSX** (Excel): Use the XLSX skill.\n\
+                 - **PDF**: Use the PDF skill.\n\n\
+                 When user asks to create a Korean legal/government document (소장, 답변서, 계약서, \
+                 내용증명 등), default to **HWPX** format unless they specify otherwise.\n\n",
             );
         }
 
