@@ -137,13 +137,30 @@ async fn handle_connection(
 ) {
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // Spawn heartbeat task (sends ping periodically)
+    // Channel for sending WebSocket messages (heartbeat pings + responses)
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Message>(32);
+
+    // Spawn heartbeat task — sends ping frames to keep the connection alive.
+    // Without this, firewalls/proxies may silently close idle WebSockets.
     let stop_clone = Arc::new(AtomicBool::new(false));
     let stop_for_heartbeat = stop_clone.clone();
+    let heartbeat_tx = outbound_tx.clone();
     let heartbeat_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
             if stop_for_heartbeat.load(Ordering::Relaxed) {
+                break;
+            }
+            if heartbeat_tx.send(Message::Ping(vec![])).await.is_err() {
+                break; // ws_sender dropped, connection closed
+            }
+        }
+    });
+
+    // Spawn outbound sender task — drains the channel and writes to WebSocket
+    let sender_task = tokio::spawn(async move {
+        while let Some(msg) = outbound_rx.recv().await {
+            if ws_sender.send(msg).await.is_err() {
                 break;
             }
         }
@@ -163,7 +180,7 @@ async fn handle_connection(
         let msg = match msg_result {
             Ok(Message::Text(text)) => text.to_string(),
             Ok(Message::Ping(data)) => {
-                let _ = ws_sender.send(Message::Pong(data)).await;
+                let _ = outbound_tx.send(Message::Pong(data)).await;
                 continue;
             }
             Ok(Message::Close(_)) => {
@@ -200,7 +217,7 @@ async fn handle_connection(
                     "id": msg_id,
                     "has_key": has_key,
                 });
-                let _ = ws_sender
+                let _ = outbound_tx
                     .send(Message::Text(response.to_string().into()))
                     .await;
             }
@@ -217,7 +234,7 @@ async fn handle_connection(
                 )
                 .await;
 
-                send_response(&mut ws_sender, &msg_id, &response_text).await;
+                send_response_via_channel(&outbound_tx, &msg_id, &response_text).await;
             }
 
             // ── hybrid_relay: no LLM key, use proxy token for LLM ──
@@ -239,7 +256,7 @@ async fn handle_connection(
                 )
                 .await;
 
-                send_response(&mut ws_sender, &msg_id, &response_text).await;
+                send_response_via_channel(&outbound_tx, &msg_id, &response_text).await;
             }
 
             // ── channel_relay: channel message (KakaoTalk, WhatsApp, etc.) ──
@@ -264,7 +281,7 @@ async fn handle_connection(
                 )
                 .await;
 
-                send_response(&mut ws_sender, &msg_id, &response_text).await;
+                send_response_via_channel(&outbound_tx, &msg_id, &response_text).await;
             }
 
             _ => {
@@ -273,18 +290,15 @@ async fn handle_connection(
         }
     }
 
+    // Shut down heartbeat and sender tasks
     stop_clone.store(true, Ordering::Relaxed);
     heartbeat_task.abort();
+    sender_task.abort();
 }
 
-/// Send a response (done or error) back to Railway.
-async fn send_response(
-    ws_sender: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        Message,
-    >,
+/// Send a response (done or error) back to Railway via the outbound channel.
+async fn send_response_via_channel(
+    tx: &tokio::sync::mpsc::Sender<Message>,
     msg_id: &str,
     response_text: &str,
 ) {
@@ -293,7 +307,7 @@ async fn send_response(
         "id": msg_id,
         "content": response_text,
     });
-    let _ = ws_sender
+    let _ = tx
         .send(Message::Text(response.to_string().into()))
         .await;
 }
