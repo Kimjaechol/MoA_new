@@ -419,15 +419,19 @@ impl Tool for CalendarCreateEventTool {
                     event["reminders"] = json!([reminder_minutes as i64]);
                 }
 
-                let mut body = json!({"event": event});
+                // Kakao API uses form-encoded params: event=<json_string>&calendar_id=<id>
+                let event_json_str = event.to_string();
+                let mut form_params = vec![("event", event_json_str.as_str())];
+                let cal_id_str;
                 if let Some(cal_id) = calendar_id {
-                    body["calendar_id"] = json!(cal_id);
+                    cal_id_str = cal_id.clone();
+                    form_params.push(("calendar_id", &cal_id_str));
                 }
 
                 let resp = client
                     .post("https://kapi.kakao.com/v2/api/calendar/create/event")
                     .header("Authorization", format!("Bearer {access_token}"))
-                    .json(&body)
+                    .form(&form_params)
                     .send()
                     .await?;
 
