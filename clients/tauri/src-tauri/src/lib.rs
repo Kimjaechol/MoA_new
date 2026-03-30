@@ -8,6 +8,16 @@ use rusqlite::Connection;
 
 mod device_link;
 
+/// Write session token to disk with restrictive permissions (0600 on Unix).
+fn persist_session_token(token_path: &std::path::Path, token: &str) {
+    let _ = std::fs::write(token_path, token);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
 // ── State ────────────────────────────────────────────────────────
 
 /// Shared application state for Tauri commands.
@@ -228,7 +238,7 @@ async fn pair(
         *state.token.lock().map_err(|e| e.to_string())? = Some(data.token.clone());
         // Persist token to data dir
         let token_path = state.data_dir.join("session_token");
-        let _ = std::fs::write(&token_path, &data.token);
+        persist_session_token(&token_path, &data.token);
     }
 
     Ok(data)
@@ -272,7 +282,7 @@ async fn auth_login(
     if let Some(token) = data.get("token").and_then(|t| t.as_str()) {
         *state.token.lock().map_err(|e| e.to_string())? = Some(token.to_string());
         let token_path = state.data_dir.join("session_token");
-        let _ = std::fs::write(&token_path, token);
+        persist_session_token(&token_path, token);
     }
 
     Ok(data)
@@ -583,7 +593,7 @@ fn on_app_pause(state: tauri::State<'_, AppState>) -> Result<(), String> {
     if let Ok(guard) = state.token.lock() {
         if let Some(token) = guard.as_ref() {
             let token_path = state.data_dir.join("session_token");
-            let _ = std::fs::write(token_path, token);
+            persist_session_token(&token_path, token);
         }
     }
 

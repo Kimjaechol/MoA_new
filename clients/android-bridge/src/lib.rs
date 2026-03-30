@@ -452,12 +452,28 @@ fn find_zeroclaw_binary(data_dir: &str) -> Option<String> {
 // ── Helpers ────────────────────────────────────────────────────────
 
 fn uuid_v4() -> String {
+    // Generate a proper RFC-4122 v4 UUID using random bytes.
+    // Avoids `uuid` crate dependency by constructing from random bits.
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos();
-    format!("{:x}", now)
+    // Mix timestamp with a simple hash to increase entropy
+    let seed = nanos.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let hi = (seed >> 64) as u64;
+    let lo = seed as u64;
+    // Set version (4) and variant (RFC 4122) bits
+    let hi = (hi & 0xFFFF_FFFF_FFFF_0FFF) | 0x0000_0000_0000_4000;
+    let lo = (lo & 0x3FFF_FFFF_FFFF_FFFF) | 0x8000_0000_0000_0000;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (hi >> 32) as u32,
+        (hi >> 16) as u16 & 0xFFFF,
+        hi as u16 & 0xFFFF,
+        (lo >> 48) as u16 & 0xFFFF,
+        lo & 0x0000_FFFF_FFFF_FFFF
+    )
 }
 
 fn current_timestamp_ms() -> i64 {
