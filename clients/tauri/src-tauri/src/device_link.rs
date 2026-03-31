@@ -164,7 +164,7 @@ async fn handle_connection(
             if stop_for_heartbeat.load(Ordering::Relaxed) {
                 break;
             }
-            if heartbeat_tx.send(Message::Ping(vec![])).await.is_err() {
+            if heartbeat_tx.send(Message::Ping(vec![].into())).await.is_err() {
                 break;
             }
         }
