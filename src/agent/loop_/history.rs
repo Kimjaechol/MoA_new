@@ -4,7 +4,9 @@ use anyhow::Result;
 use std::fmt::Write;
 
 /// Keep this many most-recent non-system messages after compaction.
-const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
+/// 12 messages provides enough context for coherent follow-up while keeping
+/// the body size well within the 2MB gateway limit (~50-80KB typical).
+const COMPACTION_KEEP_RECENT_MESSAGES: usize = 12;
 
 /// Safety cap for compaction source transcript passed to the summarizer.
 const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;

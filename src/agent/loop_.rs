@@ -250,7 +250,11 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
-const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
+/// Trigger compaction sooner to prevent body size overflow (64KB→2MB gateway
+/// limit). 20 messages ≈ 80-150KB which is safely within the 2MB chat body
+/// limit, while preserving enough context for coherent multi-turn conversation.
+/// The compaction keeps the 12 most recent messages and summarizes the rest.
+const DEFAULT_MAX_HISTORY_MESSAGES: usize = 20;
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
