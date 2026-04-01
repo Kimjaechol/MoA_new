@@ -363,10 +363,19 @@ pub(super) fn build_cross_session_context(
     }
 
     const HEADER: &str = "[Recent conversation history — verbatim, continue this conversation naturally]\n";
-    // Threshold for memo substitution: turns shorter than this are verbatim.
-    // Typical human conversation turns are well under 2000 chars.
-    // Longer turns are almost always documents, code, search results, or RAG output.
-    let memo_threshold = turn_max_chars.min(2000);
+
+    // ── 3-tier progressive compression thresholds ──
+    // Tier 1: 0~999 chars     → verbatim (normal conversation)
+    // Tier 2: 1000~1499 chars → keep first 70% verbatim, summarize last 30%
+    // Tier 3: 1500~1999 chars → keep first 50% verbatim, summarize last 50%
+    // Tier 4: 2000+ chars     → 10% proportional memo (existing logic)
+    //
+    // This is pure string processing — no LLM call, zero cost.
+    // Prevents gradual token bloat from medium-length turns that individually
+    // seem acceptable but collectively consume excessive context.
+    let memo_threshold_full = turn_max_chars.min(2000); // Tier 4 (full memo)
+    let memo_threshold_heavy = 1500; // Tier 3 (50% tail compression)
+    let memo_threshold_light = 1000; // Tier 2 (30% tail compression)
 
     let estimated = HEADER.len() + take_count.min(600) * 120;
     let mut ctx = String::with_capacity(estimated.min(max_bytes + 512));
@@ -378,12 +387,31 @@ pub(super) fn build_cross_session_context(
         let content = &turn.content;
         let char_count = content.chars().count();
 
-        let formatted = if char_count <= memo_threshold {
-            // ── Short turn: verbatim (natural conversation) ──
+        let formatted = if char_count < memo_threshold_light {
+            // ── Tier 1: Short turn (< 1000 chars) — verbatim ──
             format!("{label}: {content}\n")
+        } else if char_count < memo_threshold_heavy {
+            // ── Tier 2: Medium turn (1000~1499 chars) — keep 70%, compress tail 30% ──
+            let keep_chars = (char_count * 70) / 100;
+            let kept: String = content.chars().take(keep_chars).collect();
+            let tail: String = content.chars().skip(keep_chars).collect();
+            let tail_summary = summarize_section(&tail, (char_count * 5) / 100); // 5% summary
+            format!(
+                "{label}: {kept}\n  [📋 이하 {tail_len}자 축약: {tail_summary}]\n",
+                tail_len = char_count - keep_chars,
+            )
+        } else if char_count < memo_threshold_full {
+            // ── Tier 3: Long turn (1500~1999 chars) — keep 50%, compress tail 50% ──
+            let keep_chars = char_count / 2;
+            let kept: String = content.chars().take(keep_chars).collect();
+            let tail: String = content.chars().skip(keep_chars).collect();
+            let tail_summary = summarize_section(&tail, (char_count * 8) / 100); // 8% summary
+            format!(
+                "{label}: {kept}\n  [📋 이하 {tail_len}자 축약: {tail_summary}]\n",
+                tail_len = char_count - keep_chars,
+            )
         } else {
-            // ── Long turn: memo substitution ──
-            // Preserve: opening (~300 chars), closing (~300 chars), generate memo for middle
+            // ── Tier 4: Very long turn (2000+ chars) — 10% proportional memo ──
             let opening_chars = 300;
             let closing_chars = 300;
 
@@ -397,7 +425,6 @@ pub(super) fn build_cross_session_context(
                 .rev()
                 .collect();
 
-            // Generate a compact memo from the middle content
             let memo = generate_turn_memo(content, char_count);
 
             format!(
@@ -672,8 +699,41 @@ mod tests {
             ChatMessage { role: "assistant".into(), content: "네, 변호사님! 무엇을 도와드릴까요?".into() },
         ];
         let ctx = build_cross_session_context(&turns, 0, 16000, 2000);
-        // Short turns should be verbatim
         assert!(ctx.contains("User: 안녕하세요 변호사님"));
         assert!(ctx.contains("Assistant: 네, 변호사님! 무엇을 도와드릴까요?"));
+    }
+
+    #[test]
+    fn build_cross_session_tier2_medium_turn_partial_compress() {
+        // 1000~1499 chars: keep 70%, compress tail 30%
+        let content = "가".repeat(1200);
+        let turns = vec![ChatMessage { role: "assistant".into(), content }];
+        let ctx = build_cross_session_context(&turns, 0, 32000, 2000);
+        // Should contain the 축약 marker
+        assert!(ctx.contains("축약"));
+        // Should NOT be fully verbatim (would be 1200 chars + label)
+        assert!(ctx.len() < 1200 * 3 + 100); // Korean chars are 3 bytes each
+    }
+
+    #[test]
+    fn build_cross_session_tier3_long_turn_half_compress() {
+        // 1500~1999 chars: keep 50%, compress tail 50%
+        let content = "나".repeat(1700);
+        let turns = vec![ChatMessage { role: "assistant".into(), content }];
+        let ctx = build_cross_session_context(&turns, 0, 32000, 2000);
+        assert!(ctx.contains("축약"));
+        // Should be significantly shorter than verbatim
+        assert!(ctx.len() < 1700 * 3);
+    }
+
+    #[test]
+    fn build_cross_session_under_1000_verbatim() {
+        // Under 1000 chars: fully verbatim
+        let content = "다".repeat(999);
+        let turns = vec![ChatMessage { role: "user".into(), content: content.clone() }];
+        let ctx = build_cross_session_context(&turns, 0, 32000, 2000);
+        assert!(!ctx.contains("축약"));
+        assert!(!ctx.contains("MEMO"));
+        assert!(ctx.contains(&content));
     }
 }
