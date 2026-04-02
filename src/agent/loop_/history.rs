@@ -189,8 +189,11 @@ pub(super) fn memo_substitute_attachments(content: &str) -> Option<String> {
         result.push_str(&after);
     }
 
-    // Only return Some if we actually compressed something meaningful
-    if result.chars().count() < content.chars().count() - 100 {
+    // Only return Some if we actually compressed something meaningful.
+    // Use saturating_sub to prevent usize underflow on short content.
+    let original_len = content.chars().count();
+    let result_len = result.chars().count();
+    if result_len < original_len.saturating_sub(100) {
         Some(result)
     } else {
         None

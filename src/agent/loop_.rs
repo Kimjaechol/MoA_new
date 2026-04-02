@@ -2175,9 +2175,9 @@ pub(crate) async fn run_tool_call_loop(
         // Native mode: use JSON-structured messages so convert_messages() can
         // reconstruct proper OpenAI-format tool_calls and tool result messages.
         // Prompt mode: use XML-based text format as before.
-        // Layer 1: compress embedded attachments in tool results to save tokens.
-        let assistant_history_content = history::memo_substitute_attachments(&assistant_history_content)
-            .unwrap_or(assistant_history_content);
+        // NOTE: Do NOT apply memo substitution here — assistant_history_content
+        // may contain tool_call JSON structures that must not be modified.
+        // Layer 1 memo substitution only applies to plain text responses (line 1801).
         history.push(ChatMessage::assistant(assistant_history_content));
         if native_tool_calls.is_empty() {
             let all_results_have_ids = use_native_tools
