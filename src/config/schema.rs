@@ -1584,13 +1584,16 @@ fn default_ace_shortterm_window_secs() -> i64 {
 }
 
 fn default_ace_rag_max_chars() -> usize {
-    60_000 // RAG 검색 결과 최대 60K자 (~30K 토큰 한국어)
+    1_200_000 // 컨텍스트 윈도우 100만 토큰의 약 60% (한국어 기준 ~120만자)
+    // 실제 RAG 검색 결과는 관련 대화만 선별하므로 이 한계에 도달할 일은 거의 없음.
+    // Layer 1 첨부메모가 이미 대용량 콘텐츠를 압축하므로 안전.
 }
 
 fn default_ace_total_budget_chars() -> usize {
-    120_000 // 총 컨텍스트 예산 120K자 (~60-80K 토큰)
-    // Layer 0~2가 효율적으로 관리하므로 넉넉하게 설정해도 안전.
-    // 실제 사용량: Layer 0 ~20K자 + Layer 2 RAG ~60K자 = ~80K자 typical
+    2_000_000 // 컨텍스트 윈도우 100만 토큰 전체 (한영 혼합 평균 ~200만자)
+    // 실제 사용량은 Layer 0(~20K) + Layer 2 RAG(관련 대화만) ≈ 총 ~80K~150K자가 일반적.
+    // 최대치를 넓게 잡아도 Layer 0~2의 효율적 관리로 불필요한 낭비 없음.
+    // 소형 모델(128K 윈도우)에서는 config에서 축소 가능.
 }
 
 fn default_loop_detection_no_progress_threshold() -> usize {
