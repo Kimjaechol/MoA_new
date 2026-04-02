@@ -107,13 +107,9 @@ pub(super) async fn auto_compact_history(
     };
     let transcript = build_compaction_transcript(&to_compact);
 
-    // NOTE: Compaction uses the economy tier model (MiniMax M2.7) when available
+    // NOTE: Compaction uses the economy tier model (Gemini Flash Lite) when available
     // via the task-based routing in billing/llm_router.rs (TaskCategory::Compaction).
-    // The caller should pass the economy model here to save ~88% vs Opus 4.6.
-    //
-    // MiniMax M2.7 language enforcement: MUST specify output language explicitly
-    // because M2.7 tends to mix Russian, Chinese, Arabic into responses.
-    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.\n\nCRITICAL LANGUAGE RULE: You MUST respond in the SAME language as the majority of the conversation. If the conversation is in Korean, respond ONLY in Korean. If in English, respond ONLY in English. NEVER mix languages. NEVER use Russian, Chinese, or Arabic unless the conversation is in that language.";
+    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only. Respond in the SAME language as the conversation.";
 
     let summarizer_user = format!(
         "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
@@ -193,8 +189,11 @@ pub(super) fn memo_substitute_attachments(content: &str) -> Option<String> {
         result.push_str(&after);
     }
 
-    // Only return Some if we actually compressed something meaningful
-    if result.chars().count() < content.chars().count() - 100 {
+    // Only return Some if we actually compressed something meaningful.
+    // Use saturating_sub to prevent usize underflow on short content.
+    let original_len = content.chars().count();
+    let result_len = result.chars().count();
+    if result_len < original_len.saturating_sub(100) {
         Some(result)
     } else {
         None
