@@ -79,6 +79,29 @@ impl HotMemoryCache {
             }
         }
 
+        // 2. Always cache user instructions & standing orders
+        // These are tasks the user has told MoA to do regularly — cron jobs,
+        // recurring reminders, standing directives. They must be top-of-mind
+        // for the agent at all times, especially for cron and heartbeat.
+        const INSTRUCTION_KEY_PREFIXES: &[&str] = &[
+            "user_instruction_",    // "매일 아침 날씨 알려줘" 등 지시사항
+            "user_standing_order_", // 상시 지시 (예: "항상 존칭 사용")
+            "user_cron_",           // cron 작업 관련 기억
+            "user_reminder_",       // 리마인더/알림 관련
+            "user_schedule_",       // 일정 관련 지시
+        ];
+
+        if let Ok(all_entries) = mem.list(None, None).await {
+            for entry in all_entries {
+                if INSTRUCTION_KEY_PREFIXES
+                    .iter()
+                    .any(|prefix| entry.key.starts_with(prefix))
+                {
+                    cache.insert(entry.key.clone(), entry);
+                }
+            }
+        }
+
         // 2. Cache top N most frequently recalled entries
         if let Ok(hot) = mem.hot_memories(self.max_entries).await {
             for entry in hot {

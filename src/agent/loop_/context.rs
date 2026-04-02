@@ -901,7 +901,7 @@ impl SectionPriority {
     }
 }
 
-/// Build profile context block (essential, always loaded).
+/// Build profile + standing instructions context block (essential, always loaded).
 async fn build_profile_context(mem: &dyn Memory) -> String {
     const ESSENTIAL_PROFILE_KEYS: &[&str] = &[
         "user_profile_identity",
@@ -913,29 +913,67 @@ async fn build_profile_context(mem: &dyn Memory) -> String {
         "user_moa_preferences",
     ];
 
+    /// Key prefixes for user instructions that must always be in context.
+    /// These are standing orders, cron directives, recurring reminders —
+    /// the user's "지시사항" that MoA must never forget.
+    const INSTRUCTION_PREFIXES: &[&str] = &[
+        "user_instruction_",
+        "user_standing_order_",
+        "user_cron_",
+        "user_reminder_",
+        "user_schedule_",
+    ];
+
     let mut context = String::new();
     let mut loaded = false;
 
+    // 1. User profile (항상 로드)
     for key in ESSENTIAL_PROFILE_KEYS {
         if let Ok(Some(entry)) = mem.get(key).await {
             if !loaded {
                 context.push_str("[이용자 프로필 — 항상 로드]\n");
                 loaded = true;
             }
-            let ts = if entry.timestamp.is_empty() {
-                String::new()
-            } else {
-                let short = if entry.timestamp.len() > 19 {
-                    &entry.timestamp[..19]
-                } else {
-                    &entry.timestamp
-                };
-                format!(" [{}]", short)
-            };
+            let ts = format_short_timestamp(&entry.timestamp);
             let _ = writeln!(context, "- {}:{} {}", entry.key, ts, entry.content);
         }
     }
+    if loaded {
+        context.push('\n');
+    }
+
+    // 2. User instructions & standing orders (항상 로드)
+    // "매일 9시에 날씨 알려줘", "항상 존칭 사용해줘" 등
+    if let Ok(all_entries) = mem.list(None, None).await {
+        let instructions: Vec<_> = all_entries
+            .iter()
+            .filter(|e| INSTRUCTION_PREFIXES.iter().any(|p| e.key.starts_with(p)))
+            .collect();
+
+        if !instructions.is_empty() {
+            context.push_str("[이용자 지시사항 — 항상 이행]\n");
+            for entry in &instructions {
+                let ts = format_short_timestamp(&entry.timestamp);
+                let _ = writeln!(context, "- {}:{} {}", entry.key, ts, entry.content);
+            }
+            context.push('\n');
+        }
+    }
+
     context
+}
+
+fn format_short_timestamp(timestamp: &str) -> String {
+    if timestamp.is_empty() {
+        String::new()
+    } else {
+        let short = if timestamp.len() > 19 {
+            &timestamp[..19]
+        } else {
+            timestamp
+        };
+        format!(" [{}]", short)
+    }
 }
 
 #[cfg(test)]

@@ -696,7 +696,18 @@ impl PromptSection for ToolUsageStrategySection {
                  **3. 중요도 인식:**\n\
                  Frequently referenced memories (user profile, work info, family info) are \
                  automatically prioritized in search results. When you notice a memory is \
-                 being referenced repeatedly, it's a sign of high importance — preserve it carefully.\n\n",
+                 being referenced repeatedly, it's a sign of high importance — preserve it carefully.\n\n\
+                 **4. 이용자 지시사항 저장 (Standing Orders):**\n\
+                 When the user gives a STANDING INSTRUCTION (recurring task, preference, directive), \
+                 ALWAYS save it with the appropriate key prefix:\n\
+                 - `user_instruction_<topic>`: 일반 지시 (\"항상 존칭 사용해줘\")\n\
+                 - `user_standing_order_<topic>`: 상시 지시 (\"모든 문서는 HWPX로 만들어줘\")\n\
+                 - `user_cron_<job_name>`: cron 작업 지시 (\"매일 9시에 날씨 알려줘\")\n\
+                 - `user_reminder_<topic>`: 리마인더 (\"매주 금요일 퇴근 전에 주간보고 리마인드\")\n\
+                 - `user_schedule_<topic>`: 일정 관련 (\"매월 15일 카드값 알림\")\n\n\
+                 These instructions are ALWAYS loaded into context and cached in memory. \
+                 MoA must never forget a user's standing order. They take priority over \
+                 general conversation in cron/heartbeat processing.\n\n",
             );
         }
 
