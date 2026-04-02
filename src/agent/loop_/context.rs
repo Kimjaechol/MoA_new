@@ -627,6 +627,317 @@ fn summarize_section(section: &str, budget: usize) -> String {
     topic
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// ACE (Adaptive Context Engine) — 4-Layer Context Builder
+// ═══════════════════════════════════════════════════════════════════
+
+/// Result from the ACE context builder, including any trimmed memories
+/// that the user should be notified about.
+pub(super) struct AceContextResult {
+    /// The constructed context string to prepend to the user message.
+    pub context: String,
+    /// If Layer 3 trimmed RAG results, this contains a notification
+    /// for the user about available but hidden memories.
+    pub trimmed_memories_notice: Option<String>,
+}
+
+/// Build context using the 4-layer ACE architecture.
+///
+/// - **Layer 0**: Immediate context — last `immediate_turns` of conversation (verbatim)
+/// - **Layer 1**: Attachment memo — already applied to history[] entries (no work here)
+/// - **Layer 2**: RAG enrichment — search long-term memory + ontology for related past conversations
+/// - **Layer 3**: Budget guard — trim oldest RAG results if total exceeds budget
+pub(super) async fn build_ace_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    session_id: Option<&str>,
+    ontology: Option<&OntologyRepo>,
+    _recent_turns: &[ChatMessage], // Layer 0 is managed by caller via history[]
+    config: &AceConfig,
+) -> AceContextResult {
+    let mut sections: Vec<ContextSection> = Vec::new();
+    let mut total_chars: usize = 0;
+
+    // ── Layer 0: Immediate context (직전 N턴 원문, 절대 제거 안 함) ──
+    // This is the "방금 말한 거", "아까 그거" reference window.
+    // Already in history[], so we don't add it to context preamble.
+    // Layer 0 is managed by the caller (loop_.rs) keeping history[] intact.
+
+    // ── Phase: Essential profile recall (항상 로드) ──
+    let profile_block = build_profile_context(mem).await;
+    if !profile_block.is_empty() {
+        let chars = profile_block.chars().count();
+        total_chars += chars;
+        sections.push(ContextSection {
+            content: profile_block,
+            chars,
+            priority: SectionPriority::Essential, // never trimmed
+            timestamp: None,
+        });
+    }
+
+    // ── Layer 2a: RAG memory search (관련 과거 대화 검색) ──
+    let mut seen_keys = HashSet::new();
+    if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
+        let relevant: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                e.score.map_or(true, |s| s >= min_relevance_score)
+                    && !memory::is_assistant_autosave_key(&e.key)
+            })
+            .collect();
+
+        if !relevant.is_empty() {
+            let mut block = String::from("[관련 과거 대화 및 기억 (RAG 검색)]\n");
+            for entry in &relevant {
+                seen_keys.insert(entry.key.clone());
+                let ts = if entry.timestamp.is_empty() {
+                    String::new()
+                } else {
+                    let short = if entry.timestamp.len() > 19 {
+                        &entry.timestamp[..19]
+                    } else {
+                        &entry.timestamp
+                    };
+                    format!(" [{}]", short)
+                };
+                let _ = writeln!(block, "- {}:{} {}", entry.key, ts, entry.content);
+            }
+            let chars = block.chars().count();
+            total_chars += chars;
+            // Use the most recent timestamp from entries for sorting
+            let latest_ts = relevant
+                .iter()
+                .filter_map(|e| {
+                    if e.timestamp.is_empty() { None } else { Some(e.timestamp.as_str()) }
+                })
+                .max()
+                .map(String::from);
+            sections.push(ContextSection {
+                content: block,
+                chars,
+                priority: SectionPriority::RagMemory,
+                timestamp: latest_ts,
+            });
+        }
+    }
+
+    // ── Layer 2b: Ontology graph search (인물/사건/장소 관계) ──
+    if let Some(repo) = ontology {
+        let owner = session_id.unwrap_or("cli_interactive");
+        if let Ok(objects) = repo.search_objects(owner, None, user_msg, MAX_ONTOLOGY_ENTRIES) {
+            if !objects.is_empty() {
+                let mut block = String::from("[관련 관계 정보 (온톨로지)]\n");
+                let mut cross_keywords = Vec::new();
+                for obj in &objects {
+                    let title = obj.title.as_deref().unwrap_or("(untitled)");
+                    let props = if obj.properties.is_null()
+                        || obj.properties.as_object().is_some_and(|m| m.is_empty())
+                    {
+                        String::new()
+                    } else {
+                        obj.properties.to_string()
+                    };
+                    if props.is_empty() {
+                        let _ = writeln!(block, "- {title}");
+                    } else {
+                        let _ = writeln!(block, "- {title}: {props}");
+                    }
+                    if let Some(t) = obj.title.as_deref() {
+                        cross_keywords.push(t.to_string());
+                    }
+                }
+
+                let chars = block.chars().count();
+                total_chars += chars;
+                sections.push(ContextSection {
+                    content: block,
+                    chars,
+                    priority: SectionPriority::Ontology,
+                    timestamp: None,
+                });
+
+                // ── Layer 2c: Cross-search (온톨로지 → 메모리 교차검색) ──
+                if !cross_keywords.is_empty() {
+                    let cross_query = cross_keywords.iter().take(5).cloned().collect::<Vec<_>>().join(" ");
+                    if let Ok(enriched) = mem.recall(&cross_query, MAX_CROSS_SEARCH_ENTRIES, session_id).await {
+                        let new_entries: Vec<_> = enriched
+                            .iter()
+                            .filter(|e| {
+                                e.score.unwrap_or(1.0) >= min_relevance_score
+                                    && !memory::is_assistant_autosave_key(&e.key)
+                                    && !seen_keys.contains(&e.key)
+                            })
+                            .collect();
+                        if !new_entries.is_empty() {
+                            let mut block = String::from("[교차검색 — 관련 추가 기억]\n");
+                            for entry in &new_entries {
+                                seen_keys.insert(entry.key.clone());
+                                let _ = writeln!(block, "- {}: {}", entry.key, entry.content);
+                            }
+                            let chars = block.chars().count();
+                            total_chars += chars;
+                            sections.push(ContextSection {
+                                content: block,
+                                chars,
+                                priority: SectionPriority::CrossSearch,
+                                timestamp: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Layer 3: Budget guard — trim oldest RAG results if over budget ──
+    let budget = config.total_budget_chars;
+    let mut trimmed_notice: Option<String> = None;
+
+    if total_chars > budget {
+        // Sort trimmable sections by priority (lowest first), then by age (oldest first)
+        let mut trimmable_indices: Vec<usize> = sections
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.priority.is_trimmable())
+            .map(|(i, _)| i)
+            .collect();
+
+        // Trim from lowest priority first (CrossSearch → RagMemory → Ontology)
+        trimmable_indices.sort_by(|&a, &b| {
+            sections[a].priority.rank().cmp(&sections[b].priority.rank())
+        });
+
+        let mut trimmed_summaries: Vec<String> = Vec::new();
+        let mut removed_indices = Vec::new();
+
+        for &idx in &trimmable_indices {
+            if total_chars <= budget {
+                break;
+            }
+            total_chars -= sections[idx].chars;
+            // Build a short summary of what was trimmed
+            let first_line = sections[idx]
+                .content
+                .lines()
+                .skip(1) // skip the header
+                .find(|l| l.trim().len() > 5)
+                .unwrap_or("(내용)")
+                .trim()
+                .chars()
+                .take(60)
+                .collect::<String>();
+            let ts = sections[idx].timestamp.as_deref().unwrap_or("날짜 미상");
+            trimmed_summaries.push(format!("  • [{ts}] {first_line}"));
+            removed_indices.push(idx);
+        }
+
+        // Remove trimmed sections (in reverse order to preserve indices)
+        removed_indices.sort_unstable();
+        for idx in removed_indices.into_iter().rev() {
+            sections.remove(idx);
+        }
+
+        // Build user notification about hidden memories
+        if !trimmed_summaries.is_empty() {
+            let notice = format!(
+                "\n---\n💡 아래 과거 기억이 저장되어 있지만 컨텍스트 예산 초과로 \
+                 이번 대화에는 포함되지 않았습니다:\n{}\n\
+                 추가로 검색해드릴까요? (\"기억 검색해줘\" 라고 말씀해주세요)\n---",
+                trimmed_summaries.join("\n")
+            );
+            trimmed_notice = Some(notice);
+        }
+    }
+
+    // Assemble final context
+    let mut context = String::with_capacity(total_chars + 512);
+    for section in &sections {
+        context.push_str(&section.content);
+        context.push('\n');
+    }
+
+    AceContextResult {
+        context,
+        trimmed_memories_notice: trimmed_notice,
+    }
+}
+
+/// ACE configuration passed to the context builder.
+pub(super) struct AceConfig {
+    pub total_budget_chars: usize,
+    pub rag_max_chars: usize,
+}
+
+struct ContextSection {
+    content: String,
+    chars: usize,
+    priority: SectionPriority,
+    timestamp: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SectionPriority {
+    Essential,   // user profile — never trimmed
+    Ontology,    // relationship graph — trimmed last
+    RagMemory,   // past conversation RAG — trimmed second
+    CrossSearch, // cross-referenced enrichment — trimmed first
+}
+
+impl SectionPriority {
+    fn is_trimmable(&self) -> bool {
+        !matches!(self, Self::Essential)
+    }
+
+    /// Lower rank = trimmed first
+    fn rank(&self) -> u8 {
+        match self {
+            Self::CrossSearch => 0,
+            Self::RagMemory => 1,
+            Self::Ontology => 2,
+            Self::Essential => 3,
+        }
+    }
+}
+
+/// Build profile context block (essential, always loaded).
+async fn build_profile_context(mem: &dyn Memory) -> String {
+    const ESSENTIAL_PROFILE_KEYS: &[&str] = &[
+        "user_profile_identity",
+        "user_profile_family",
+        "user_profile_work",
+        "user_profile_lifestyle",
+        "user_profile_communication",
+        "user_profile_routine",
+        "user_moa_preferences",
+    ];
+
+    let mut context = String::new();
+    let mut loaded = false;
+
+    for key in ESSENTIAL_PROFILE_KEYS {
+        if let Ok(Some(entry)) = mem.get(key).await {
+            if !loaded {
+                context.push_str("[이용자 프로필 — 항상 로드]\n");
+                loaded = true;
+            }
+            let ts = if entry.timestamp.is_empty() {
+                String::new()
+            } else {
+                let short = if entry.timestamp.len() > 19 {
+                    &entry.timestamp[..19]
+                } else {
+                    &entry.timestamp
+                };
+                format!(" [{}]", short)
+            };
+            let _ = writeln!(context, "- {}:{} {}", entry.key, ts, entry.content);
+        }
+    }
+    context
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

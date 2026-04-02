@@ -40,7 +40,8 @@ mod history;
 mod parsing;
 mod promotion;
 
-use context::{build_context, build_cross_session_context, build_hardware_context};
+#[allow(unused_imports)]
+use context::{build_ace_context, build_context, build_cross_session_context, build_hardware_context, AceConfig};
 use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use execution::{
     execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
@@ -250,11 +251,13 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
-/// Trigger compaction sooner to prevent body size overflow (64KB→2MB gateway
-/// limit). 20 messages ≈ 80-150KB which is safely within the 2MB chat body
-/// limit, while preserving enough context for coherent multi-turn conversation.
-/// The compaction keeps the 12 most recent messages and summarizes the rest.
-const DEFAULT_MAX_HISTORY_MESSAGES: usize = 20;
+/// ACE Layer 0 safety net: history compaction threshold.
+/// With ACE, Layer 1 (attachment memo) keeps individual messages small,
+/// and Layer 2 (RAG) handles older context. This threshold is a safety net
+/// that only fires if the conversation somehow exceeds 30 messages
+/// (e.g., long coding sessions with many tool calls).
+/// Layer 0 preserves 10 most recent turns (20 messages) verbatim.
+const DEFAULT_MAX_HISTORY_MESSAGES: usize = 30;
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
