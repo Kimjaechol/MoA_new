@@ -269,21 +269,28 @@ pub trait Memory: Send + Sync {
     }
 
     /// Increment the recall count for a memory entry.
-    /// Called automatically when a memory is retrieved via recall().
+    /// **Status: prepared for future integration** — will be called automatically
+    /// by the agent loop when memory entries are retrieved via recall().
     /// Entries with higher recall_count get priority in RAG search results.
+    /// SQLite backend should override this with actual UPDATE query.
     async fn track_recall(&self, _key: &str) -> anyhow::Result<()> {
-        Ok(()) // default no-op; SQLite backend overrides this
+        Ok(()) // default no-op; concrete backends override
     }
 
     /// Get the most frequently recalled memories (hot memories).
-    /// Used for the hot memory cache — these are pre-loaded at session start
-    /// and kept in-memory for instant access without SQLite queries.
+    /// **Status: prepared for future integration** — will be called by
+    /// HotMemoryCache::refresh() at session start to pre-load frequently
+    /// accessed entries into in-memory cache.
     async fn hot_memories(&self, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
-        Ok(vec![]) // default empty; SQLite backend overrides this
+        Ok(vec![]) // default empty; concrete backends override
     }
 
     /// Detect conflicts between a new value and existing memory.
-    /// Returns the existing entry if a conflict is detected (e.g., address changed).
+    /// **Status: prepared for future integration** — will be called before
+    /// memory_store() to check if new info contradicts existing entries
+    /// (e.g., address/job/phone change). Agent prompt already instructs
+    /// MoA to ask for confirmation before updating.
+    /// Returns the existing entry if a conflict is detected.
     async fn detect_conflict(
         &self,
         key: &str,
@@ -304,7 +311,9 @@ pub trait Memory: Send + Sync {
     }
 
     /// Bulk forget: remove all memories matching a keyword pattern.
-    /// Used for "망각 요청" — deleting all memories related to a topic/person.
+    /// **Status: prepared for future integration** — will be called when
+    /// user requests "전남편 관련 기억 다 지워줘". Agent prompt already
+    /// instructs MoA to confirm before deletion.
     /// Returns the number of entries deleted.
     async fn forget_matching(&self, _pattern: &str) -> anyhow::Result<usize> {
         Ok(0) // default no-op; SQLite backend overrides this

@@ -975,6 +975,8 @@ impl Default for KakaoCalendarConfig {
 }
 
 /// Apple Calendar (CalDAV) configuration.
+/// **Status: planned** — config schema ready, CalDAV implementation pending.
+/// Apple CalDAV requires app-specific password from appleid.apple.com.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AppleCalendarConfig {
     #[serde(default)]

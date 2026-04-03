@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Let the agent forget/delete a memory entry
+/// Let the agent forget/delete memory entries — by exact key or by pattern.
 pub struct MemoryForgetTool {
     memory: Arc<dyn Memory>,
     security: Arc<SecurityPolicy>,
@@ -25,7 +25,9 @@ impl Tool for MemoryForgetTool {
     }
 
     fn description(&self) -> &str {
-        "Remove a memory by key. Use to delete outdated facts or sensitive data. Returns whether the memory was found and removed."
+        "Remove memories by exact key or by keyword pattern. \
+         Supports bulk deletion for '망각 요청' — e.g. delete all memories about a topic/person. \
+         ALWAYS confirm with the user before pattern-based bulk deletion."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -34,18 +36,25 @@ impl Tool for MemoryForgetTool {
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "The key of the memory to forget"
+                    "description": "Exact key of a single memory to forget"
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Keyword pattern to bulk-delete all matching memories \
+                     (e.g. '전남편', 'old_project'). Matches against both key and content. \
+                     ALWAYS confirm with user before using this."
                 }
-            },
-            "required": ["key"]
+            }
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let key = args
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'key' parameter"))?;
+        let key = args.get("key").and_then(|v| v.as_str());
+        let pattern = args.get("pattern").and_then(|v| v.as_str());
+
+        if key.is_none() && pattern.is_none() {
+            anyhow::bail!("Missing 'key' or 'pattern' parameter — provide at least one");
+        }
 
         if let Err(error) = self
             .security
@@ -58,22 +67,64 @@ impl Tool for MemoryForgetTool {
             });
         }
 
-        match self.memory.forget(key).await {
-            Ok(true) => Ok(ToolResult {
-                success: true,
-                output: format!("Forgot memory: {key}"),
-                error: None,
-            }),
-            Ok(false) => Ok(ToolResult {
-                success: true,
-                output: format!("No memory found with key: {key}"),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
+        // Pattern-based bulk deletion (망각 요청)
+        if let Some(pat) = pattern {
+            if !pat.is_empty() {
+                match self.memory.forget_matching(pat).await {
+                    Ok(count) if count > 0 => {
+                        return Ok(ToolResult {
+                            success: true,
+                            output: format!(
+                                "'{pat}' 패턴과 일치하는 기억 {count}건을 삭제했습니다."
+                            ),
+                            error: None,
+                        });
+                    }
+                    Ok(_) => {
+                        return Ok(ToolResult {
+                            success: true,
+                            output: format!(
+                                "'{pat}' 패턴과 일치하는 기억이 없습니다."
+                            ),
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("패턴 삭제 실패: {e}")),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Exact key deletion
+        if let Some(k) = key {
+            match self.memory.forget(k).await {
+                Ok(true) => Ok(ToolResult {
+                    success: true,
+                    output: format!("Forgot memory: {k}"),
+                    error: None,
+                }),
+                Ok(false) => Ok(ToolResult {
+                    success: true,
+                    output: format!("No memory found with key: {k}"),
+                    error: None,
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to forget memory: {e}")),
+                }),
+            }
+        } else {
+            Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to forget memory: {e}")),
-            }),
+                error: Some("No key or pattern provided".into()),
+            })
         }
     }
 }
@@ -100,7 +151,9 @@ mod tests {
         let (_tmp, mem) = test_mem();
         let tool = MemoryForgetTool::new(mem, test_security());
         assert_eq!(tool.name(), "memory_forget");
-        assert!(tool.parameters_schema()["properties"]["key"].is_object());
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["key"].is_object());
+        assert!(schema["properties"]["pattern"].is_object());
     }
 
     #[tokio::test]
@@ -128,7 +181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forget_missing_key() {
+    async fn forget_missing_both_params() {
         let (_tmp, mem) = test_mem();
         let tool = MemoryForgetTool::new(mem, test_security());
         let result = tool.execute(json!({})).await;
