@@ -33,16 +33,25 @@ fn require_auth(
     }
 
     let token = extract_bearer_token(headers).unwrap_or("");
+
+    // Accept pairing token
     if state.pairing.is_authenticated(token) {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            })),
-        ))
+        return Ok(());
     }
+
+    // Also accept JWT session token (from /api/auth/login)
+    if let Some(store) = &state.auth_store {
+        if store.validate_session(token).is_some() {
+            return Ok(());
+        }
+    }
+
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "인증이 필요합니다. 앱에서 로그인해주세요."
+        })),
+    ))
 }
 
 /// Resolve the Kakao ID for the current session user (for Supabase lookups).
