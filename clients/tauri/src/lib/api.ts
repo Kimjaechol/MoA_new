@@ -855,9 +855,9 @@ export class MoAClient {
     if (raw.includes("context") || raw.includes("token limit") || raw.includes("too long")) {
       return "Message too long for the selected model. Try a shorter message.";
     }
-    // Truncate overly long raw errors
-    if (raw.length > 200) {
-      return raw.substring(0, 200) + "...";
+    // Show full error for debugging (was 200 chars, now 2000)
+    if (raw.length > 2000) {
+      return raw.substring(0, 2000) + "...";
     }
     return raw;
   }
