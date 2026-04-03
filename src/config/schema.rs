@@ -8628,6 +8628,7 @@ impl Config {
             decrypt_channel_secrets(&store, &mut config.channels_config)?;
 
             config.apply_env_overrides();
+            config.sanitize_model_ids();
             config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
@@ -8880,6 +8881,40 @@ impl Config {
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
+    /// Auto-correct common model ID mistakes that cause 400 Bad Request errors.
+    ///
+    /// Fixes:
+    /// - Strip `provider/` prefix (e.g. `anthropic/claude-opus-4-6` → `claude-opus-4-6`)
+    /// - Replace dots with hyphens in version (e.g. `claude-sonnet-4.6` → `claude-sonnet-4-6`)
+    /// - Log a warning so the user knows their config was auto-corrected
+    pub fn sanitize_model_ids(&mut self) {
+        if let Some(ref mut model) = self.default_model {
+            let original = model.clone();
+            // Strip provider prefix (anthropic/, openai/, gemini/, etc.)
+            if let Some(pos) = model.find('/') {
+                let prefix = &model[..pos];
+                if prefix.len() <= 20 && !prefix.contains('.') {
+                    *model = model[pos + 1..].to_string();
+                }
+            }
+            // Replace dots in version numbers with hyphens
+            // "claude-sonnet-4.6" → "claude-sonnet-4-6"
+            if model.starts_with("claude-") || model.starts_with("gemini-") {
+                let fixed = model.replace('.', "-");
+                if fixed != *model {
+                    *model = fixed;
+                }
+            }
+            if *model != original {
+                tracing::warn!(
+                    original = %original,
+                    corrected = %model,
+                    "Auto-corrected invalid default_model in config"
+                );
+            }
+        }
+    }
+
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         if let Some(acp) = &self.channels_config.acp {
