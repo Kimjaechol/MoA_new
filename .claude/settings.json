@@ -40,6 +40,18 @@
             "statusMessage": "Harness: secret scan..."
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git commit:*)",
+            "command": "codex review --quiet 2>&1 | head -50 | { read -r output; if [ -n \"$output\" ]; then echo \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"additionalContext\\\":\\\"Codex Review Results:\\\\n$output\\\"}}\"; fi; } 2>/dev/null || true",
+            "timeout": 120,
+            "statusMessage": "Codex: reviewing before commit..."
+          }
+        ]
       }
     ],
     "PostToolUse": [
