@@ -537,7 +537,37 @@ pub async fn handle_api_chat(
             let is_context_error = sanitized.contains("context")
                 || sanitized.contains("token limit")
                 || sanitized.contains("too long");
-            let user_message = if is_context_error {
+
+            // Detect credit/billing exhaustion errors
+            let is_credit_error = sanitized.contains("credit balance")
+                || sanitized.contains("billing")
+                || sanitized.contains("purchase credits")
+                || sanitized.contains("insufficient_quota")
+                || sanitized.contains("exceeded your current quota");
+
+            let user_message = if is_credit_error {
+                let provider = &provider_label;
+                let console_url = match provider.as_str() {
+                    "anthropic" => "https://console.anthropic.com/settings/billing",
+                    "openai" => "https://platform.openai.com/account/billing",
+                    "gemini" | "google" => "https://aistudio.google.com/billing",
+                    _ => "",
+                };
+                if console_url.is_empty() {
+                    format!(
+                        "⚠️ {provider} API 크레딧이 소진되었습니다.\n\
+                         API 크레딧을 충전하거나 결제 정보를 확인해주세요.\n\n\
+                         또는 설정에서 다른 모델로 변경할 수 있습니다."
+                    )
+                } else {
+                    format!(
+                        "⚠️ {provider} API 크레딧이 소진되었습니다.\n\
+                         크레딧 충전: {console_url}\n\n\
+                         충전 후 다시 시도해주세요. \
+                         또는 설정에서 다른 모델로 변경할 수 있습니다."
+                    )
+                }
+            } else if is_context_error {
                 "The message is too long for the selected model. Try a shorter message or switch to a model with a larger context window.".to_string()
             } else {
                 format!("LLM request failed: {sanitized}")
