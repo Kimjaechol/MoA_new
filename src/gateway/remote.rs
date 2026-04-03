@@ -836,7 +836,10 @@ async fn handle_remote_socket(
                     id: uuid::Uuid::new_v4().to_string(),
                     direction: "to_device".to_string(),
                     content,
-                    msg_type: "message".to_string(),
+                    // Remote web access: files are read-only (download only).
+                    // The device agent enforces this by blocking file_write,
+                    // file_edit, shell, and other mutating tools.
+                    msg_type: "remote_read_only".to_string(),
                 };
 
                 let msg_id = routed_msg.id.clone();

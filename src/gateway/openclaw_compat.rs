@@ -85,6 +85,12 @@ pub struct ApiChatBody {
     #[serde(default)]
     pub workspace_connected: bool,
 
+    /// When true, restricts file operations to read/download only.
+    /// Set automatically for remote web access to prevent unauthorized
+    /// file modification through the relay.
+    #[serde(default)]
+    pub remote_read_only: bool,
+
     /// LLM proxy URL for hybrid relay mode.
     /// When provided (together with `proxy_token`), the agent loop routes
     /// LLM calls through this proxy endpoint instead of calling the LLM API
@@ -326,6 +332,23 @@ pub async fn handle_api_chat(
         enriched_message = format!("{coding_context}{enriched_message}");
     }
 
+    // ── Remote read-only enforcement ──
+    // When accessed via web relay (remote_read_only=true), restrict to
+    // file download only. File write/edit/shell are physically blocked.
+    if chat_body.remote_read_only {
+        enriched_message = format!(
+            "[REMOTE ACCESS — READ ONLY]\n\
+             이 요청은 원격 웹 접속입니다. 보안을 위해 다음 도구만 사용 가능합니다:\n\
+             - file_read (파일 읽기/다운로드)\n\
+             - glob_search, content_search (파일 검색)\n\
+             - memory_recall, memory_store (기억)\n\
+             - web_search (웹 검색)\n\n\
+             파일 수정(file_write, file_edit), 셸 명령(shell), 삭제 등은 \
+             보안상 차단됩니다. 이용자에게 \"원격 접속에서는 파일 다운로드만 가능합니다\"라고 안내하세요.\n\n\
+             {enriched_message}"
+        );
+    }
+
     // ── Build config with client-provided overrides ──
     // Reload tool/feature config from disk so runtime changes (e.g. web_search_config
     // enabling search) take effect without a gateway restart.
@@ -334,6 +357,14 @@ pub async fn handle_api_chat(
         config.web_search = disk_cfg.web_search;
         config.web_fetch = disk_cfg.web_fetch;
         config.model_routes = disk_cfg.model_routes;
+    }
+
+    // Physical enforcement: remote read-only → set autonomy to ReadOnly
+    // This physically blocks file_write, file_edit, shell at the SecurityPolicy level
+    if chat_body.remote_read_only {
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        config.autonomy.allow_sensitive_file_writes = false;
+        tracing::info!("Remote read-only mode: autonomy set to read-only");
     }
 
     // Map frontend provider names to backend provider names
