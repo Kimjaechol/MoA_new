@@ -846,18 +846,41 @@ export class MoAClient {
    * Sanitize raw error text into a user-friendly message.
    */
   private sanitizeErrorForDisplay(raw: string): string {
+    // Credit/billing exhaustion
+    if (raw.includes("크레딧") || raw.includes("credit balance") || raw.includes("purchase credits") || raw.includes("insufficient_quota")) {
+      return raw; // Already user-friendly from server
+    }
+    // Auth errors
     if (raw.includes("401") || raw.includes("Unauthorized") || raw.includes("authentication")) {
-      return "API key is invalid or expired. Please update your API key in Settings.";
+      return "🔑 API 키가 올바르지 않거나 만료되었습니다.\n설정에서 API 키를 확인해주세요.";
     }
+    // Rate limiting
     if (raw.includes("429") || raw.includes("rate limit") || raw.includes("Rate limit")) {
-      return "Too many requests. Please wait a moment and try again.";
+      return "⏳ 요청 한도에 도달했습니다.\n잠시 후(1-2분) 다시 시도해주세요.";
     }
-    if (raw.includes("context") || raw.includes("token limit") || raw.includes("too long")) {
-      return "Message too long for the selected model. Try a shorter message.";
+    // Context too long
+    if (raw.includes("context") || raw.includes("token limit") || raw.includes("too long") || raw.includes("메시지가 너무")) {
+      return raw; // Already user-friendly from server
     }
-    // Show full error for debugging (was 200 chars, now 2000)
-    if (raw.length > 2000) {
-      return raw.substring(0, 2000) + "...";
+    // Network errors
+    if (raw.includes("network") || raw.includes("connection") || raw.includes("ECONNREFUSED") || raw.includes("fetch failed")) {
+      return "🌐 네트워크 연결에 문제가 있습니다.\n인터넷 연결을 확인하고 다시 시도해주세요.";
+    }
+    // Timeout
+    if (raw.includes("timeout") || raw.includes("timed out")) {
+      return "⏱️ 응답 시간이 초과되었습니다.\n다시 시도해주세요.";
+    }
+    // Server overloaded
+    if (raw.includes("overloaded") || raw.includes("503") || raw.includes("capacity")) {
+      return "🔄 AI 서버가 일시적으로 과부하 상태입니다.\n잠시 후 다시 시도해주세요.";
+    }
+    // Server-provided user-friendly messages (already formatted with emoji)
+    if (raw.includes("⚠️") || raw.includes("🔑") || raw.includes("⏳") || raw.includes("🌐")) {
+      return raw;
+    }
+    // Generic fallback — show abbreviated technical detail
+    if (raw.length > 300) {
+      return "⚠️ AI 응답 생성 중 문제가 발생했습니다.\n다시 시도해주세요. 문제가 계속되면 앱을 재시작해보세요.";
     }
     return raw;
   }
