@@ -66,6 +66,8 @@ pub(super) async fn build_context(
                     continue;
                 }
                 seen_memory_keys.insert(entry.key.clone());
+                // Track recall frequency — higher count = higher priority in future RAG
+                let _ = mem.track_recall(&entry.key).await;
                 let ts_hint = format_short_timestamp(&entry.timestamp);
                 let _ = writeln!(context, "- {}:{} {}", entry.key, ts_hint, entry.content);
                 extract_cross_search_keywords(&entry.content, &mut cross_search_keywords);

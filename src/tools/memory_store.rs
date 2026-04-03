@@ -78,12 +78,32 @@ impl Tool for MemoryStoreTool {
             });
         }
 
+        // Memory hygiene: detect conflicts before storing
+        // If the key already has different content, include a notice in the response
+        // so the LLM can inform the user about the change.
+        let conflict_notice = match self.memory.detect_conflict(key, content).await {
+            Ok(Some(conflict)) => {
+                Some(format!(
+                    "\n⚠️ 기존 기억과 충돌 감지:\n  기존: {}\n  새로: {}\n  → 기존 내용을 새 내용으로 업데이트합니다.",
+                    conflict.old_content.chars().take(100).collect::<String>(),
+                    content.chars().take(100).collect::<String>(),
+                ))
+            }
+            _ => None,
+        };
+
         match self.memory.store(key, content, category, None).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!("Stored memory: {key}"),
-                error: None,
-            }),
+            Ok(()) => {
+                let mut output = format!("Stored memory: {key}");
+                if let Some(notice) = conflict_notice {
+                    output.push_str(&notice);
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),

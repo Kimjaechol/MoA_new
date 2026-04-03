@@ -2463,6 +2463,16 @@ pub async fn run(
         None
     };
 
+    // ── Hot Memory Cache (ACE performance optimization) ────────────
+    // Pre-load frequently accessed memories (profile, instructions, top-50)
+    // into in-memory cache for instant access (~0.01ms vs ~5ms SQLite).
+    let hot_cache = crate::memory::hot_cache::HotMemoryCache::new();
+    hot_cache.refresh(mem.as_ref()).await;
+    tracing::debug!(
+        cached_entries = hot_cache.len(),
+        "Hot memory cache initialized"
+    );
+
     // ── Ontology repo for promotion engine ────────────────────────
     let ontology_repo = crate::ontology::OntologyRepo::open(&config.workspace_dir).ok();
 
