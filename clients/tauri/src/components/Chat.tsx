@@ -969,7 +969,7 @@ function MessageBubble({ message, locale, onRetry }: MessageBubbleProps) {
       )}
       <div className="message-content">
         {isUser ? (
-          <div className="message-bubble">{message.content}</div>
+          <div className="message-bubble" style={{ whiteSpace: "pre-wrap" }}>{message.content}</div>
         ) : (
           <div
             className="message-bubble"
