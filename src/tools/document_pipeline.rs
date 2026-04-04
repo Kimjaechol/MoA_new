@@ -793,13 +793,12 @@ impl Tool for DocumentPipelineTool {
         }
 
         // Full processing from here
-        // Get API keys: try local env first, then admin keys from Railway
-        let upstage_key = std::env::var("UPSTAGE_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("ADMIN_UPSTAGE_API_KEY").ok());
-        let gemini_key = std::env::var("GEMINI_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("ADMIN_GEMINI_API_KEY").ok());
+        // OCR API key: always use operator's admin key (2.2x credit billing)
+        // Simplified to single route — no local key fallback complexity
+        let upstage_key = std::env::var("ADMIN_UPSTAGE_API_KEY")
+            .or_else(|_| std::env::var("UPSTAGE_API_KEY"))
+            .ok();
+        let gemini_key: Option<String> = None; // disabled — single route via Upstage only
 
         let result = match doc_type {
             DocumentType::DigitalPdf => self.process_digital_pdf(path, gemini_key.as_deref()).await,
