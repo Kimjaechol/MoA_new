@@ -8886,6 +8886,7 @@ impl Config {
     /// Fixes:
     /// - Strip `provider/` prefix (e.g. `anthropic/claude-opus-4-6` → `claude-opus-4-6`)
     /// - Replace dots with hyphens in version (e.g. `claude-sonnet-4.6` → `claude-sonnet-4-6`)
+    /// - Fix session backend "none" → "sqlite" (required for conversation continuity)
     /// - Log a warning so the user knows their config was auto-corrected
     pub fn sanitize_model_ids(&mut self) {
         if let Some(ref mut model) = self.default_model {
@@ -8912,6 +8913,30 @@ impl Config {
                     "Auto-corrected invalid default_model in config"
                 );
             }
+        }
+
+        // Fix session backend: "none" disables conversation continuity.
+        // MoA requires session persistence for cross-session context.
+        if matches!(self.agent.session.backend, AgentSessionBackend::None) {
+            self.agent.session.backend = AgentSessionBackend::Sqlite;
+            tracing::warn!(
+                "Auto-corrected agent.session.backend from 'none' to 'sqlite' \
+                 (required for conversation continuity)"
+            );
+        }
+
+        // Fix require_pairing for localhost-only gateways.
+        // When host is 127.0.0.1 (local app), pairing creates unnecessary 401 errors
+        // for the Tauri app's API calls (tools, heartbeat, workspace).
+        if self.gateway.require_pairing
+            && (self.gateway.host == "127.0.0.1" || self.gateway.host == "localhost")
+            && !self.gateway.allow_public_bind
+        {
+            self.gateway.require_pairing = false;
+            tracing::info!(
+                "Auto-disabled gateway.require_pairing for localhost-only gateway \
+                 (JWT session auth is used instead)"
+            );
         }
     }
 
