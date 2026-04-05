@@ -861,6 +861,29 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
     let app_handle = app.handle().clone();
 
     tauri::async_runtime::spawn(async move {
+        // Step 0: Kill any stale zeroclaw processes from previous sessions.
+        // This prevents port conflicts when the app is restarted without
+        // the previous sidecar being properly terminated.
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/f", "/im", "zeroclaw.exe"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            // Brief wait for port release
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "zeroclaw.*gateway"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
         // Step 1: Check if gateway is already running
         emit_gateway_status(&app_handle, "starting", "Checking for running gateway...");
         if is_gateway_reachable(&gateway_url).await {
