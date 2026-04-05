@@ -861,29 +861,9 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
     let app_handle = app.handle().clone();
 
     tauri::async_runtime::spawn(async move {
-        // Step 0: Kill any stale zeroclaw processes from previous sessions.
-        // This prevents port conflicts when the app is restarted without
-        // the previous sidecar being properly terminated.
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/f", "/im", "zeroclaw.exe"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            // Brief wait for port release
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = std::process::Command::new("pkill")
-                .args(["-f", "zeroclaw.*gateway"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-
+        // Step 0: Check if a previous zeroclaw is still running.
+        // If so, reuse it instead of killing — the user may have chosen
+        // "background mode" on previous close.
         // Step 1: Check if gateway is already running
         emit_gateway_status(&app_handle, "starting", "Checking for running gateway...");
         if is_gateway_reachable(&gateway_url).await {
@@ -2427,6 +2407,55 @@ pub fn run() {
                 }
             }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Prevent default close — show choice dialog
+                api.prevent_close();
+
+                let win = window.clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::dialog::{MessageDialogBuilder, MessageDialogKind, MessageDialogButtons};
+
+                    // Ask user: quit completely or run in background?
+                    let answer = MessageDialogBuilder::new(
+                        "MoA 종료",
+                        "MoA를 어떻게 종료할까요?\n\n\
+                         [예] 완전 종료 — MoA와 백그라운드 서비스를 모두 종료합니다.\n\
+                         [아니오] 백그라운드 유지 — 창만 닫고 AI 서비스는 계속 실행합니다.\n\
+                                 (채널 메시지 수신, cron 작업 계속 실행)",
+                    )
+                    .kind(MessageDialogKind::Info)
+                    .buttons(MessageDialogButtons::YesNo)
+                    .blocking_show();
+
+                    if answer {
+                        // YES = 완전 종료: kill zeroclaw + close app
+                        #[cfg(target_os = "windows")]
+                        {
+                            let _ = std::process::Command::new("taskkill")
+                                .args(["/f", "/im", "zeroclaw.exe"])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status();
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            let _ = std::process::Command::new("pkill")
+                                .args(["-f", "zeroclaw.*gateway"])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status();
+                        }
+                        // Close window and exit app
+                        let _ = win.destroy();
+                        std::process::exit(0);
+                    } else {
+                        // NO = 백그라운드 유지: hide window, keep zeroclaw running
+                        let _ = win.hide();
+                    }
+                });
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running MoA application");
