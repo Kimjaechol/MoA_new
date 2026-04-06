@@ -7532,13 +7532,6 @@ pub struct KakaoTalkConfig {
     /// HTTP port for the webhook receiver server (default: 8787)
     #[serde(default = "default_kakao_port")]
     pub port: u16,
-    /// Auto-approve new users on first message (default: true).
-    /// When true, any KakaoTalk user who sends a message is automatically
-    /// registered — no pairing code, no web login, no extra steps.
-    /// The user just opens the KakaoTalk channel and starts chatting.
-    /// This is the simplest onboarding for non-technical users.
-    #[serde(default = "default_true")]
-    pub auto_approve: bool,
 }
 
 fn default_kakao_port() -> u16 {
@@ -9964,7 +9957,6 @@ impl Config {
                     webhook_secret: None,
                     allowed_users: vec![],
                     port: default_kakao_port(),
-                    auto_approve: true,
                 });
             kk.rest_api_key = key;
         }
@@ -9987,7 +9979,6 @@ impl Config {
                     webhook_secret: None,
                     allowed_users: vec![],
                     port: default_kakao_port(),
-                    auto_approve: true,
                 });
             kk.admin_key = key;
         }
