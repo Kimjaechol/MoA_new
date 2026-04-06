@@ -59,6 +59,8 @@ pub struct KakaoTalkChannel {
     pairing_store: Option<Arc<super::pairing::ChannelPairingStore>>,
     /// Gateway base URL for pairing web pages.
     gateway_url: Option<String>,
+    /// Auto-approve new users on first message (default: true).
+    auto_approve: bool,
 }
 
 /// Cached reply context for a KakaoTalk user session.
@@ -79,6 +81,8 @@ struct WebhookState {
     reply_contexts: Arc<RwLock<HashMap<String, ReplyContext>>>,
     pairing_store: Option<Arc<super::pairing::ChannelPairingStore>>,
     gateway_url: Option<String>,
+    /// Auto-approve new users on first message (no pairing needed).
+    auto_approve: bool,
 }
 
 impl KakaoTalkChannel {
@@ -102,6 +106,7 @@ impl KakaoTalkChannel {
             reply_contexts: Arc::new(RwLock::new(HashMap::new())),
             pairing_store,
             gateway_url,
+            auto_approve: true, // default: auto-approve for easiest onboarding
         }
     }
 
@@ -111,7 +116,7 @@ impl KakaoTalkChannel {
         pairing_store: Option<Arc<super::pairing::ChannelPairingStore>>,
         gateway_url: Option<String>,
     ) -> Self {
-        Self::new(
+        let mut ch = Self::new(
             config.rest_api_key.clone(),
             config.admin_key.clone(),
             config.webhook_secret.clone(),
@@ -119,7 +124,9 @@ impl KakaoTalkChannel {
             config.port,
             pairing_store,
             gateway_url,
-        )
+        );
+        ch.auto_approve = config.auto_approve;
+        ch
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
@@ -482,8 +489,27 @@ async fn handle_webhook(
 
         // Check user allowlist
         if !state.allowed_users.iter().any(|u| u == "*" || u == user_id) {
-            // Check if user was paired via web flow (one-click auto-pair)
-            if let Some(ref store) = state.pairing_store {
+            // ── Auto-approve mode (default for KakaoTalk) ──
+            // When auto_approve is enabled, any KakaoTalk user who sends a message
+            // is automatically registered. No pairing, no web login, no extra steps.
+            // The user just opens the channel and starts chatting — simplest onboarding.
+            if state.auto_approve {
+                let uid = user_id.to_string();
+                tracing::info!("KakaoTalk: auto-approving new user: {uid}");
+                tokio::spawn(async move {
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        super::pairing::persist_channel_allowlist("kakao", &uid)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
+                    {
+                        tracing::error!("KakaoTalk: failed to persist auto-approved user: {e}");
+                    }
+                });
+                // Fall through to process message — first message is handled immediately
+            }
+            // ── Manual pairing mode (auto_approve=false) ──
+            else if let Some(ref store) = state.pairing_store {
                 if store.is_paired("kakao", user_id) {
                     let uid = user_id.to_string();
                     tokio::spawn(async move {
@@ -496,7 +522,6 @@ async fn handle_webhook(
                             tracing::error!("KakaoTalk: failed to persist pairing: {e}");
                         }
                     });
-                    // Fall through to process message normally
                 } else {
                     // Create token and show one-click connect button
                     if let Some(ref gw_url) = state.gateway_url {
@@ -702,6 +727,7 @@ impl Channel for KakaoTalkChannel {
             reply_contexts: Arc::clone(&self.reply_contexts),
             pairing_store: self.pairing_store.clone(),
             gateway_url: self.gateway_url.clone(),
+            auto_approve: self.auto_approve,
         };
 
         let app = Router::new()
