@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod auth_api;
+pub mod channel_router;
 pub mod llm_proxy;
 mod openai_compat;
 mod openclaw_compat;
@@ -1797,9 +1798,18 @@ pub(super) async fn try_relay_channel_to_device(
 
 /// Process a channel message with device-first relay.
 ///
-/// Tries to route the message to the user's local device first.
-/// Falls back to Railway processing if device is offline or not paired.
-/// This is the primary entry point for all channel webhook handlers.
+/// Routes the message to the user's specific MoA device via the common
+/// channel routing framework.  Each user's memories and tools stay on
+/// their local device — Railway only relays messages.
+///
+/// Flow:
+/// 1. Check for channel commands (/디바이스, /모드, /도움말, etc.)
+/// 2. Check for pairing code (one-click channel linking)
+/// 3. Look up channel_link → (user_id, device_id, autonomy_mode)
+/// 4. Route to device via DeviceRouter
+/// 5. Collect response and return
+///
+/// If the user isn't linked yet, returns an onboarding message with auth URL.
 pub(super) async fn process_channel_message(
     state: &AppState,
     channel_name: &str,
@@ -1807,30 +1817,137 @@ pub(super) async fn process_channel_message(
     content: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    // ── Step 0: Check for pairing code ──
-    // If the user sends a message that looks like a pairing code (4-64 char
-    // alphanumeric/dash, including UUID tokens), try to consume it and pair.
-    // This enables one-click channel pairing: user sends the code in the
-    // channel chat, and we automatically link their channel identity to
-    // their MoA account.
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => return run_gateway_chat_with_tools(state, content, session_id).await,
+    };
+    let device_router = match state.device_router.as_ref() {
+        Some(r) => r,
+        None => return run_gateway_chat_with_tools(state, content, session_id).await,
+    };
+
+    // Ensure channel_links table exists (idempotent)
+    let _ = auth_store.ensure_channel_links_table();
+
+    // ── Step 0: Handle channel commands ──
+    if let Some(reply) = channel_router::handle_channel_command(
+        auth_store,
+        device_router,
+        channel_name,
+        sender_platform_uid,
+        content,
+    ) {
+        return Ok(reply);
+    }
+
+    // ── Step 1: Check for pairing code ──
     if let Some(pairing_response) =
         try_consume_pairing_code(state, channel_name, sender_platform_uid, content)
     {
         return Ok(pairing_response);
     }
 
-    let sid = session_id.unwrap_or("");
+    // ── Step 2: Route to device via channel router ──
+    let result = channel_router::route_channel_message(
+        auth_store,
+        device_router,
+        channel_name,
+        sender_platform_uid,
+        content,
+    )
+    .await;
 
-    // Step 1: Try device relay (preserves local tool keys)
-    let device_response =
-        try_relay_channel_to_device(state, channel_name, sender_platform_uid, content, sid).await;
+    match result {
+        channel_router::RouteResult::Delivered { msg_id, response_rx } => {
+            // Collect response from device (up to 120s)
+            let collector = channel_router::ResponseCollector {
+                rx: response_rx,
+                msg_id,
+            };
+            Ok(collector
+                .collect(std::time::Duration::from_secs(120))
+                .await)
+        }
 
-    if let Some(response) = device_response {
-        return Ok(response);
+        channel_router::RouteResult::NotLinked => {
+            // User not linked — show onboarding message with auth URL
+            let gateway_url = resolve_public_gateway_url(state);
+            let auth_url = channel_router::build_onboarding_url(
+                &gateway_url,
+                channel_name,
+                sender_platform_uid,
+            );
+            Ok(channel_router::onboarding_message(&auth_url))
+        }
+
+        channel_router::RouteResult::NoDeviceSelected { link } => {
+            // User is linked but no device selected — show device list
+            match auth_store.list_devices(&link.user_id) {
+                Ok(devices) if devices.len() == 1 => {
+                    // Single device — auto-select
+                    let _ = auth_store.update_channel_device(
+                        channel_name,
+                        sender_platform_uid,
+                        &devices[0].device_id,
+                    );
+                    // Retry routing now that device is set
+                    let retry = channel_router::route_channel_message(
+                        auth_store,
+                        device_router,
+                        channel_name,
+                        sender_platform_uid,
+                        content,
+                    )
+                    .await;
+                    match retry {
+                        channel_router::RouteResult::Delivered { msg_id, response_rx } => {
+                            let collector = channel_router::ResponseCollector {
+                                rx: response_rx,
+                                msg_id,
+                            };
+                            Ok(collector
+                                .collect(std::time::Duration::from_secs(120))
+                                .await)
+                        }
+                        channel_router::RouteResult::DeviceOffline { device_name, .. } => {
+                            Ok(channel_router::device_offline_message(
+                                device_name.as_deref(),
+                            ))
+                        }
+                        _ => Ok("디바이스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.".into()),
+                    }
+                }
+                Ok(devices) if devices.is_empty() => {
+                    Ok("MoA 앱이 설치된 디바이스가 없습니다. 먼저 MoA 앱을 설치해 주세요.".into())
+                }
+                Ok(devices) => {
+                    // Multiple devices — ask user to select
+                    Ok(channel_router::device_selection_message(
+                        &devices,
+                        device_router,
+                    ))
+                }
+                Err(_) => {
+                    Ok("디바이스 목록을 확인할 수 없습니다. 잠시 후 다시 시도해 주세요.".into())
+                }
+            }
+        }
+
+        channel_router::RouteResult::DeviceOffline {
+            device_name, ..
+        } => Ok(channel_router::device_offline_message(device_name.as_deref())),
     }
+}
 
-    // Step 2: Fallback to Railway processing
-    run_gateway_chat_with_tools(state, content, session_id).await
+/// Resolve the public URL for this gateway (for generating auth links).
+fn resolve_public_gateway_url(state: &AppState) -> String {
+    if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
+        return format!("https://{}", domain.trim_end_matches('/'));
+    }
+    let config = state.config.lock();
+    let host = &config.gateway.host;
+    let port = config.gateway.port;
+    format!("http://{}:{}", host, port)
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
