@@ -213,17 +213,20 @@ pub async fn route_channel_message(
     }
 
     let msg_id = Uuid::new_v4().to_string();
-    let msg_type = if link.autonomy_mode == "full" {
-        "remote_message"
-    } else {
-        "remote_read_only"
-    };
 
+    // Use "channel_relay" type which device_link already handles.
+    // The device processes it via local gateway → agent loop → memory store.
+    // Autonomy mode is embedded in the payload so the local gateway can enforce it.
     let routed = RoutedMessage {
         id: msg_id.clone(),
         direction: "to_device".into(),
-        content: content.to_string(),
-        msg_type: msg_type.into(),
+        content: serde_json::json!({
+            "content": content,
+            "channel": channel,
+            "autonomy_mode": &link.autonomy_mode,
+        })
+        .to_string(),
+        msg_type: "channel_relay".into(),
     };
 
     let (resp_tx, resp_rx) = mpsc::channel::<RoutedMessage>(64);
@@ -282,17 +285,17 @@ pub fn handle_channel_command(
     if trimmed == CB_MODE_FULL || trimmed == "/모드 전체" {
         let _ = auth_store.set_channel_autonomy_mode(channel, platform_uid, "full");
         return Some(ChannelReply::with_buttons(
-            "🔓 전체 모드로 전환되었습니다.\n\nMoA가 파일 작성, 명령 실행 등 모든 기능을 사용할 수 있습니다.",
+            "🔓 전체 모드로 전환되었습니다.\n\nMoA가 파일 작성, 명령 실행 등 모든 기능을 사용할 수 있습니다.\n대화 내용은 계속 기억에 저장됩니다.",
             vec![
-                postback("🔒 읽기 전용으로 되돌리기", CB_MODE_READONLY),
+                postback("🔒 안전 모드로 되돌리기", CB_MODE_READONLY),
                 postback("⚙️ 설정", CB_SETTINGS),
             ],
         ));
     }
-    if trimmed == CB_MODE_READONLY || trimmed == "/모드 읽기전용" {
+    if trimmed == CB_MODE_READONLY || trimmed == "/모드 읽기전용" || trimmed == "/모드 안전" {
         let _ = auth_store.set_channel_autonomy_mode(channel, platform_uid, "read_only");
         return Some(ChannelReply::with_buttons(
-            "🔒 읽기 전용 모드로 전환되었습니다.\n\nMoA가 검색, 기억 조회만 수행합니다.",
+            "🔒 안전 모드로 전환되었습니다.\n\n대화 내용은 계속 기억에 저장됩니다.\n검색, 기억 조회가 가능하며, 파일 수정과 명령 실행은 제한됩니다.",
             vec![
                 postback("🔓 전체 모드로 전환", CB_MODE_FULL),
                 postback("⚙️ 설정", CB_SETTINGS),
@@ -340,11 +343,11 @@ fn settings_menu(
     let mode_label = if current_mode == "full" {
         "🔓 전체 모드"
     } else {
-        "🔒 읽기 전용"
+        "🔒 안전 모드"
     };
 
     let mode_toggle = if current_mode == "full" {
-        postback("🔒 읽기 전용으로 전환", CB_MODE_READONLY)
+        postback("🔒 안전 모드로 전환", CB_MODE_READONLY)
     } else {
         postback("🔓 전체 모드로 전환", CB_MODE_FULL)
     };
@@ -353,7 +356,7 @@ fn settings_menu(
         format!(
             "⚙️ MoA 설정\n\n\
              현재 모드: {mode_label}\n\
-             • 읽기 전용: 검색, 기억 조회만\n\
+             • 안전 모드: 대화, 검색, 기억 저장/조회 (파일 수정·명령 실행 제한)\n\
              • 전체 모드: 파일 작성, 명령 실행 등 모든 기능"
         ),
         vec![
