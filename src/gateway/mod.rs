@@ -1817,19 +1817,46 @@ pub(super) async fn process_channel_message(
     content: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
+    let reply = process_channel_message_rich(
+        state,
+        channel_name,
+        sender_platform_uid,
+        content,
+        session_id,
+    )
+    .await?;
+    Ok(reply.as_plain_text())
+}
+
+/// Same as `process_channel_message` but returns a structured `ChannelReply`
+/// with buttons.  Channel-specific webhook handlers (KakaoTalk, Telegram)
+/// can render these buttons in their native format (quickReplies, inline_keyboard).
+pub(super) async fn process_channel_message_rich(
+    state: &AppState,
+    channel_name: &str,
+    sender_platform_uid: &str,
+    content: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<channel_router::ChannelReply> {
     let auth_store = match state.auth_store.as_ref() {
         Some(s) => s,
-        None => return run_gateway_chat_with_tools(state, content, session_id).await,
+        None => {
+            let text = run_gateway_chat_with_tools(state, content, session_id).await?;
+            return Ok(channel_router::ChannelReply::text(text));
+        }
     };
     let device_router = match state.device_router.as_ref() {
         Some(r) => r,
-        None => return run_gateway_chat_with_tools(state, content, session_id).await,
+        None => {
+            let text = run_gateway_chat_with_tools(state, content, session_id).await?;
+            return Ok(channel_router::ChannelReply::text(text));
+        }
     };
 
     // Ensure channel_links table exists (idempotent)
     let _ = auth_store.ensure_channel_links_table();
 
-    // ── Step 0: Handle channel commands ──
+    // ── Step 0: Handle button callbacks and commands ──
     if let Some(reply) = channel_router::handle_channel_command(
         auth_store,
         device_router,
@@ -1844,7 +1871,7 @@ pub(super) async fn process_channel_message(
     if let Some(pairing_response) =
         try_consume_pairing_code(state, channel_name, sender_platform_uid, content)
     {
-        return Ok(pairing_response);
+        return Ok(channel_router::ChannelReply::text(pairing_response));
     }
 
     // ── Step 2: Route to device via channel router ──
@@ -1859,7 +1886,6 @@ pub(super) async fn process_channel_message(
 
     match result {
         channel_router::RouteResult::Delivered { msg_id, response_rx } => {
-            // Collect response from device (up to 120s)
             let collector = channel_router::ResponseCollector {
                 rx: response_rx,
                 msg_id,
@@ -1870,27 +1896,24 @@ pub(super) async fn process_channel_message(
         }
 
         channel_router::RouteResult::NotLinked => {
-            // User not linked — show onboarding message with auth URL
             let gateway_url = resolve_public_gateway_url(state);
             let auth_url = channel_router::build_onboarding_url(
                 &gateway_url,
                 channel_name,
                 sender_platform_uid,
             );
-            Ok(channel_router::onboarding_message(&auth_url))
+            Ok(channel_router::onboarding_reply(&auth_url))
         }
 
         channel_router::RouteResult::NoDeviceSelected { link } => {
-            // User is linked but no device selected — show device list
             match auth_store.list_devices(&link.user_id) {
                 Ok(devices) if devices.len() == 1 => {
-                    // Single device — auto-select
+                    // Single device — auto-select and retry
                     let _ = auth_store.update_channel_device(
                         channel_name,
                         sender_platform_uid,
                         &devices[0].device_id,
                     );
-                    // Retry routing now that device is set
                     let retry = channel_router::route_channel_message(
                         auth_store,
                         device_router,
@@ -1910,32 +1933,29 @@ pub(super) async fn process_channel_message(
                                 .await)
                         }
                         channel_router::RouteResult::DeviceOffline { device_name, .. } => {
-                            Ok(channel_router::device_offline_message(
-                                device_name.as_deref(),
-                            ))
+                            Ok(channel_router::device_offline_reply(device_name.as_deref()))
                         }
-                        _ => Ok("디바이스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.".into()),
+                        _ => Ok(channel_router::ChannelReply::text(
+                            "디바이스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+                        )),
                     }
                 }
-                Ok(devices) if devices.is_empty() => {
-                    Ok("MoA 앱이 설치된 디바이스가 없습니다. 먼저 MoA 앱을 설치해 주세요.".into())
-                }
-                Ok(devices) => {
-                    // Multiple devices — ask user to select
-                    Ok(channel_router::device_selection_message(
-                        &devices,
-                        device_router,
-                    ))
-                }
-                Err(_) => {
-                    Ok("디바이스 목록을 확인할 수 없습니다. 잠시 후 다시 시도해 주세요.".into())
-                }
+                Ok(devices) if devices.is_empty() => Ok(channel_router::ChannelReply::text(
+                    "MoA 앱이 설치된 디바이스가 없습니다. 먼저 MoA 앱을 설치해 주세요.",
+                )),
+                Ok(devices) => Ok(channel_router::device_selection_reply(
+                    &devices,
+                    device_router,
+                )),
+                Err(_) => Ok(channel_router::ChannelReply::text(
+                    "디바이스 목록을 확인할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+                )),
             }
         }
 
-        channel_router::RouteResult::DeviceOffline {
-            device_name, ..
-        } => Ok(channel_router::device_offline_message(device_name.as_deref())),
+        channel_router::RouteResult::DeviceOffline { device_name, .. } => {
+            Ok(channel_router::device_offline_reply(device_name.as_deref()))
+        }
     }
 }
 
