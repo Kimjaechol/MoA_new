@@ -1137,6 +1137,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/qq", post(handle_qq_webhook))
+        .route("/kakao", post(handle_kakao_webhook))
         // ── OpenClaw migration: tools-enabled chat endpoint (extended timeout) ──
         .merge(chat_routes)
         // ── OpenAI-compatible endpoints (extended timeout) ──
@@ -3762,6 +3763,108 @@ async fn handle_qq_webhook(
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+// ── KakaoTalk Webhook (Chatbot Skill API) ───────────────────────────
+
+/// POST /kakao — KakaoTalk Chatbot Skill webhook.
+///
+/// Receives messages from KakaoTalk channel and routes them to the user's
+/// MoA device via the common channel routing framework.  Returns Kakao Skill
+/// JSON with `quickReplies` for native button rendering.
+async fn handle_kakao_webhook(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("KakaoTalk webhook: invalid JSON: {e}");
+            return kakao_skill_json("요청을 처리할 수 없습니다.", &[]);
+        }
+    };
+
+    // Kakao Chatbot Skill format: { "userRequest": { "user": { "id": "..." }, "utterance": "..." } }
+    let user_id = payload
+        .pointer("/userRequest/user/id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let utterance = payload
+        .pointer("/userRequest/utterance")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if utterance.is_empty() {
+        return kakao_skill_json("메시지를 입력해주세요.", &[]);
+    }
+
+    tracing::info!(
+        channel = "kakao",
+        user_id,
+        utterance_len = utterance.len(),
+        "KakaoTalk webhook received"
+    );
+
+    // Route through the common channel routing framework
+    match process_channel_message_rich(&state, "kakao", user_id, utterance, None).await {
+        Ok(reply) => kakao_skill_json(&reply.text, &reply.buttons),
+        Err(e) => {
+            tracing::error!("KakaoTalk processing failed: {e:#}");
+            kakao_skill_json(
+                "메시지를 처리하는 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+                &[],
+            )
+        }
+    }
+}
+
+/// Render a ChannelReply as Kakao Chatbot Skill JSON with quickReplies.
+fn kakao_skill_json(
+    text: &str,
+    buttons: &[channel_router::ReplyButton],
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut quick_replies = Vec::new();
+
+    for btn in buttons {
+        match &btn.action {
+            channel_router::ButtonAction::PostBack(data) => {
+                quick_replies.push(serde_json::json!({
+                    "label": btn.label,
+                    "action": "message",
+                    "messageText": data,
+                }));
+            }
+            channel_router::ButtonAction::WebLink(url) => {
+                quick_replies.push(serde_json::json!({
+                    "label": btn.label,
+                    "action": "webLink",
+                    "webLinkUrl": url,
+                }));
+            }
+        }
+    }
+
+    let mut template = serde_json::json!({
+        "outputs": [{
+            "simpleText": {
+                "text": text
+            }
+        }]
+    });
+
+    if !quick_replies.is_empty() {
+        template["quickReplies"] = serde_json::Value::Array(quick_replies);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "version": "2.0",
+            "template": template
+        })),
+    )
 }
 
 #[cfg(test)]
