@@ -295,7 +295,9 @@ pub struct RemoteLoginRequest {
     pub username: String,
     pub password: String,
     pub device_id: String,
-    pub pairing_code: String,
+    /// Optional — only required if the user has set a pairing code on the device.
+    #[serde(default)]
+    pub pairing_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -404,30 +406,48 @@ pub async fn handle_remote_login(
         }
     };
 
-    // 3. Verify device pairing code
-    match auth_store.verify_device_pairing_code(&body.device_id, &body.pairing_code) {
-        Ok(true) => {} // Pairing code valid
-        Ok(false) => {
-            device_router.record_login_failure(&client_key);
+    // 3. Verify device pairing code (only if the user has set one)
+    let has_pairing_code = auth_store
+        .device_has_pairing_code(&body.device_id)
+        .unwrap_or(false);
+
+    if has_pairing_code {
+        let code = body.pairing_code.as_deref().unwrap_or("");
+        if code.is_empty() {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
-                    "error": "Invalid device pairing code"
+                    "error": "이 디바이스에는 페어링 코드가 설정되어 있습니다. 코드를 입력해 주세요.",
+                    "requires_pairing_code": true
                 })),
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!("Failed to verify pairing code: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "Failed to verify pairing code"
-                })),
-            )
-                .into_response();
+        match auth_store.verify_device_pairing_code(&body.device_id, code) {
+            Ok(true) => {} // Valid
+            Ok(false) => {
+                device_router.record_login_failure(&client_key);
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "페어링 코드가 올바르지 않습니다."
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!("Failed to verify pairing code: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "페어링 코드 확인 중 문제가 발생했습니다."
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
+    // If no pairing code is set → skip verification (email auth is still enforced)
 
     // 4. Check if email verification is required
     if let Some(ref email_svc) = state.email_verify_service {

@@ -122,10 +122,10 @@ function AuthPageInner() {
         setToken(result.token);
         router.push(redirectTo);
       } else if (devices.length === 1) {
-        // Single device - skip device selection, go to pairing code
+        // Single device - try connecting without pairing code first
         setSelectedDeviceId(devices[0].device_id);
         setSelectedDeviceName(devices[0].device_name);
-        setStep('pairing-code');
+        await tryRemoteLoginWithoutPairingCode(devices[0].device_id);
       } else {
         // Multiple devices - show device selection
         setStep('device-select');
@@ -180,27 +180,49 @@ function AuthPageInner() {
     }
   }, [username, password, confirmPassword, signupEmail]);
 
-  const handleDeviceSelect = useCallback(() => {
+  // Try remote login without pairing code — if server says code is required, show the step
+  const tryRemoteLoginWithoutPairingCode = useCallback(async (deviceId: string) => {
+    setLoading(true);
+    setError('');
+    try {
+      const result = await remoteLogin(username, password, deviceId, '');
+      if (result.requires_email_verification) {
+        setEmailHint(result.email_hint || '');
+        setVerificationExpiresIn(300);
+        setStep('email-verify');
+      } else if (result.session_token) {
+        setToken(result.session_token);
+        router.push(redirectTo);
+      }
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : '';
+      // Server requires pairing code for this device → show pairing code step
+      if (errMsg.includes('pairing') || errMsg.includes('페어링')) {
+        setStep('pairing-code');
+      } else {
+        setError(errMsg || '연결에 실패했습니다.');
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [username, password, router, redirectTo]);
+
+  const handleDeviceSelect = useCallback(async () => {
     if (!selectedDeviceId) {
-      setError('Please select a device');
+      setError('디바이스를 선택해 주세요');
       return;
     }
     setError('');
     const device = userDevices.find((d) => d.device_id === selectedDeviceId);
     setSelectedDeviceName(device?.device_name || '');
-    setStep('pairing-code');
-  }, [selectedDeviceId, userDevices]);
+    // Try without pairing code first
+    await tryRemoteLoginWithoutPairingCode(selectedDeviceId);
+  }, [selectedDeviceId, userDevices, tryRemoteLoginWithoutPairingCode]);
 
   const handlePairingCode = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError('');
-
-    if (!pairingCode.trim()) {
-      setError('Please enter the pairing code');
-      setLoading(false);
-      return;
-    }
 
     try {
       // Use remote login endpoint: validates credentials + device + pairing code
