@@ -270,6 +270,43 @@ impl AuthStore {
         }
     }
 
+    /// Change a user's password. Used for:
+    /// - Kakao OAuth users setting their first password (enables app login)
+    /// - Regular users changing their password
+    pub fn set_password(&self, user_id: &str, new_password: &str) -> Result<()> {
+        if new_password.len() < 4 {
+            bail!("Password must be at least 4 characters");
+        }
+        let salt = generate_salt();
+        let hash = hash_password(new_password, &salt);
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE users SET password_hash = ?1, salt = ?2 WHERE id = ?3",
+            rusqlite::params![hash, salt, user_id],
+        )?;
+        if updated == 0 {
+            bail!("User not found");
+        }
+        Ok(())
+    }
+
+    /// Change a user's username. Used for Kakao users who want a custom username.
+    pub fn set_username(&self, user_id: &str, new_username: &str) -> Result<()> {
+        let trimmed = new_username.trim();
+        if trimmed.is_empty() || trimmed.len() > 64 {
+            bail!("Username must be 1-64 characters");
+        }
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE users SET username = ?1 WHERE id = ?2",
+            rusqlite::params![trimmed, user_id],
+        )?;
+        if updated == 0 {
+            bail!("User not found");
+        }
+        Ok(())
+    }
+
     /// Look up a user by ID.
     pub fn get_user(&self, user_id: &str) -> Result<Option<User>> {
         let conn = self.conn.lock();

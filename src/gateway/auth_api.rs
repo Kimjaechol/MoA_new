@@ -226,6 +226,80 @@ pub async fn handle_auth_logout(
     Json(serde_json::json!({ "status": "ok" })).into_response()
 }
 
+// ── POST /api/auth/set-password ─────────────────────────────────
+
+/// Set or change password. Required for Kakao OAuth users who want to
+/// use the MoA app (which requires username/password login).
+pub async fn handle_auth_set_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "Auth not configured" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Require valid session
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    let session = match auth_store.validate_session(token) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "로그인이 필요합니다." })),
+            )
+                .into_response();
+        }
+    };
+
+    let new_password = body["password"].as_str().unwrap_or("");
+    if new_password.len() < 4 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "비밀번호는 4자 이상이어야 합니다." })),
+        )
+            .into_response();
+    }
+
+    // Optional: also update username (for Kakao users who want custom username)
+    if let Some(new_username) = body["username"].as_str() {
+        if !new_username.is_empty() {
+            if let Err(e) = auth_store.set_username(&session.user_id, new_username) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": format!("아이디 변경에 실패했습니다: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match auth_store.set_password(&session.user_id, new_password) {
+        Ok(()) => Json(serde_json::json!({
+            "status": "ok",
+            "message": "비밀번호가 설정되었습니다. 이제 아이디와 비밀번호로 로그인할 수 있습니다."
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("비밀번호 설정에 실패했습니다: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 // ── GET /api/auth/devices ───────────────────────────────────────
 
 pub async fn handle_auth_devices_list(
