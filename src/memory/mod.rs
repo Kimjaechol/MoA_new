@@ -2,6 +2,8 @@ pub mod backend;
 pub mod chunker;
 pub mod cli;
 pub mod cortex;
+pub mod document_store;
+pub mod document_summarizer;
 pub mod embeddings;
 pub mod hot_cache;
 pub mod hybrid;
