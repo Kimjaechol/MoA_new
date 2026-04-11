@@ -3536,9 +3536,30 @@ of them without any new indexing infrastructure.
    recursively walks the folder (default depth 4, max 50 files per call,
    skips hidden / `node_modules` / `target`), classifies each file, and
    runs the converter only on files that aren't already fresh in the
-   cache. Image PDFs default to `skip_image_pdfs = true` to avoid
-   surprise Upstage charges; the agent must explicitly opt in after
-   asking the user.
+   cache.
+
+   **Two-pass image-PDF consent flow** — image PDFs always cost credits
+   (Upstage OCR, 2.2× billing) so the user must approve them before
+   conversion:
+   - **First pass**: agent calls `folder_index({ folder })`. Non-image
+     documents (digital PDFs, HWP, DOC, XLS, PPT) are converted in this
+     call. Image PDFs are NOT converted; instead they are returned in
+     the response under `pending_consent: [{ path, size_bytes,
+     estimated_credits }]` along with `consent_required: true`,
+     `consent_total_estimated_credits`, and a pre-formatted bilingual
+     `consent_message` the agent can paste verbatim into the chat
+     ("OCR이 필요한 이미지 PDF N개가 발견되었습니다 ... 동의하시나요? /
+     N image PDF(s) need OCR conversion ... Reply 'yes' to convert").
+   - **Second pass**: after the user agrees, the agent re-calls
+     `folder_index({ folder, consent_granted_image_pdfs: [...] })`
+     passing the exact paths the user approved. Those files are
+     converted via Upstage OCR; non-listed image PDFs remain skipped.
+     Re-running with the same arguments is idempotent thanks to the
+     mtime/size cache check.
+
+   The legacy `skip_image_pdfs: false` argument still works as a
+   blanket override for power users who want every image PDF in the
+   tree converted without an explicit allowlist.
 3. **Web URL** (`web_fetch` tool, `src/tools/web_fetch.rs:609`): if the
    URL path ends in `.pdf` and the workspace was injected at construction
    time, the tool downloads the bytes (with PDF magic-byte sanity check),

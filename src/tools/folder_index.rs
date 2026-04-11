@@ -60,6 +60,12 @@ struct Args {
     max_depth: usize,
     #[serde(default = "default_skip_image_pdfs")]
     skip_image_pdfs: bool,
+    /// Explicit list of image PDF paths the user has consented to convert.
+    /// When non-empty, those exact paths are converted regardless of
+    /// `skip_image_pdfs`. Used in the SECOND PASS after the agent surfaced
+    /// the consent dialog and the user clicked "동의합니다 / Yes".
+    #[serde(default)]
+    consent_granted_image_pdfs: Vec<String>,
 }
 
 fn default_max_files() -> usize {
@@ -70,6 +76,15 @@ fn default_max_depth() -> usize {
 }
 fn default_skip_image_pdfs() -> bool {
     true
+}
+
+/// One image PDF discovered during indexing that needs explicit user
+/// consent because OCR will deduct credits.
+#[derive(Debug, Clone, Serialize)]
+struct PendingConsent {
+    path: String,
+    size_bytes: u64,
+    estimated_credits: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,12 +98,69 @@ struct ConvertedReport {
     failed: Vec<FailureReport>,
     truncated: bool,
     cache_root: String,
+    /// Image PDFs found that need user consent before conversion.
+    /// Empty when there is nothing to ask the user about.
+    pending_consent: Vec<PendingConsent>,
+    /// True when at least one image PDF is awaiting consent.
+    /// The agent MUST surface a confirmation dialog (chat or popup)
+    /// before re-calling this tool with `consent_granted_image_pdfs`.
+    consent_required: bool,
+    /// Pre-formatted Korean + English message the agent can paste into
+    /// the chat to ask for consent. Includes the file count and the
+    /// total estimated credit cost.
+    consent_message: Option<String>,
+    /// Total estimated credits to convert ALL pending image PDFs.
+    consent_total_estimated_credits: u32,
 }
 
 #[derive(Debug, Serialize)]
 struct FailureReport {
     path: String,
     error: String,
+}
+
+/// Estimate Upstage OCR credit cost for an image PDF, mirroring the
+/// formula in `DocumentPipelineTool::estimate_pdf_credits`. Kept private
+/// to that tool, so we re-derive it here to avoid a public API change.
+fn estimate_image_pdf_credits(file_size_bytes: u64) -> u32 {
+    let estimated_pages = (file_size_bytes / 100_000).max(1) as u32;
+    (estimated_pages * 6).max(10)
+}
+
+/// Build the bilingual consent message the agent surfaces to the user.
+fn build_consent_message(pending: &[PendingConsent], total_credits: u32) -> String {
+    let count = pending.len();
+    let bullets: String = pending
+        .iter()
+        .take(10)
+        .map(|p| {
+            let name = std::path::Path::new(&p.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&p.path);
+            format!("  - {name} (~{} 크레딧)", p.estimated_credits)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more = if count > 10 {
+        format!("\n  …외 {}개", count - 10)
+    } else {
+        String::new()
+    };
+    format!(
+        "OCR이 필요한 이미지 PDF {count}개가 발견되었습니다.\n\
+         AI가 검색하고 위 문서를 읽기 위해서는 마크다운/HTML로 변환해야 합니다.\n\
+         (총 예상 크레딧 차감: ~{total_credits} 크레딧, Upstage OCR API)\n\
+         \n\
+         대상 파일:\n{bullets}{more}\n\
+         \n\
+         동의하시나요? 변환을 진행하려면 \"동의합니다\" 또는 \"yes\"라고 답해주세요.\n\
+         그렇지 않으면 이미지 PDF는 건너뛰고 나머지 문서만 검색에 사용됩니다.\n\
+         \n\
+         ──────────────\n\
+         {count} image PDF(s) need OCR conversion (total ~{total_credits} credits via Upstage). \
+         Reply 'yes' to convert, anything else to skip."
+    )
 }
 
 /// Recursive directory walker that yields supported document paths in
@@ -176,10 +248,22 @@ impl Tool for FolderIndexTool {
          XLS/XLSX, PPT/PPTX) inside a folder into Markdown + HTML and persist \
          them to the document cache so the LLM can read and search them later. \
          Idempotent: re-runs only convert files added or modified since the \
-         last pass. Image-PDF OCR is opt-in via `skip_image_pdfs: false` \
-         because it costs credits (Upstage OCR, 2.2× billing). Use this \
-         immediately after `workspace_folder_link` to make a folder \
-         searchable. Default limits: 50 files per call, 4 levels deep."
+         last pass. Use this immediately after `workspace_folder_link` to make \
+         a folder searchable.\n\
+         \n\
+         Two-pass image-PDF consent flow:\n\
+         1. FIRST PASS — call with just `folder`. Non-image documents are \
+            converted in this call. Image PDFs are NOT converted; instead they \
+            are returned in `pending_consent` with an estimated credit cost. \
+            If `consent_required` is true, surface `consent_message` to the \
+            user verbatim and wait for their reply.\n\
+         2. SECOND PASS — after the user agrees, call again with the same \
+            `folder` PLUS `consent_granted_image_pdfs` containing the exact \
+            paths from `pending_consent` that the user approved. Those files \
+            are then OCR'd via Upstage (2.2× credit billing) and cached.\n\
+         \n\
+         Default limits: 50 files per call, 4 levels deep. Skips hidden \
+         directories, `node_modules`, `target`, `venv`, `.venv`."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -204,7 +288,12 @@ impl Tool for FolderIndexTool {
                 },
                 "skip_image_pdfs": {
                     "type": "boolean",
-                    "description": "If true (default), image PDFs are skipped to avoid Upstage OCR credit charges."
+                    "description": "If true (default), image PDFs are returned in pending_consent instead of being converted. Set to false ONLY when the user has agreed in advance to convert ALL image PDFs in the folder."
+                },
+                "consent_granted_image_pdfs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Second-pass argument: explicit list of image PDF paths the user just approved via the consent dialog. These exact paths are converted regardless of skip_image_pdfs."
                 }
             },
             "required": ["folder"]
@@ -269,11 +358,21 @@ impl Tool for FolderIndexTool {
             .map_err(|e| anyhow::anyhow!("init document cache: {e}"))?;
         let pipeline = DocumentPipelineTool::new((*self.security).clone());
 
+        // Normalize the consent allowlist to a HashSet for O(1) lookup.
+        // We compare on raw path strings; the agent passes back exactly
+        // the strings the previous tool call returned in `pending_consent`.
+        let consent_allow: std::collections::HashSet<String> = parsed
+            .consent_granted_image_pdfs
+            .iter()
+            .map(|s| s.clone())
+            .collect();
+
         let mut converted = 0usize;
         let mut cached_hits = 0usize;
         let mut skipped_image_pdf = 0usize;
         let skipped_unsupported = 0usize;
         let mut failures: Vec<FailureReport> = Vec::new();
+        let mut pending_consent: Vec<PendingConsent> = Vec::new();
 
         for path in &to_process {
             // Cheap stale-check: if a fresh entry already exists, count
@@ -293,33 +392,59 @@ impl Tool for FolderIndexTool {
                 }
             }
 
-            // Optionally skip image PDFs to avoid surprise OCR charges.
-            // We delegate the classification to the existing pipeline tool
-            // so the rules stay in one place.
-            if parsed.skip_image_pdfs
-                && path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("pdf"))
-                    .unwrap_or(false)
-            {
+            let is_pdf = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false);
+
+            // ── Image-PDF consent gate ──
+            // For PDFs, ask the pipeline to classify_only (free, fast).
+            // If the result is image_pdf:
+            //   1. If the path appears in the consent allowlist
+            //      (second pass after the user said yes), convert.
+            //   2. Else if `skip_image_pdfs == false` (legacy override),
+            //      convert.
+            //   3. Else collect the file into pending_consent so the
+            //      agent surfaces the dialog before re-running.
+            if is_pdf {
                 let classify = pipeline
                     .execute(json!({
                         "file_path": path.to_string_lossy(),
                         "classify_only": true,
                     }))
                     .await;
+
+                let mut classified_as_image_pdf = false;
+                let mut size_bytes: u64 = 0;
                 if let Ok(result) = classify {
                     if result.success {
                         if let Ok(report) = serde_json::from_str::<Value>(&result.output) {
-                            if report.get("doc_type").and_then(|v| v.as_str())
-                                == Some("image_pdf")
-                            {
-                                skipped_image_pdf += 1;
-                                continue;
-                            }
+                            classified_as_image_pdf = report
+                                .get("doc_type")
+                                .and_then(|v| v.as_str())
+                                == Some("image_pdf");
+                            size_bytes = report
+                                .get("file_size_bytes")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
                         }
                     }
+                }
+
+                if classified_as_image_pdf {
+                    let path_str = path.to_string_lossy().into_owned();
+                    let granted = consent_allow.contains(&path_str);
+                    if !granted && parsed.skip_image_pdfs {
+                        pending_consent.push(PendingConsent {
+                            path: path_str,
+                            size_bytes,
+                            estimated_credits: estimate_image_pdf_credits(size_bytes),
+                        });
+                        skipped_image_pdf += 1;
+                        continue;
+                    }
+                    // Fall through to convert (granted OR override).
                 }
             }
 
@@ -332,6 +457,14 @@ impl Tool for FolderIndexTool {
             }
         }
 
+        let consent_total_estimated_credits: u32 = pending_consent
+            .iter()
+            .map(|p| p.estimated_credits)
+            .sum();
+        let consent_required = !pending_consent.is_empty();
+        let consent_message = consent_required
+            .then(|| build_consent_message(&pending_consent, consent_total_estimated_credits));
+
         let report = ConvertedReport {
             folder: folder.to_string_lossy().into_owned(),
             workspace_dir: self.workspace_dir.to_string_lossy().into_owned(),
@@ -342,6 +475,10 @@ impl Tool for FolderIndexTool {
             failed: failures,
             truncated,
             cache_root: cache.root().to_string_lossy().into_owned(),
+            pending_consent,
+            consent_required,
+            consent_message,
+            consent_total_estimated_credits,
         };
 
         Ok(ToolResult {
@@ -468,5 +605,108 @@ mod tests {
             err.contains("workspace_folder_link") || err.contains("not in any allowed"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── Image-PDF consent flow ──
+
+    #[test]
+    fn estimate_credits_minimum_floor() {
+        // Tiny PDFs (under 100 KB) still cost the 10-credit minimum.
+        assert_eq!(estimate_image_pdf_credits(0), 10);
+        assert_eq!(estimate_image_pdf_credits(99_999), 10);
+    }
+
+    #[test]
+    fn estimate_credits_scales_with_size() {
+        // 1 MB ≈ 10 estimated pages × 6 credits = 60 credits.
+        assert_eq!(estimate_image_pdf_credits(1_000_000), 60);
+        // 5 MB ≈ 50 pages × 6 = 300 credits.
+        assert_eq!(estimate_image_pdf_credits(5_000_000), 300);
+    }
+
+    #[test]
+    fn build_consent_message_lists_files_and_credits() {
+        let pending = vec![
+            PendingConsent {
+                path: "/Users/me/work/scan_a.pdf".into(),
+                size_bytes: 524_288,
+                estimated_credits: 30,
+            },
+            PendingConsent {
+                path: "/Users/me/work/scan_b.pdf".into(),
+                size_bytes: 1_048_576,
+                estimated_credits: 60,
+            },
+        ];
+        let total = 90;
+        let msg = build_consent_message(&pending, total);
+        assert!(msg.contains("이미지 PDF 2개"));
+        assert!(msg.contains("90 크레딧"));
+        assert!(msg.contains("scan_a.pdf"));
+        assert!(msg.contains("scan_b.pdf"));
+        assert!(msg.contains("동의합니다"));
+        // English fallback for non-Korean speakers.
+        assert!(msg.contains("Reply 'yes'"));
+    }
+
+    #[test]
+    fn build_consent_message_truncates_after_ten_files() {
+        let pending: Vec<PendingConsent> = (0..15)
+            .map(|i| PendingConsent {
+                path: format!("/x/scan_{i}.pdf"),
+                size_bytes: 100_000,
+                estimated_credits: 10,
+            })
+            .collect();
+        let msg = build_consent_message(&pending, 150);
+        assert!(msg.contains("이미지 PDF 15개"));
+        // First 10 are listed, the rest are summarized.
+        assert!(msg.contains("scan_0.pdf"));
+        assert!(msg.contains("scan_9.pdf"));
+        assert!(!msg.contains("scan_14.pdf"));
+        assert!(msg.contains("외 5개"));
+    }
+
+    #[tokio::test]
+    async fn args_parsing_accepts_consent_granted_image_pdfs() {
+        // Verify the JSON schema accepts the new second-pass argument.
+        let parsed: super::Args = serde_json::from_value(json!({
+            "folder": "/x",
+            "consent_granted_image_pdfs": [
+                "/x/scan_a.pdf",
+                "/x/sub/scan_b.pdf"
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parsed.consent_granted_image_pdfs.len(), 2);
+        assert_eq!(parsed.consent_granted_image_pdfs[0], "/x/scan_a.pdf");
+        // Defaults are still applied for the un-supplied fields.
+        assert_eq!(parsed.max_files, DEFAULT_MAX_FILES);
+        assert_eq!(parsed.max_depth, DEFAULT_MAX_DEPTH);
+        assert!(parsed.skip_image_pdfs);
+    }
+
+    #[tokio::test]
+    async fn empty_folder_returns_no_consent_required() {
+        // Workspace and target folder are the same so the allowlist
+        // check passes (workspace is always allowed).
+        let workspace = TempDir::new().unwrap();
+        let policy = SecurityPolicy::default();
+        let mut policy = policy;
+        policy.workspace_dir = workspace.path().to_path_buf();
+        let tool = FolderIndexTool::new(workspace.path().to_path_buf(), Arc::new(policy));
+
+        let result = tool
+            .execute(json!({
+                "folder": workspace.path().canonicalize().unwrap().to_string_lossy(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "tool should succeed on empty folder");
+        let report: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(report["converted"], 0);
+        assert_eq!(report["consent_required"], false);
+        assert_eq!(report["pending_consent"].as_array().unwrap().len(), 0);
+        assert_eq!(report["consent_total_estimated_credits"], 0);
     }
 }
