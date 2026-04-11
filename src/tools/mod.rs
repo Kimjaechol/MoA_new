@@ -42,6 +42,7 @@ pub mod feishu_doc;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod folder_index;
 pub mod git_operations;
 pub mod glob_search;
 #[cfg(feature = "hardware")]
@@ -51,6 +52,7 @@ pub mod hardware_memory_map;
 #[cfg(feature = "hardware")]
 pub mod hardware_memory_read;
 pub mod http_request;
+pub mod hwpx_create;
 pub mod image_info;
 pub mod mcp_client;
 pub mod mcp_protocol;
@@ -498,18 +500,24 @@ pub fn all_tools_with_runtime(
     }
 
     if web_fetch_config.enabled {
-        tool_arcs.push(Arc::new(WebFetchTool::new(
-            security.clone(),
-            web_fetch_config.provider.clone(),
-            web_fetch_config.api_key.clone(),
-            web_fetch_config.api_url.clone(),
-            web_fetch_config.allowed_domains.clone(),
-            web_fetch_config.blocked_domains.clone(),
-            root_config.security.url_access.clone(),
-            web_fetch_config.max_response_size,
-            web_fetch_config.timeout_secs,
-            web_fetch_config.user_agent.clone(),
-        )));
+        // Inject workspace_dir so PDF URLs are auto-converted via the
+        // document_pipeline + DocumentCache instead of failing with
+        // "Unsupported content type". See `WebFetchTool::with_workspace_dir`.
+        tool_arcs.push(Arc::new(
+            WebFetchTool::new(
+                security.clone(),
+                web_fetch_config.provider.clone(),
+                web_fetch_config.api_key.clone(),
+                web_fetch_config.api_url.clone(),
+                web_fetch_config.allowed_domains.clone(),
+                web_fetch_config.blocked_domains.clone(),
+                root_config.security.url_access.clone(),
+                web_fetch_config.max_response_size,
+                web_fetch_config.timeout_secs,
+                web_fetch_config.user_agent.clone(),
+            )
+            .with_workspace_dir(workspace_dir),
+        ));
     }
 
     // Web search tool (enabled by default for GLM and other models)
@@ -569,6 +577,16 @@ pub fn all_tools_with_runtime(
     // Document processing pipeline (image PDF → Upstage OCR, digital PDF → local, office → Hancom)
     tool_arcs.push(Arc::new(DocumentPipelineTool::new(
         security.as_ref().clone(),
+    )));
+
+    // HWPX (Korean Hangul) document creation via bundled Python skill
+    tool_arcs.push(Arc::new(hwpx_create::HwpxCreateTool::new()));
+
+    // Folder indexer: batch-convert every supported document inside a
+    // user-linked folder so the LLM can read & search them.
+    tool_arcs.push(Arc::new(folder_index::FolderIndexTool::new(
+        workspace_dir.to_path_buf(),
+        security.clone(),
     )));
 
     // PPTX text extraction
