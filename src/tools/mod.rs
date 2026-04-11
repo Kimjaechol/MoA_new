@@ -51,6 +51,7 @@ pub mod hardware_memory_map;
 #[cfg(feature = "hardware")]
 pub mod hardware_memory_read;
 pub mod http_request;
+pub mod hwpx_create;
 pub mod image_info;
 pub mod mcp_client;
 pub mod mcp_protocol;
@@ -563,6 +564,9 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(DocumentPipelineTool::new(
         security.as_ref().clone(),
     )));
+
+    // HWPX (Korean Hangul) document creation via bundled Python skill
+    tool_arcs.push(Arc::new(hwpx_create::HwpxCreateTool::new()));
 
     // PPTX text extraction
     tool_arcs.push(Arc::new(PptxReadTool::new(security.clone())));
