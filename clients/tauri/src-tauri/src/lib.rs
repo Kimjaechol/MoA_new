@@ -1496,8 +1496,44 @@ fn venv_python() -> Option<PathBuf> {
     if bin.exists() { Some(bin) } else { None }
 }
 
+/// Directory holding a python-build-standalone runtime that MoA
+/// auto-downloads when no system Python 3 is present. Lives next to
+/// the venv at `~/.moa/python-runtime/`.
+const PYTHON_RUNTIME_DIR: &str = "python-runtime";
+
+/// Pinned python-build-standalone release. Updating this to a newer
+/// release date is the only step needed to ship a Python upgrade —
+/// the URL pattern below is stable across releases.
+const PBS_RELEASE_DATE: &str = "20240814";
+const PBS_PYTHON_VERSION: &str = "3.12.5";
+
+/// Return the path to the python binary inside the bootstrapped
+/// runtime, regardless of whether it has been installed yet.
+fn moa_runtime_python_path() -> Option<PathBuf> {
+    let root = dirs_next::home_dir()?
+        .join(".moa")
+        .join(PYTHON_RUNTIME_DIR)
+        .join("python");
+    let bin = if cfg!(target_os = "windows") {
+        root.join("python.exe")
+    } else {
+        root.join("bin").join("python3")
+    };
+    Some(bin)
+}
+
+/// Return the runtime python binary if it actually exists on disk.
+fn moa_runtime_python() -> Option<PathBuf> {
+    let p = moa_runtime_python_path()?;
+    p.exists().then_some(p)
+}
+
 /// Find a usable Python 3 binary on the system (for creating the venv).
+/// Priority: bootstrapped MoA runtime → system PATH.
 fn find_system_python() -> Option<String> {
+    if let Some(runtime_py) = moa_runtime_python() {
+        return Some(runtime_py.to_string_lossy().into_owned());
+    }
     let names = if cfg!(target_os = "windows") {
         vec!["python", "python3"]
     } else {
@@ -1518,6 +1554,118 @@ fn find_system_python() -> Option<String> {
         }
     }
     None
+}
+
+/// Download URL for the appropriate python-build-standalone tarball
+/// based on the current target OS + architecture. Returns `None` for
+/// unsupported targets (mobile, etc.).
+fn pbs_download_url() -> Option<String> {
+    let triple = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "aarch64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "x86_64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "x86_64-pc-windows-msvc-shared"
+    } else {
+        return None;
+    };
+
+    Some(format!(
+        "https://github.com/astral-sh/python-build-standalone/releases/download/{date}/cpython-{ver}+{date}-{triple}-install_only.tar.gz",
+        date = PBS_RELEASE_DATE,
+        ver = PBS_PYTHON_VERSION,
+        triple = triple,
+    ))
+}
+
+/// Download a self-contained Python runtime from python-build-standalone
+/// and extract it to `~/.moa/python-runtime/`. Returns the path to the
+/// extracted python binary.
+///
+/// This is the **silent auto-install path**: end users never see a
+/// "would you like to install Python?" dialog. We just download
+/// (~30 MB) and extract to a folder under the MoA home directory —
+/// no admin rights, no system PATH changes, no consent prompt.
+async fn download_python_runtime(
+    app_handle: &tauri::AppHandle,
+) -> Result<PathBuf, String> {
+    use tokio::process::Command;
+
+    let emit = |stage: &str, detail: &str| {
+        let _ = app_handle.emit(
+            "python-env-status",
+            serde_json::json!({ "stage": stage, "detail": detail }),
+        );
+    };
+
+    let url = pbs_download_url().ok_or_else(|| {
+        "Auto Python install not supported on this platform. Please install Python 3 manually.".to_string()
+    })?;
+
+    let runtime_dir = dirs_next::home_dir()
+        .ok_or_else(|| "Cannot determine home directory.".to_string())?
+        .join(".moa")
+        .join(PYTHON_RUNTIME_DIR);
+
+    if let Some(existing) = moa_runtime_python() {
+        return Ok(existing);
+    }
+
+    std::fs::create_dir_all(&runtime_dir)
+        .map_err(|e| format!("create runtime dir: {e}"))?;
+
+    emit(
+        "downloading_python",
+        "Python을 자동으로 설치하고 있습니다 (약 30MB, 1회만 진행)...",
+    );
+
+    let archive_path = runtime_dir.join("python-runtime.tar.gz");
+    let bytes = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("download Python runtime: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("download HTTP error: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("download body: {e}"))?;
+    std::fs::write(&archive_path, &bytes)
+        .map_err(|e| format!("save archive: {e}"))?;
+
+    emit("extracting_python", "Python 압축 해제 중...");
+
+    // Extract via system `tar` (universal on macOS/Linux/Windows 10+).
+    // python-build-standalone tarballs unpack into a `python/` directory
+    // alongside the archive.
+    let tar_status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&runtime_dir)
+        .output()
+        .await
+        .map_err(|e| format!("spawn tar: {e}"))?;
+    if !tar_status.status.success() {
+        let stderr = String::from_utf8_lossy(&tar_status.stderr);
+        return Err(format!("tar extract failed: {stderr}"));
+    }
+
+    let _ = std::fs::remove_file(&archive_path);
+
+    let bin = moa_runtime_python_path()
+        .ok_or_else(|| "Cannot resolve runtime python path".to_string())?;
+    if !bin.exists() {
+        return Err(format!(
+            "Python runtime extracted but binary missing at {}",
+            bin.display()
+        ));
+    }
+
+    emit("python_installed", "Python 자동 설치 완료.");
+    Ok(bin)
 }
 
 /// Resolve the best Python binary to use for running scripts.
@@ -1543,13 +1691,26 @@ async fn ensure_python_env(app_handle: tauri::AppHandle) {
         );
     };
 
-    // 1. Find a system Python
+    // 1. Find a Python — system PATH or previously bootstrapped runtime.
+    //    If neither exists, silently auto-download python-build-standalone
+    //    (~30MB) into ~/.moa/python-runtime/. The user is informed via
+    //    the python-env-status events but is NOT asked for consent —
+    //    end users don't know what Python is and the user explicitly
+    //    asked for transparent setup.
     let system_python = match find_system_python() {
         Some(p) => p,
-        None => {
-            emit("error", "Python 3 not found on this system. PDF features will be unavailable.");
-            return;
-        }
+        None => match download_python_runtime(&app_handle).await {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(e) => {
+                emit(
+                    "error",
+                    &format!(
+                        "Python 자동 설치에 실패했습니다. PDF 기능을 사용할 수 없습니다.\n원인: {e}"
+                    ),
+                );
+                return;
+            }
+        },
     };
 
     let venv_dir = match moa_venv_dir() {

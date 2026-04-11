@@ -944,14 +944,52 @@ struct PymupdfResult {
     page_count: u32,
 }
 
-/// Resolve `python3` (or `python` as fallback). Returns `None` only on
-/// truly broken systems where neither is on PATH.
-fn pymupdf_python_binary() -> Option<&'static str> {
+/// Resolve the best Python binary to invoke for `pymupdf_convert.py`.
+///
+/// Priority order — matches the Tauri sidecar's `ensure_python_env` flow
+/// in `clients/tauri/src-tauri/src/lib.rs`:
+///
+/// 1. **`~/.moa/python-env/bin/python3`** (Unix) or
+///    **`~/.moa/python-env/Scripts/python.exe`** (Windows) —
+///    the isolated venv that the MoA Tauri app creates on first launch
+///    and pre-installs `pymupdf4llm` + `markdown` into. This is the
+///    happy path: end users get a working Python without ever touching
+///    pip themselves.
+///
+/// 2. **`python3` / `python` on PATH** — fallback for developers who
+///    run `cargo run` directly or for non-Tauri deployments.
+///
+/// Returns `None` only when neither path resolves to an executable.
+/// Returned as `String` (not `&'static str`) because option 1 is a
+/// dynamic absolute path.
+fn pymupdf_python_binary() -> Option<String> {
+    // Option 1: MoA-managed venv (created by Tauri ensure_python_env).
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+    {
+        let venv_py = if cfg!(target_os = "windows") {
+            home.join(".moa")
+                .join("python-env")
+                .join("Scripts")
+                .join("python.exe")
+        } else {
+            home.join(".moa")
+                .join("python-env")
+                .join("bin")
+                .join("python3")
+        };
+        if venv_py.exists() {
+            return Some(venv_py.to_string_lossy().into_owned());
+        }
+    }
+
+    // Option 2: system PATH fallback.
     if which::which("python3").is_ok() {
-        return Some("python3");
+        return Some("python3".to_string());
     }
     if which::which("python").is_ok() {
-        return Some("python");
+        return Some("python".to_string());
     }
     None
 }
@@ -964,10 +1002,16 @@ async fn run_pymupdf_convert(input_path: &Path) -> anyhow::Result<PymupdfResult>
 
     let python = pymupdf_python_binary().ok_or_else(|| {
         anyhow::anyhow!(
-            "python3 not found on PATH. Install Python 3 to enable digital-PDF \
-             conversion (pymupdf4llm-based rich HTML)."
+            "Python 3 not found. The MoA Tauri app normally installs an isolated \
+             Python venv at ~/.moa/python-env on first launch — if you are running \
+             zeroclaw outside of the MoA app, install Python 3 manually or run the \
+             MoA app once to bootstrap the venv."
         )
     })?;
+
+    // The python binary path may be an absolute path (MoA venv) or a
+    // PATH-resolvable name ("python3"). Either form is accepted by
+    // `Command::new`.
 
     // Write the bundled script to a fresh temp dir; auto-cleans on drop.
     let tmp_dir = tempfile::tempdir()
@@ -982,7 +1026,7 @@ async fn run_pymupdf_convert(input_path: &Path) -> anyhow::Result<PymupdfResult>
     // already gets html + markdown back via stdout JSON; the cache layer
     // handles the on-disk write via DocumentPipelineTool::execute's own
     // `output_dir` argument.
-    let output = Command::new(python)
+    let output = Command::new(&python)
         .arg(&script_path)
         .arg(input_path)
         .arg("--format")
