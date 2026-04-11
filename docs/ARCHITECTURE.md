@@ -2694,9 +2694,23 @@ provides three conversion engines, all routed by file extension:
 
 | Engine | Format | Cost | Source |
 |---|---|---|---|
-| `pdf-extract` (bundled Rust) | Digital PDF | Free, local | `cargo` dep |
+| `pymupdf4llm` (bundled Python script) | Digital PDF | Free, local (requires `python3` + `pip install pymupdf4llm`) | `src/tools/pdf_skill/pymupdf_convert.py` (embedded via `include_str!`) |
 | Hancom DocsConverter API | HWP / HWPX / DOC / XLS / PPT and the `x` variants | Free | Operator-run server (`HANCOM_HOST` / `HANCOM_PORT` env) |
 | Upstage Document Parser API | Image PDF (scanned) | Paid (2.2× credit billing) | `ADMIN_UPSTAGE_API_KEY` env |
+
+**Why PyMuPDF instead of `pdf-extract` for digital PDFs**: the previous
+backend used the `pdf-extract` Rust crate, which extracts plain text
+only — the resulting `.html` was just `<p>plain text</p>` wrapping
+with no headings, tables, or layout. The new path uses `pymupdf4llm`
+(built on PyMuPDF/fitz) which preserves headings, tables, lists, code
+blocks, and document structure, producing **rich** Markdown that
+converts to clean structured HTML — exactly what the user needs for
+re-use in the web editor and for LLM comprehension. The script is
+bundled into the binary at compile time so no separate install step
+is needed beyond `python3` + `pip install pymupdf4llm`. The
+`classify_pdf` path (used only to detect "image PDF vs digital PDF"
+before routing) still uses `pdf-extract` since it needs nothing more
+than "is there any text".
 
 The new auto-conversion subsystem is a **thin orchestration layer over
 those engines**. It does not reimplement any conversion logic.
