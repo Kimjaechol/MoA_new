@@ -82,8 +82,7 @@ def build_tts(language: str, tier: str):
             voice_options=TypecastVoiceOptions(
                 voice_id=os.environ.get("TYPECAST_VOICE_ID_KO_FEMALE", ""),
                 model="ssfm-v30",
-                emotion="normal",
-                emotion_intensity=1.0,
+                emotion_type="smart",  # AI auto-detects emotion from context
                 speed=1.0,
             ),
             language="kor",  # ISO 639-3 for Korean

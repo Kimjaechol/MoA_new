@@ -75,11 +75,20 @@ class TypecastVoiceOptions:
     model: str = DEFAULT_MODEL
     """TTS model: 'ssfm-v30' (latest) or 'ssfm-v21' (stable)."""
 
-    emotion: str = "normal"
-    """Emotion preset: normal, happy, sad, angry, whisper, toneup, tonedown."""
+    emotion_type: str = "smart"
+    """Emotion detection mode:
+    - 'smart' (default, recommended): AI auto-detects emotion from text context.
+      Uses previous_text/next_text for better accuracy. Supports all 7 emotions
+      (normal, happy, sad, angry, whisper, toneup, tonedown) × 37 languages.
+    - 'preset': Manual emotion selection via emotion_preset field.
+    """
+
+    emotion_preset: str = "normal"
+    """Manual emotion preset (only used when emotion_type='preset'):
+    normal, happy, sad, angry, whisper, toneup, tonedown."""
 
     emotion_intensity: float = 1.0
-    """Emotion intensity: 0.0–2.0 (default 1.0)."""
+    """Emotion intensity: 0.0–2.0 (default 1.0). Only for preset mode."""
 
     speed: float = 1.0
     """Speech speed multiplier: 0.5–2.0 (default 1.0)."""
@@ -143,11 +152,26 @@ class TypecastTTS(tts.TTS):
         if self._language:
             body["language"] = self._language
 
-        # Emotion prompt (PresetPrompt format)
-        if self._opts.emotion != "normal" or self._opts.emotion_intensity != 1.0:
+        # Emotion prompt
+        if self._opts.emotion_type == "smart":
+            # SmartPrompt: AI auto-detects optimal emotion + intonation
+            # from the text itself and optional surrounding context.
+            # This produces the most natural Korean speech because the
+            # model understands "이게 슬픈 상황인지 화난 상황인지" from context.
+            body["prompt"] = {
+                "emotion_type": "smart",
+            }
+            # If we have conversation history, pass it as context
+            # for even more accurate emotion detection.
+            if hasattr(self, "_previous_text") and self._previous_text:
+                body["prompt"]["previous_text"] = self._previous_text[:2000]
+            if hasattr(self, "_next_text") and self._next_text:
+                body["prompt"]["next_text"] = self._next_text[:2000]
+        elif self._opts.emotion_type == "preset":
+            # PresetPrompt: Manual emotion selection
             body["prompt"] = {
                 "emotion_type": "preset",
-                "emotion_preset": self._opts.emotion,
+                "emotion_preset": self._opts.emotion_preset,
                 "emotion_intensity": self._opts.emotion_intensity,
             }
 
@@ -163,6 +187,24 @@ class TypecastTTS(tts.TTS):
             body["output"] = output
 
         return body
+
+    def set_context(self, previous_text: str = "", next_text: str = ""):
+        """Set conversation context for Smart Emotion.
+
+        Smart Emotion uses surrounding text to auto-detect the right
+        emotion and intonation. Call this before synthesize() with the
+        previous assistant/user turn and (if known) the next turn.
+
+        Example:
+            tts.set_context(
+                previous_text="의뢰인이 눈물을 글썽이며 말했다",
+                next_text=""
+            )
+            stream = await tts.synthesize("정말 힘드셨겠어요...")
+            # → AI detects empathetic/sad tone from context
+        """
+        self._previous_text = previous_text
+        self._next_text = next_text
 
     async def synthesize(self, text: str) -> tts.ChunkedStream:
         """Synthesize text to audio frames via Typecast TTS API.
