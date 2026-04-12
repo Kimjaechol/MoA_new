@@ -2694,9 +2694,49 @@ provides three conversion engines, all routed by file extension:
 
 | Engine | Format | Cost | Source |
 |---|---|---|---|
-| `pdf-extract` (bundled Rust) | Digital PDF | Free, local | `cargo` dep |
+| `pymupdf4llm` (bundled Python script) | Digital PDF | Free, local (requires `python3` + `pip install pymupdf4llm`) | `src/tools/pdf_skill/pymupdf_convert.py` (embedded via `include_str!`) |
 | Hancom DocsConverter API | HWP / HWPX / DOC / XLS / PPT and the `x` variants | Free | Operator-run server (`HANCOM_HOST` / `HANCOM_PORT` env) |
 | Upstage Document Parser API | Image PDF (scanned) | Paid (2.2× credit billing) | `ADMIN_UPSTAGE_API_KEY` env |
+
+**Why PyMuPDF instead of `pdf-extract` for digital PDFs**: the previous
+backend used the `pdf-extract` Rust crate, which extracts plain text
+only — the resulting `.html` was just `<p>plain text</p>` wrapping
+with no headings, tables, or layout. The new path uses `pymupdf4llm`
+(built on PyMuPDF/fitz) which preserves headings, tables, lists, code
+blocks, and document structure, producing **rich** Markdown that
+converts to clean structured HTML — exactly what the user needs for
+re-use in the web editor and for LLM comprehension. The script is
+bundled into the binary at compile time. The `classify_pdf` path
+(used only to detect "image PDF vs digital PDF" before routing)
+still uses `pdf-extract` since it needs nothing more than "is there
+any text".
+
+**Zero-setup Python for end users**: the MoA Tauri app handles every
+Python concern silently — end users never need to know what Python
+is, never run `pip`, and never see a "do you want to install" dialog:
+
+1. On first launch (`clients/tauri/src-tauri/src/lib.rs:ensure_python_env`),
+   the app probes for a system Python 3 on PATH.
+2. If none is found, it **automatically downloads
+   python-build-standalone** (~30 MB self-contained Python tarball
+   from `astral-sh/python-build-standalone`) into
+   `~/.moa/python-runtime/`. No admin rights, no system PATH
+   changes, no consent prompt — the user only sees a brief progress
+   indicator ("Python을 자동으로 설치하고 있습니다 …").
+3. Either way (system Python or downloaded runtime), the app then
+   creates an isolated venv at `~/.moa/python-env/` and installs
+   `pymupdf4llm` + `markdown` into it.
+4. The backend (`document_pipeline.rs:pymupdf_python_binary`) checks
+   `~/.moa/python-env/{bin,Scripts}/python(.exe)` first, falling
+   back to system PATH only when running zeroclaw outside the
+   Tauri shell (developer mode).
+
+The pinned python-build-standalone release lives in two constants
+(`PBS_RELEASE_DATE`, `PBS_PYTHON_VERSION`) — bumping the Python
+version is a one-line change. Supported targets: macOS x86_64 / arm64,
+Linux x86_64 / arm64, Windows x86_64. Mobile (iOS / Android) keeps
+its existing fallback path since python-build-standalone does not
+publish mobile tarballs.
 
 The new auto-conversion subsystem is a **thin orchestration layer over
 those engines**. It does not reimplement any conversion logic.

@@ -258,63 +258,67 @@ impl DocumentPipelineTool {
         }
     }
 
-    /// Process a digital PDF locally using pdf-extract (or PyMuPDF via sidecar).
+    /// Process a digital PDF using the bundled `pymupdf_convert.py` script.
     ///
-    /// LLM correction is optional and only runs when the user has their own
-    /// LLM API key configured. If no key, the raw extraction is returned as-is.
+    /// Why PyMuPDF instead of pdf-extract:
+    /// - `pdf-extract` returns plain text only — the resulting HTML loses
+    ///   headings, tables, and structure (just `<p>plain</p>` wrapping).
+    /// - `pymupdf4llm` (built on PyMuPDF/fitz) preserves layout, headings,
+    ///   tables, lists, and code blocks, producing rich Markdown that
+    ///   converts to clean structured HTML — exactly what the user wants
+    ///   for re-use in the web editor and for LLM comprehension.
+    ///
+    /// The script is bundled into the binary at compile time via
+    /// [`include_str!`] and written to a per-call temp directory at
+    /// runtime, so users only need `python3` and `pymupdf4llm` installed.
+    /// Install hint surfaced in the error message if either is missing.
+    ///
+    /// `pdf-extract` is no longer used here (the user explicitly asked to
+    /// remove it as a fallback). The classification path
+    /// (`classify_pdf` / `is_digital_pdf`) still uses `pdf-extract` since
+    /// it only needs to know whether *any* text exists, not the formatted
+    /// content.
+    ///
+    /// LLM correction is currently disabled at the call site (no key
+    /// passed). The hook is preserved so a future enhancement can
+    /// re-enable it without touching this method.
     async fn process_digital_pdf(
         &self,
         path: &Path,
         gemini_api_key: Option<&str>,
     ) -> anyhow::Result<DocumentOutput> {
-        tracing::info!("Processing digital PDF: {}", path.display());
+        tracing::info!(
+            "Processing digital PDF via PyMuPDF: {}",
+            path.display()
+        );
 
-        // Extract text using pdf-extract (local, no API call needed)
-        let text = {
-            let path = path.to_owned();
-            tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                let data = std::fs::read(&path)?;
-                #[cfg(feature = "rag-pdf")]
-                {
-                    let text = pdf_extract::extract_text_from_mem(&data)
-                        .map_err(|e| anyhow::anyhow!("PDF text extraction failed: {e}"))?;
-                    Ok(text)
-                }
-                #[cfg(not(feature = "rag-pdf"))]
-                {
-                    let _ = data;
-                    anyhow::bail!("PDF extraction requires the 'rag-pdf' feature flag")
-                }
-            })
-            .await??
-        };
+        let result = run_pymupdf_convert(path).await?;
 
-        // Convert plain text to basic HTML structure
-        let html = text_to_html(&text);
-        let markdown = text_to_markdown(&text);
+        let mut html = result.html;
+        let mut markdown = result.markdown;
 
-        // Optional: Gemini Flash-Lite correction
-        let (html, markdown) = if let Some(key) = gemini_api_key {
+        // Optional Gemini correction (disabled by default — see method doc).
+        if let Some(key) = gemini_api_key {
             match self.gemini_correct(&html, key).await {
                 Ok(corrected_html) => {
                     let corrected_md = html_to_markdown(&corrected_html);
-                    (corrected_html, corrected_md)
+                    html = corrected_html;
+                    markdown = corrected_md;
                 }
                 Err(e) => {
-                    tracing::warn!("Gemini correction failed, using raw extraction: {e}");
-                    (html, markdown)
+                    tracing::warn!(
+                        "Gemini correction failed, using raw PyMuPDF output: {e}"
+                    );
                 }
             }
-        } else {
-            (html, markdown)
-        };
+        }
 
         Ok(DocumentOutput {
             html,
             markdown,
             doc_type: "digital_pdf".to_string(),
-            page_count: 0, // Could be extracted with more sophisticated parsing
-            engine: "pdf-extract".to_string(),
+            page_count: result.page_count,
+            engine: "pymupdf4llm".to_string(),
         })
     }
 
@@ -924,6 +928,183 @@ struct DocumentOutput {
 
 // ── HTML/Markdown conversion helpers ────────────────────────────
 
+// ── Bundled PyMuPDF subprocess (digital PDF conversion) ────────────────
+
+/// PyMuPDF script bundled into the binary at compile time. Mirrors the
+/// pattern used by `hwpx_create.rs` so users only need `python3` and
+/// `pymupdf4llm` on PATH — no external file dependencies, no separate
+/// install step.
+const PYMUPDF_CONVERT_PY: &str = include_str!("pdf_skill/pymupdf_convert.py");
+
+/// Decoded result of one `pymupdf_convert.py` invocation.
+#[derive(Debug)]
+struct PymupdfResult {
+    html: String,
+    markdown: String,
+    page_count: u32,
+}
+
+/// Resolve the best Python binary to invoke for `pymupdf_convert.py`.
+///
+/// Priority order — matches the Tauri sidecar's `ensure_python_env` flow
+/// in `clients/tauri/src-tauri/src/lib.rs`:
+///
+/// 1. **`~/.moa/python-env/bin/python3`** (Unix) or
+///    **`~/.moa/python-env/Scripts/python.exe`** (Windows) —
+///    the isolated venv that the MoA Tauri app creates on first launch
+///    and pre-installs `pymupdf4llm` + `markdown` into. This is the
+///    happy path: end users get a working Python without ever touching
+///    pip themselves.
+///
+/// 2. **`python3` / `python` on PATH** — fallback for developers who
+///    run `cargo run` directly or for non-Tauri deployments.
+///
+/// Returns `None` only when neither path resolves to an executable.
+/// Returned as `String` (not `&'static str`) because option 1 is a
+/// dynamic absolute path.
+fn pymupdf_python_binary() -> Option<String> {
+    // Option 1: MoA-managed venv (created by Tauri ensure_python_env).
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+    {
+        let venv_py = if cfg!(target_os = "windows") {
+            home.join(".moa")
+                .join("python-env")
+                .join("Scripts")
+                .join("python.exe")
+        } else {
+            home.join(".moa")
+                .join("python-env")
+                .join("bin")
+                .join("python3")
+        };
+        if venv_py.exists() {
+            return Some(venv_py.to_string_lossy().into_owned());
+        }
+    }
+
+    // Option 2: system PATH fallback.
+    if which::which("python3").is_ok() {
+        return Some("python3".to_string());
+    }
+    if which::which("python").is_ok() {
+        return Some("python".to_string());
+    }
+    None
+}
+
+/// Run the bundled PyMuPDF script against `input_path` and return the
+/// rich HTML + Markdown it produces. Errors carry an actionable install
+/// hint when Python or `pymupdf4llm` is missing.
+async fn run_pymupdf_convert(input_path: &Path) -> anyhow::Result<PymupdfResult> {
+    use tokio::process::Command;
+
+    let python = pymupdf_python_binary().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Python 3 not found. The MoA Tauri app normally installs an isolated \
+             Python venv at ~/.moa/python-env on first launch — if you are running \
+             zeroclaw outside of the MoA app, install Python 3 manually or run the \
+             MoA app once to bootstrap the venv."
+        )
+    })?;
+
+    // The python binary path may be an absolute path (MoA venv) or a
+    // PATH-resolvable name ("python3"). Either form is accepted by
+    // `Command::new`.
+
+    // Write the bundled script to a fresh temp dir; auto-cleans on drop.
+    let tmp_dir = tempfile::tempdir()
+        .map_err(|e| anyhow::anyhow!("failed to create PyMuPDF temp dir: {e}"))?;
+    let script_path = tmp_dir.path().join("pymupdf_convert.py");
+    tokio::fs::write(&script_path, PYMUPDF_CONVERT_PY)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to materialize bundled script: {e}"))?;
+
+    // Run python3 pymupdf_convert.py <input> --format both
+    // We do NOT pass --output-dir because the caller (`process_digital_pdf`)
+    // already gets html + markdown back via stdout JSON; the cache layer
+    // handles the on-disk write via DocumentPipelineTool::execute's own
+    // `output_dir` argument.
+    let output = Command::new(&python)
+        .arg(&script_path)
+        .arg(input_path)
+        .arg("--format")
+        .arg("both")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to spawn {python} pymupdf_convert.py: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        // Try to parse the JSON error from stdout (the script writes JSON
+        // even on failure) so we surface the underlying reason cleanly.
+        if let Ok(json) = serde_json::from_str::<Value>(&stdout) {
+            if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+                let install_hint = if err.contains("pymupdf4llm not installed") {
+                    "\nInstall hint: pip install pymupdf4llm"
+                } else {
+                    ""
+                };
+                return Err(anyhow::anyhow!(
+                    "PyMuPDF conversion failed: {err}{install_hint}"
+                ));
+            }
+        }
+        return Err(anyhow::anyhow!(
+            "PyMuPDF conversion exited {}: {stderr}",
+            output.status
+        ));
+    }
+
+    let json: Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+        anyhow::anyhow!(
+            "PyMuPDF script returned non-JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })?;
+
+    if !json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let err = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(anyhow::anyhow!(
+            "PyMuPDF script reported failure: {err}"
+        ));
+    }
+
+    let html = json
+        .get("html")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let markdown = json
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let page_count = json
+        .get("page_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    if html.is_empty() && markdown.is_empty() {
+        return Err(anyhow::anyhow!(
+            "PyMuPDF script returned empty html and markdown"
+        ));
+    }
+
+    Ok(PymupdfResult {
+        html,
+        markdown,
+        page_count,
+    })
+}
+
 /// Convert plain text to basic HTML with paragraph structure.
 fn text_to_html(text: &str) -> String {
     let mut html = String::from("<!DOCTYPE html><html><body>\n");
@@ -1107,6 +1288,63 @@ mod tests {
         let md = html_to_markdown(html);
         assert!(md.contains("# Title"));
         assert!(md.contains("**world**"));
+    }
+
+    // ── PyMuPDF subprocess helpers ──
+
+    #[test]
+    fn pymupdf_script_is_bundled_and_valid() {
+        // include_str! at compile time guarantees presence; this verifies
+        // the asset wasn't accidentally truncated.
+        assert!(PYMUPDF_CONVERT_PY.contains("def convert_pdf"));
+        assert!(PYMUPDF_CONVERT_PY.contains("import pymupdf4llm"));
+        assert!(PYMUPDF_CONVERT_PY.len() > 1000);
+    }
+
+    #[tokio::test]
+    async fn run_pymupdf_convert_returns_install_hint_when_python_missing_or_pkg_missing() {
+        // Use a definitely-nonexistent path to force a script error
+        // (file-not-found from the script side). The error message should
+        // mention either the install hint OR a clear error string. We do
+        // NOT assert success because the test machine may or may not
+        // have python3 + pymupdf4llm installed.
+        let result = run_pymupdf_convert(Path::new("/definitely/not/a/real/file.pdf")).await;
+        match result {
+            Ok(_) => panic!("expected an error for nonexistent file"),
+            Err(e) => {
+                let msg = e.to_string();
+                // Either: python missing → install hint
+                //         python present + pymupdf missing → install hint with pip
+                //         python + pymupdf present → "File not found" from script
+                assert!(
+                    msg.contains("File not found")
+                        || msg.contains("python3 not found")
+                        || msg.contains("pymupdf4llm")
+                        || msg.contains("PyMuPDF"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Opt-in integration test: only runs when MOA_TEST_PYMUPDF=1 because
+    /// it requires `python3` + `pymupdf4llm` installed and a real PDF file.
+    #[tokio::test]
+    async fn pymupdf_converts_real_pdf_when_env_set() {
+        if std::env::var("MOA_TEST_PYMUPDF").ok().as_deref() != Some("1") {
+            return;
+        }
+        let pdf_path = match std::env::var("MOA_TEST_PDF_PATH") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => return, // require an explicit fixture path
+        };
+        if !pdf_path.exists() {
+            return;
+        }
+        let result = run_pymupdf_convert(&pdf_path).await.unwrap();
+        assert!(!result.markdown.is_empty(), "markdown should be non-empty");
+        assert!(!result.html.is_empty(), "html should be non-empty");
+        assert!(result.html.contains("<html"), "html should be a real HTML document");
     }
 
     #[test]
