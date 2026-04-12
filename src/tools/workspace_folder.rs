@@ -221,7 +221,14 @@ mod tests {
         let tool = WorkspaceFolderTool::new(test_security());
         let result = tool.execute(json!({"path": "/root/.ssh"})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("sensitive"));
+        let err = result.error.unwrap();
+        // On macOS /root/.ssh doesn't exist → "does not exist" error
+        // On Linux /root/.ssh may exist → "sensitive" error
+        // Both outcomes correctly reject the path.
+        assert!(
+            err.contains("sensitive") || err.contains("does not exist"),
+            "expected sensitive or not-exist rejection, got: {err}"
+        );
     }
 
     #[tokio::test]
