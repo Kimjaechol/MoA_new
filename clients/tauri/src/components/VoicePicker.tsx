@@ -50,23 +50,63 @@ const label = (cat: CategoryLabel | undefined, locale: string): string => {
   return (cat as any)[key] || cat.en || "";
 };
 
-// Infer native language from voice name pattern.
-// Typecast API doesn't provide a language field, but Korean-romanized
-// names (Soye, Sanghoon, Eunsol...) speak Korean natively, while
-// Western names (Hailey, Charlotte, Dylan...) speak English natively.
+// Infer native language from voice name.
+// Typecast voices are named after their native language/nationality:
+// Korean names speak Korean natively, German names speak German
+// natively, etc. An English name speaking Korean sounds unnatural.
+//
+// Explicit name→language mapping for non-obvious names, plus
+// pattern-based fallback for Korean romanization.
+
+const VOICE_LANGUAGE_MAP: Record<string, string> = {
+  // German (독일어)
+  "Alena": "de", "Hans": "de", "Elias": "de",
+  // French (프랑스어)
+  "Noel": "fr", "Charlotte": "fr",
+  // Portuguese (포르투갈어)
+  "Carlos": "pt",
+  // Italian (이탈리아어)
+  "Leo": "it",
+  // Spanish (스페인어)
+  "Eman": "es",
+  // Japanese (일본어)
+  "Kanno": "ja", "Mio": "ja",
+  // Chinese (중국어)
+  "Noa": "zh",
+  // Korean special names
+  "Ae-ran": "ko", "Lady Cho": "ko", "Reporter Kang": "ko",
+  "Sportscaster Kang": "ko", "Sportscaster Tony": "ko",
+  "Captain Bill": "ko", "Classic Narrator": "ko",
+  "Instructor Han": "ko", "Jeong Choi": "ko", "Miran Choi": "ko",
+  "Klip Kim": "ko", "Risan Ji": "ko", "Chan-gu": "ko",
+  "Salty Chan-gu": "ko", "Mister Gop": "ko",
+  "MBTI ET (F)": "ko", "MBTI ET (M)": "ko", "MBTI IT (M)": "ko",
+  "Santa Reporter": "ko", "Neoguard": "ko", "Koombo": "ko",
+  "Dollar Jr.": "ko", "Doughnut": "ko", "Keybo": "ko",
+  "Avong": "ko", "DU5T": "ko", "P-0150N": "ko", "Slushy": "ko",
+  "Sindarin": "ko", "Frankenstein": "ko", "Jack-o'-Lantern": "ko",
+  "Rex": "ko", "Jolly": "ko",
+};
+
 const KOREAN_PREFIXES = [
-  "ae","bo","byeong","cha","chae","chan","da","do","dong","du","eu","ga","geo","gi","go","gu","gw",
-  "ha","hae","han","he","ho","hu","hw","hy","in","ja","je","ji","jin","jo","ju","jun",
-  "ku","kw","ky","la","mi","min","mo","moon","mu","my","na","no","ra","ro","sa","se",
-  "shi","si","so","su","sung","sy","vi","wo","ya","ye","yi","yo","yu",
+  "ae","bo","byeong","cha","chae","chan","da","do","dong","du","duk",
+  "eu","ga","geo","geun","gi","go","gu","gun","gw",
+  "ha","hae","han","he","hee","ho","hos","hu","hw","hy",
+  "ig","ij","in","ja","jae","je","ji","jin","jo","joo","ju","jun","jung",
+  "kang","ki","ku","kw","ky",
+  "mi","min","mo","moo","moon","mu","mun","my",
+  "na","nae","no","py","ra","ray","ro",
+  "sa","sang","se","seo","seok","seol","seon","seung","shi","shin","si","sio","siw","so","su","sung","suy",
+  "tae","wo","won","woo","ya","ye","yeon","yi","yo","yu",
 ];
 
 function inferNativeLanguage(name: string): string {
+  // 1. Explicit mapping (highest priority)
+  if (VOICE_LANGUAGE_MAP[name]) return VOICE_LANGUAGE_MAP[name];
+  // 2. Korean romanization pattern
   const lower = name.toLowerCase().replace(/[^a-z]/g, "");
-  // Special Korean compound names
-  if (/^(mbti|lady|reporter|sportscaster|captain|classic)/.test(lower)) return "ko"; // Korean persona
-  // Check Korean romanization prefixes
   if (KOREAN_PREFIXES.some(p => lower.startsWith(p))) return "ko";
+  // 3. Default: English
   return "en";
 }
 
@@ -262,16 +302,37 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
 
           {/* Native Language (주요 구사언어) */}
           <div className="voice-picker-filter-row">
-            <span className="voice-picker-filter-label">{isKo ? "언어" : "Language"}</span>
+            <span className="voice-picker-filter-label">{isKo ? "언어" : "Lang"}</span>
             <div className="voice-picker-pills">
               <button className={nativeLang === "all" ? "active" : ""} onClick={() => setNativeLang("all")}>
                 {isKo ? "전체" : "All"}
               </button>
               <button className={nativeLang === "ko" ? "active" : ""} onClick={() => setNativeLang("ko")}>
-                🇰🇷 {isKo ? "한국어 네이티브" : "Korean Native"}
+                🇰🇷 {isKo ? "한국어" : "Korean"}
               </button>
               <button className={nativeLang === "en" ? "active" : ""} onClick={() => setNativeLang("en")}>
-                🇺🇸 {isKo ? "영어 네이티브" : "English Native"}
+                🇺🇸 {isKo ? "영어" : "English"}
+              </button>
+              <button className={nativeLang === "ja" ? "active" : ""} onClick={() => setNativeLang("ja")}>
+                🇯🇵 {isKo ? "일본어" : "Japanese"}
+              </button>
+              <button className={nativeLang === "zh" ? "active" : ""} onClick={() => setNativeLang("zh")}>
+                🇨🇳 {isKo ? "중국어" : "Chinese"}
+              </button>
+              <button className={nativeLang === "es" ? "active" : ""} onClick={() => setNativeLang("es")}>
+                🇪🇸 {isKo ? "스페인어" : "Spanish"}
+              </button>
+              <button className={nativeLang === "de" ? "active" : ""} onClick={() => setNativeLang("de")}>
+                🇩🇪 {isKo ? "독일어" : "German"}
+              </button>
+              <button className={nativeLang === "fr" ? "active" : ""} onClick={() => setNativeLang("fr")}>
+                🇫🇷 {isKo ? "프랑스어" : "French"}
+              </button>
+              <button className={nativeLang === "pt" ? "active" : ""} onClick={() => setNativeLang("pt")}>
+                🇧🇷 {isKo ? "포르투갈어" : "Portuguese"}
+              </button>
+              <button className={nativeLang === "it" ? "active" : ""} onClick={() => setNativeLang("it")}>
+                🇮🇹 {isKo ? "이탈리아어" : "Italian"}
               </button>
             </div>
           </div>
@@ -288,7 +349,8 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
               .map(uc => label(cats.use_cases[uc], locale))
               .filter(Boolean);
             const voiceLang = inferNativeLanguage(voice.voice_name);
-            const langFlag = voiceLang === "ko" ? "🇰🇷" : "🇺🇸";
+            const langFlags: Record<string, string> = { ko: "🇰🇷", en: "🇺🇸", ja: "🇯🇵", zh: "🇨🇳", es: "🇪🇸", de: "🇩🇪", fr: "🇫🇷", pt: "🇧🇷", it: "🇮🇹" };
+            const langFlag = langFlags[voiceLang] || "🌐";
 
             return (
               <div
