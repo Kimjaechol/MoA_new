@@ -283,7 +283,15 @@ pub enum Domain {
 /// Kind of voice provider backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoiceProviderKind {
-    /// Gemini 2.5 Flash Native Audio Dialog.
+    /// Gemini 3.1 Flash Live (replaces 2.5 Flash Native Audio).
+    ///
+    /// ## Breaking changes from 2.5 → 3.1 (2026-04)
+    /// - `thinkingBudget` → `thinkingLevel` (minimal/low/medium/high)
+    /// - Server event structure changed (event parsing rewritten)
+    /// - `send_client_content` rejected after first model turn (error 1007)
+    /// - Tool calling: sequential only (NON_BLOCKING removed)
+    /// - Affective dialog removed
+    /// - Proactive audio removed
     GeminiLive,
     /// OpenAI GPT-4o Realtime.
     OpenAiRealtime,
@@ -293,7 +301,7 @@ impl VoiceProviderKind {
     /// Get the model identifier string for API calls.
     pub fn model_id(self) -> &'static str {
         match self {
-            Self::GeminiLive => "gemini-2.5-flash-native-audio-preview-12-2025",
+            Self::GeminiLive => "gemini-3.1-flash-live-preview",
             Self::OpenAiRealtime => "gpt-4o-realtime-preview",
         }
     }
@@ -1061,7 +1069,7 @@ mod tests {
     fn voice_provider_kind_model_ids() {
         assert_eq!(
             VoiceProviderKind::GeminiLive.model_id(),
-            "gemini-2.5-flash-native-audio-preview-12-2025"
+            "gemini-3.1-flash-live-preview"
         );
         assert_eq!(
             VoiceProviderKind::OpenAiRealtime.model_id(),

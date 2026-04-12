@@ -1,8 +1,17 @@
-//! Gemini Live WebSocket client for real-time voice interpretation.
+//! Gemini 3.1 Flash Live WebSocket client for real-time voice interpretation.
 //!
 //! Implements the bidirectional streaming protocol for Google's Gemini
-//! Live API (BidiGenerateContent), enabling continuous audio streaming
-//! with automatic Voice Activity Detection (VAD).
+//! 3.1 Flash Live API (BidiGenerateContent), enabling continuous audio
+//! streaming with automatic Voice Activity Detection (VAD).
+//!
+//! ## Migration from 2.5 Flash → 3.1 Flash Live (2026-04)
+//!
+//! - Model ID: `gemini-2.5-flash-native-audio-preview-12-2025` →
+//!   `gemini-3.1-flash-live-preview`
+//! - `thinkingBudget: u32` → `thinkingLevel: String` (minimal/low/medium/high)
+//! - `send_client_content` rejected after first model turn (error 1007)
+//! - Tool calling: sequential only (NON_BLOCKING removed)
+//! - Affective dialog and proactive audio removed in 3.1
 //!
 //! ## Protocol Overview
 //!
@@ -136,10 +145,16 @@ pub struct GenerationConfig {
     pub thinking_config: Option<ThinkingConfig>,
 }
 
+/// Gemini 3.1 Flash Live thinking configuration.
+///
+/// ## Breaking change from 2.5
+/// 2.5 used `thinkingBudget: u32` (token count).
+/// 3.1 uses `thinkingLevel: String` (enum: "minimal", "low", "medium", "high").
+/// Setting an integer budget will silently fail or error on 3.1.
 #[derive(Debug, Serialize)]
 pub struct ThinkingConfig {
-    #[serde(rename = "thinkingBudget")]
-    pub thinking_budget: u32,
+    #[serde(rename = "thinkingLevel")]
+    pub thinking_level: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,7 +207,12 @@ pub fn build_setup_message(config: &InterpreterConfig, vad: &VadConfig) -> Setup
                         },
                     },
                 }),
-                thinking_config: Some(ThinkingConfig { thinking_budget: 0 }),
+                // 3.1 Flash Live: "minimal" disables extended reasoning
+                // for fastest audio response. Use "medium"/"high" for
+                // complex legal interpretation that needs more thought.
+                thinking_config: Some(ThinkingConfig {
+                    thinking_level: "minimal".to_string(),
+                }),
             },
             system_instruction: Some(SystemInstruction {
                 parts: vec![TextPart {
