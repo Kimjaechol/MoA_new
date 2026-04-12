@@ -842,7 +842,7 @@ export function Chat({
             className="chat-action-btn"
             onClick={() => setShowVoicePicker(true)}
             disabled={!isConnected}
-            title={locale === "ko" ? "AI 음성 선택" : "Choose AI Voice"}
+            title={locale === "ko" ? "비서 선택" : "Choose Assistant"}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
@@ -850,7 +850,7 @@ export function Chat({
               <line x1="12" y1="19" x2="12" y2="23" />
               <line x1="8" y1="23" x2="16" y2="23" />
             </svg>
-            <span>{selectedAiVoice ? selectedAiVoice.voiceName : (locale === "ko" ? "음성 선택" : "Voice")}</span>
+            <span>{selectedAiVoice ? selectedAiVoice.voiceName : (locale === "ko" ? "비서 선택" : "Assistant")}</span>
           </button>
           <button
             type="button"

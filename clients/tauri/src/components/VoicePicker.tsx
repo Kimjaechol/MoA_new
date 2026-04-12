@@ -75,6 +75,7 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
   const [age, setAge] = useState<string>("all");
   const [mood, setMood] = useState<string>("all");
   const [searchText, setSearchText] = useState("");
+  const [expertise, setExpertise] = useState<string>("all");
 
   // Fetch voices on mount
   useEffect(() => {
@@ -106,13 +107,16 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
       const useCases = data.mood_to_use_cases[mood];
       voices = voices.filter(v => v.use_cases.some(uc => useCases.includes(uc)));
     }
+    if (expertise !== "all") {
+      voices = voices.filter(v => v.use_cases.includes(expertise));
+    }
     if (searchText.trim()) {
       const q = searchText.toLowerCase();
       voices = voices.filter(v => v.voice_name.toLowerCase().includes(q));
     }
 
     return voices;
-  }, [data, gender, age, mood, searchText]);
+  }, [data, gender, age, mood, expertise, searchText]);
 
   const handleSelect = useCallback((voice: Voice) => {
     saveSelectedVoice(voice.voice_id, voice.voice_name, voice.gender);
@@ -152,11 +156,11 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
       <div className="voice-picker-modal" onClick={e => e.stopPropagation()}>
         {/* Header */}
         <div className="voice-picker-header">
-          <h2>{isKo ? "🎙️ AI 음성 선택" : "🎙️ Choose AI Voice"}</h2>
+          <h2>{isKo ? "✨ 비서 선택" : "✨ Choose Your Assistant"}</h2>
           <span className="voice-picker-subtitle">
             {isKo
-              ? `${filteredVoices.length}개 음성 · Smart Emotion · ${data!.languages_count}개 언어`
-              : `${filteredVoices.length} voices · Smart Emotion · ${data!.languages_count} languages`}
+              ? `${filteredVoices.length}명의 비서 · Smart Emotion · ${data!.languages_count}개 언어 구사`
+              : `${filteredVoices.length} assistants · Smart Emotion · ${data!.languages_count} languages`}
           </span>
           <button onClick={onClose} className="voice-picker-x" aria-label="Close">✕</button>
         </div>
@@ -167,7 +171,7 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
           <input
             type="text"
             className="voice-picker-search"
-            placeholder={isKo ? "이름으로 검색..." : "Search by name..."}
+            placeholder={isKo ? "비서 이름 검색..." : "Search assistant..."}
             value={searchText}
             onChange={e => setSearchText(e.target.value)}
           />
@@ -189,7 +193,7 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
 
           {/* Age */}
           <div className="voice-picker-filter-row">
-            <span className="voice-picker-filter-label">{isKo ? "연령" : "Age"}</span>
+            <span className="voice-picker-filter-label">{isKo ? "나이" : "Age"}</span>
             <div className="voice-picker-pills">
               <button className={age === "all" ? "active" : ""} onClick={() => setAge("all")}>
                 {isKo ? "전체" : "All"}
@@ -202,15 +206,30 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
             </div>
           </div>
 
-          {/* Mood */}
+          {/* Speaking Style (어투) */}
           <div className="voice-picker-filter-row">
-            <span className="voice-picker-filter-label">{isKo ? "분위기" : "Mood"}</span>
+            <span className="voice-picker-filter-label">{isKo ? "어투" : "Style"}</span>
             <div className="voice-picker-pills">
               <button className={mood === "all" ? "active" : ""} onClick={() => setMood("all")}>
                 {isKo ? "전체" : "All"}
               </button>
               {Object.entries(cats.mood).map(([key, lbl]) => (
                 <button key={key} className={mood === key ? "active" : ""} onClick={() => setMood(key)}>
+                  {label(lbl, locale)}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Expertise (전공분야) */}
+          <div className="voice-picker-filter-row">
+            <span className="voice-picker-filter-label">{isKo ? "전공" : "Expertise"}</span>
+            <div className="voice-picker-pills">
+              <button className={expertise === "all" ? "active" : ""} onClick={() => setExpertise("all")}>
+                {isKo ? "전체" : "All"}
+              </button>
+              {Object.entries(cats.use_cases).map(([key, lbl]) => (
+                <button key={key} className={expertise === key ? "active" : ""} onClick={() => setExpertise(key)}>
                   {label(lbl, locale)}
                 </button>
               ))}
@@ -255,7 +274,7 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
           })}
           {filteredVoices.length === 0 && (
             <div className="voice-picker-empty">
-              {isKo ? "조건에 맞는 음성이 없습니다." : "No voices match your filters."}
+              {isKo ? "조건에 맞는 비서가 없습니다." : "No assistants match your filters."}
             </div>
           )}
         </div>
