@@ -13,6 +13,7 @@ import {
   type AttachmentFile,
 } from "../lib/chat-attachments";
 import { apiClient } from "../lib/api";
+import VoicePicker, { loadSelectedVoice } from "./VoicePicker";
 import { isTauri } from "../lib/tauri-bridge";
 
 // ---------------------------------------------------------------------------
@@ -156,6 +157,9 @@ export function Chat({
   const [ttsSettings, setTtsSettings] = useState<TtsSettings>(loadTtsSettings);
   const [showTtsSettings, setShowTtsSettings] = useState(false);
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
+  // ── AI Voice Picker (Typecast) ──
+  const [showVoicePicker, setShowVoicePicker] = useState(false);
+  const [selectedAiVoice, setSelectedAiVoice] = useState(() => loadSelectedVoice());
   const ttsSettingsRef = useRef(ttsSettings);
   useEffect(() => { ttsSettingsRef.current = ttsSettings; }, [ttsSettings]);
   useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
@@ -806,7 +810,20 @@ export function Chat({
           </button>
         </form>
 
-        {/* Action buttons row: folder, github, microphone */}
+        {/* VoicePicker modal */}
+        {showVoicePicker && (
+          <VoicePicker
+            locale={locale}
+            selectedVoiceId={selectedAiVoice?.voiceId}
+            onSelect={(id, name, gender) => {
+              setSelectedAiVoice({ voiceId: id, voiceName: name, gender });
+              setShowVoicePicker(false);
+            }}
+            onClose={() => setShowVoicePicker(false)}
+          />
+        )}
+
+        {/* Action buttons row: folder, github, microphone, voice picker */}
         <div className="chat-action-buttons">
           <button
             type="button"
@@ -819,6 +836,21 @@ export function Chat({
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
             </svg>
             <span>{locale === "ko" ? "폴더 연결" : "Folder"}</span>
+          </button>
+          <button
+            type="button"
+            className="chat-action-btn"
+            onClick={() => setShowVoicePicker(true)}
+            disabled={!isConnected}
+            title={locale === "ko" ? "비서 선택" : "Choose Assistant"}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" y1="19" x2="12" y2="23" />
+              <line x1="8" y1="23" x2="16" y2="23" />
+            </svg>
+            <span>{selectedAiVoice ? selectedAiVoice.voiceName : (locale === "ko" ? "비서 선택" : "Assistant")}</span>
           </button>
           <button
             type="button"
