@@ -77,14 +77,16 @@ def build_tts(language: str, tier: str):
       - 그 외            → Cartesia Sonic-3 (글로벌 기본)
     """
     if language == "ko" and tier == "premium" and os.getenv("TYPECAST_API_KEY"):
-        logger.info("TTS: Typecast (ko premium)")
+        logger.info("TTS: Typecast ssfm-v30 (ko premium)")
         return TypecastTTS(
             voice_options=TypecastVoiceOptions(
-                voice_id=os.environ["TYPECAST_VOICE_ID_KO_FEMALE"],
+                voice_id=os.environ.get("TYPECAST_VOICE_ID_KO_FEMALE", ""),
+                model="ssfm-v30",
                 emotion="normal",
-                speed_x=1.0,
+                emotion_intensity=1.0,
+                speed=1.0,
             ),
-            language="ko",
+            language="kor",  # ISO 639-3 for Korean
         )
 
     logger.info("TTS: Cartesia Sonic-3 (default)")
