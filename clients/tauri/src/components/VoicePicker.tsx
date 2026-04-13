@@ -139,6 +139,38 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
   const [expertise, setExpertise] = useState<string>("all");
   const [nativeLang, setNativeLang] = useState<string>("all");
 
+  // Collapsible filter sections
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+
+  const toggleSection = useCallback((section: string) => {
+    setCollapsedSections(prev => {
+      const next = new Set(prev);
+      if (next.has(section)) next.delete(section);
+      else next.add(section);
+      return next;
+    });
+  }, []);
+
+  const activeFilterCount = useMemo(() => {
+    let count = 0;
+    if (gender !== "all") count++;
+    if (age !== "all") count++;
+    if (mood !== "all") count++;
+    if (expertise !== "all") count++;
+    if (nativeLang !== "all") count++;
+    if (searchText.trim()) count++;
+    return count;
+  }, [gender, age, mood, expertise, nativeLang, searchText]);
+
+  const resetFilters = useCallback(() => {
+    setGender("all");
+    setAge("all");
+    setMood("all");
+    setExpertise("all");
+    setNativeLang("all");
+    setSearchText("");
+  }, []);
+
   // Fetch voices on mount (Tauri bridge → fallback to direct HTTP)
   useEffect(() => {
     (async () => {
@@ -240,110 +272,162 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
 
         {/* Filters */}
         <div className="voice-picker-filters">
-          {/* Search */}
-          <input
-            type="text"
-            className="voice-picker-search"
-            placeholder={isKo ? "비서 이름 검색..." : "Search assistant..."}
-            value={searchText}
-            onChange={e => setSearchText(e.target.value)}
-          />
+          {/* Search + Reset row */}
+          <div className="voice-picker-search-row">
+            <input
+              type="text"
+              className="voice-picker-search"
+              placeholder={isKo ? "비서 이름 검색..." : "Search assistant..."}
+              value={searchText}
+              onChange={e => setSearchText(e.target.value)}
+            />
+            {activeFilterCount > 0 && (
+              <button className="voice-picker-reset-btn" onClick={resetFilters}>
+                {isKo ? "초기화" : "Reset"} ({activeFilterCount})
+              </button>
+            )}
+          </div>
 
           {/* Gender */}
           <div className="voice-picker-filter-row">
-            <span className="voice-picker-filter-label">{isKo ? "성별" : "Gender"}</span>
-            <div className="voice-picker-pills">
-              <button className={gender === "all" ? "active" : ""} onClick={() => setGender("all")}>
-                {isKo ? "전체" : "All"}
-              </button>
-              {Object.entries(cats.gender).map(([key, lbl]) => (
-                <button key={key} className={gender === key ? "active" : ""} onClick={() => setGender(key)}>
-                  {label(lbl, locale)}
+            <button
+              className={`voice-picker-filter-label ${gender !== "all" ? "has-active" : ""}`}
+              onClick={() => toggleSection("gender")}
+              aria-expanded={!collapsedSections.has("gender")}
+            >
+              <span className="filter-chevron">{collapsedSections.has("gender") ? "+" : "-"}</span>
+              {isKo ? "성별" : "Gender"}
+            </button>
+            {!collapsedSections.has("gender") && (
+              <div className="voice-picker-pills">
+                <button className={gender === "all" ? "active" : ""} onClick={() => setGender("all")}>
+                  {isKo ? "전체" : "All"}
                 </button>
-              ))}
-            </div>
+                {Object.entries(cats.gender).map(([key, lbl]) => (
+                  <button key={key} className={gender === key ? "active" : ""} onClick={() => setGender(key)}>
+                    {label(lbl, locale)}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Age */}
           <div className="voice-picker-filter-row">
-            <span className="voice-picker-filter-label">{isKo ? "나이" : "Age"}</span>
-            <div className="voice-picker-pills">
-              <button className={age === "all" ? "active" : ""} onClick={() => setAge("all")}>
-                {isKo ? "전체" : "All"}
-              </button>
-              {Object.entries(cats.age).map(([key, lbl]) => (
-                <button key={key} className={age === key ? "active" : ""} onClick={() => setAge(key)}>
-                  {label(lbl, locale)}
+            <button
+              className={`voice-picker-filter-label ${age !== "all" ? "has-active" : ""}`}
+              onClick={() => toggleSection("age")}
+              aria-expanded={!collapsedSections.has("age")}
+            >
+              <span className="filter-chevron">{collapsedSections.has("age") ? "+" : "-"}</span>
+              {isKo ? "나이" : "Age"}
+            </button>
+            {!collapsedSections.has("age") && (
+              <div className="voice-picker-pills">
+                <button className={age === "all" ? "active" : ""} onClick={() => setAge("all")}>
+                  {isKo ? "전체" : "All"}
                 </button>
-              ))}
-            </div>
+                {Object.entries(cats.age).map(([key, lbl]) => (
+                  <button key={key} className={age === key ? "active" : ""} onClick={() => setAge(key)}>
+                    {label(lbl, locale)}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Speaking Style (어투) */}
           <div className="voice-picker-filter-row">
-            <span className="voice-picker-filter-label">{isKo ? "어투" : "Style"}</span>
-            <div className="voice-picker-pills">
-              <button className={mood === "all" ? "active" : ""} onClick={() => setMood("all")}>
-                {isKo ? "전체" : "All"}
-              </button>
-              {Object.entries(cats.mood).map(([key, lbl]) => (
-                <button key={key} className={mood === key ? "active" : ""} onClick={() => setMood(key)}>
-                  {label(lbl, locale)}
+            <button
+              className={`voice-picker-filter-label ${mood !== "all" ? "has-active" : ""}`}
+              onClick={() => toggleSection("mood")}
+              aria-expanded={!collapsedSections.has("mood")}
+            >
+              <span className="filter-chevron">{collapsedSections.has("mood") ? "+" : "-"}</span>
+              {isKo ? "어투" : "Style"}
+            </button>
+            {!collapsedSections.has("mood") && (
+              <div className="voice-picker-pills">
+                <button className={mood === "all" ? "active" : ""} onClick={() => setMood("all")}>
+                  {isKo ? "전체" : "All"}
                 </button>
-              ))}
-            </div>
+                {Object.entries(cats.mood).map(([key, lbl]) => (
+                  <button key={key} className={mood === key ? "active" : ""} onClick={() => setMood(key)}>
+                    {label(lbl, locale)}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Expertise (전공분야) */}
           <div className="voice-picker-filter-row">
-            <span className="voice-picker-filter-label">{isKo ? "전공" : "Expertise"}</span>
-            <div className="voice-picker-pills">
-              <button className={expertise === "all" ? "active" : ""} onClick={() => setExpertise("all")}>
-                {isKo ? "전체" : "All"}
-              </button>
-              {Object.entries(cats.use_cases).map(([key, lbl]) => (
-                <button key={key} className={expertise === key ? "active" : ""} onClick={() => setExpertise(key)}>
-                  {label(lbl, locale)}
+            <button
+              className={`voice-picker-filter-label ${expertise !== "all" ? "has-active" : ""}`}
+              onClick={() => toggleSection("expertise")}
+              aria-expanded={!collapsedSections.has("expertise")}
+            >
+              <span className="filter-chevron">{collapsedSections.has("expertise") ? "+" : "-"}</span>
+              {isKo ? "전공" : "Expertise"}
+            </button>
+            {!collapsedSections.has("expertise") && (
+              <div className="voice-picker-pills">
+                <button className={expertise === "all" ? "active" : ""} onClick={() => setExpertise("all")}>
+                  {isKo ? "전체" : "All"}
                 </button>
-              ))}
-            </div>
+                {Object.entries(cats.use_cases).map(([key, lbl]) => (
+                  <button key={key} className={expertise === key ? "active" : ""} onClick={() => setExpertise(key)}>
+                    {label(lbl, locale)}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Native Language (주요 구사언어) */}
           <div className="voice-picker-filter-row">
-            <span className="voice-picker-filter-label">{isKo ? "언어" : "Lang"}</span>
-            <div className="voice-picker-pills">
-              <button className={nativeLang === "all" ? "active" : ""} onClick={() => setNativeLang("all")}>
-                {isKo ? "전체" : "All"}
-              </button>
-              <button className={nativeLang === "ko" ? "active" : ""} onClick={() => setNativeLang("ko")}>
-                🇰🇷 {isKo ? "한국어" : "Korean"}
-              </button>
-              <button className={nativeLang === "en" ? "active" : ""} onClick={() => setNativeLang("en")}>
-                🇺🇸 {isKo ? "영어" : "English"}
-              </button>
-              <button className={nativeLang === "ja" ? "active" : ""} onClick={() => setNativeLang("ja")}>
-                🇯🇵 {isKo ? "일본어" : "Japanese"}
-              </button>
-              <button className={nativeLang === "zh" ? "active" : ""} onClick={() => setNativeLang("zh")}>
-                🇨🇳 {isKo ? "중국어" : "Chinese"}
-              </button>
-              <button className={nativeLang === "es" ? "active" : ""} onClick={() => setNativeLang("es")}>
-                🇪🇸 {isKo ? "스페인어" : "Spanish"}
-              </button>
-              <button className={nativeLang === "de" ? "active" : ""} onClick={() => setNativeLang("de")}>
-                🇩🇪 {isKo ? "독일어" : "German"}
-              </button>
-              <button className={nativeLang === "fr" ? "active" : ""} onClick={() => setNativeLang("fr")}>
-                🇫🇷 {isKo ? "프랑스어" : "French"}
-              </button>
-              <button className={nativeLang === "pt" ? "active" : ""} onClick={() => setNativeLang("pt")}>
-                🇧🇷 {isKo ? "포르투갈어" : "Portuguese"}
-              </button>
-              <button className={nativeLang === "it" ? "active" : ""} onClick={() => setNativeLang("it")}>
-                🇮🇹 {isKo ? "이탈리아어" : "Italian"}
-              </button>
-            </div>
+            <button
+              className={`voice-picker-filter-label ${nativeLang !== "all" ? "has-active" : ""}`}
+              onClick={() => toggleSection("lang")}
+              aria-expanded={!collapsedSections.has("lang")}
+            >
+              <span className="filter-chevron">{collapsedSections.has("lang") ? "+" : "-"}</span>
+              {isKo ? "국적" : "Nationality"}
+            </button>
+            {!collapsedSections.has("lang") && (
+              <div className="voice-picker-pills">
+                <button className={nativeLang === "all" ? "active" : ""} onClick={() => setNativeLang("all")}>
+                  {isKo ? "전체" : "All"}
+                </button>
+                <button className={nativeLang === "ko" ? "active" : ""} onClick={() => setNativeLang("ko")}>
+                  {isKo ? "한국어" : "Korean"}
+                </button>
+                <button className={nativeLang === "en" ? "active" : ""} onClick={() => setNativeLang("en")}>
+                  {isKo ? "영어" : "English"}
+                </button>
+                <button className={nativeLang === "ja" ? "active" : ""} onClick={() => setNativeLang("ja")}>
+                  {isKo ? "일본어" : "Japanese"}
+                </button>
+                <button className={nativeLang === "zh" ? "active" : ""} onClick={() => setNativeLang("zh")}>
+                  {isKo ? "중국어" : "Chinese"}
+                </button>
+                <button className={nativeLang === "es" ? "active" : ""} onClick={() => setNativeLang("es")}>
+                  {isKo ? "스페인어" : "Spanish"}
+                </button>
+                <button className={nativeLang === "de" ? "active" : ""} onClick={() => setNativeLang("de")}>
+                  {isKo ? "독일어" : "German"}
+                </button>
+                <button className={nativeLang === "fr" ? "active" : ""} onClick={() => setNativeLang("fr")}>
+                  {isKo ? "프랑스어" : "French"}
+                </button>
+                <button className={nativeLang === "pt" ? "active" : ""} onClick={() => setNativeLang("pt")}>
+                  {isKo ? "포르투갈어" : "Portuguese"}
+                </button>
+                <button className={nativeLang === "it" ? "active" : ""} onClick={() => setNativeLang("it")}>
+                  {isKo ? "이탈리아어" : "Italian"}
+                </button>
+              </div>
+            )}
           </div>
         </div>
 

@@ -19,7 +19,9 @@
     "tauri:ios:init": "tauri ios init",
     "mobile:setup": "bash scripts/mobile-setup.sh all",
     "mobile:setup:android": "bash scripts/mobile-setup.sh android",
-    "mobile:setup:ios": "bash scripts/mobile-setup.sh ios"
+    "mobile:setup:ios": "bash scripts/mobile-setup.sh ios",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@livekit/components-react": "^2.9.20",
@@ -47,10 +49,14 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^29.0.2",
     "typescript": "^5.6.3",
-    "vite": "^6.0.3"
+    "vite": "^6.0.3",
+    "vitest": "^4.1.4"
   }
 }

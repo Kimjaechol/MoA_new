@@ -4315,14 +4315,28 @@ html, body {
 
 /* Filters */
 .voice-picker-filters { padding: 12px 24px; border-bottom: 1px solid #2a2a4a; }
+.voice-picker-search-row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
 .voice-picker-search {
-  width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid #333;
-  background: #12122a; color: #fff; font-size: 0.85rem; margin-bottom: 10px;
+  flex: 1; padding: 8px 12px; border-radius: 8px; border: 1px solid #333;
+  background: #12122a; color: #fff; font-size: 0.85rem;
   outline: none;
 }
 .voice-picker-search:focus { border-color: #4a6cf7; }
-.voice-picker-filter-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
-.voice-picker-filter-label { font-size: 0.72rem; color: #888; min-width: 36px; }
+.voice-picker-reset-btn {
+  background: #2a1a3a; border: 1px solid #6a4cf7; color: #b8a0ff; border-radius: 8px;
+  padding: 6px 14px; font-size: 0.72rem; cursor: pointer; white-space: nowrap;
+  transition: all 0.15s;
+}
+.voice-picker-reset-btn:hover { background: #3a2a4a; color: #fff; }
+.voice-picker-filter-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+.voice-picker-filter-label {
+  font-size: 0.72rem; color: #888; min-width: 52px; cursor: pointer;
+  background: none; border: none; padding: 2px 0; text-align: left;
+  display: flex; align-items: center; gap: 4px; transition: color 0.15s;
+}
+.voice-picker-filter-label:hover { color: #ccc; }
+.voice-picker-filter-label.has-active { color: #4a6cf7; }
+.filter-chevron { font-size: 0.65rem; color: #666; width: 10px; display: inline-block; }
 .voice-picker-pills { display: flex; gap: 4px; flex-wrap: wrap; }
 .voice-picker-pills button {
   background: #22223a; border: 1px solid #333; color: #aaa; border-radius: 14px;
