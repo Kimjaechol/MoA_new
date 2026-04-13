@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
@@ -52,7 +52,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -1352,12 +1352,32 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer({
+            let cors = CorsLayer::new()
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers([
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    header::ACCEPT,
+                ])
+                .max_age(Duration::from_secs(3600));
+            match std::env::var("CORS_ALLOWED_ORIGINS") {
+                Ok(origins) if !origins.is_empty() && origins != "*" => {
+                    let parsed: Vec<HeaderValue> = origins
+                        .split(',')
+                        .filter_map(|o| o.trim().parse().ok())
+                        .collect();
+                    cors.allow_origin(AllowOrigin::list(parsed))
+                }
+                _ => cors.allow_origin(Any),
+            }
+        })
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 
