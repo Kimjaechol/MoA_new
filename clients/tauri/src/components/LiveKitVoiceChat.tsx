@@ -53,8 +53,11 @@ interface ChatTranscript {
   isFinal: boolean;
 }
 
+type VoiceMode = "pipeline" | "s2s";
+
 export function LiveKitVoiceChat({ locale, onClose }: LiveKitVoiceChatProps) {
   const [status, setStatus] = useState<VoiceChatStatus>("idle");
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>("pipeline");
   const [transcripts, setTranscripts] = useState<ChatTranscript[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(false);
@@ -132,6 +135,7 @@ export function LiveKitVoiceChat({ locale, onClose }: LiveKitVoiceChatProps) {
           metadata: JSON.stringify({
             language: "ko",
             tier: "premium",
+            voice_mode: voiceMode,
           }),
         }),
       });
@@ -347,11 +351,45 @@ export function LiveKitVoiceChat({ locale, onClose }: LiveKitVoiceChatProps) {
         </button>
       </div>
 
+      {/* Mode selector */}
+      <div className="lk-mode-selector">
+        <button
+          className={`lk-mode-btn ${voiceMode === "pipeline" ? "active" : ""}`}
+          onClick={() => setVoiceMode("pipeline")}
+          disabled={isActive}
+          title={locale === "ko"
+            ? "모드 A: Deepgram STT → Gemini LLM → Typecast TTS (고품질, 개별 제어)"
+            : "Mode A: Deepgram STT → Gemini LLM → Typecast TTS (high quality, modular)"}
+        >
+          {locale === "ko" ? "모드 A: 파이프라인" : "Mode A: Pipeline"}
+        </button>
+        <button
+          className={`lk-mode-btn ${voiceMode === "s2s" ? "active" : ""}`}
+          onClick={() => setVoiceMode("s2s")}
+          disabled={isActive}
+          title={locale === "ko"
+            ? "모드 B: Gemini 3.1 Flash Live 올인원 (저지연, Google 음성)"
+            : "Mode B: Gemini 3.1 Flash Live all-in-one (low latency, Google voice)"}
+        >
+          {locale === "ko" ? "모드 B: Gemini Live" : "Mode B: Gemini Live"}
+        </button>
+      </div>
+
       {/* Stack info */}
       <div className="lk-stack-info">
-        <span>STT: Deepgram Nova-3</span>
-        <span>VAD: Silero</span>
-        <span>TTS: Typecast</span>
+        {voiceMode === "pipeline" ? (
+          <>
+            <span>STT: Deepgram Nova-3</span>
+            <span>LLM: Gemini 3.1 Flash Lite</span>
+            <span>TTS: Typecast</span>
+            <span>VAD: Silero</span>
+          </>
+        ) : (
+          <>
+            <span>Gemini 3.1 Flash Live (S2S)</span>
+            <span>VAD: Silero</span>
+          </>
+        )}
         <span>Transport: LiveKit</span>
       </div>
 
