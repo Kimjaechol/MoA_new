@@ -44,6 +44,7 @@ pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
 pub mod billing;
+pub mod categories;
 pub mod channels;
 pub mod coding;
 pub mod config;

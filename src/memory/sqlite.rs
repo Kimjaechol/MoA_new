@@ -55,6 +55,13 @@ pub struct SqliteMemory {
 }
 
 impl SqliteMemory {
+    /// Expose the connection for cross-module tests (e.g. category CRUD tests).
+    /// Only available in test builds.
+    #[cfg(test)]
+    pub fn conn_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
+    }
+
     pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
         Self::with_embedder(
             workspace_dir,
@@ -339,6 +346,23 @@ impl SqliteMemory {
                 ON phone_calls(caller_object_id, started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_phone_calls_risk
                 ON phone_calls(risk_level, started_at DESC) WHERE risk_level != 'safe';",
+        )?;
+
+        // user_categories — user-created custom categories
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS user_categories (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid            TEXT NOT NULL UNIQUE,
+                name            TEXT NOT NULL,
+                icon            TEXT,
+                parent_seed_key TEXT,
+                order_index     INTEGER NOT NULL DEFAULT 0,
+                created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+                UNIQUE(name, parent_seed_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_categories_order
+                ON user_categories(parent_seed_key, order_index);",
         )?;
 
         Ok(())
