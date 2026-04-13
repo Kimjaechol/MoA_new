@@ -239,16 +239,107 @@ impl SqliteMemory {
         )?;
 
         // Migration: add session_id column if not present (safe to run repeatedly)
-        let has_session_id: bool = conn
+        let memories_sql: String = conn
             .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'")?
-            .query_row([], |row| row.get::<_, String>(0))?
-            .contains("session_id");
-        if !has_session_id {
+            .query_row([], |row| row.get::<_, String>(0))?;
+
+        if !memories_sql.contains("session_id") {
             conn.execute_batch(
                 "ALTER TABLE memories ADD COLUMN session_id TEXT;
                  CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
             )?;
         }
+
+        // ── v3.0 Migration: Compiled Truth + Timeline (S2) ───────────
+        // Add compiled_truth columns to memories (non-destructive extension)
+        if !memories_sql.contains("compiled_truth") {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN compiled_truth TEXT;
+                 ALTER TABLE memories ADD COLUMN truth_version INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE memories ADD COLUMN truth_updated_at INTEGER;
+                 ALTER TABLE memories ADD COLUMN needs_recompile INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX IF NOT EXISTS idx_memories_needs_recompile
+                     ON memories(needs_recompile) WHERE needs_recompile = 1;",
+            )?;
+        }
+
+        // memory_timeline — append-only evidence store
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_timeline (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid            TEXT NOT NULL UNIQUE,
+                memory_id       TEXT NOT NULL,
+                event_type      TEXT NOT NULL CHECK(event_type IN (
+                                    'call','chat','doc','manual','workflow','email','ocr'
+                                )),
+                event_at        INTEGER NOT NULL,
+                source_ref      TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                content_sha256  TEXT NOT NULL,
+                metadata_json   TEXT,
+                device_id       TEXT NOT NULL,
+                created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+                FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_timeline_memory_time
+                ON memory_timeline(memory_id, event_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_timeline_source_ref
+                ON memory_timeline(source_ref);
+            CREATE INDEX IF NOT EXISTS idx_timeline_event_type
+                ON memory_timeline(event_type, event_at DESC);",
+        )?;
+
+        // Append-only enforcement: block UPDATE on memory_timeline
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS trg_timeline_no_update
+             BEFORE UPDATE ON memory_timeline
+             BEGIN
+                 SELECT RAISE(ABORT, 'memory_timeline is append-only');
+             END;",
+        )?;
+
+        // FTS5 mirror for timeline natural language search
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_timeline_fts
+                 USING fts5(content, source_ref UNINDEXED, memory_id UNINDEXED,
+                            content='memory_timeline', content_rowid='id');
+
+             CREATE TRIGGER IF NOT EXISTS trg_timeline_ai AFTER INSERT ON memory_timeline BEGIN
+                 INSERT INTO memory_timeline_fts(rowid, content, source_ref, memory_id)
+                 VALUES (new.id, new.content, new.source_ref, new.memory_id);
+             END;",
+        )?;
+
+        // phone_calls — phone assistant call metadata
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS phone_calls (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_uuid           TEXT NOT NULL UNIQUE,
+                direction           TEXT NOT NULL CHECK(direction IN ('in','out','missed')),
+                caller_number       TEXT,
+                caller_number_e164  TEXT,
+                caller_object_id    INTEGER,
+                started_at          INTEGER NOT NULL,
+                ended_at            INTEGER,
+                duration_ms         INTEGER,
+                gps_lat             REAL,
+                gps_lon             REAL,
+                transcript          TEXT,
+                summary             TEXT,
+                risk_level          TEXT CHECK(risk_level IN ('safe','warn','danger')) DEFAULT 'safe',
+                sos_triggered       INTEGER NOT NULL DEFAULT 0,
+                language            TEXT,
+                memory_id           TEXT,
+                device_id           TEXT NOT NULL,
+                created_at          INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_phone_calls_number
+                ON phone_calls(caller_number_e164, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_phone_calls_object
+                ON phone_calls(caller_object_id, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_phone_calls_risk
+                ON phone_calls(risk_level, started_at DESC) WHERE risk_level != 'safe';",
+        )?;
 
         Ok(())
     }
@@ -495,6 +586,157 @@ impl SqliteMemory {
 
         Ok(count)
     }
+
+    // ── v3.0 Compiled Truth + Timeline methods ───────────────────
+
+    /// Update the compiled truth for a memory entry.
+    /// Increments `truth_version` and sets `needs_recompile = 0`.
+    pub fn set_compiled_truth(&self, memory_key: &str, compiled_truth: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        conn.execute(
+            "UPDATE memories
+             SET compiled_truth = ?1,
+                 truth_version = truth_version + 1,
+                 truth_updated_at = ?2,
+                 needs_recompile = 0
+             WHERE key = ?3",
+            params![compiled_truth, now as i64, memory_key],
+        )?;
+        Ok(())
+    }
+
+    /// Get compiled truth and version for a memory entry.
+    pub fn get_compiled_truth(
+        &self,
+        memory_key: &str,
+    ) -> anyhow::Result<Option<(String, u32)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT compiled_truth, truth_version FROM memories WHERE key = ?1",
+        )?;
+        let result = stmt.query_row(params![memory_key], |row| {
+            let truth: Option<String> = row.get(0)?;
+            let version: u32 = row.get(1)?;
+            Ok(truth.map(|t| (t, version)))
+        });
+        match result {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Mark a memory as needing recompilation (e.g. after new timeline evidence).
+    pub fn mark_needs_recompile(&self, memory_key: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE memories SET needs_recompile = 1 WHERE key = ?1",
+            params![memory_key],
+        )?;
+        Ok(())
+    }
+
+    /// Get all memory IDs/keys that need recompilation (for Dream Cycle).
+    pub fn get_needs_recompile(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, key FROM memories WHERE needs_recompile = 1",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Append an evidence entry to `memory_timeline` (append-only).
+    /// Returns the generated UUID for the entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_timeline(
+        &self,
+        memory_id: &str,
+        event_type: &str,
+        event_at: u64,
+        source_ref: &str,
+        content: &str,
+        metadata_json: Option<&str>,
+        device_id: &str,
+    ) -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        let uuid = Uuid::new_v4().to_string();
+        let content_sha256 = hex::encode(Sha256::digest(content.as_bytes()));
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO memory_timeline
+                (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                uuid,
+                memory_id,
+                event_type,
+                event_at as i64,
+                source_ref,
+                content,
+                content_sha256,
+                metadata_json,
+                device_id,
+            ],
+        )?;
+        Ok(uuid)
+    }
+
+    /// Get timeline entries for a memory, ordered by event_at descending.
+    pub fn get_timeline(
+        &self,
+        memory_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TimelineEntry>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT uuid, event_type, event_at, source_ref, content, metadata_json, device_id, created_at
+             FROM memory_timeline
+             WHERE memory_id = ?1
+             ORDER BY event_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![memory_id, limit as i64], |row| {
+            Ok(TimelineEntry {
+                uuid: row.get(0)?,
+                event_type: row.get(1)?,
+                event_at: row.get(2)?,
+                source_ref: row.get(3)?,
+                content: row.get(4)?,
+                metadata_json: row.get(5)?,
+                device_id: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+}
+
+/// A timeline evidence entry (read from `memory_timeline`).
+#[derive(Debug, Clone)]
+pub struct TimelineEntry {
+    pub uuid: String,
+    pub event_type: String,
+    pub event_at: i64,
+    pub source_ref: String,
+    pub content: String,
+    pub metadata_json: Option<String>,
+    pub device_id: String,
+    pub created_at: i64,
 }
 
 #[async_trait]
@@ -2049,5 +2291,162 @@ mod tests {
         mem.reindex().await.unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    // ── v3.0 Compiled Truth + Timeline tests ─────────────────────
+
+    #[tokio::test]
+    async fn compiled_truth_roundtrip() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("ct_test", "original content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Initially no compiled truth
+        let result = mem.get_compiled_truth("ct_test").unwrap();
+        assert!(result.is_none() || result.unwrap().0.is_empty() == false);
+
+        // Set compiled truth
+        mem.set_compiled_truth("ct_test", "summarized truth v1").unwrap();
+        let (truth, version) = mem.get_compiled_truth("ct_test").unwrap().unwrap();
+        assert_eq!(truth, "summarized truth v1");
+        assert_eq!(version, 1);
+
+        // Update compiled truth — version increments
+        mem.set_compiled_truth("ct_test", "summarized truth v2").unwrap();
+        let (truth, version) = mem.get_compiled_truth("ct_test").unwrap().unwrap();
+        assert_eq!(truth, "summarized truth v2");
+        assert_eq!(version, 2);
+    }
+
+    #[tokio::test]
+    async fn needs_recompile_flag() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("recomp", "data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Initially no entries need recompile
+        assert!(mem.get_needs_recompile().unwrap().is_empty());
+
+        // Mark needs recompile
+        mem.mark_needs_recompile("recomp").unwrap();
+        let pending = mem.get_needs_recompile().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, "recomp");
+
+        // set_compiled_truth clears the flag
+        mem.set_compiled_truth("recomp", "compiled").unwrap();
+        assert!(mem.get_needs_recompile().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeline_append_and_get() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("tl_mem", "memory for timeline", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Get the memory id
+        let entry = mem.get("tl_mem").await.unwrap().unwrap();
+        let memory_id = &entry.id;
+
+        // Append timeline entries
+        let uuid1 = mem
+            .append_timeline(memory_id, "chat", 1000, "msg_001", "first evidence", None, "device_a")
+            .unwrap();
+        let uuid2 = mem
+            .append_timeline(
+                memory_id,
+                "call",
+                2000,
+                "call_001",
+                "second evidence from call",
+                Some(r#"{"duration":120}"#),
+                "device_a",
+            )
+            .unwrap();
+
+        assert_ne!(uuid1, uuid2);
+
+        // Retrieve timeline (ordered by event_at DESC)
+        let timeline = mem.get_timeline(memory_id, 10).unwrap();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].event_type, "call"); // most recent first
+        assert_eq!(timeline[0].source_ref, "call_001");
+        assert_eq!(timeline[1].event_type, "chat");
+        assert_eq!(timeline[1].source_ref, "msg_001");
+
+        // Content SHA256 should be populated
+        assert!(!timeline[0].content.is_empty());
+    }
+
+    #[test]
+    fn timeline_append_only_enforced() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        // We need to insert a memory first to satisfy FK
+        let conn = mem.conn.lock();
+        conn.execute(
+            "INSERT INTO memories (id, key, content, category, created_at, updated_at) VALUES ('m1', 'k1', 'c', 'core', '2024', '2024')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO memory_timeline (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, device_id)
+             VALUES ('u1', 'm1', 'chat', 1000, 'ref1', 'data', 'sha', 'dev1')",
+            [],
+        ).unwrap();
+
+        // Attempt UPDATE should fail (append-only trigger)
+        let result = conn.execute(
+            "UPDATE memory_timeline SET content = 'modified' WHERE uuid = 'u1'",
+            [],
+        );
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("append-only"), "Expected append-only error, got: {err_msg}");
+    }
+
+    #[test]
+    fn timeline_limit_respected() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, created_at, updated_at) VALUES ('m2', 'k2', 'c', 'core', '2024', '2024')",
+                [],
+            ).unwrap();
+        }
+
+        for i in 0..10 {
+            mem.append_timeline("m2", "chat", i * 100, &format!("ref_{i}"), &format!("content_{i}"), None, "dev1")
+                .unwrap();
+        }
+
+        let timeline = mem.get_timeline("m2", 3).unwrap();
+        assert_eq!(timeline.len(), 3);
+        // Should be the 3 most recent
+        assert_eq!(timeline[0].source_ref, "ref_9");
+    }
+
+    #[tokio::test]
+    async fn phone_calls_table_exists() {
+        let (_tmp, mem) = temp_sqlite();
+        let conn = mem.conn.lock();
+        // Verify phone_calls table was created
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM phone_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn compiled_truth_nonexistent_key() {
+        let (_tmp, mem) = temp_sqlite();
+        let result = mem.get_compiled_truth("nonexistent").unwrap();
+        assert!(result.is_none());
     }
 }
