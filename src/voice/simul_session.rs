@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use super::events::{InterpretationMode, ServerMessage};
 use super::gemini_live::{GeminiLiveSession, VadConfig, VadSensitivity};
-use super::pipeline::{Domain, Formality, InterpreterConfig, LanguageCode, VoiceProviderKind};
+use super::pipeline::{Domain, Formality, InterpreterConfig, LanguageCode, VoiceAge, VoiceGender, VoiceProviderKind};
 use super::simul::{SegmentationConfig, SegmentationEngine};
 use super::VoiceEvent;
 
@@ -54,6 +54,10 @@ pub struct SimulSessionConfig {
     pub formality: Formality,
     /// Segmentation configuration.
     pub segmentation: SegmentationConfig,
+    /// User voice gender for Gemini voice selection.
+    pub voice_gender: VoiceGender,
+    /// User voice age for Gemini voice selection.
+    pub voice_age: VoiceAge,
 }
 
 // ── Session handle ────────────────────────────────────────────────
@@ -197,6 +201,9 @@ impl SimulSession {
             preserve_tone: true,
             api_key: None,
             provider: VoiceProviderKind::GeminiLive,
+            voice_gender: config.voice_gender,
+            voice_age: config.voice_age,
+            voice_clone_id: None,
         }
     }
 

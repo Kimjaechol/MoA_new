@@ -1459,6 +1459,7 @@ pub async fn handle_ws_voice(
 enum VoiceSessionHandle {
     Gemini(crate::voice::simul_session::SimulSession),
     Deepgram(crate::voice::deepgram_simul::DeepgramSimulSession),
+    TypecastPipeline(crate::voice::typecast_interp::TypecastInterpSession),
 }
 
 impl VoiceSessionHandle {
@@ -1466,6 +1467,7 @@ impl VoiceSessionHandle {
         match self {
             Self::Gemini(s) => s.send_audio(pcm_data).await,
             Self::Deepgram(s) => s.send_audio(pcm_data).await,
+            Self::TypecastPipeline(s) => s.send_audio(pcm_data).await,
         }
     }
 
@@ -1476,6 +1478,7 @@ impl VoiceSessionHandle {
         match self {
             Self::Gemini(s) => s.event_rx.clone(),
             Self::Deepgram(s) => s.event_rx.clone(),
+            Self::TypecastPipeline(s) => s.event_rx.clone(),
         }
     }
 
@@ -1483,6 +1486,7 @@ impl VoiceSessionHandle {
         match self {
             Self::Gemini(s) => s.stop().await,
             Self::Deepgram(s) => s.stop().await,
+            Self::TypecastPipeline(s) => s.stop().await,
         }
     }
 }
@@ -1491,9 +1495,10 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
     use crate::voice::{
         deepgram_simul::{DeepgramSimulConfig, DeepgramSimulSession},
         events::{ClientMessage, ServerMessage},
-        pipeline::{Domain, Formality, LanguageCode},
+        pipeline::{Domain, Formality, LanguageCode, VoiceAge, VoiceGender},
         simul::SegmentationConfig,
         simul_session::{SimulSession, SimulSessionConfig},
+        typecast_interp::{TypecastInterpConfig, TypecastInterpSession},
     };
     use base64::Engine;
 
@@ -1541,7 +1546,10 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                 provider,
                 domain,
                 formality,
-                ..
+                voice_gender,
+                voice_age,
+                voice_clone_id,
+                device_id: _,
             } => {
                 // Stop any existing session
                 if let Some(session) = active_session.take() {
@@ -1556,21 +1564,27 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                     .as_deref()
                     .or(voice_config.default_provider.as_deref())
                     .unwrap_or("gemini");
-                let use_deepgram = provider_str == "deepgram";
 
-                // Resolve API key based on provider
-                let api_key = if use_deepgram {
-                    voice_config
+                // Resolve primary API key based on provider
+                let api_key = match provider_str {
+                    "deepgram" => voice_config
                         .deepgram_api_key
                         .clone()
                         .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok())
-                        .unwrap_or_default()
-                } else {
-                    voice_config.gemini_api_key.clone().unwrap_or_default()
+                        .unwrap_or_default(),
+                    "typecast_pipeline" => voice_config
+                        .deepgram_api_key
+                        .clone()
+                        .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok())
+                        .unwrap_or_default(),
+                    _ => voice_config.gemini_api_key.clone().unwrap_or_default(),
                 };
 
                 if api_key.is_empty() {
-                    let key_name = if use_deepgram { "Deepgram" } else { "Gemini" };
+                    let key_name = match provider_str {
+                        "deepgram" | "typecast_pipeline" => "Deepgram",
+                        _ => "Gemini",
+                    };
                     let err = ServerMessage::Error {
                         session_id: session_id.clone(),
                         code: "NO_API_KEY".into(),
@@ -1614,53 +1628,102 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                     "Voice WebSocket: starting interpretation session"
                 );
 
+                // Parse voice profile (shared across providers)
+                let gender_val = voice_gender
+                    .as_deref()
+                    .and_then(VoiceGender::from_str_opt)
+                    .unwrap_or_default();
+                let age_val = voice_age
+                    .as_deref()
+                    .and_then(VoiceAge::from_str_opt)
+                    .unwrap_or_default();
+
                 // Start the session with the selected provider
-                let session_result: anyhow::Result<VoiceSessionHandle> = if use_deepgram {
-                    let dg_config = DeepgramSimulConfig {
-                        session_id: session_id.clone(),
-                        api_key,
-                        source_lang: src_lang,
-                        model: voice_config.deepgram_model.clone(),
-                        segmentation,
-                    };
-                    DeepgramSimulSession::start(dg_config)
-                        .await
-                        .map(VoiceSessionHandle::Deepgram)
-                } else {
-                    // Parse optional domain/formality (only for Gemini — full interpretation)
-                    let domain_val = domain
-                        .as_deref()
-                        .map(|d| match d {
-                            "business" => Domain::Business,
-                            "medical" => Domain::Medical,
-                            "legal" => Domain::Legal,
-                            "technical" => Domain::Technical,
-                            _ => Domain::General,
-                        })
-                        .unwrap_or(Domain::General);
+                let session_result: anyhow::Result<VoiceSessionHandle> = match provider_str {
+                    "deepgram" => {
+                        let dg_config = DeepgramSimulConfig {
+                            session_id: session_id.clone(),
+                            api_key,
+                            source_lang: src_lang,
+                            model: voice_config.deepgram_model.clone(),
+                            segmentation,
+                        };
+                        DeepgramSimulSession::start(dg_config)
+                            .await
+                            .map(VoiceSessionHandle::Deepgram)
+                    }
 
-                    let formality_val = formality
-                        .as_deref()
-                        .map(|f| match f {
-                            "formal" => Formality::Formal,
-                            "casual" => Formality::Casual,
-                            _ => Formality::Neutral,
-                        })
-                        .unwrap_or(Formality::Neutral);
+                    "typecast_pipeline" => {
+                        // STT+LLM+TTS mode: Deepgram → LLM translation → Typecast TTS
+                        let typecast_key = std::env::var("TYPECAST_API_KEY").unwrap_or_default();
+                        let llm_key = std::env::var("GEMINI_API_KEY")
+                            .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+                            .unwrap_or_default();
+                        let llm_model = std::env::var("TYPECAST_INTERP_LLM_MODEL")
+                            .unwrap_or_else(|_| "gemini-3.1-flash-lite-preview".to_string());
+                        let llm_base = std::env::var("TYPECAST_INTERP_LLM_BASE_URL")
+                            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
 
-                    let config = SimulSessionConfig {
-                        session_id: session_id.clone(),
-                        api_key,
-                        source_lang: src_lang,
-                        target_lang: tgt_lang,
-                        mode,
-                        domain: domain_val,
-                        formality: formality_val,
-                        segmentation,
-                    };
-                    SimulSession::start(config)
-                        .await
-                        .map(VoiceSessionHandle::Gemini)
+                        let tc_config = TypecastInterpConfig {
+                            session_id: session_id.clone(),
+                            deepgram_api_key: api_key,
+                            deepgram_model: voice_config.deepgram_model.clone(),
+                            source_lang: src_lang,
+                            target_lang: tgt_lang,
+                            typecast_api_key: typecast_key,
+                            voice_clone_id: voice_clone_id.clone(),
+                            voice_gender: gender_val,
+                            voice_age: age_val,
+                            fallback_voice_id: None, // TODO: resolve from cached voice list
+                            llm_api_key: llm_key,
+                            llm_model,
+                            llm_base_url: llm_base,
+                            segmentation,
+                            bidirectional: mode == crate::voice::events::InterpretationMode::Bidirectional,
+                        };
+                        TypecastInterpSession::start(tc_config)
+                            .await
+                            .map(VoiceSessionHandle::TypecastPipeline)
+                    }
+
+                    _ => {
+                        // Default: Gemini Live (full S2S interpretation)
+                        let domain_val = domain
+                            .as_deref()
+                            .map(|d| match d {
+                                "business" => Domain::Business,
+                                "medical" => Domain::Medical,
+                                "legal" => Domain::Legal,
+                                "technical" => Domain::Technical,
+                                _ => Domain::General,
+                            })
+                            .unwrap_or(Domain::General);
+
+                        let formality_val = formality
+                            .as_deref()
+                            .map(|f| match f {
+                                "formal" => Formality::Formal,
+                                "casual" => Formality::Casual,
+                                _ => Formality::Neutral,
+                            })
+                            .unwrap_or(Formality::Neutral);
+
+                        let config = SimulSessionConfig {
+                            session_id: session_id.clone(),
+                            api_key,
+                            source_lang: src_lang,
+                            target_lang: tgt_lang,
+                            mode,
+                            domain: domain_val,
+                            formality: formality_val,
+                            segmentation,
+                            voice_gender: gender_val,
+                            voice_age: age_val,
+                        };
+                        SimulSession::start(config)
+                            .await
+                            .map(VoiceSessionHandle::Gemini)
+                    }
                 };
 
                 match session_result {

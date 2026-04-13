@@ -47,6 +47,15 @@ pub enum ClientMessage {
         /// Optional formality level.
         #[serde(skip_serializing_if = "Option::is_none")]
         formality: Option<String>,
+        /// User voice gender for TTS matching ("male" or "female").
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "voiceGender")]
+        voice_gender: Option<String>,
+        /// User voice age group ("child", "teenager", "young_adult", "middle_age", "elder").
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "voiceAge")]
+        voice_age: Option<String>,
+        /// Typecast voice clone ID (speak_resource_id) for cloned-voice TTS.
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "voiceCloneId")]
+        voice_clone_id: Option<String>,
     },
 
     /// Stop the current session.
@@ -224,6 +233,9 @@ mod tests {
             provider: None,
             domain: None,
             formality: None,
+            voice_gender: None,
+            voice_age: None,
+            voice_clone_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("session_start"));

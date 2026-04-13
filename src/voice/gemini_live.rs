@@ -203,7 +203,11 @@ pub fn build_setup_message(config: &InterpreterConfig, vad: &VadConfig) -> Setup
                 speech_config: Some(SpeechConfig {
                     voice_config: VoiceConfig {
                         prebuilt_voice_config: PrebuiltVoiceConfig {
-                            voice_name: "Aoede".to_string(),
+                            voice_name: super::pipeline::select_gemini_voice(
+                                config.voice_gender,
+                                config.voice_age,
+                            )
+                            .to_string(),
                         },
                     },
                 }),

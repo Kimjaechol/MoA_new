@@ -330,6 +330,79 @@ pub trait VoiceProvider: Send + Sync {
 
 // ── Interpreter configuration ────────────────────────────────────
 
+/// User voice profile for matching TTS output to the speaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VoiceGender {
+    #[default]
+    Male,
+    Female,
+}
+
+/// User age group for voice matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VoiceAge {
+    Child,
+    Teenager,
+    YoungAdult,
+    #[default]
+    MiddleAge,
+    Elder,
+}
+
+impl VoiceGender {
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "male" | "m" => Some(Self::Male),
+            "female" | "f" => Some(Self::Female),
+            _ => None,
+        }
+    }
+}
+
+impl VoiceAge {
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "child" => Some(Self::Child),
+            "teenager" => Some(Self::Teenager),
+            "young_adult" | "young" => Some(Self::YoungAdult),
+            "middle_age" | "middle" | "adult" => Some(Self::MiddleAge),
+            "elder" | "senior" => Some(Self::Elder),
+            _ => None,
+        }
+    }
+
+    /// Map to Typecast API age parameter.
+    pub fn as_typecast_str(self) -> &'static str {
+        match self {
+            Self::Child => "child",
+            Self::Teenager => "teenager",
+            Self::YoungAdult => "young_adult",
+            Self::MiddleAge => "middle_age",
+            Self::Elder => "elder",
+        }
+    }
+}
+
+/// Select the best Gemini prebuilt voice based on user gender and age.
+///
+/// Gemini 3.1 Flash Live voices:
+/// - Aoede: Female, warm/expressive (young-middle)
+/// - Kore: Female, neutral/professional (middle)
+/// - Charon: Male, deep/mature (middle-elder)
+/// - Fenrir: Male, clear/younger (young-middle)
+/// - Puck: Male, versatile/neutral (young)
+pub fn select_gemini_voice(gender: VoiceGender, age: VoiceAge) -> &'static str {
+    match (gender, age) {
+        (VoiceGender::Female, VoiceAge::Child | VoiceAge::Teenager) => "Aoede",
+        (VoiceGender::Female, VoiceAge::YoungAdult) => "Aoede",
+        (VoiceGender::Female, VoiceAge::MiddleAge | VoiceAge::Elder) => "Kore",
+        (VoiceGender::Male, VoiceAge::Child | VoiceAge::Teenager) => "Puck",
+        (VoiceGender::Male, VoiceAge::YoungAdult) => "Fenrir",
+        (VoiceGender::Male, VoiceAge::MiddleAge) => "Charon",
+        (VoiceGender::Male, VoiceAge::Elder) => "Charon",
+    }
+}
+
 /// Configuration for a voice interpretation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterpreterConfig {
@@ -349,6 +422,14 @@ pub struct InterpreterConfig {
     pub api_key: Option<String>,
     /// Voice provider to use.
     pub provider: VoiceProviderKind,
+    /// User's voice gender for TTS matching.
+    pub voice_gender: VoiceGender,
+    /// User's voice age group for TTS matching.
+    pub voice_age: VoiceAge,
+    /// Typecast voice clone ID (speak_resource_id from voice cloning API).
+    /// When set, TTS uses the cloned voice; otherwise falls back to
+    /// auto-matched voice based on gender/age/language.
+    pub voice_clone_id: Option<String>,
 }
 
 impl Default for InterpreterConfig {
@@ -362,6 +443,9 @@ impl Default for InterpreterConfig {
             preserve_tone: true,
             api_key: None,
             provider: VoiceProviderKind::GeminiLive,
+            voice_gender: VoiceGender::default(),
+            voice_age: VoiceAge::default(),
+            voice_clone_id: None,
         }
     }
 }
