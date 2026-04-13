@@ -26,6 +26,7 @@ pub mod openai_realtime;
 pub mod pipeline;
 pub mod simul;
 pub mod simul_session;
+pub mod typecast_interp;
 
 // ── Shared voice event type ──────────────────────────────────────
 
@@ -72,3 +73,5 @@ pub use pipeline::{
 pub use simul::{CommittedSegment, SegmentationConfig, SegmentationEngine};
 #[allow(unused_imports)]
 pub use simul_session::{SimulSession, SimulSessionConfig};
+#[allow(unused_imports)]
+pub use typecast_interp::{TypecastInterpConfig, TypecastInterpSession};
