@@ -977,6 +977,7 @@ export function Chat({
             <LiveKitVoiceChat
               locale={locale}
               onClose={() => setShowLiveKitChat(false)}
+              initialMode={voiceChatMode}
             />
           </div>
         )}

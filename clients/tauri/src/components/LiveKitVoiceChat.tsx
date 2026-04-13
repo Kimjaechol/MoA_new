@@ -34,6 +34,7 @@ import { apiClient } from "../lib/api";
 interface LiveKitVoiceChatProps {
   locale: Locale;
   onClose: () => void;
+  initialMode?: "pipeline" | "s2s";
 }
 
 type VoiceChatStatus =
@@ -55,9 +56,9 @@ interface ChatTranscript {
 
 type VoiceMode = "pipeline" | "s2s";
 
-export function LiveKitVoiceChat({ locale, onClose }: LiveKitVoiceChatProps) {
+export function LiveKitVoiceChat({ locale, onClose, initialMode }: LiveKitVoiceChatProps) {
   const [status, setStatus] = useState<VoiceChatStatus>("idle");
-  const [voiceMode, setVoiceMode] = useState<VoiceMode>("pipeline");
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>(initialMode || "pipeline");
   const [transcripts, setTranscripts] = useState<ChatTranscript[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(false);
