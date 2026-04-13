@@ -72,6 +72,7 @@ pub mod observability;
 pub(crate) mod onboard;
 pub mod ontology;
 pub mod peripherals;
+pub mod phone;
 #[allow(unused_imports)]
 pub(crate) mod plugins;
 pub mod providers;

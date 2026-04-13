@@ -55,11 +55,19 @@ pub struct SqliteMemory {
 }
 
 impl SqliteMemory {
-    /// Expose the connection for cross-module tests (e.g. category CRUD tests).
-    /// Only available in test builds.
+    /// Expose the connection for cross-module operations (categories, phone_calls).
+    ///
+    /// Prefer the typed methods on `SqliteMemory` when available.
+    /// Use this only for modules that need direct table access (e.g. `CategoryStore`,
+    /// `post_call::insert_phone_call`).
+    pub fn connection(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
+    }
+
+    /// Alias for tests — same as `connection()`.
     #[cfg(test)]
     pub fn conn_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
-        self.conn.lock()
+        self.connection()
     }
 
     pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
