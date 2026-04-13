@@ -373,6 +373,57 @@ impl SqliteMemory {
                 ON user_categories(parent_seed_key, order_index);",
         )?;
 
+        // workflow_runs — workflow execution history (for learning loop)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS workflow_runs (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid              TEXT NOT NULL UNIQUE,
+                workflow_id       INTEGER NOT NULL,
+                workflow_version  INTEGER NOT NULL DEFAULT 1,
+                started_at        INTEGER NOT NULL,
+                ended_at          INTEGER,
+                status            TEXT NOT NULL CHECK(status IN (
+                                      'running','success','failed','cancelled','paused'
+                                  )),
+                trigger_source    TEXT,
+                input_json        TEXT,
+                input_sha256      TEXT,
+                output_ref        TEXT,
+                output_sha256     TEXT,
+                error_message     TEXT,
+                cost_tokens_in    INTEGER DEFAULT 0,
+                cost_tokens_out   INTEGER DEFAULT 0,
+                cost_llm_calls    INTEGER DEFAULT 0,
+                feedback_rating   INTEGER,
+                feedback_note     TEXT,
+                device_id         TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_wfruns_workflow
+                ON workflow_runs(workflow_id, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_wfruns_status
+                ON workflow_runs(status, started_at DESC);",
+        )?;
+
+        // workflow_suggestions — Dream Cycle output (improvement inbox)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS workflow_suggestions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid             TEXT NOT NULL UNIQUE,
+                workflow_id      INTEGER,
+                suggestion_type  TEXT NOT NULL CHECK(suggestion_type IN (
+                                     'fix_failure','default_value','abstraction','deprecation'
+                                 )),
+                title            TEXT NOT NULL,
+                description      TEXT NOT NULL,
+                patch_yaml       TEXT,
+                created_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+                reviewed_at      INTEGER,
+                review_decision  TEXT CHECK(review_decision IN ('accepted','rejected','snoozed'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_wfsug_pending
+                ON workflow_suggestions(created_at DESC) WHERE reviewed_at IS NULL;",
+        )?;
+
         Ok(())
     }
 

@@ -11,13 +11,17 @@
 
 pub mod exec;
 pub mod intent;
+pub mod learning;
 pub mod parser;
+pub mod preset;
 pub mod registry;
 pub mod scaffold;
 
 // Re-export key types
 pub use exec::{execute, CostTracker, ExecContext, WorkflowRunResult};
 pub use intent::{classify_heuristic, classify_intent, IntentConfig, WorkflowIntent};
+pub use learning::{analyze_workflow, run_learning_loop, LearningConfig, SuggestionType, WorkflowSuggestion};
 pub use parser::{parse_spec, InputDef, Limits, Step, WorkflowSpec};
+pub use preset::{import_presets, parse_preset, LAWYER_PRESETS};
 pub use registry::ToolRegistry;
 pub use scaffold::{scaffold, ScaffoldRequest, ScaffoldResponse};
