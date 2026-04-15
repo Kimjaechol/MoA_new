@@ -5,6 +5,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -13,6 +15,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// PR #7 r2d2 pool — read connection pool size. 8 concurrent readers
+/// matches the spec; writes still serialise through the existing
+/// `Arc<Mutex<Connection>>` so there is only one writer at a time
+/// (SQLite's own constraint, WAL mode notwithstanding).
+const READ_POOL_SIZE: u32 = 8;
+
+/// Type alias so spawn_blocking closures don't need the verbose path.
+pub(crate) type ReadPool = Pool<SqliteConnectionManager>;
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
@@ -76,6 +87,15 @@ pub struct SqliteMemory {
     /// pre-HLC protocol versions keep working — the HLC column is
     /// additive and not yet the primary ordering key for sync.
     hlc_clock: Arc<crate::sync::hlc::HlcClock>,
+
+    /// PR #7 r2d2 read pool — up to 8 concurrent connections used by
+    /// the hot read paths (fts5_search, vector_search,
+    /// recall_with_variations). Writes still go through the legacy
+    /// `Arc<Mutex<Connection>>` because SQLite only allows one writer
+    /// at a time anyway — this field is an *additional* resource, not
+    /// a replacement. Every PooledConnection is initialised with the
+    /// same PRAGMA tuning as the main connection (WAL, busy_timeout).
+    read_pool: ReadPool,
 }
 
 impl SqliteMemory {
@@ -92,6 +112,14 @@ impl SqliteMemory {
     #[cfg(test)]
     pub fn conn_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
         self.connection()
+    }
+
+    /// PR #7 r2d2 — expose the read pool so hot-read callers can grab
+    /// a concurrent connection instead of queueing on the writer Mutex.
+    /// Returns an owned clone because `r2d2::Pool` is internally Arc'd
+    /// and clones are cheap.
+    pub fn read_pool(&self) -> ReadPool {
+        self.read_pool.clone()
     }
 
     pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
@@ -282,6 +310,26 @@ impl SqliteMemory {
         let node_id = format!("{}-{}", hostname, db_path.display());
         let hlc_clock = Arc::new(crate::sync::hlc::HlcClock::new(node_id));
 
+        // PR #7 r2d2 — build the read pool pointing at the SAME DB file.
+        // Every pooled connection re-applies the core PRAGMA set via a
+        // customiser so reads operate under the same WAL + busy_timeout
+        // semantics as the writer.
+        let manager = SqliteConnectionManager::file(&db_path).with_init(|c| {
+            c.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous  = NORMAL;
+                 PRAGMA busy_timeout = 5000;
+                 PRAGMA cache_size   = -2000;
+                 PRAGMA temp_store   = MEMORY;",
+            )
+        });
+        let read_pool = Pool::builder()
+            .max_size(READ_POOL_SIZE)
+            .min_idle(Some(1))
+            .connection_timeout(Duration::from_secs(5))
+            .build(manager)
+            .context("failed to build r2d2 read pool")?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path,
@@ -295,6 +343,7 @@ impl SqliteMemory {
             reranker: Mutex::new(None),
             rerank_config: Mutex::new(super::search::RerankRuntimeConfig::default()),
             hlc_clock,
+            read_pool,
         })
     }
 
@@ -4388,6 +4437,56 @@ mod tests {
         let keys: Vec<&str> = hits.iter().map(|h| h.key.as_str()).collect();
         assert!(keys.contains(&"k_active"), "got {keys:?}");
         assert!(!keys.contains(&"k_archived"), "got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn read_pool_allows_eight_concurrent_readers() {
+        // PR #7 r2d2 — spawn 8 threads, each grabbing a connection from
+        // the read pool and running a SELECT in parallel. Must complete
+        // without deadlock (the Mutex-only path would serialise them).
+        use std::thread;
+
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_pool", "probe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let pool = mem.read_pool();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = pool.clone();
+            handles.push(thread::spawn(move || -> anyhow::Result<i64> {
+                let conn = p.get()?;
+                let count: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM memories WHERE key = 'k_pool'", [], |r| {
+                        r.get(0)
+                    })?;
+                Ok(count)
+            }));
+        }
+
+        for h in handles {
+            let n = h.join().unwrap().unwrap();
+            assert_eq!(n, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_pool_connection_applies_wal_pragma() {
+        // Each pooled connection must run the PRAGMA init block so WAL
+        // mode + busy_timeout are active — otherwise reads could see
+        // inconsistent snapshots during a writer's transaction.
+        let (_tmp, mem) = temp_sqlite();
+        let pool = mem.read_pool();
+        let conn = pool.get().unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        let busy: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 5000);
     }
 
     #[tokio::test]

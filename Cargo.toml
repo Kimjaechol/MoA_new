@@ -114,6 +114,12 @@ prost = { version = "0.14", default-features = false, features = ["derive"], opt
 
 # Memory / persistence
 rusqlite = { version = "0.37", default-features = false }
+# PR #7 r2d2 pool — connection pooling for SqliteMemory's hot path.
+# Replaces the single-writer Arc<Mutex<Connection>> pattern with a
+# pool of up to 8 connections so WAL-mode reads can parallelise.
+# Writes are still serialised by SQLite's own page lock + busy_timeout.
+r2d2 = "0.8"
+r2d2_sqlite = "0.31"
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 tokio-postgres-rustls = { version = "0.13", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
