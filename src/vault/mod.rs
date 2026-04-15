@@ -8,11 +8,14 @@
 // delta-journal sync to peers → unified parallel search with first brain.
 
 pub mod briefing;
+pub mod converter;
 pub mod health;
 pub mod hub;
 pub mod ingest;
 pub mod llm_engine;
 pub mod schema;
+pub mod scheduler;
+pub mod slm_engine;
 pub mod store;
 pub mod unified_search;
 pub mod watcher;

@@ -15,6 +15,7 @@
 // authoritative via checksum uniqueness — restart is safe even without
 // the seen-map: repeated files are detected as `already_present`.
 
+use super::converter::{ConvertOutcome, Converter, NoopConverter};
 use super::ingest::{IngestInput, SourceType};
 use super::store::VaultStore;
 use anyhow::Result;
@@ -33,6 +34,14 @@ pub struct FolderWatcher {
     seen: Mutex<HashMap<PathBuf, SystemTime>>,
     device_id: String,
     domain: String,
+    /// Converter chain for non-plaintext files (hwp/docx/pdf/...).
+    /// Defaults to `NoopConverter`; callers inject a production chain
+    /// via `with_converter`.
+    converter: Arc<dyn Converter>,
+    /// Output directory for dual-format artifacts (.moa-vault/converted/).
+    /// If None, converted output isn't written to disk (still ingested
+    /// into SQLite). Set via `with_converted_dir`.
+    converted_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -57,7 +66,22 @@ impl FolderWatcher {
             seen: Mutex::new(HashMap::new()),
             device_id: device_id.into(),
             domain: domain.into(),
+            converter: Arc::new(NoopConverter),
+            converted_dir: None,
         }
+    }
+
+    /// Inject a production converter chain for HWP/DOCX/PDF/... files.
+    pub fn with_converter(mut self, converter: Arc<dyn Converter>) -> Self {
+        self.converter = converter;
+        self
+    }
+
+    /// Write converted .md + .html artifacts into this directory
+    /// (created if missing). Typically `<root>/.moa-vault/converted/`.
+    pub fn with_converted_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.converted_dir = Some(dir.into());
+        self
     }
 
     /// Walk the folder once and ingest any new/modified supported files.
@@ -94,24 +118,32 @@ impl FolderWatcher {
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_default();
 
-            let markdown: Option<String> = match ext.as_str() {
-                "md" | "markdown" | "txt" => std::fs::read_to_string(&path).ok(),
-                "hwp" | "hwpx" | "docx" | "pdf" => {
-                    // Phase 5 follow-up: wire `src/tools/document_pipeline.rs`
-                    // converters here to produce MD+HTML. For now we skip +
-                    // log so the watcher never blocks on a format it can't
-                    // handle yet.
-                    tracing::info!(
-                        path = %path.display(),
-                        "FolderWatcher: {ext} conversion pending — skipped"
-                    );
-                    stats.skipped += 1;
-                    None
-                }
-                _ => {
-                    stats.skipped += 1;
-                    None
-                }
+            let (markdown, html): (Option<String>, Option<String>) = match ext.as_str() {
+                "md" | "markdown" | "txt" => (std::fs::read_to_string(&path).ok(), None),
+                _ => match self.converter.convert(&path).await {
+                    ConvertOutcome::Ok(c) => {
+                        // Persist dual-format artifacts to .moa-vault/converted/
+                        // if a directory was configured.
+                        if let Some(ref out_dir) = self.converted_dir {
+                            if let Err(e) = write_artifacts(out_dir, &path, &c) {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    "failed to write converted artifacts: {e}"
+                                );
+                            }
+                        }
+                        (Some(c.markdown), c.html)
+                    }
+                    ConvertOutcome::Unsupported => {
+                        stats.skipped += 1;
+                        (None, None)
+                    }
+                    ConvertOutcome::Failed(e) => {
+                        tracing::warn!(path = %path.display(), "converter failed: {e}");
+                        stats.errors += 1;
+                        (None, None)
+                    }
+                },
             };
 
             if let Some(md) = markdown {
@@ -130,7 +162,7 @@ impl FolderWatcher {
                         original_path: Some(&original_path_str),
                         title: title_guess.as_deref(),
                         markdown: &md,
-                        html_content: None,
+                        html_content: html.as_deref(),
                         doc_type: Some(ext.as_str()),
                         domain: &self.domain,
                     })
@@ -177,6 +209,21 @@ impl FolderWatcher {
             }
         }
     }
+}
+
+fn write_artifacts(out_dir: &Path, src: &Path, c: &crate::vault::converter::Converted) -> Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("converted");
+    let md_path = out_dir.join(format!("{stem}.md"));
+    std::fs::write(&md_path, &c.markdown)?;
+    if let Some(ref html) = c.html {
+        let html_path = out_dir.join(format!("{stem}.html"));
+        std::fs::write(&html_path, html)?;
+    }
+    Ok(())
 }
 
 fn collect_paths(root: &Path, max_depth: u32) -> Result<Vec<PathBuf>> {
@@ -282,6 +329,73 @@ mod tests {
         let stats = watcher.scan_once().await.unwrap();
         assert_eq!(stats.newly_ingested, 1);
         assert!(stats.skipped >= 1);
+    }
+
+    /// Stub converter that always returns fixed markdown/html for .docx.
+    struct DocxStubConverter;
+    #[async_trait::async_trait]
+    impl super::super::converter::Converter for DocxStubConverter {
+        fn name(&self) -> &'static str {
+            "docx_stub"
+        }
+        async fn convert(
+            &self,
+            path: &std::path::Path,
+        ) -> super::super::converter::ConvertOutcome {
+            if path.extension().and_then(|e| e.to_str()) == Some("docx") {
+                super::super::converter::ConvertOutcome::Ok(
+                    super::super::converter::Converted {
+                        markdown: format!(
+                            "# 변환 결과\n\n본문 민법 제750조 설명. {body}",
+                            body = "본문 ".repeat(500)
+                        ),
+                        html: Some("<h1>변환</h1>".into()),
+                        source_ext: "docx".into(),
+                    },
+                )
+            } else {
+                super::super::converter::ConvertOutcome::Unsupported
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn converter_routes_docx_to_ingest() {
+        let (tmp, vault) = setup();
+        std::fs::write(tmp.path().join("contract.docx"), b"binary").unwrap();
+        let out_dir = tmp.path().join(".moa-vault/converted");
+        let watcher = FolderWatcher::new(tmp.path(), vault.clone(), "dev", "legal")
+            .with_converter(Arc::new(DocxStubConverter))
+            .with_converted_dir(&out_dir);
+        let stats = watcher.scan_once().await.unwrap();
+        assert_eq!(stats.newly_ingested, 1);
+        // Dual-format artifacts produced.
+        assert!(out_dir.join("contract.md").exists());
+        assert!(out_dir.join("contract.html").exists());
+    }
+
+    #[tokio::test]
+    async fn converter_failure_increments_errors() {
+        struct FailingConverter;
+        #[async_trait::async_trait]
+        impl super::super::converter::Converter for FailingConverter {
+            fn name(&self) -> &'static str {
+                "fail"
+            }
+            async fn convert(
+                &self,
+                _path: &std::path::Path,
+            ) -> super::super::converter::ConvertOutcome {
+                super::super::converter::ConvertOutcome::Failed(anyhow::anyhow!("boom"))
+            }
+        }
+        let (tmp, vault) = setup();
+        std::fs::write(tmp.path().join("x.docx"), b"").unwrap();
+        let watcher = FolderWatcher::new(tmp.path(), vault.clone(), "dev", "legal")
+            .with_converter(Arc::new(FailingConverter));
+        let stats = watcher.scan_once().await.unwrap();
+        assert!(stats.errors >= 1);
+        assert_eq!(stats.newly_ingested, 0);
     }
 
     #[tokio::test]
