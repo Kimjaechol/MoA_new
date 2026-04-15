@@ -158,6 +158,64 @@ impl SecurityHooks {
         }
     }
 
+    /// pii_masker: mask sensitive personal data before sending to external LLMs.
+    ///
+    /// Masks:
+    /// - Korean residential numbers (NNNNNN-NNNNNNN)
+    /// - Credit card numbers (reveals last 4 digits only)
+    /// - Phone numbers (reveals last 4 digits only)
+    /// - Email addresses (preserves domain, masks local part)
+    pub fn pii_masker(text: &str) -> String {
+        let mut out = text.to_string();
+
+        // Order matters: specific patterns first (RRN, phone) before generic cards.
+        // Korean RRN: NNNNNN-NNNNNNN → NNNNNN-*******
+        out = mask_rrn(&out);
+        // Phone: 010/011/070 + digits → ***-****-NNNN
+        out = mask_phones(&out);
+        // Credit card: 13-19 digit sequences → masked prefix + last 4
+        out = mask_cards(&out);
+        // Email: local@domain → l***@domain
+        out = mask_emails(&out);
+
+        out
+    }
+
+    /// payment_trace: build a structured audit entry for Layer C operations.
+    /// Returns a JSON string ready for moa-bridge audit-append.
+    pub fn payment_trace(
+        stage: &str,
+        provider: &str,
+        amount: u64,
+        merchant: &str,
+        workflow: &str,
+    ) -> String {
+        serde_json::json!({
+            "stage": stage,
+            "provider": provider,
+            "amount_krw": amount,
+            "merchant": merchant,
+            "workflow": workflow,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        })
+        .to_string()
+    }
+
+    /// device_integrity: gate that requires the device to be trusted
+    /// (Play Integrity / DeviceCheck result stored in HookContext).
+    pub fn device_integrity(ctx: &HookContext) -> HookDecision {
+        if ctx.device_trusted {
+            HookDecision::Allow
+        } else {
+            HookDecision::Deny(
+                "Device integrity check failed (Play Integrity / DeviceCheck)".to_string(),
+            )
+        }
+    }
+
     /// amount_guard: verify an upcoming transaction fits within caps.
     pub fn amount_guard(amount_krw: u64, ctx: &HookContext) -> HookDecision {
         if amount_krw == 0 {
@@ -192,6 +250,164 @@ pub fn enforce(decision: HookDecision) -> Result<()> {
         HookDecision::RequireConfirm(msg) => bail!("consent required: {msg}"),
         HookDecision::Deny(msg) => bail!("denied: {msg}"),
     }
+}
+
+// ── PII masking helpers ──────────────────────────────────────────
+
+fn mask_cards(input: &str) -> String {
+    // Match 13-19 digit sequences (optionally with - or space separators)
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // Try to match a card-like sequence
+        let mut digits = String::new();
+        let mut raw_len = 0;
+        let mut j = i;
+        while j < chars.len() && digits.len() < 20 {
+            let c = chars[j];
+            if c.is_ascii_digit() {
+                digits.push(c);
+                raw_len += 1;
+            } else if (c == '-' || c == ' ') && !digits.is_empty() && raw_len < 24 {
+                raw_len += 1;
+            } else {
+                break;
+            }
+            j += 1;
+        }
+        if digits.len() >= 13 && digits.len() <= 19 {
+            // Mask: show last 4 digits only
+            let masked_prefix: String = digits.chars().take(digits.len() - 4).map(|_| '*').collect();
+            let last4: String = digits.chars().skip(digits.len() - 4).collect();
+            out.push_str(&format!("{masked_prefix}{last4}"));
+            i += raw_len;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn mask_rrn(input: &str) -> String {
+    // Korean RRN: NNNNNN-NNNNNNN → NNNNNN-*******
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 14 <= chars.len() {
+            let window: String = chars[i..i + 14].iter().collect();
+            if is_rrn(&window) {
+                out.push_str(&window[..7]);
+                out.push_str("*******");
+                i += 14;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn is_rrn(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 14 {
+        return false;
+    }
+    for (idx, b) in bytes.iter().enumerate() {
+        if idx == 6 {
+            if *b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_digit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn mask_phones(input: &str) -> String {
+    // 010-NNNN-NNNN or 01012345678 → ***-****-NNNN
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // Try with separators first
+        let tail = &chars[i..].iter().collect::<String>();
+        if let Some((raw_len, matched)) = try_phone_match(tail) {
+            // Extract digits, show last 4
+            let digits: String = matched.chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits.len() >= 10 {
+                let last4: String = digits.chars().skip(digits.len() - 4).collect();
+                out.push_str(&format!("***-****-{last4}"));
+                i += raw_len;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn try_phone_match(tail: &str) -> Option<(usize, String)> {
+    let prefixes = ["010", "011", "016", "017", "018", "019", "070"];
+    for p in &prefixes {
+        if tail.starts_with(p) {
+            // Consume p + remaining digits with optional separators
+            let mut raw_len = p.len();
+            let mut matched = p.to_string();
+            let chars: Vec<char> = tail.chars().skip(p.len()).collect();
+            let mut digit_count = 0;
+            for c in chars.iter() {
+                if c.is_ascii_digit() {
+                    matched.push(*c);
+                    raw_len += 1;
+                    digit_count += 1;
+                    if digit_count >= 8 {
+                        return Some((raw_len, matched));
+                    }
+                } else if (*c == '-' || *c == ' ') && digit_count < 8 {
+                    matched.push(*c);
+                    raw_len += 1;
+                } else {
+                    break;
+                }
+            }
+            if digit_count >= 7 {
+                return Some((raw_len, matched));
+            }
+        }
+    }
+    None
+}
+
+fn mask_emails(input: &str) -> String {
+    // local@domain → l***@domain (preserves domain for routing debug)
+    let mut out = String::with_capacity(input.len());
+    for word in input.split_inclusive(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        if let Some(at_pos) = word.find('@') {
+            // Extract trailing whitespace/punctuation
+            let (email_part, sep) = {
+                let end = word.find(|c: char| c.is_whitespace() || c == ',' || c == ';').unwrap_or(word.len());
+                (&word[..end], &word[end..])
+            };
+            if let Some(at) = email_part.find('@') {
+                let local = &email_part[..at];
+                let domain = &email_part[at..];
+                if local.len() >= 2 && domain.contains('.') {
+                    let first: String = local.chars().take(1).collect();
+                    out.push_str(&format!("{first}***{domain}{sep}"));
+                    continue;
+                }
+            }
+            let _ = at_pos;
+        }
+        out.push_str(word);
+    }
+    out
 }
 
 // Allow ConsentLevel comparison via <, >= for hierarchy checks.
@@ -360,6 +576,90 @@ mod tests {
         );
         assert!(matches!(
             SecurityHooks::amount_guard(10_001, &ctx),
+            HookDecision::Deny(_)
+        ));
+    }
+
+    // ── pii_masker tests ────────────────────────────────────────
+
+    #[test]
+    fn mask_credit_card_number() {
+        let out = SecurityHooks::pii_masker("카드: 1234-5678-9012-3456 사용");
+        assert!(!out.contains("1234-5678"));
+        assert!(out.contains("3456"));
+        assert!(out.contains("****"));
+    }
+
+    #[test]
+    fn mask_plain_card_digits() {
+        let out = SecurityHooks::pii_masker("card 1234567890123456 end");
+        assert!(out.contains("3456"));
+        assert!(!out.contains("1234567890123456"));
+    }
+
+    #[test]
+    fn mask_rrn() {
+        let out = SecurityHooks::pii_masker("주민: 901231-1234567 입니다");
+        assert!(out.contains("901231-*******"));
+        assert!(!out.contains("1234567"));
+    }
+
+    #[test]
+    fn mask_phone_dashed() {
+        let out = SecurityHooks::pii_masker("010-1234-5678 연락");
+        assert!(out.contains("5678"));
+        assert!(!out.contains("1234-5678"));
+    }
+
+    #[test]
+    fn mask_email() {
+        let out = SecurityHooks::pii_masker("contact alice@example.com pls");
+        assert!(out.contains("@example.com"));
+        assert!(out.contains("***"));
+        assert!(!out.contains("alice@"));
+    }
+
+    #[test]
+    fn mask_preserves_non_pii() {
+        let out = SecurityHooks::pii_masker("Hello world, nothing sensitive");
+        assert_eq!(out, "Hello world, nothing sensitive");
+    }
+
+    // ── payment_trace tests ─────────────────────────────────────
+
+    #[test]
+    fn payment_trace_returns_json() {
+        let trace = SecurityHooks::payment_trace(
+            "pre_invoke",
+            "passkey",
+            50_000,
+            "coupang",
+            "one_time",
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&trace).unwrap();
+        assert_eq!(parsed["stage"], "pre_invoke");
+        assert_eq!(parsed["provider"], "passkey");
+        assert_eq!(parsed["amount_krw"], 50_000);
+        assert_eq!(parsed["merchant"], "coupang");
+    }
+
+    // ── device_integrity tests ──────────────────────────────────
+
+    #[test]
+    fn device_integrity_allows_trusted() {
+        let ctx = ctx_base();
+        assert_eq!(
+            SecurityHooks::device_integrity(&ctx),
+            HookDecision::Allow
+        );
+    }
+
+    #[test]
+    fn device_integrity_denies_untrusted() {
+        let mut ctx = ctx_base();
+        ctx.device_trusted = false;
+        assert!(matches!(
+            SecurityHooks::device_integrity(&ctx),
             HookDecision::Deny(_)
         ));
     }

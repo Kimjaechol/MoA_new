@@ -44,6 +44,71 @@ pub fn bundled_skills() -> HashMap<&'static str, &'static str> {
         "shopping.audit_log_payment",
         include_str!("skills/shopping/audit_log_payment.yaml"),
     );
+    // ── Shopping skills (Phase 2: 15 extended) ─────────────────
+    m.insert(
+        "shopping.search_naver_api",
+        include_str!("skills/shopping/search_naver_api.yaml"),
+    );
+    m.insert(
+        "shopping.compare_danawa",
+        include_str!("skills/shopping/compare_danawa.yaml"),
+    );
+    m.insert(
+        "shopping.goto_checkout",
+        include_str!("skills/shopping/goto_checkout.yaml"),
+    );
+    m.insert(
+        "shopping.fill_shipping",
+        include_str!("skills/shopping/fill_shipping.yaml"),
+    );
+    m.insert(
+        "shopping.compliance_check",
+        include_str!("skills/shopping/compliance_check.yaml"),
+    );
+    m.insert(
+        "shopping.tos_for_site",
+        include_str!("skills/shopping/tos_for_site.yaml"),
+    );
+    m.insert(
+        "shopping.preload_ticket_page",
+        include_str!("skills/shopping/preload_ticket_page.yaml"),
+    );
+    m.insert(
+        "shopping.seat_assist",
+        include_str!("skills/shopping/seat_assist.yaml"),
+    );
+    m.insert(
+        "shopping.parse_receipt",
+        include_str!("skills/shopping/parse_receipt.yaml"),
+    );
+    m.insert(
+        "shopping.image_search_to_query",
+        include_str!("skills/shopping/image_search_to_query.yaml"),
+    );
+    m.insert(
+        "shopping.coupon_finder",
+        include_str!("skills/shopping/coupon_finder.yaml"),
+    );
+    m.insert(
+        "shopping.apply_coupons",
+        include_str!("skills/shopping/apply_coupons.yaml"),
+    );
+    m.insert(
+        "shopping.price_watch",
+        include_str!("skills/shopping/price_watch.yaml"),
+    );
+    m.insert(
+        "shopping.return_request",
+        include_str!("skills/shopping/return_request.yaml"),
+    );
+    m.insert(
+        "shopping.gift_recommender",
+        include_str!("skills/shopping/gift_recommender.yaml"),
+    );
+    m.insert(
+        "shopping.outfit_from_weather",
+        include_str!("skills/shopping/outfit_from_weather.yaml"),
+    );
     m
 }
 

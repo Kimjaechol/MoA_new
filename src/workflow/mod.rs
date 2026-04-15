@@ -9,6 +9,7 @@
 //   exec.rs    — WorkflowSpec + inputs → execution with cost tracking
 //   registry.rs — tool permission whitelist
 
+pub mod audit;
 pub mod exec;
 pub mod hooks;
 pub mod intent;

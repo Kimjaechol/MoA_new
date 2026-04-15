@@ -68,12 +68,40 @@ pub const SHOPPING_PRESETS: &[Preset] = &[
         yaml: include_str!("presets/shopping/01_product_search.yaml"),
     },
     Preset {
+        slug: "shopping_02_seasonal_outfit",
+        yaml: include_str!("presets/shopping/02_seasonal_outfit.yaml"),
+    },
+    Preset {
+        slug: "shopping_03a_recurring_register",
+        yaml: include_str!("presets/shopping/03a_recurring_register.yaml"),
+    },
+    Preset {
         slug: "shopping_03b_recurring_execute",
         yaml: include_str!("presets/shopping/03b_recurring_execute.yaml"),
     },
     Preset {
         slug: "shopping_04_one_time_purchase",
         yaml: include_str!("presets/shopping/04_one_time_purchase.yaml"),
+    },
+    Preset {
+        slug: "shopping_05_gift_recommendation",
+        yaml: include_str!("presets/shopping/05_gift_recommendation.yaml"),
+    },
+    Preset {
+        slug: "shopping_06_open_run_ticket",
+        yaml: include_str!("presets/shopping/06_open_run_ticket.yaml"),
+    },
+    Preset {
+        slug: "shopping_07_price_drop_watch",
+        yaml: include_str!("presets/shopping/07_price_drop_watch.yaml"),
+    },
+    Preset {
+        slug: "shopping_08_coupon_max_discount",
+        yaml: include_str!("presets/shopping/08_coupon_max_discount.yaml"),
+    },
+    Preset {
+        slug: "shopping_09_return_refund",
+        yaml: include_str!("presets/shopping/09_return_refund.yaml"),
     },
 ];
 
