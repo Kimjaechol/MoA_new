@@ -3645,6 +3645,8 @@ SourceType::ChatPaste char_count:
 | **#3 FTS5 trigram + 적응형 가중치** | ✅ 완료 | `memories_fts`·`vault_docs_fts` 모두 `tokenize='trigram'`. `src/vault/normalize.rs` 신설(fullwidth→halfwidth + whitespace squeeze) · `korean_char_ratio` · `adaptive_weights` 언어 적응형(한 0.25/0.75, 영 0.4/0.6). `search_fts`가 normalize 적용. | `src/memory/sqlite.rs:232–239` · `src/vault/schema.rs:112–120` · `src/vault/normalize.rs` · `src/vault/store.rs::search_fts` |
 | **#7 PRAGMA 부분** | ✅ 기존 설정 검증 | 이미 `PRAGMA journal_mode=WAL; synchronous=NORMAL; busy_timeout=5000; cache_size=-2000; temp_store=MEMORY;` 적용됨. `src/memory/sqlite.rs:144–159`. HLC/r2d2 pool은 후속 세션. | `src/memory/sqlite.rs:144` |
 | **#1 아키텍처** | ✅ 완료 (ONNX 통합은 feature-gated) | `src/memory/embeddings.rs` → `src/memory/embedding/` 디렉토리 분리 (mod/noop/openai/custom_http/local_fastembed). Trait에 `model()`·`version()` 추가 → PR #2 메타컬럼 공급 가능. `PROVIDER_*` 상수 4종 (`local_fastembed`/`openai`/`custom_http`/`none`). `fastembed = "5"`를 `embedding-local` feature로 **opt-in** 추가 (기본 빌드에 ONNX 런타임 미포함 → 바이너리 크기 목표 유지). Feature off 시 `LocalFastembedStub`이 `embed()`에서 안내 에러 반환. `doctor::embedding_provider_validation_error`가 `local_fastembed`/`openrouter` 수용. 기존 `memory::embeddings::*` 경로 유지 (`pub use embedding as embeddings` 호환 alias). | `src/memory/embedding/{mod,noop,openai,custom_http,local_fastembed}.rs` · `Cargo.toml` (fastembed optional + `embedding-local` feature) · `src/doctor/mod.rs::embedding_provider_validation_error` |
+| **#7 HLC** | ✅ 완료 | 신설 `src/sync/hlc.rs` — `Hlc { wall_ms, logical, node_id }` 구조체 + `HlcClock` lock-free 시계 (packed u64 CAS). `encode()`/`parse()` 라운드트립, 5분 시계 스큐 수용 (`update_bumps_past_remote_under_5min_clock_skew` 테스트), 8스레드 800 tick 동시성에서 단조성 보장. 13 테스트 pass. 스키마 마이그레이션(`memories.updated_at` → HLC 문자열)은 sync protocol 버전 bump와 함께 별도 PR로 분리. | `src/sync/hlc.rs` · `src/sync/mod.rs` |
+| **#7 Credit TOCTOU** | ✅ 완료 | `src/billing/payment.rs`에 `ReservationId` 타입 + `reserve_credits(user, max)` / `commit_reservation(rid, actual)` / `cancel_reservation(rid)` 추가. `credit_reservations` 테이블 신설 (open/committed/cancelled). 예약은 원자적 `UPDATE … WHERE balance >= ?`으로 음수 잔액 불가능. 10스레드 fuzz 테스트 (`fuzz_concurrent_reservations_never_go_negative`)로 동시성 검증. 10개 신규 테스트 pass. | `src/billing/payment.rs::{reserve_credits,commit_reservation,cancel_reservation}` |
 
 #### 후속 세션 실행 스펙 (PR #1 실데이터 검증 · #4 · #5 · #6 · #7 나머지 · #8 · #9)
 
@@ -3674,11 +3676,11 @@ SourceType::ChatPaste char_count:
 - **Decay**: `decay_score = ln(recall_count+1) × exp(-days / half_life) + 0.1`. `half_life` 카테고리별 (identity=∞, work=365, chat=30). 매일 배치 `UPDATE memories SET decay_score=?`. `decay_score<0.05` → `archived=1` 소프트 삭제.
 - **수락 기준**: "나는 변호사다" 50회 → `consolidated_fact` 1개 + `archived=50`. identity decay되지 않음. 아카이브 UI로 복구 가능.
 
-##### PR #7 (나머지) — HLC + r2d2 pool + credit atomicity
-- **HLC**: 신설 `src/sync/hlc.rs`. `Hlc { wall_ms, logical, node_id }` CockroachDB 스타일. `memories.updated_at` 등 타임스탬프 컬럼을 HLC 문자열(`{wall_ms}.{logical}.{node}`)로 교체.
-- **r2d2**: Cargo에 `r2d2 = "0.8"` + `r2d2_sqlite`. 기존 `Arc<Mutex<Connection>>` → `Pool<SqliteConnectionManager>` (크기 8). 읽기 병렬화, 쓰기만 직렬.
-- **TOCTOU**: `src/billing/payment.rs::reserve_credits(user_id, max) → ReservationId`, `commit_reservation(rid, actual)`. SQL `UPDATE balances SET balance = balance - ? WHERE user_id = ? AND balance >= ? RETURNING balance`.
-- **수락 기준**: 5분 시계 차이에서 HLC 순서 정확 / fuzz 10 동시 차감에서 잔액 음수 불가 / 읽기 8스레드 데드락 없음.
+##### PR #7 (잔여) — r2d2 pool + HLC 통합
+- **완료 범위** (별도 커밋): HLC 모듈 (`src/sync/hlc.rs`, 13 테스트) + Credit 예약 원자성 (reserve/commit/cancel, 10 테스트 · 10스레드 fuzz). 두 수락 기준 모두 충족.
+- **잔여 1 — r2d2 pool**: Cargo에 `r2d2 = "0.8"` + `r2d2_sqlite`. 현재 `Arc<Mutex<Connection>>` 패턴이 `src/memory/{sqlite,document_store}.rs` · `src/vault/store.rs` · `src/billing/*` · `src/phone/*` 등 10+ 크레이트 경계에 퍼져 있음. 단일 커밋 범위로는 너무 커서 별도 sprint 권장. 이행 순서: (1) 내부 핫패스부터 pool 도입(SqliteMemory), (2) vault_store, (3) 나머지. 각 단계에서 `r2d2 pool size=8` + 읽기 병렬화 벤치마크 필요.
+- **잔여 2 — HLC 스키마 통합**: `memories.updated_at` / `vault_documents.updated_at` / sync delta 타임스탬프를 `TEXT NOT NULL` HLC 문자열로 교체. 스키마 마이그레이션 + sync protocol version bump 동반 필요 — 장애 복구 경로 검증 후 진행.
+- **수락 기준 (잔여분)**: r2d2 8스레드 읽기 데드락 없음, 마이그레이션 후 기존 시간 비교 API 호환.
 
 ##### PR #8 — RAGAS Evaluation Harness
 - **목표**: `faithfulness / answer_relevance / context_precision / context_recall` 자동 측정 + CI 통합.
