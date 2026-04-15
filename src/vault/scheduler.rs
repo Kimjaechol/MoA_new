@@ -29,6 +29,10 @@ pub struct VaultScheduler {
     last_health_check: Arc<Mutex<Option<Instant>>>,
     idle_threshold: Duration,
     health_cadence: Duration,
+    /// Number of hub compiles per idle tick (Plan §7-5 worker budget).
+    hub_batch_size: usize,
+    /// Max concurrent hub compiles per batch.
+    hub_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -46,6 +50,8 @@ impl VaultScheduler {
             last_health_check: Arc::new(Mutex::new(None)),
             idle_threshold: DEFAULT_IDLE_THRESHOLD,
             health_cadence: DEFAULT_HEALTH_CADENCE,
+            hub_batch_size: 4,
+            hub_concurrency: 2,
         }
     }
 
@@ -56,6 +62,18 @@ impl VaultScheduler {
 
     pub fn with_health_cadence(mut self, t: Duration) -> Self {
         self.health_cadence = t;
+        self
+    }
+
+    /// Override how many hubs to compile per idle tick (default 4).
+    pub fn with_hub_batch_size(mut self, n: usize) -> Self {
+        self.hub_batch_size = n;
+        self
+    }
+
+    /// Override max concurrent hub compiles within one batch (default 2).
+    pub fn with_hub_concurrency(mut self, n: usize) -> Self {
+        self.hub_concurrency = n;
         self
     }
 
@@ -78,23 +96,23 @@ impl VaultScheduler {
             return Ok(stats);
         }
 
-        // 1. Hub compile queue — process one candidate per tick so the
-        //    loop stays responsive to wake-ups.
-        if let Some(entity) = hub::compile_queue_next(&self.vault)? {
-            match hub::incremental_update(&self.vault, &entity) {
-                Ok((impact, _r)) => {
-                    tracing::debug!(
-                        entity = %entity,
-                        ?impact,
-                        "scheduler compiled hub"
-                    );
-                    stats.hubs_compiled += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(entity = %entity, "hub compile failed: {e}");
-                }
-            }
+        // 1. Hub compile queue — batch-compile up to `hub_batch_size`
+        //    candidates with `hub_concurrency` parallel workers per batch.
+        let batch = hub::compile_batch(
+            self.vault.clone(),
+            self.hub_batch_size,
+            self.hub_concurrency,
+        )
+        .await
+        .unwrap_or_default();
+        for (entity, impact) in &batch {
+            tracing::debug!(
+                entity = %entity,
+                ?impact,
+                "scheduler compiled hub (batch)"
+            );
         }
+        stats.hubs_compiled += batch.len();
 
         // 2. Periodic health check.
         let should_check = {

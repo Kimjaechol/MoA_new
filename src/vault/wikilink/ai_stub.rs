@@ -70,6 +70,58 @@ pub trait AIEngine: Send + Sync {
     ) -> anyhow::Result<BriefingNarrative> {
         Ok(BriefingNarrative::default())
     }
+
+    /// Assign each backlinked document to one or more skeleton sections
+    /// of the hub note. Returns a vector aligned with `docs` where each
+    /// entry is the list of section indices (0-based) the doc belongs to.
+    /// Empty vectors are permitted (doc not pinned to any section).
+    ///
+    /// Default: hash-mod distribution (`doc_id mod section_count`) so
+    /// every doc lands in exactly one section — matches the historical
+    /// behaviour before this trait method existed.
+    async fn assign_hub_sections(
+        &self,
+        _subtype: &str,
+        sections: &[&str],
+        docs: &[(i64, String, String)], // (doc_id, title, content_preview)
+    ) -> anyhow::Result<Vec<Vec<usize>>> {
+        let n = sections.len().max(1);
+        Ok(docs
+            .iter()
+            .map(|(id, _, _)| vec![id.unsigned_abs() as usize % n])
+            .collect())
+    }
+
+    /// Detect contradictions among a set of claims about the same entity.
+    /// Default: empty — only LlmAIEngine produces real detections.
+    async fn detect_contradictions(
+        &self,
+        _entity: &str,
+        _claims: &[ContentClaim],
+    ) -> anyhow::Result<Vec<Contradiction>> {
+        Ok(Vec::new())
+    }
+}
+
+/// A single factual statement extracted from a vault document, used as
+/// input to `AIEngine::detect_contradictions`.
+#[derive(Debug, Clone)]
+pub struct ContentClaim {
+    pub doc_id: i64,
+    pub title: String,
+    /// ≤500 char snippet centred on the entity mention.
+    pub statement: String,
+}
+
+/// A detected contradiction between two documents about the same entity.
+#[derive(Debug, Clone)]
+pub struct Contradiction {
+    pub left_doc_id: i64,
+    pub right_doc_id: i64,
+    /// Short human-readable summary (e.g. "A says 2024-01-01, B says 2026-04-01").
+    pub description: String,
+    /// 1 (minor) – 10 (fundamental / case-altering)
+    pub severity: u8,
 }
 
 /// Provider-free default. Strategy:

@@ -10,7 +10,7 @@
 
 use crate::providers::traits::Provider;
 use crate::vault::wikilink::{
-    ai_stub::{BriefingNarrative, HeuristicAIEngine},
+    ai_stub::{BriefingNarrative, ContentClaim, Contradiction, HeuristicAIEngine},
     AIEngine, CompoundToken, GatekeepVerdict, KeyConcept,
 };
 use async_trait::async_trait;
@@ -162,6 +162,141 @@ JSON만 반환:\n{{\"kept\":[\"...\"],\"synonyms\":[[\"대표표현\",\"원문�
             Err(e) => {
                 tracing::warn!("LlmAIEngine gatekeep parse failed: {e}; falling back");
                 self.fallback.gatekeep(candidates, doc_preview).await
+            }
+        }
+    }
+
+    async fn assign_hub_sections(
+        &self,
+        subtype: &str,
+        sections: &[&str],
+        docs: &[(i64, String, String)],
+    ) -> anyhow::Result<Vec<Vec<usize>>> {
+        if docs.is_empty() || sections.is_empty() {
+            return Ok(Vec::new());
+        }
+        let section_list = sections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("  {i}: {s}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let doc_block = docs
+            .iter()
+            .map(|(id, title, preview)| {
+                format!(
+                    "[Doc-{id}] {title}\n발췌: {}",
+                    preview.chars().take(350).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let prompt = format!(
+            "당신은 법률 허브노트 편집자. 아래 {subtype} 허브의 각 섹션에 어떤 \
+백링크 문서를 매핑할지 결정하세요. 각 문서는 **1개 이상의** 섹션에 속할 수 \
+있습니다. 관련 없으면 빈 배열.\n\n\
+반환: JSON 객체 {{\"assignments\":[[섹션번호,...], ...]}} — 배열 길이는 \
+입력 문서 수와 같아야 합니다. 오직 JSON만.\n\n\
+섹션:\n{section_list}\n\n문서:\n{doc_block}"
+        );
+        let raw = match self
+            .provider
+            .simple_chat(&prompt, &self.model, DEFAULT_TEMPERATURE)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("assign_hub_sections call failed, falling back: {e}");
+                return self.fallback.assign_hub_sections(subtype, sections, docs).await;
+            }
+        };
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            assignments: Vec<Vec<usize>>,
+        }
+        match extract_json_object::<Resp>(&raw) {
+            Ok(r) if r.assignments.len() == docs.len() => Ok(r.assignments),
+            Ok(_) => {
+                tracing::warn!("assign_hub_sections length mismatch; falling back");
+                self.fallback.assign_hub_sections(subtype, sections, docs).await
+            }
+            Err(e) => {
+                tracing::warn!("assign_hub_sections parse failed: {e}; falling back");
+                self.fallback.assign_hub_sections(subtype, sections, docs).await
+            }
+        }
+    }
+
+    async fn detect_contradictions(
+        &self,
+        entity: &str,
+        claims: &[ContentClaim],
+    ) -> anyhow::Result<Vec<Contradiction>> {
+        if claims.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let claim_block = claims
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                format!(
+                    "[{i}] Doc-{} {title}\n  주장: {statement}",
+                    c.doc_id,
+                    title = c.title,
+                    statement = c.statement.chars().take(400).collect::<String>(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let prompt = format!(
+            "엔티티 '{entity}'에 대한 아래 주장들을 비교해 **사실이 충돌하는 \
+쌍**을 찾으세요. 사실 진술이 아닌 의견 차이는 제외. 충돌 없으면 빈 배열. \
+JSON만: {{\"contradictions\":[{{\"left\":<idx>,\"right\":<idx>,\
+\"description\":\"짧은 요약\",\"severity\":1-10}}]}}\n\n주장:\n{claim_block}"
+        );
+        let raw = match self
+            .provider
+            .simple_chat(&prompt, &self.model, DEFAULT_TEMPERATURE)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("detect_contradictions call failed, falling back: {e}");
+                return Ok(Vec::new());
+            }
+        };
+        #[derive(Deserialize)]
+        struct Item {
+            left: usize,
+            right: usize,
+            #[serde(default)]
+            description: String,
+            #[serde(default)]
+            severity: u8,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            contradictions: Vec<Item>,
+        }
+        match extract_json_object::<Resp>(&raw) {
+            Ok(r) => Ok(r
+                .contradictions
+                .into_iter()
+                .filter_map(|it| {
+                    let (l, r) = (claims.get(it.left)?, claims.get(it.right)?);
+                    Some(Contradiction {
+                        left_doc_id: l.doc_id,
+                        right_doc_id: r.doc_id,
+                        description: it.description,
+                        severity: it.severity.clamp(1, 10),
+                    })
+                })
+                .collect()),
+            Err(e) => {
+                tracing::warn!("detect_contradictions parse failed: {e}");
+                Ok(Vec::new())
             }
         }
     }

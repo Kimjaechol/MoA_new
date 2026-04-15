@@ -500,6 +500,12 @@ impl VaultStore {
     pub fn connection(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
     }
+
+    /// Expose the embedder for vault modules that need to compute
+    /// embeddings of auxiliary text (e.g. `health::semantic_tag_clusters`).
+    pub fn embedder(&self) -> Arc<dyn EmbeddingProvider> {
+        self.embedder.clone()
+    }
 }
 
 // ── helpers ────────────────────────────────────────────────────────

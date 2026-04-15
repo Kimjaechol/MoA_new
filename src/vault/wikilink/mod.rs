@@ -8,7 +8,9 @@ pub mod insert;
 pub mod tokens;
 pub mod vocabulary;
 
-pub use ai_stub::{AIEngine, GatekeepVerdict, HeuristicAIEngine, KeyConcept};
+pub use ai_stub::{
+    AIEngine, ContentClaim, Contradiction, GatekeepVerdict, HeuristicAIEngine, KeyConcept,
+};
 pub use tokens::{CompoundToken, CompoundTokenKind};
 
 use anyhow::Result;

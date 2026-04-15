@@ -147,6 +147,123 @@ fn pct_penalty(offending: i64, universe: i64, max_penalty: f32) -> f32 {
     max_penalty * ratio
 }
 
+/// A cluster of tag names that the semantic detector believes refer to
+/// the same concept. `representative` is the canonical form (longest
+/// name — usually the most descriptive).
+#[derive(Debug, Clone)]
+pub struct TagCluster {
+    pub representative: String,
+    pub members: Vec<String>,
+    /// Average pairwise cosine similarity within the cluster.
+    pub avg_similarity: f32,
+}
+
+/// Cluster similar tags via cosine similarity of their embeddings.
+/// Requires a non-Noop embedder on the vault; returns empty otherwise.
+///
+/// Deterministic: single-linkage clustering with threshold; tie-breaks
+/// by lexicographic tag order.
+pub async fn semantic_tag_clusters(
+    vault: &VaultStore,
+    threshold: f32,
+) -> Result<Vec<TagCluster>> {
+    let tags: Vec<String> = {
+        let conn = vault.connection().lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT tag_name FROM vault_tags ORDER BY tag_name",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+    if tags.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    // Embed each tag. Skip tags with empty embeddings (NoopEmbedding).
+    let embedder = vault.embedder();
+    let mut embeddings: Vec<(String, Vec<f32>)> = Vec::with_capacity(tags.len());
+    for t in tags {
+        match embedder.embed_one(&t).await {
+            Ok(v) if !v.is_empty() => embeddings.push((t, v)),
+            _ => {}
+        }
+    }
+    if embeddings.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    // Single-linkage clustering.
+    let n = embeddings.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], i: usize) -> usize {
+        if p[i] == i {
+            return i;
+        }
+        let r = find(p, p[i]);
+        p[i] = r;
+        r
+    }
+    let mut sim_accum: std::collections::HashMap<(usize, usize), Vec<f32>> =
+        std::collections::HashMap::new();
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let score = crate::memory::vector::cosine_similarity(
+                &embeddings[i].1,
+                &embeddings[j].1,
+            );
+            if score >= threshold {
+                let ri = find(&mut parent, i);
+                let rj = find(&mut parent, j);
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+                let root = find(&mut parent, i);
+                sim_accum.entry((root, root)).or_default().push(score);
+            }
+        }
+    }
+
+    // Group members by root.
+    let mut groups: std::collections::HashMap<usize, Vec<String>> =
+        std::collections::HashMap::new();
+    for (idx, (tag, _)) in embeddings.iter().enumerate() {
+        let root = find(&mut parent, idx);
+        groups.entry(root).or_default().push(tag.clone());
+    }
+
+    let mut clusters: Vec<TagCluster> = Vec::new();
+    for (root, members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        // Representative: longest name (usually most descriptive).
+        let representative = members
+            .iter()
+            .max_by_key(|s| s.chars().count())
+            .cloned()
+            .unwrap_or_default();
+        let scores = sim_accum.get(&(root, root)).cloned().unwrap_or_default();
+        let avg = if scores.is_empty() {
+            0.0
+        } else {
+            scores.iter().sum::<f32>() / scores.len() as f32
+        };
+        let mut members_sorted = members;
+        members_sorted.sort();
+        clusters.push(TagCluster {
+            representative,
+            members: members_sorted,
+            avg_similarity: avg,
+        });
+    }
+    clusters.sort_by(|a, b| a.representative.cmp(&b.representative));
+    Ok(clusters)
+}
+
 /// Detect tag hygiene issues by counting approximate-duplicate pairs.
 /// A "pair" is two tags whose lowercase+whitespace-normalised forms
 /// coincide but raw strings differ (e.g. "민사/손해배상" and "민사 / 손해배상").
@@ -209,6 +326,104 @@ mod tests {
         let vault = mem_store().await;
         let report = run(&vault).unwrap();
         assert!((report.score - 100.0).abs() < 0.1);
+    }
+
+    // ── R3: Semantic tag clustering ────────────────────────────
+    use crate::memory::embeddings::EmbeddingProvider;
+    use async_trait::async_trait;
+
+    /// Deterministic fake embedder: 3-dim vector keyed on the first
+    /// character of the input. Tags sharing the first char produce
+    /// identical vectors → cosine similarity 1.0.
+    struct PrefixEmbedder;
+    #[async_trait]
+    impl EmbeddingProvider for PrefixEmbedder {
+        fn name(&self) -> &str { "prefix-fake" }
+        fn dimensions(&self) -> usize { 3 }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            let mut out = Vec::with_capacity(texts.len());
+            for t in texts {
+                let code = t.chars().next().map(|c| c as u32).unwrap_or(0) as f32;
+                let a = (code % 17.0) / 17.0;
+                let b = (code % 31.0) / 31.0;
+                let c = (code % 13.0) / 13.0;
+                let norm = (a * a + b * b + c * c).sqrt().max(1e-6);
+                out.push(vec![a / norm, b / norm, c / norm]);
+            }
+            Ok(out)
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_clusters_group_similar_embeddings() {
+        let (_tmp, vault_owned) = {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+            let v = VaultStore::with_shared_connection(conn)
+                .unwrap()
+                .with_embedder(Arc::new(PrefixEmbedder));
+            (tmp, v)
+        };
+
+        let pad = "본문 ".repeat(200);
+        for (tag, title) in [
+            ("민사소송", "doc1"),
+            ("민사조정", "doc2"),
+            ("형사기소", "doc3"),
+            ("형사수사", "doc4"),
+        ] {
+            let md = format!(
+                "---\ntitle: {title}\ntags: {tag}\n---\n# {title}\n\n민법 제750조. {pad}"
+            );
+            vault_owned
+                .ingest_markdown(IngestInput {
+                    source_type: SourceType::LocalFile,
+                    source_device_id: "dev",
+                    original_path: None,
+                    title: Some(title),
+                    markdown: &md,
+                    html_content: None,
+                    doc_type: None,
+                    domain: "legal",
+                })
+                .await
+                .unwrap();
+        }
+        // Threshold 0.99 — PrefixEmbedder groups tags with identical first char.
+        let clusters = semantic_tag_clusters(&vault_owned, 0.99).await.unwrap();
+        // Expect at least one cluster (e.g. 민사소송 ↔ 민사조정 share '민').
+        assert!(
+            clusters.iter().any(|c| c.members.contains(&"민사소송".into())
+                && c.members.contains(&"민사조정".into())),
+            "expected clustering of 민사* tags; got {clusters:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_clusters_empty_when_no_embedder() {
+        let (_tmp, vault) = {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+            let v = VaultStore::with_shared_connection(conn).unwrap();
+            (tmp, v)
+        };
+        let pad = "본문 ".repeat(200);
+        vault
+            .ingest_markdown(IngestInput {
+                source_type: SourceType::LocalFile,
+                source_device_id: "dev",
+                original_path: None,
+                title: Some("x"),
+                markdown: &format!("---\ntags: a, b\n---\n# x\n\n{pad}"),
+                html_content: None,
+                doc_type: None,
+                domain: "legal",
+            })
+            .await
+            .unwrap();
+        // Noop embedder → no embeddings → no clusters.
+        let clusters = semantic_tag_clusters(&vault, 0.5).await.unwrap();
+        assert!(clusters.is_empty());
     }
 
     #[tokio::test]

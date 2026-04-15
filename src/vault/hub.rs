@@ -224,6 +224,8 @@ pub fn compile_queue_next(vault: &VaultStore) -> Result<Option<String>> {
 
 /// Compile one hub note on demand. Idempotent — running twice overwrites
 /// `content_md` with the latest render and updates `last_compiled`.
+/// Uses the hash-mod section distribution. For LLM-quality section
+/// assignment call `compile_hub_with_ai` instead.
 pub fn compile_hub(vault: &VaultStore, entity_name: &str) -> Result<HubCompileReport> {
     let subtype = HubSubtype::classify(entity_name);
     let backlinking_docs = fetch_backlinking_docs(vault, entity_name)?;
@@ -584,6 +586,294 @@ pub fn incremental_update(
     }
 }
 
+/// Compile a hub using LLM-driven section assignment. Requires an
+/// `AIEngine` so each backlinked doc can be placed into the *right*
+/// section(s) rather than hash-distributed.
+///
+/// Still idempotent. Falls back to the hash-mod path if the engine
+/// returns an empty or malformed assignment.
+pub async fn compile_hub_with_ai(
+    vault: &VaultStore,
+    entity_name: &str,
+    engine: &dyn super::wikilink::AIEngine,
+) -> Result<HubCompileReport> {
+    let subtype = HubSubtype::classify(entity_name);
+    let docs = fetch_backlinking_docs(vault, entity_name)?;
+
+    // Gather content previews for the engine.
+    let preview_docs: Vec<(i64, String, String)> = {
+        let conn = vault.connection().lock();
+        docs.iter()
+            .map(|(id, title)| {
+                let preview: String = conn
+                    .query_row(
+                        "SELECT SUBSTR(content, 1, 600) FROM vault_documents WHERE id = ?1",
+                        rusqlite::params![id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap_or_default();
+                (*id, title.clone(), preview)
+            })
+            .collect()
+    };
+
+    let section_names = skeleton_for(subtype);
+    let section_refs: Vec<&str> = section_names.iter().copied().collect();
+    let assignments = engine
+        .assign_hub_sections(subtype.as_str(), &section_refs, &preview_docs)
+        .await
+        .unwrap_or_default();
+
+    let (markdown, sections, gaps) =
+        render_with_assignments(subtype, entity_name, &docs, &assignments);
+
+    let conn = vault.connection().lock();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    conn.execute(
+        "INSERT INTO hub_notes
+            (entity_name, hub_subtype, backlink_count, compile_type,
+             last_compiled, structure_elements, mapped_documents,
+             hub_threshold, content_md)
+         VALUES (?1, ?2, ?3, 'ai_assisted', ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(entity_name) DO UPDATE SET
+            hub_subtype = excluded.hub_subtype,
+            backlink_count = excluded.backlink_count,
+            compile_type = 'ai_assisted',
+            last_compiled = excluded.last_compiled,
+            structure_elements = excluded.structure_elements,
+            mapped_documents = excluded.mapped_documents,
+            pending_backlinks = 0,
+            content_md = excluded.content_md",
+        params![
+            entity_name,
+            subtype.as_str(),
+            docs.len() as i64,
+            now as i64,
+            sections as i64,
+            docs.len() as i64,
+            HUB_THRESHOLD_DEFAULT,
+            markdown,
+        ],
+    )?;
+
+    Ok(HubCompileReport {
+        entity_name: entity_name.to_string(),
+        subtype,
+        backlink_count: docs.len() as i64,
+        sections,
+        evidence_gaps: gaps,
+        markdown,
+    })
+}
+
+/// Render skeleton markdown honouring AI assignments. Each entry in
+/// `assignments[i]` lists the section indices doc `i` maps to. If the
+/// assignments vector is empty or any index is out of range the function
+/// falls back to hash-mod distribution for that doc (defensive).
+fn render_with_assignments(
+    subtype: HubSubtype,
+    entity: &str,
+    docs: &[(i64, String)],
+    assignments: &[Vec<usize>],
+) -> (String, usize, usize) {
+    let skeleton = skeleton_for(subtype);
+    let section_count = skeleton.len();
+
+    let mut section_docs: std::collections::HashMap<usize, Vec<&(i64, String)>> =
+        std::collections::HashMap::new();
+    for (i, doc) in docs.iter().enumerate() {
+        let targets: Vec<usize> = match assignments.get(i) {
+            Some(t) if !t.is_empty() => t
+                .iter()
+                .copied()
+                .filter(|idx| *idx < section_count)
+                .collect(),
+            _ => vec![(doc.0.unsigned_abs() as usize) % section_count],
+        };
+        let targets = if targets.is_empty() {
+            vec![(doc.0.unsigned_abs() as usize) % section_count]
+        } else {
+            targets
+        };
+        for idx in targets {
+            section_docs.entry(idx).or_default().push(doc);
+        }
+    }
+
+    let mut md = String::with_capacity(512 + docs.len() * 40);
+    md.push_str(&format!("# {entity}\n\n"));
+    md.push_str(&format!(
+        "> **Hub subtype**: `{}` · **Backlinks**: {} · **AI-assigned sections**\n\n",
+        subtype.as_str(),
+        docs.len()
+    ));
+
+    let mut gaps = 0usize;
+    for (idx, section_title) in skeleton.iter().enumerate() {
+        let mapped = section_docs.get(&idx).cloned().unwrap_or_default();
+        if mapped.is_empty() {
+            md.push_str(&format!("## {section_title}\n\n"));
+            md.push_str("⚠️ **Evidence Gap** — 매핑된 문서 0건.\n\n");
+            gaps += 1;
+        } else {
+            md.push_str(&format!(
+                "## {section_title}\n\n📎 {}건: {}\n\n",
+                mapped.len(),
+                mapped
+                    .iter()
+                    .map(|(id, t)| format!("[Doc-{id}] {t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    (md, section_count, gaps)
+}
+
+/// Pick the top-N threshold-crossing hubs by priority_score and compile
+/// them concurrently. Returns a summary of each compile's impact level.
+///
+/// `max_concurrent` caps the number of in-flight compile tasks; the
+/// Tokio `Semaphore` ensures we don't stampede the AI engine. When
+/// `max_concurrent = 1` this degrades to sequential.
+pub async fn compile_batch(
+    vault: std::sync::Arc<VaultStore>,
+    batch_size: usize,
+    max_concurrent: usize,
+) -> Result<Vec<(String, ImpactLevel)>> {
+    if batch_size == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Snapshot the queue, then spawn compile tasks.
+    let candidates: Vec<(String, i64, i64, Option<i64>)> = {
+        let conn = vault.connection().lock();
+        let now = unix_epoch() as i64;
+        let mut stmt = conn.prepare(
+            "SELECT entity_name, backlink_count, pending_backlinks, last_compiled
+             FROM hub_notes
+             WHERE backlink_count >= hub_threshold",
+        )?;
+        let rows: Vec<(String, i64, i64, Option<i64>)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        let _ = now;
+        rows
+    };
+
+    // Score + sort by priority descending.
+    let now = unix_epoch();
+    let mut scored: Vec<(String, f32)> = candidates
+        .into_iter()
+        .map(|(n, bl, pending, last)| {
+            (n, priority_score(bl, pending, last.map(|t| t as u64), now))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    scored.truncate(batch_size);
+
+    if scored.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
+    let mut tasks = Vec::with_capacity(scored.len());
+    for (entity, _score) in scored {
+        let vault_c = vault.clone();
+        let sem_c = sem.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem_c.acquire_owned().await.ok()?;
+            // incremental_update is sync; tokio::task::spawn_blocking keeps
+            // the semaphore permit held for the duration without starving
+            // other async tasks on the runtime.
+            let entity_for_task = entity.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                incremental_update(&vault_c, &entity_for_task)
+            })
+            .await
+            .ok()?
+            .ok()?;
+            Some((entity, result.0))
+        }));
+    }
+
+    let mut out: Vec<(String, ImpactLevel)> = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        if let Ok(Some(r)) = t.await {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+/// Run LLM-backed contradiction detection across the backlinked docs
+/// of an entity. Stores `conflict_pending = len(contradictions)` on the
+/// hub row and returns the full list so the UI can surface them.
+///
+/// Uses `AIEngine::detect_contradictions` — Heuristic returns empty so
+/// this is effectively a no-op until a real `LlmAIEngine` or
+/// `OllamaSlmEngine` is attached.
+pub async fn detect_entity_contradictions(
+    vault: &VaultStore,
+    entity_name: &str,
+    engine: &dyn super::wikilink::AIEngine,
+) -> Result<Vec<super::wikilink::Contradiction>> {
+    use super::wikilink::ContentClaim;
+
+    let claims: Vec<ContentClaim> = {
+        let conn = vault.connection().lock();
+        let mut stmt = conn.prepare(
+            "SELECT d.id, COALESCE(d.title,''), SUBSTR(d.content, 1, 700)
+             FROM vault_links l JOIN vault_documents d ON d.id = l.source_doc_id
+             WHERE l.target_raw = ?1
+             LIMIT 30",
+        )?;
+        let rows: Vec<ContentClaim> = stmt
+            .query_map(params![entity_name], |r| {
+                Ok(ContentClaim {
+                    doc_id: r.get::<_, i64>(0)?,
+                    title: r.get::<_, String>(1)?,
+                    statement: r.get::<_, String>(2)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+    if claims.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let contradictions = engine.detect_contradictions(entity_name, &claims).await?;
+
+    {
+        let conn = vault.connection().lock();
+        conn.execute(
+            "UPDATE hub_notes
+             SET conflict_pending = ?1
+             WHERE entity_name = ?2",
+            params![contradictions.len() as i64, entity_name],
+        )?;
+    }
+    Ok(contradictions)
+}
+
 /// Expose skeleton length for callers needing to size sections.
 fn skeleton_for(subtype: HubSubtype) -> &'static [&'static str] {
     match subtype {
@@ -832,6 +1122,226 @@ mod tests {
         assert_eq!(subtype, "statute_article");
     }
 
+    // ── R1: AI-assisted section assignment ──────────────────────
+
+    use super::super::wikilink::{
+        AIEngine, ContentClaim, Contradiction, GatekeepVerdict, HeuristicAIEngine, KeyConcept,
+    };
+    use async_trait::async_trait;
+
+    struct FixedAssignmentEngine {
+        /// For every doc index, returns these section indices.
+        section_sets: Vec<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl AIEngine for FixedAssignmentEngine {
+        async fn extract_key_concepts(
+            &self,
+            _md: &str,
+            _c: &[super::super::wikilink::CompoundToken],
+        ) -> anyhow::Result<Vec<KeyConcept>> {
+            Ok(vec![])
+        }
+        async fn gatekeep(
+            &self,
+            _c: &[String],
+            _p: &str,
+        ) -> anyhow::Result<GatekeepVerdict> {
+            Ok(GatekeepVerdict::default())
+        }
+        async fn assign_hub_sections(
+            &self,
+            _s: &str,
+            _sec: &[&str],
+            docs: &[(i64, String, String)],
+        ) -> anyhow::Result<Vec<Vec<usize>>> {
+            Ok(docs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    self.section_sets
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn compile_hub_with_ai_respects_assignments() {
+        let vault = mem_store().await;
+        for i in 0..6 {
+            let md = format!(
+                "# 문서{i}\n\n민법 제750조는 본 사건의 근거 조항이다. {body}",
+                body = "본문 ".repeat(200)
+            );
+            vault
+                .ingest_markdown(IngestInput {
+                    source_type: SourceType::LocalFile,
+                    source_device_id: "dev",
+                    original_path: None,
+                    title: Some(&format!("문서{i}")),
+                    markdown: &md,
+                    html_content: None,
+                    doc_type: None,
+                    domain: "legal",
+                })
+                .await
+                .unwrap();
+        }
+        // Every doc → sections 0 and 4 (조문 원문 + 판례 해설).
+        let engine = FixedAssignmentEngine {
+            section_sets: vec![vec![0, 4]; 6],
+        };
+        let report = compile_hub_with_ai(&vault, "민법 제750조", &engine)
+            .await
+            .unwrap();
+        assert!(report.markdown.contains("AI-assigned sections"));
+        // Section 0 (조문 원문) and section 4 (판례 해설) both get 6 docs.
+        assert!(report.markdown.contains("📎 6건"));
+        // Compile_type persisted as ai_assisted.
+        let ct: String = {
+            let c = vault.connection().lock();
+            c.query_row(
+                "SELECT compile_type FROM hub_notes WHERE entity_name = '민법 제750조'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(ct, "ai_assisted");
+    }
+
+    #[tokio::test]
+    async fn compile_hub_with_ai_falls_back_on_empty_assignments() {
+        let vault = mem_store().await;
+        vault
+            .ingest_markdown(IngestInput {
+                source_type: SourceType::LocalFile,
+                source_device_id: "dev",
+                original_path: None,
+                title: Some("mono"),
+                markdown: &format!("# mono\n민법 제750조. {}", "본문 ".repeat(200)),
+                html_content: None,
+                doc_type: None,
+                domain: "legal",
+            })
+            .await
+            .unwrap();
+        // Engine returns empty assignments → falls back to hash distribution.
+        let engine = FixedAssignmentEngine {
+            section_sets: vec![vec![]],
+        };
+        let report = compile_hub_with_ai(&vault, "민법 제750조", &engine)
+            .await
+            .unwrap();
+        assert!(report.markdown.contains("📎"));
+    }
+
+    // ── R4: Contradiction detection ─────────────────────────────
+
+    struct AlwaysDetectEngine;
+    #[async_trait]
+    impl AIEngine for AlwaysDetectEngine {
+        async fn extract_key_concepts(
+            &self,
+            _md: &str,
+            _c: &[super::super::wikilink::CompoundToken],
+        ) -> anyhow::Result<Vec<KeyConcept>> {
+            Ok(vec![])
+        }
+        async fn gatekeep(
+            &self,
+            _c: &[String],
+            _p: &str,
+        ) -> anyhow::Result<GatekeepVerdict> {
+            Ok(GatekeepVerdict::default())
+        }
+        async fn detect_contradictions(
+            &self,
+            _entity: &str,
+            claims: &[ContentClaim],
+        ) -> anyhow::Result<Vec<Contradiction>> {
+            if claims.len() >= 2 {
+                Ok(vec![Contradiction {
+                    left_doc_id: claims[0].doc_id,
+                    right_doc_id: claims[1].doc_id,
+                    description: "test disagreement".into(),
+                    severity: 7,
+                }])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_entity_contradictions_records_count() {
+        let vault = mem_store().await;
+        // Ingest 2 docs both linking to "민법 제750조".
+        for i in 0..2 {
+            vault
+                .ingest_markdown(IngestInput {
+                    source_type: SourceType::LocalFile,
+                    source_device_id: "dev",
+                    original_path: None,
+                    title: Some(&format!("doc{i}")),
+                    markdown: &format!(
+                        "# doc{i}\n민법 제750조에 관하여 본 사건에서 쟁점이 됨. {}",
+                        "본문 ".repeat(200)
+                    ),
+                    html_content: None,
+                    doc_type: None,
+                    domain: "legal",
+                })
+                .await
+                .unwrap();
+        }
+        // Seed the hub row so conflict_pending can be updated.
+        refresh_backlink_counts(&vault).unwrap();
+        let contradictions =
+            detect_entity_contradictions(&vault, "민법 제750조", &AlwaysDetectEngine)
+                .await
+                .unwrap();
+        assert_eq!(contradictions.len(), 1);
+        assert_eq!(contradictions[0].severity, 7);
+        // Hub row updated.
+        let pending: i64 = {
+            let c = vault.connection().lock();
+            c.query_row(
+                "SELECT conflict_pending FROM hub_notes WHERE entity_name = '민법 제750조'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pending, 1);
+    }
+
+    #[tokio::test]
+    async fn detect_contradictions_short_circuits_on_single_claim() {
+        let vault = mem_store().await;
+        vault
+            .ingest_markdown(IngestInput {
+                source_type: SourceType::LocalFile,
+                source_device_id: "dev",
+                original_path: None,
+                title: Some("only"),
+                markdown: &format!("# only\n민법 제750조. {}", "본문 ".repeat(200)),
+                html_content: None,
+                doc_type: None,
+                domain: "legal",
+            })
+            .await
+            .unwrap();
+        let out = detect_entity_contradictions(&vault, "민법 제750조", &AlwaysDetectEngine)
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
     #[tokio::test]
     async fn incremental_update_light_path_is_cheap() {
         let vault = mem_store().await;
@@ -858,5 +1368,69 @@ mod tests {
             .unwrap()
         };
         assert_eq!(compile_type, "light");
+    }
+
+    // ── R2: Parallel compile worker ────────────────────────────
+
+    #[tokio::test]
+    async fn compile_batch_processes_top_n_by_priority() {
+        let vault = std::sync::Arc::new(mem_store().await);
+        // Seed three hub rows with distinct priorities.
+        {
+            let c = vault.connection().lock();
+            c.execute(
+                "INSERT INTO hub_notes (entity_name, hub_subtype, backlink_count,
+                    hub_threshold, pending_backlinks, last_compiled, structure_elements)
+                 VALUES
+                    ('small', 'general_concept', 5, 5, 0, NULL, 5),
+                    ('medium', 'general_concept', 50, 5, 50, NULL, 5),
+                    ('huge', 'general_concept', 500, 5, 500, NULL, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let results = compile_batch(vault.clone(), 2, 2).await.unwrap();
+        assert_eq!(results.len(), 2);
+        let names: std::collections::HashSet<&str> =
+            results.iter().map(|(n, _)| n.as_str()).collect();
+        // Top-2 by priority: huge + medium.
+        assert!(names.contains("huge"));
+        assert!(names.contains("medium"));
+    }
+
+    #[tokio::test]
+    async fn compile_batch_empty_when_nothing_over_threshold() {
+        let vault = std::sync::Arc::new(mem_store().await);
+        {
+            let c = vault.connection().lock();
+            c.execute(
+                "INSERT INTO hub_notes (entity_name, hub_subtype, backlink_count,
+                    hub_threshold)
+                 VALUES ('tiny', 'general_concept', 2, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let results = compile_batch(vault, 5, 2).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compile_batch_serialised_when_max_concurrent_is_one() {
+        let vault = std::sync::Arc::new(mem_store().await);
+        {
+            let c = vault.connection().lock();
+            c.execute(
+                "INSERT INTO hub_notes (entity_name, hub_subtype, backlink_count,
+                    hub_threshold, pending_backlinks, last_compiled, structure_elements)
+                 VALUES
+                    ('a', 'general_concept', 10, 5, 0, NULL, 5),
+                    ('b', 'general_concept', 10, 5, 0, NULL, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let results = compile_batch(vault, 5, 1).await.unwrap();
+        assert_eq!(results.len(), 2);
     }
 }
