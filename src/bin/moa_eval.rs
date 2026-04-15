@@ -99,6 +99,10 @@ struct Args {
     top_k: usize,
     output: Option<PathBuf>,
     evals_dir: PathBuf,
+    /// PR #8 LLM judge — optional JSONL output containing the raw
+    /// retrieval-context tuples the Python judge (`eval_rag_llm.py`)
+    /// consumes. One line per gold query.
+    emit_retrieval: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -107,6 +111,7 @@ fn parse_args() -> Result<Args> {
         top_k: 10,
         output: None,
         evals_dir: PathBuf::from("tests/evals"),
+        emit_retrieval: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
@@ -130,6 +135,9 @@ fn parse_args() -> Result<Args> {
                     .map(PathBuf::from)
                     .context("--evals-dir requires a path")?;
             }
+            "--emit-retrieval" => {
+                args.emit_retrieval = iter.next().map(PathBuf::from);
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -152,6 +160,7 @@ fn print_help() {
            --top-k <N>                Recall window size (default: 10)\n  \
            --output <PATH>            Write JSON report to file (default: stdout text)\n  \
            --evals-dir <PATH>         Override evals dir (default: tests/evals)\n  \
+           --emit-retrieval <PATH>    Emit retrieval JSONL for LLM judge\n  \
            -h, --help                 Show this help"
     );
 }
@@ -190,9 +199,14 @@ async fn evaluate_set(
     mem: &SqliteMemory,
     golds: &[GoldEntry],
     top_k: usize,
+    emit_retrieval: Option<&Path>,
 ) -> Result<HashMap<String, DomainScore>> {
     // Group by domain so we can report per-set numbers.
     let mut per_domain: HashMap<String, Vec<(f64, f64, f64)>> = HashMap::new();
+    // PR #8 LLM judge — stream retrieval tuples to JSONL when --emit-retrieval
+    // is set. We buffer into a Vec then write once at the end so a mid-run
+    // cargo-kill doesn't leave a half-written file.
+    let mut retrieval_out: Vec<serde_json::Value> = Vec::new();
 
     for g in golds {
         let hits = mem
@@ -230,6 +244,31 @@ async fn evaluate_set(
             .entry(g.domain.clone())
             .or_default()
             .push((recall, precision, mrr));
+
+        if emit_retrieval.is_some() {
+            let contexts: Vec<&str> = hits.iter().map(|h| h.content.as_str()).collect();
+            retrieval_out.push(serde_json::json!({
+                "query": g.query,
+                "gold_keys": g.gold_keys,
+                "retrieved_keys": retrieved_keys,
+                "retrieved_contexts": contexts,
+                // answer intentionally empty — the Python judge treats
+                // "" as "synthesize via judge model" or skip faithfulness
+                // gracefully. See tests/evals/scripts/eval_rag_llm.py.
+                "answer": "",
+                "domain": g.domain,
+            }));
+        }
+    }
+
+    if let Some(path) = emit_retrieval {
+        use std::io::Write;
+        let mut file = fs::File::create(path)
+            .with_context(|| format!("create retrieval file {}", path.display()))?;
+        for entry in &retrieval_out {
+            writeln!(file, "{entry}")?;
+        }
+        eprintln!("wrote {} retrieval records → {}", retrieval_out.len(), path.display());
     }
 
     let mut out = HashMap::new();
@@ -345,7 +384,13 @@ async fn main() -> Result<()> {
     let mem = SqliteMemory::new(tmp.path()).context("open SqliteMemory")?;
     seed_corpus(&mem, &corpus).await?;
 
-    let per_domain = evaluate_set(&mem, &goldens, args.top_k).await?;
+    let per_domain = evaluate_set(
+        &mem,
+        &goldens,
+        args.top_k,
+        args.emit_retrieval.as_deref(),
+    )
+    .await?;
 
     // Build the report. Overall is the unweighted mean across all queries.
     let total_queries: usize = per_domain.values().map(|d| d.queries).sum();
