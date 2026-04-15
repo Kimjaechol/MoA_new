@@ -23,6 +23,27 @@ pub struct GatekeepVerdict {
     pub synonym_pairs: Vec<(String, String)>,
 }
 
+/// Structured briefing narrative produced by `AIEngine::narrate_briefing`.
+/// Each field is a markdown-ready block. Empty strings are permitted for
+/// sections the AI had no evidence for.
+#[derive(Debug, Clone, Default)]
+pub struct BriefingNarrative {
+    /// 사건 경과 (timeline)
+    pub timeline: String,
+    /// 양측 주장 대비
+    pub contentions: String,
+    /// 핵심 쟁점
+    pub issues: String,
+    /// 증거 현황 및 미비
+    pub evidence: String,
+    /// 관련 판례 요약
+    pub precedents: String,
+    /// 다음 기일 준비 체크리스트
+    pub checklist: String,
+    /// 전략 제안 (강점 / 약점)
+    pub strategy: String,
+}
+
 /// Pluggable AI driver — production uses LLM, tests use heuristic.
 #[async_trait]
 pub trait AIEngine: Send + Sync {
@@ -37,6 +58,18 @@ pub trait AIEngine: Send + Sync {
         candidates: &[String],
         doc_preview: &str,
     ) -> anyhow::Result<GatekeepVerdict>;
+
+    /// Synthesize a 7-section case briefing from the supplied context.
+    /// Default implementation returns an empty narrative so existing
+    /// engines remain valid without overriding.
+    async fn narrate_briefing(
+        &self,
+        _case_number: &str,
+        _primary_docs: &[(i64, String, String)], // (doc_id, title, content_preview)
+        _related_docs: &[(i64, String)],
+    ) -> anyhow::Result<BriefingNarrative> {
+        Ok(BriefingNarrative::default())
+    }
 }
 
 /// Provider-free default. Strategy:
@@ -106,6 +139,50 @@ impl AIEngine for HeuristicAIEngine {
         Ok(GatekeepVerdict {
             kept,
             synonym_pairs,
+        })
+    }
+
+    async fn narrate_briefing(
+        &self,
+        case_number: &str,
+        primary_docs: &[(i64, String, String)],
+        related_docs: &[(i64, String)],
+    ) -> anyhow::Result<BriefingNarrative> {
+        // Structured template: deterministic, no LLM. Lists docs
+        // per-section and leaves a note requesting LLM fill-in.
+        let mut timeline = String::from("이 사건 **관련 문서 시계열**:\n\n");
+        for (id, title, _) in primary_docs {
+            timeline.push_str(&format!("- [Doc-{id}] {title}\n"));
+        }
+
+        let mut evidence = String::from("이 사건과 직접 매핑된 문서:\n\n");
+        for (id, title, _) in primary_docs {
+            evidence.push_str(&format!("- [Doc-{id}] {title}\n"));
+        }
+        if primary_docs.is_empty() {
+            evidence.push_str("(사건 프론트매터 매칭 없음 — 문서에 `case_number` 필드 기재 필요)\n");
+        }
+
+        let precedents = if related_docs.is_empty() {
+            "관련 판례·자료 매핑 없음.".to_string()
+        } else {
+            let mut s = String::from("1-depth 그래프 확장으로 식별된 관련 자료:\n\n");
+            for (id, title) in related_docs {
+                s.push_str(&format!("- [Doc-{id}] {title}\n"));
+            }
+            s
+        };
+
+        Ok(BriefingNarrative {
+            timeline,
+            contentions: format!(
+                "사건번호 {case_number}에 대한 양측 주장 대비는 LLM 서사 합성에서 제공됩니다 (Heuristic 엔진은 구조만 채움)."
+            ),
+            issues: "핵심 쟁점은 LLM 서사 합성에서 제공됩니다.".to_string(),
+            evidence,
+            precedents,
+            checklist: "- [ ] 쟁점 정리\n- [ ] 증거 현황\n- [ ] 다음 기일 준비사항\n".to_string(),
+            strategy: "전략 제안은 LLM 서사 합성에서 제공됩니다.".to_string(),
         })
     }
 }
