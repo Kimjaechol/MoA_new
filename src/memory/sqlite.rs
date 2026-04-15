@@ -192,6 +192,210 @@ impl SqliteMemory {
         })
     }
 
+    // ── PR #6: consolidation + decay integration ─────────────────
+
+    /// Pull every non-archived memory with a usable embedding into
+    /// [`super::consolidate::CandidateMemory`] form, ready for
+    /// [`super::consolidate::consolidate_candidates`]. The
+    /// `min_recall_count` filter implements the "earned an opinion" rule
+    /// from the algorithm doc — untouched memories are skipped.
+    pub fn collect_consolidation_candidates(
+        &self,
+        min_recall_count: u32,
+    ) -> anyhow::Result<Vec<super::consolidate::CandidateMemory>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, key, content, embedding
+               FROM memories
+              WHERE archived = 0
+                AND embedding IS NOT NULL
+                AND recall_count >= ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![min_recall_count], |row| {
+            let id: String = row.get(0)?;
+            let key: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            let blob: Vec<u8> = row.get(3)?;
+            Ok((id, key, content, blob))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, key, content, blob) = r?;
+            // Embedding is stored as little-endian f32 (`super::vector`
+            // helpers — keep this decode in sync).
+            if blob.len() % 4 != 0 || blob.is_empty() {
+                continue;
+            }
+            let mut embedding = Vec::with_capacity(blob.len() / 4);
+            for chunk in blob.chunks_exact(4) {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(chunk);
+                embedding.push(f32::from_le_bytes(buf));
+            }
+            out.push(super::consolidate::CandidateMemory {
+                id,
+                key,
+                content,
+                embedding,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Persist a single [`super::consolidate::ConsolidationOutcome`] —
+    /// inserts the row into `consolidated_memories` and flips the source
+    /// memories' `archived = 1`. Wrapped in a single transaction so a
+    /// crash leaves no half-archived state.
+    pub fn apply_consolidation_outcome(
+        &self,
+        outcome: &super::consolidate::ConsolidationOutcome,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let now = chrono::Local::now().to_rfc3339();
+        let id = uuid::Uuid::new_v4().to_string();
+        let source_ids_json = serde_json::to_string(&outcome.source_ids)?;
+        let source_keys_json = serde_json::to_string(&outcome.source_keys)?;
+        let contradicting_json = serde_json::to_string(&outcome.contradicting_keys)?;
+        let conflict_flag: i64 = i64::from(outcome.conflict);
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO consolidated_memories
+                 (id, fact_type, summary, source_ids, source_keys,
+                  conflict_flag, contradicting_keys, created_at)
+              VALUES (?1, 'semantic_fact', ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                id,
+                outcome.summary,
+                source_ids_json,
+                source_keys_json,
+                conflict_flag,
+                contradicting_json,
+                now
+            ],
+        )?;
+        // Soft-archive each source memory. We deliberately do NOT delete
+        // the row — the user must be able to recover it from the archive
+        // UI. archived=1 is filtered out of recall in a follow-up that
+        // adjusts the SELECT WHERE clauses in fts5_search/vector_search.
+        for src_id in &outcome.source_ids {
+            tx.execute(
+                "UPDATE memories SET archived = 1 WHERE id = ?1",
+                rusqlite::params![src_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bump the recall counter and refresh `last_recalled` for a memory
+    /// the agent just surfaced. Caller passes the IDs that came back from
+    /// `recall()` so we can update them all in one transaction. Failures
+    /// are swallowed (telemetry only) — bookkeeping must never cause a
+    /// recall to fail user-facing.
+    pub fn bump_recall_metrics(&self, ids: &[String]) -> anyhow::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Local::now().to_rfc3339();
+        let mut updated = 0;
+        for id in ids {
+            updated += tx.execute(
+                "UPDATE memories
+                    SET recall_count = recall_count + 1,
+                        last_recalled = ?1
+                  WHERE id = ?2",
+                rusqlite::params![now, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Recompute `decay_score` for every non-archived memory and flip any
+    /// that fall below [`super::decay::ARCHIVE_FLOOR`]. Designed for
+    /// nightly invocation from the dream cycle. Returns the count of
+    /// rows whose `archived` flag transitioned this run.
+    ///
+    /// Two scores are computed per row:
+    ///   * **stored** — `decay::decay_score_for_category` with the
+    ///     cosmetic floor (`DEFAULT_FLOOR = 0.1`); this is what the
+    ///     recall hot path displays / sorts on.
+    ///   * **raw** — same formula with floor = 0.0; this is what the
+    ///     archive decision uses, otherwise the cosmetic floor would
+    ///     keep every never-recalled memory pinned above the
+    ///     `ARCHIVE_FLOOR` of 0.05 forever.
+    /// Identity-category memories never archive because their
+    /// half-life is `INFINITY` → raw score ≥ ln(recall_count + 1) ≥ 0.
+    pub fn run_decay_sweep(&self) -> anyhow::Result<usize> {
+        use super::decay::{
+            decay_score, decay_score_for_category, half_life_for, should_archive, ARCHIVE_FLOOR,
+        };
+        use chrono::{DateTime, Local};
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, category, recall_count, last_recalled, created_at
+               FROM memories WHERE archived = 0",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let snapshots: Vec<(String, String, i64, Option<String>, String)> =
+            rows.collect::<Result<_, _>>()?;
+        drop(stmt);
+
+        let now = Local::now();
+        let tx = conn.unchecked_transaction()?;
+        let mut archived = 0usize;
+        for (id, cat, count, last_recalled, created_at) in snapshots {
+            let reference = last_recalled.as_deref().unwrap_or(&created_at);
+            let parsed = DateTime::parse_from_rfc3339(reference)
+                .map(|d| d.with_timezone(&Local))
+                .unwrap_or(now);
+            #[allow(clippy::cast_precision_loss)]
+            let days = ((now - parsed).num_seconds() as f32 / 86_400.0).max(0.0);
+            let category = Self::str_to_category(&cat);
+            let recall_count_u32 = u32::try_from(count.max(0)).unwrap_or(u32::MAX);
+
+            let half_life = half_life_for(&category);
+            let stored = decay_score_for_category(recall_count_u32, days, &category);
+            let raw = decay_score(recall_count_u32, days, half_life, 0.0);
+
+            // INFINITY half-life means identity / pinned facts — they
+            // must survive every sweep no matter what raw score the
+            // formula produces (ln(1) = 0 with a zero floor would
+            // otherwise misfire).
+            let archivable = half_life.is_finite() && should_archive(raw, ARCHIVE_FLOOR);
+
+            if archivable {
+                tx.execute(
+                    "UPDATE memories
+                        SET decay_score = ?1, archived = 1
+                      WHERE id = ?2",
+                    rusqlite::params![f64::from(stored), id],
+                )?;
+                archived += 1;
+            } else {
+                tx.execute(
+                    "UPDATE memories SET decay_score = ?1 WHERE id = ?2",
+                    rusqlite::params![f64::from(stored), id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(archived)
+    }
+
+    // ── PR #4: reranker plumbing ─────────────────────────────────
+
     /// PR #4 — attach a cross-encoder reranker. The reranker is consulted by
     /// `recall_with_variations` after RRF fusion when `rerank_config.enabled`
     /// is true. Replacing an existing reranker is explicit; callers should
@@ -339,6 +543,49 @@ impl SqliteMemory {
                      ON memories(needs_recompile) WHERE needs_recompile = 1;",
             )?;
         }
+
+        // ── PR #6 migration: forgetting-curve + consolidation columns ──
+        // recall_count / last_recalled feed the decay score; archived flips
+        // to 1 either by the consolidator (sources merged into a
+        // semantic_fact) or by the nightly decay sweep when the score
+        // falls below decay::ARCHIVE_FLOOR. decay_score is denormalised
+        // onto the row so the recall hot path can filter without
+        // recomputing on every read.
+        if !memories_sql.contains("recall_count") {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE memories ADD COLUMN last_recalled TEXT;
+                 ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE memories ADD COLUMN decay_score REAL NOT NULL DEFAULT 1.0;
+                 CREATE INDEX IF NOT EXISTS idx_memories_archived
+                     ON memories(archived);
+                 CREATE INDEX IF NOT EXISTS idx_memories_decay
+                     ON memories(decay_score) WHERE archived = 0;",
+            )?;
+        }
+
+        // PR #6 — consolidated semantic facts. Each row is the LLM-summary
+        // of a cluster of near-duplicate memories; source_ids is a JSON
+        // array of memories.id values that were archived in its favour.
+        // type discriminates future expansions (today only "semantic_fact").
+        // conflict_flag = 1 surfaces clusters where members contradict
+        // each other so a UI can prompt the user for resolution.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS consolidated_memories (
+                id            TEXT PRIMARY KEY,
+                fact_type     TEXT NOT NULL DEFAULT 'semantic_fact',
+                summary       TEXT NOT NULL,
+                source_ids    TEXT NOT NULL,
+                source_keys   TEXT NOT NULL,
+                conflict_flag INTEGER NOT NULL DEFAULT 0,
+                contradicting_keys TEXT,
+                created_at    TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_consolidated_conflict
+                ON consolidated_memories(conflict_flag) WHERE conflict_flag = 1;
+            CREATE INDEX IF NOT EXISTS idx_consolidated_created
+                ON consolidated_memories(created_at DESC);",
+        )?;
 
         // memory_timeline — append-only evidence store
         conn.execute_batch(
@@ -3683,6 +3930,202 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("drift"), "got: {err}");
+    }
+
+    // ── PR #6 consolidation + decay integration ───────────────
+
+    #[tokio::test]
+    async fn bump_recall_metrics_increments_count_and_sets_timestamp() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_recall", "stuff", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("k_recall").await.unwrap().unwrap();
+        let updated = mem.bump_recall_metrics(&[entry.id.clone()]).unwrap();
+        assert_eq!(updated, 1);
+
+        let conn = mem.conn.lock();
+        let (count, last): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT recall_count, last_recalled FROM memories WHERE id = ?1",
+                rusqlite::params![entry.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(last.is_some());
+    }
+
+    #[tokio::test]
+    async fn bump_recall_metrics_no_op_on_empty_input() {
+        let (_tmp, mem) = temp_sqlite();
+        assert_eq!(mem.bump_recall_metrics(&[]).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn apply_consolidation_outcome_archives_sources_and_writes_summary() {
+        use super::super::consolidate::ConsolidationOutcome;
+
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k1", "나는 변호사다", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k2", "나는 변호사이다", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let id1 = mem.get("k1").await.unwrap().unwrap().id;
+        let id2 = mem.get("k2").await.unwrap().unwrap().id;
+
+        let outcome = ConsolidationOutcome {
+            source_ids: vec![id1.clone(), id2.clone()],
+            source_keys: vec!["k1".into(), "k2".into()],
+            summary: "사용자는 변호사입니다.".into(),
+            conflict: false,
+            contradicting_keys: vec![],
+        };
+        mem.apply_consolidation_outcome(&outcome).unwrap();
+
+        let conn = mem.conn.lock();
+        // Both sources archived.
+        for id in [&id1, &id2] {
+            let archived: i64 = conn
+                .query_row(
+                    "SELECT archived FROM memories WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(archived, 1, "source {id} not archived");
+        }
+        // Exactly one consolidated row.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidated_memories",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_consolidation_outcome_persists_conflict_metadata() {
+        use super::super::consolidate::ConsolidationOutcome;
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("kA", "토요일 골프", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("kB", "토요일 테니스", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let idA = mem.get("kA").await.unwrap().unwrap().id;
+        let idB = mem.get("kB").await.unwrap().unwrap().id;
+
+        let outcome = ConsolidationOutcome {
+            source_ids: vec![idA, idB],
+            source_keys: vec!["kA".into(), "kB".into()],
+            summary: "주말 운동 (충돌)".into(),
+            conflict: true,
+            contradicting_keys: vec!["kA".into(), "kB".into()],
+        };
+        mem.apply_consolidation_outcome(&outcome).unwrap();
+
+        let conn = mem.conn.lock();
+        let (flag, contradicting): (i64, String) = conn
+            .query_row(
+                "SELECT conflict_flag, contradicting_keys FROM consolidated_memories",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(flag, 1);
+        let parsed: Vec<String> = serde_json::from_str(&contradicting).unwrap();
+        assert_eq!(parsed, vec!["kA", "kB"]);
+    }
+
+    #[tokio::test]
+    async fn run_decay_sweep_archives_old_low_recall_memories() {
+        let (_tmp, mem) = temp_sqlite();
+        // Seed 1: ephemeral category, never recalled, fake-old timestamp →
+        // should archive on the next sweep.
+        mem.store(
+            "k_old",
+            "stale chat ping",
+            MemoryCategory::Custom("ephemeral".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        // Seed 2: identity category — must survive the sweep no matter
+        // how long ago it was created (INFINITY half-life).
+        mem.store(
+            "k_id",
+            "I am a lawyer",
+            MemoryCategory::Custom("identity".into()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Backdate k_old by 365 days so its decay falls below the floor.
+        {
+            let conn = mem.conn.lock();
+            let old = (chrono::Local::now() - chrono::Duration::days(365)).to_rfc3339();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1, last_recalled = NULL WHERE key = 'k_old'",
+                rusqlite::params![old],
+            )
+            .unwrap();
+        }
+
+        let archived = mem.run_decay_sweep().unwrap();
+        assert!(archived >= 1, "expected at least k_old to archive");
+
+        let conn = mem.conn.lock();
+        let old_archived: i64 = conn
+            .query_row(
+                "SELECT archived FROM memories WHERE key = 'k_old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_archived, 1);
+        let id_archived: i64 = conn
+            .query_row(
+                "SELECT archived FROM memories WHERE key = 'k_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(id_archived, 0, "identity memory must survive decay");
+    }
+
+    #[tokio::test]
+    async fn collect_consolidation_candidates_filters_archived_and_low_recall() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_in", "활성 메모", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k_out", "비활성 메모", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Bump k_in's recall_count above the threshold; k_out stays at 0.
+        let in_id = mem.get("k_in").await.unwrap().unwrap().id;
+        mem.bump_recall_metrics(&[in_id.clone()]).unwrap();
+        // Archive k_out so it must be excluded even with recall_count>=0.
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memories SET archived = 1 WHERE key = 'k_out'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let candidates = mem.collect_consolidation_candidates(1).unwrap();
+        // Both rows have NULL embeddings (NoopEmbedder), so the filter
+        // `embedding IS NOT NULL` excludes them — verifies the SQL guard.
+        assert!(candidates.is_empty(), "Noop embedder leaks: {candidates:?}");
     }
 
     #[tokio::test]

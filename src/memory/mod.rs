@@ -19,6 +19,8 @@ pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
+pub mod consolidate;
+pub mod decay;
 pub mod query_expand;
 pub mod search;
 pub mod response_cache;
