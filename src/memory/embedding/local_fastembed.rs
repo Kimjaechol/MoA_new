@@ -263,4 +263,44 @@ mod tests {
         let p = create("bge-m3", 1024);
         assert!(p.embed_one("hi").await.is_err());
     }
+
+    /// PR #1 실측 — Determinism check. Running the real BGE-M3 model
+    /// twice on the same inputs must produce byte-identical vectors.
+    /// Requires the model to be cached in ~/.moa/embedding-models/ (or
+    /// $MOA_EMBEDDING_CACHE) — first run downloads ~1.1 GB from
+    /// Hugging Face. CI's nightly-all-features lane exercises this
+    /// after the cache warm-up step.
+    #[cfg(feature = "embedding-local")]
+    #[tokio::test]
+    async fn embed_is_deterministic_for_identical_input() {
+        let p = create("bge-m3", 1024);
+        let a = p.embed(&["나는 변호사다", "hello world"]).await.unwrap();
+        let b = p.embed(&["나는 변호사다", "hello world"]).await.unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
+        for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(va.len(), 1024, "row {i} dim mismatch");
+            assert_eq!(va, vb, "row {i} not deterministic");
+        }
+    }
+
+    /// PR #1 실측 — Cross-lingual shape sanity: Korean and English
+    /// inputs must produce equal-length vectors (BGE-M3 is multilingual,
+    /// all outputs are 1024-dim) and distinct content must produce
+    /// distinct vectors (rules out a pathological "all zeros" failure).
+    #[cfg(feature = "embedding-local")]
+    #[tokio::test]
+    async fn embed_shape_and_distinctness_across_languages() {
+        let p = create("bge-m3", 1024);
+        let v = p
+            .embed(&["주택임대차보호법 대항력", "housing tenant law", "완전히 다른 주제"])
+            .await
+            .unwrap();
+        assert_eq!(v.len(), 3);
+        assert!(v.iter().all(|vec| vec.len() == 1024));
+        // Related Korean/English pair should be distinguishable from
+        // the unrelated Korean sentence.
+        assert_ne!(v[0], v[1]);
+        assert_ne!(v[0], v[2]);
+    }
 }

@@ -220,10 +220,14 @@ mod real {
             let model_id = self.model_id.clone();
 
             tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RerankCandidate>> {
-                let documents: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
+                // fastembed 5.8 expects `AsRef<[&String]>` — the API
+                // tightened in 5.13. We keep the contract portable by
+                // cloning into owned Strings; the refs happen inline.
+                let owned: Vec<String> = candidates.iter().map(|c| c.text.clone()).collect();
+                let doc_refs: Vec<&String> = owned.iter().collect();
                 let mut guard = inner.lock();
                 let scored = guard
-                    .rerank(&query, documents, true, None)
+                    .rerank(&query, doc_refs, true, None)
                     .map_err(|e| anyhow::anyhow!("fastembed rerank ({model_id}) failed: {e}"))?;
 
                 // `scored` is sorted desc by score with original `index` attached.
