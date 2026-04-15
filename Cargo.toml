@@ -113,7 +113,7 @@ ring = "0.17"
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 
 # Memory / persistence
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", default-features = false }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 tokio-postgres-rustls = { version = "0.13", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -224,7 +224,20 @@ libc = "0.2"
 
 [features]
 # Keep default minimal for widest host compatibility (including macOS 10.15).
-default = []
+# `sqlite-bundled` ships the usual bundled SQLite static build. Callers who
+# want SQLCipher instead must pass `--no-default-features --features
+# memory-sqlcipher` at build time because the two rusqlite C bundles
+# (plain SQLite vs. SQLCipher+OpenSSL) cannot coexist — an opt-in swap
+# is the standard rusqlite ergonomic.
+default = ["sqlite-bundled"]
+sqlite-bundled = ["rusqlite/bundled"]
+# PR #5 — on-disk encryption of memory/vault state using SQLCipher.
+# Pulls in a vendored OpenSSL so the resulting binary is self-contained;
+# adds ~2 MB of native code. The keyed constructor
+# `SqliteMemory::with_options_keyed` issues `PRAGMA key = '…'` so every
+# page write is AES-256 encrypted at rest. See
+# docs/security/embedding-privacy.md for the five-step rollout plan.
+memory-sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]

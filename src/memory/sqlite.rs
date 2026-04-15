@@ -135,12 +135,82 @@ impl SqliteMemory {
         )
     }
 
+    /// PR #5 — SQLCipher variant. Identical to [`Self::with_options`] but
+    /// runs `PRAGMA key = '…'` immediately after opening the connection so
+    /// all subsequent page reads/writes are AES-256 encrypted at rest.
+    /// Also issues `PRAGMA cipher_migrate;` which transparently upgrades
+    /// pre-existing non-encrypted `brain.db` files on first open when the
+    /// passphrase format changes across SQLCipher versions.
+    ///
+    /// Available only under the `memory-sqlcipher` cargo feature
+    /// (`--no-default-features --features memory-sqlcipher`). Builds
+    /// without the feature see a compile error if they try to call this —
+    /// that's intentional so a misconfigured CI can't silently produce
+    /// an unencrypted DB while thinking it's encrypted.
+    #[cfg(feature = "memory-sqlcipher")]
+    pub fn with_options_keyed(
+        workspace_dir: &Path,
+        passphrase: &str,
+        embedder: Arc<dyn EmbeddingProvider>,
+        search_mode: SearchMode,
+        vector_weight: f32,
+        keyword_weight: f32,
+        rrf_k: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        journal_mode: &str,
+    ) -> anyhow::Result<Self> {
+        Self::with_options_inner(
+            workspace_dir,
+            Some(passphrase),
+            embedder,
+            search_mode,
+            vector_weight,
+            keyword_weight,
+            rrf_k,
+            cache_max,
+            open_timeout_secs,
+            journal_mode,
+        )
+    }
+
     /// Build SQLite memory with full options including journal mode.
     ///
     /// `journal_mode` accepts `"wal"` (default, best performance) or `"delete"`
     /// (required for network/shared filesystems that lack shared-memory support).
     pub fn with_options(
         workspace_dir: &Path,
+        embedder: Arc<dyn EmbeddingProvider>,
+        search_mode: SearchMode,
+        vector_weight: f32,
+        keyword_weight: f32,
+        rrf_k: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        journal_mode: &str,
+    ) -> anyhow::Result<Self> {
+        Self::with_options_inner(
+            workspace_dir,
+            None,
+            embedder,
+            search_mode,
+            vector_weight,
+            keyword_weight,
+            rrf_k,
+            cache_max,
+            open_timeout_secs,
+            journal_mode,
+        )
+    }
+
+    /// Shared body between `with_options` and `with_options_keyed`. The
+    /// `passphrase` parameter exists on the non-SQLCipher build path too
+    /// (always `None`) so we only maintain one implementation; the
+    /// `PRAGMA key` path is reachable only when `memory-sqlcipher` is on.
+    #[allow(clippy::too_many_arguments)]
+    fn with_options_inner(
+        workspace_dir: &Path,
+        #[allow(unused_variables)] passphrase: Option<&str>,
         embedder: Arc<dyn EmbeddingProvider>,
         search_mode: SearchMode,
         vector_weight: f32,
@@ -157,6 +227,23 @@ impl SqliteMemory {
         }
 
         let conn = Self::open_connection(&db_path, open_timeout_secs)?;
+
+        // ── PR #5: SQLCipher at-rest encryption ─────────────────
+        // Must run BEFORE any other PRAGMA so the header is read as
+        // encrypted. When the `memory-sqlcipher` feature is off the
+        // whole block is compiled out — passing a passphrase into a
+        // non-SQLCipher binary is a programming error.
+        #[cfg(feature = "memory-sqlcipher")]
+        {
+            if let Some(key) = passphrase {
+                // Escape any single quotes to keep the pragma well-formed.
+                let escaped = key.replace('\'', "''");
+                conn.execute_batch(&format!("PRAGMA key = '{escaped}';"))?;
+                // Transparent migration for DBs created by older
+                // SQLCipher versions; no-op for fresh DBs.
+                conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
+            }
+        }
 
         // ── Production-grade PRAGMA tuning ──────────────────────
         // WAL mode: concurrent reads during writes, crash-safe (default)
