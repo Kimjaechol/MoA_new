@@ -77,16 +77,67 @@ jobs:
                   path: eval-report.json
                   retention-days: 30
 
+            - name: Fetch main-branch baseline (for regression diff)
+              if: github.event_name == 'pull_request'
+              continue-on-error: true
+              id: fetch_baseline
+              uses: dawidd6/action-download-artifact@v6
+              with:
+                  workflow: eval.yml
+                  branch: main
+                  name_is_regexp: true
+                  name: eval-report-.*
+                  path: baseline
+                  if_no_artifact_found: warn
+                  # Most recent main-branch artifact wins; older runs are
+                  # implicitly ignored by the action.
+
             - name: Diff against main baseline
               if: github.event_name == 'pull_request'
               continue-on-error: true
+              id: diff_baseline
               run: |
-                  # Best-effort regression diff: download the latest main-branch
-                  # eval-report artifact (if any) and compare overall recall.
-                  # Skipped silently when no baseline exists yet.
+                  # Best-effort regression diff: compare this PR's overall
+                  # context_recall against the most recent main-branch run.
+                  # Threshold lives in tests/evals/thresholds.toml under
+                  # [overall].max_regression_fraction (default 0.05).
                   set -e
-                  jq -r '.report.overall' eval-report.json > current.json
-                  cat current.json
+                  if [ ! -f eval-report.json ]; then
+                      echo "::warning::no current eval-report.json; skipping diff"
+                      exit 0
+                  fi
+                  shopt -s nullglob
+                  candidates=(baseline/*/eval-report.json baseline/eval-report.json)
+                  if [ ${#candidates[@]} -eq 0 ]; then
+                      echo "::notice::no main-branch baseline artifact yet; skipping diff"
+                      echo "regression=none" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+                  baseline="${candidates[0]}"
+                  current_recall=$(jq -r '.report.overall.context_recall' eval-report.json)
+                  baseline_recall=$(jq -r '.report.overall.context_recall' "$baseline")
+                  threshold=$(python3 -c "
+                  import sys, tomllib
+                  try:
+                      with open('tests/evals/thresholds.toml', 'rb') as f:
+                          cfg = tomllib.load(f)
+                      print(cfg.get('overall', {}).get('max_regression_fraction', 0.05))
+                  except Exception:
+                      print(0.05)
+                  ")
+                  echo "baseline_recall=$baseline_recall current_recall=$current_recall threshold=$threshold"
+                  regression=$(python3 -c "
+                  b=float('$baseline_recall'); c=float('$current_recall'); t=float('$threshold')
+                  drop = (b - c) / max(b, 1e-9)
+                  print('fail' if drop > t else 'ok')
+                  ")
+                  echo "regression=$regression" >> "$GITHUB_OUTPUT"
+                  echo "baseline_recall=$baseline_recall" >> "$GITHUB_OUTPUT"
+                  echo "current_recall=$current_recall" >> "$GITHUB_OUTPUT"
+                  if [ "$regression" = "fail" ]; then
+                      echo "::error::retrieval recall regression exceeds threshold ($baseline_recall → $current_recall, threshold=$threshold)"
+                      exit 1
+                  fi
 
             - name: Post PR comment
               if: github.event_name == 'pull_request' && always()
@@ -110,6 +161,14 @@ jobs:
                           body += `| ${s.domain} | ${s.queries} | ${s.context_recall.toFixed(3)} | ${s.context_precision.toFixed(3)} | ${s.mrr.toFixed(3)} |\n`;
                       }
                       body += `| **overall** | **${r.overall.queries}** | **${r.overall.context_recall.toFixed(3)}** | **${r.overall.context_precision.toFixed(3)}** | **${r.overall.mrr.toFixed(3)}** |\n\n`;
+                      // PR #8 잔여 — baseline diff line from the previous step.
+                      const regression = '${{ steps.diff_baseline.outputs.regression }}';
+                      const baselineRecall = '${{ steps.diff_baseline.outputs.baseline_recall }}';
+                      const currentRecall = '${{ steps.diff_baseline.outputs.current_recall }}';
+                      if (regression && regression !== 'none' && baselineRecall && currentRecall) {
+                          const emoji = regression === 'ok' ? ':chart_with_upwards_trend:' : ':warning:';
+                          body += `${emoji} baseline recall: ${parseFloat(baselineRecall).toFixed(3)} → ${parseFloat(currentRecall).toFixed(3)} (${regression})\n\n`;
+                      }
                       body += v.length === 0
                           ? ':white_check_mark: All thresholds met.\n'
                           : `:x: **${v.length} threshold violation(s):**\n` + v.map(x => `- ${x}`).join('\n') + '\n';

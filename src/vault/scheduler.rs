@@ -22,13 +22,25 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_IDLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// Health check minimum cadence.
 pub const DEFAULT_HEALTH_CADENCE: Duration = Duration::from_secs(24 * 3600);
+/// PR #9 community detection minimum cadence — weekly.
+pub const DEFAULT_COMMUNITY_CADENCE: Duration = Duration::from_secs(7 * 24 * 3600);
 
 pub struct VaultScheduler {
     vault: Arc<VaultStore>,
+    /// PR #9 — optional ontology repo. When present, the scheduler runs
+    /// weekly community detection (Label Propagation → write into
+    /// `ontology_communities`) during idle time. Kept optional so
+    /// vault-only deployments (no ontology layer) still work.
+    ontology: Option<Arc<crate::ontology::OntologyRepo>>,
     last_activity: Arc<Mutex<Instant>>,
     last_health_check: Arc<Mutex<Option<Instant>>>,
+    /// PR #9 — tracks when the last community-detection pass ran. Bumped
+    /// after a successful detection so the next tick can decide whether
+    /// to run again based on `community_cadence`.
+    last_community_detection: Arc<Mutex<Option<Instant>>>,
     idle_threshold: Duration,
     health_cadence: Duration,
+    community_cadence: Duration,
     /// Number of hub compiles per idle tick (Plan §7-5 worker budget).
     hub_batch_size: usize,
     /// Max concurrent hub compiles per batch.
@@ -40,19 +52,40 @@ pub struct SchedulerStats {
     pub hubs_compiled: usize,
     pub health_checks_run: usize,
     pub briefings_refreshed: usize,
+    /// PR #9 — number of communities rewritten this tick (0 when
+    /// detection was skipped because cadence hadn't elapsed).
+    pub communities_detected: usize,
 }
 
 impl VaultScheduler {
     pub fn new(vault: Arc<VaultStore>) -> Self {
         Self {
             vault,
+            ontology: None,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             last_health_check: Arc::new(Mutex::new(None)),
+            last_community_detection: Arc::new(Mutex::new(None)),
             idle_threshold: DEFAULT_IDLE_THRESHOLD,
             health_cadence: DEFAULT_HEALTH_CADENCE,
+            community_cadence: DEFAULT_COMMUNITY_CADENCE,
             hub_batch_size: 4,
             hub_concurrency: 2,
         }
+    }
+
+    /// PR #9 — attach an OntologyRepo so the weekly community-detection
+    /// job can run. Without an attached repo the scheduler silently
+    /// skips detection (back-compat for vault-only deployments).
+    pub fn with_ontology(mut self, repo: Arc<crate::ontology::OntologyRepo>) -> Self {
+        self.ontology = Some(repo);
+        self
+    }
+
+    /// PR #9 — override the minimum cadence between community detection
+    /// passes. Defaults to weekly; tests typically drop this to seconds.
+    pub fn with_community_cadence(mut self, t: Duration) -> Self {
+        self.community_cadence = t;
+        self
     }
 
     pub fn with_idle_threshold(mut self, t: Duration) -> Self {
@@ -156,6 +189,57 @@ impl VaultScheduler {
             }
         }
 
+        // 4. PR #9 — weekly community detection. Only runs when
+        //    (a) an OntologyRepo is attached, (b) cadence has elapsed
+        //    since the last successful pass, and (c) the graph is
+        //    non-empty. The summariser is intentionally a no-op here
+        //    (empty string, no keywords) — a follow-up pass with an LLM
+        //    provider attached is responsible for filling in the summary
+        //    text and `set_community_embedding`. This keeps the scheduler
+        //    free of provider plumbing while still capturing structure.
+        if let Some(onto) = &self.ontology {
+            let should_run = {
+                let last = self.last_community_detection.lock();
+                match *last {
+                    None => true,
+                    Some(t) => t.elapsed() >= self.community_cadence,
+                }
+            };
+            if should_run {
+                match onto.load_graph_view() {
+                    Ok(graph) if !graph.nodes.is_empty() => {
+                        let assignment = crate::ontology::community::detect_communities(&graph);
+                        match onto.replace_communities_level_zero(&assignment, |_, _| {
+                            // Placeholder summariser. The LLM-driven
+                            // summariser lives in the dream cycle
+                            // consolidation path; a separate VaultScheduler
+                            // refactor (PR #9 잔여) will share it.
+                            (String::new(), Vec::new())
+                        }) {
+                            Ok(n) => {
+                                *self.last_community_detection.lock() = Some(Instant::now());
+                                stats.communities_detected = n;
+                                tracing::info!(
+                                    communities = n,
+                                    nodes = graph.nodes.len(),
+                                    "scheduler ran weekly community detection"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("community detection write failed: {e}")
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // Empty graph — mark as "ran" anyway so we don't
+                        // retry every tick on an empty deployment.
+                        *self.last_community_detection.lock() = Some(Instant::now());
+                    }
+                    Err(e) => tracing::warn!("community graph load failed: {e}"),
+                }
+            }
+        }
+
         Ok(stats)
     }
 
@@ -252,6 +336,74 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(90)).await;
         tx.send(()).unwrap();
         let _ = handle.await.unwrap();
+    }
+
+    // ── PR #9 wire-up: VaultScheduler community detection ────────
+
+    #[tokio::test]
+    async fn tick_skips_community_detection_without_ontology_repo() {
+        let (_tmp, vault) = setup();
+        let sched = VaultScheduler::new(vault.clone())
+            .with_idle_threshold(Duration::from_millis(1))
+            .with_community_cadence(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let stats = sched.tick().await.unwrap();
+        assert_eq!(stats.communities_detected, 0);
+    }
+
+    #[tokio::test]
+    async fn tick_detects_communities_when_cadence_elapsed() {
+        use crate::ontology::OntologyRepo;
+
+        let tmp = TempDir::new().unwrap();
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let vault = Arc::new(VaultStore::with_shared_connection(conn).unwrap());
+        let repo = Arc::new(OntologyRepo::open(tmp.path()).unwrap());
+        let a = repo
+            .ensure_object("Contact", "Alice", &serde_json::json!({}), "u1")
+            .unwrap();
+        let b = repo
+            .ensure_object("Contact", "Bob", &serde_json::json!({}), "u1")
+            .unwrap();
+        repo.create_link("knows", a, b, None).unwrap();
+
+        let sched = VaultScheduler::new(vault)
+            .with_ontology(repo.clone())
+            .with_idle_threshold(Duration::from_millis(1))
+            .with_community_cadence(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let stats = sched.tick().await.unwrap();
+        assert!(
+            stats.communities_detected >= 1,
+            "expected ≥1 community, got {}",
+            stats.communities_detected
+        );
+        let listed = repo.list_communities_level_zero().unwrap();
+        assert!(!listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn community_detection_respects_cadence_between_ticks() {
+        use crate::ontology::OntologyRepo;
+
+        let tmp = TempDir::new().unwrap();
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let vault = Arc::new(VaultStore::with_shared_connection(conn).unwrap());
+        let repo = Arc::new(OntologyRepo::open(tmp.path()).unwrap());
+        repo.ensure_object("Contact", "Solo", &serde_json::json!({}), "u1")
+            .unwrap();
+
+        let sched = VaultScheduler::new(vault)
+            .with_ontology(repo)
+            .with_idle_threshold(Duration::from_millis(1))
+            .with_community_cadence(Duration::from_secs(3600));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let _first = sched.tick().await.unwrap();
+        let second = sched.tick().await.unwrap();
+        assert_eq!(
+            second.communities_detected, 0,
+            "second tick within cadence must skip"
+        );
     }
 
     #[tokio::test]
