@@ -61,6 +61,29 @@ pub const LAWYER_PRESETS: &[Preset] = &[
     },
 ];
 
+/// All bundled shopping presets, embedded at compile time.
+pub const SHOPPING_PRESETS: &[Preset] = &[
+    Preset {
+        slug: "shopping_01_product_search",
+        yaml: include_str!("presets/shopping/01_product_search.yaml"),
+    },
+    Preset {
+        slug: "shopping_03b_recurring_execute",
+        yaml: include_str!("presets/shopping/03b_recurring_execute.yaml"),
+    },
+    Preset {
+        slug: "shopping_04_one_time_purchase",
+        yaml: include_str!("presets/shopping/04_one_time_purchase.yaml"),
+    },
+];
+
+/// All bundled presets combined.
+pub fn all_presets() -> Vec<&'static Preset> {
+    let mut all: Vec<&'static Preset> = LAWYER_PRESETS.iter().collect();
+    all.extend(SHOPPING_PRESETS.iter());
+    all
+}
+
 /// Parse a preset into a WorkflowSpec.
 pub fn parse_preset(preset: &Preset) -> Result<WorkflowSpec> {
     parse_spec(preset.yaml).with_context(|| format!("preset '{}' invalid", preset.slug))
@@ -281,6 +304,46 @@ mod tests {
         for p in LAWYER_PRESETS {
             let spec = parse_preset(p).unwrap();
             assert!(!spec.steps.is_empty(), "{}: steps must not be empty", p.slug);
+        }
+    }
+
+    // ── Shopping preset tests ───────────────────────────────────
+
+    #[test]
+    fn all_shopping_presets_parse() {
+        let failures = validate_all_presets(SHOPPING_PRESETS);
+        assert!(
+            failures.is_empty(),
+            "Some shopping presets failed: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn shopping_presets_use_shopping_category() {
+        for p in SHOPPING_PRESETS {
+            let spec = parse_preset(p).unwrap();
+            assert_eq!(
+                spec.parent_category, "shopping",
+                "{}: must be parent_category='shopping'",
+                p.slug
+            );
+        }
+    }
+
+    #[test]
+    fn all_presets_combined() {
+        let combined = all_presets();
+        assert_eq!(combined.len(), LAWYER_PRESETS.len() + SHOPPING_PRESETS.len());
+    }
+
+    #[test]
+    fn all_shopping_slugs_prefixed() {
+        for p in SHOPPING_PRESETS {
+            assert!(
+                p.slug.starts_with("shopping_"),
+                "slug '{}' must start with 'shopping_'",
+                p.slug
+            );
         }
     }
 }
