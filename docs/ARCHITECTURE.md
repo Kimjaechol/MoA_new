@@ -3647,6 +3647,7 @@ SourceType::ChatPaste char_count:
 | **#1 아키텍처** | ✅ 완료 (ONNX 통합은 feature-gated) | `src/memory/embeddings.rs` → `src/memory/embedding/` 디렉토리 분리 (mod/noop/openai/custom_http/local_fastembed). Trait에 `model()`·`version()` 추가 → PR #2 메타컬럼 공급 가능. `PROVIDER_*` 상수 4종 (`local_fastembed`/`openai`/`custom_http`/`none`). `fastembed = "5"`를 `embedding-local` feature로 **opt-in** 추가 (기본 빌드에 ONNX 런타임 미포함 → 바이너리 크기 목표 유지). Feature off 시 `LocalFastembedStub`이 `embed()`에서 안내 에러 반환. `doctor::embedding_provider_validation_error`가 `local_fastembed`/`openrouter` 수용. 기존 `memory::embeddings::*` 경로 유지 (`pub use embedding as embeddings` 호환 alias). | `src/memory/embedding/{mod,noop,openai,custom_http,local_fastembed}.rs` · `Cargo.toml` (fastembed optional + `embedding-local` feature) · `src/doctor/mod.rs::embedding_provider_validation_error` |
 | **#7 HLC** | ✅ 완료 | 신설 `src/sync/hlc.rs` — `Hlc { wall_ms, logical, node_id }` 구조체 + `HlcClock` lock-free 시계 (packed u64 CAS). `encode()`/`parse()` 라운드트립, 5분 시계 스큐 수용 (`update_bumps_past_remote_under_5min_clock_skew` 테스트), 8스레드 800 tick 동시성에서 단조성 보장. 13 테스트 pass. 스키마 마이그레이션(`memories.updated_at` → HLC 문자열)은 sync protocol 버전 bump와 함께 별도 PR로 분리. | `src/sync/hlc.rs` · `src/sync/mod.rs` |
 | **#7 Credit TOCTOU** | ✅ 완료 | `src/billing/payment.rs`에 `ReservationId` 타입 + `reserve_credits(user, max)` / `commit_reservation(rid, actual)` / `cancel_reservation(rid)` 추가. `credit_reservations` 테이블 신설 (open/committed/cancelled). 예약은 원자적 `UPDATE … WHERE balance >= ?`으로 음수 잔액 불가능. 10스레드 fuzz 테스트 (`fuzz_concurrent_reservations_never_go_negative`)로 동시성 검증. 10개 신규 테스트 pass. | `src/billing/payment.rs::{reserve_credits,commit_reservation,cancel_reservation}` |
+| **#4 RRF + Reranker (아키텍처)** | ✅ 완료 (실측은 feature build 필요) | 신설 `src/memory/search/{mod,fusion,rerank}.rs`. `k_way_rrf` 진정한 k-way 구현 — 이전 "flatten→2way" 손실을 복구(다중 쿼리에서 한 번이라도 rank-1 찍는 문서가 과잉 가중되지 않음). 11 fusion 테스트 (score-scale invariance, 교집합 부스트, 중복 처리 등). `Reranker` trait + `NoopReranker` + `BgeReranker` (fastembed 5 `TextRerank` via `embedding-local` feature, off 시 stub가 안내 에러). `[memory.rerank]` config 추가(enabled/model/top_k_before/top_k_after). `SqliteMemory`에 `set_reranker()`/`set_rerank_config()` interior-mutable 주입 지점. `recall_with_variations`가 k-way RRF + top-50 후보 → rerank → top-10로 일원화. 15 신규 테스트 pass. | `src/memory/search/{mod,fusion,rerank}.rs` · `src/memory/sqlite.rs::recall_with_variations` · `src/config/schema.rs::RerankConfig` |
 
 #### 후속 세션 실행 스펙 (PR #1 실데이터 검증 · #4 · #5 · #6 · #7 나머지 · #8 · #9)
 
@@ -3655,12 +3656,9 @@ SourceType::ChatPaste char_count:
 - **남은 작업**: (a) `cargo test --features embedding-local` 실제 BGE-M3 다운로드 + 결정론 테스트 (동일 입력 → 동일 벡터). (b) `config.toml` 기본값을 `"local_fastembed"`으로 승격하는 건은 `embedding-local` 피처가 릴리즈 기본으로 켜진 뒤에 바꾼다 — 현재 기본은 `"none"` 유지(회귀 0). (c) Tauri 다운로드 진행률 이벤트 UI. (d) CPU 32배치 < 2s 성능 검증.
 - **주의**: `fastembed = "5"`는 `ort` 2.x(ONNX Runtime)를 끌어오므로 nightly-all-features 레인에서 처음 빌드 시 플랫폼 라이브러리(libonnxruntime)가 필요할 수 있음. `.github/workflows/nightly-all-features.yml`의 Linux deps 단계 확인 필요.
 
-##### PR #4 — RRF + Cross-Encoder Reranker
-- **목표**: 선형 가중합 → RRF(k=60) + BGE-reranker-v2-m3 crossencoder (약 560MB) 계층.
-- **파일**: `src/memory/search/fusion.rs` (RRF) · `src/memory/search/rerank.rs`. `SqliteMemory::recall_with_variations` 기존 RRF를 이 구현으로 일원화.
-- **설정**: `[search.rerank] enabled=true, model="bge-reranker-v2-m3", top_k_before=50, top_k_after=10`.
-- **폴백**: 저사양(모바일) `enabled=false` → `src/vault/normalize::adaptive_weights` 기반 언어 적응형 가중치로 degrade.
-- **수락 기준**: RRF 단위 테스트 + rerank on/off 정확도 개선 ≥5 point + p95 latency < 500ms.
+##### PR #4 (잔여 실측) — Reranker 실데이터 벤치
+- **완료 범위 요약**: `k_way_rrf` 구현 + 11 unit test / `Reranker` trait + `BgeReranker` (feature-gated) + 4 rerank test / `[memory.rerank]` config / `SqliteMemory::recall_with_variations` 일원화. 기본 빌드 522→552 pass, 0 회귀.
+- **남은 작업**: (a) `cargo build --features embedding-local` 후 BGE-reranker-v2-m3 다운로드 + 실제 쿼리로 on/off 정확도 비교 (수락 기준: ≥5 point 개선). (b) p95 latency <500ms 실측(상위 50 후보 × 560MB 모델). (c) 저사양 모바일 빌드에서 `enabled=false`로 `vault::normalize::adaptive_weights` degrade가 의도대로 동작하는지 확인.
 
 ##### PR #5 (full) — Embedding sync encryption + vec2text defence
 - **목표**: `SyncDelta` 암호화 페이로드에 embedding BLOB 포함. (vec2text EMNLP 2023 공격 92% 복원 방어).

@@ -20,6 +20,7 @@ pub mod none;
 pub mod postgres;
 pub mod qdrant;
 pub mod query_expand;
+pub mod search;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;

@@ -59,6 +59,16 @@ pub struct SqliteMemory {
     /// Interior-mutable so the factory can attach post-construction without
     /// breaking the `Memory` trait upcast path.
     sync: Mutex<Option<Arc<Mutex<super::sync::SyncEngine>>>>,
+
+    /// PR #4 — optional cross-encoder reranker. Interior-mutable with the
+    /// same rationale as `sync` above: the factory wires the reranker after
+    /// `SqliteMemory` is already constructed, and we want to keep the
+    /// `Memory` trait free of reranker specifics.
+    reranker: Mutex<Option<Arc<dyn super::search::Reranker>>>,
+
+    /// PR #4 — rerank runtime settings (enabled flag + top_k window).
+    /// Defaults to `RerankRuntimeConfig::default()` which is `enabled = false`.
+    rerank_config: Mutex<super::search::RerankRuntimeConfig>,
 }
 
 impl SqliteMemory {
@@ -177,7 +187,34 @@ impl SqliteMemory {
             rrf_k,
             cache_max,
             sync: Mutex::new(None),
+            reranker: Mutex::new(None),
+            rerank_config: Mutex::new(super::search::RerankRuntimeConfig::default()),
         })
+    }
+
+    /// PR #4 — attach a cross-encoder reranker. The reranker is consulted by
+    /// `recall_with_variations` after RRF fusion when `rerank_config.enabled`
+    /// is true. Replacing an existing reranker is explicit; callers should
+    /// not install one at hot path.
+    pub fn set_reranker(&self, reranker: Arc<dyn super::search::Reranker>) {
+        *self.reranker.lock() = Some(reranker);
+    }
+
+    /// PR #4 — update rerank runtime config (enabled/model/top_k). The config
+    /// is read on every recall so changes take effect immediately.
+    pub fn set_rerank_config(&self, cfg: super::search::RerankRuntimeConfig) {
+        *self.rerank_config.lock() = cfg;
+    }
+
+    /// Snapshot of the current rerank config — used by the hot path without
+    /// holding a lock across awaits.
+    fn rerank_config(&self) -> super::search::RerankRuntimeConfig {
+        self.rerank_config.lock().clone()
+    }
+
+    /// Snapshot of the currently attached reranker, if any.
+    fn active_reranker(&self) -> Option<Arc<dyn super::search::Reranker>> {
+        self.reranker.lock().clone()
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
@@ -1077,52 +1114,128 @@ impl SqliteMemory {
             }
         }
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+        // PR #4 — how big a candidate pool the reranker (if any) wants to
+        // see. Fetched here so the blocking task can over-fetch when a
+        // reranker is attached.
+        let rerank_cfg = self.rerank_config();
+        let reranker = self.active_reranker();
+        let fetch_limit = if reranker.is_some() && rerank_cfg.enabled {
+            rerank_cfg.top_k_before.max(limit)
+        } else {
+            limit
+        };
+
+        let results: anyhow::Result<Vec<MemoryEntry>> = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
 
-            // Collect ranked lists from all queries × {vec, fts}
-            let mut all_vec_results: Vec<(String, f32)> = Vec::new();
-            let mut all_fts_results: Vec<(String, f32)> = Vec::new();
+            // PR #4: collect one ranker slice per (query × ranker_kind). The
+            // previous implementation flattened all queries into two big
+            // lists and 2-way merged them, losing the rank-per-query signal
+            // that RRF is designed to exploit. k_way_rrf keeps each list
+            // separate so a document that lands rank-1 in multiple query
+            // variations dominates one that lands rank-1 once.
+            let mut per_ranker_lists: Vec<Vec<(String, f32)>> =
+                Vec::with_capacity(queries_owned.len() * 2);
+            let mut any_vec_hit = false;
 
             for (i, q) in queries_owned.iter().enumerate() {
-                let fts = Self::fts5_search(&conn, q, limit * 2).unwrap_or_default();
-                all_fts_results.extend(fts);
+                let fts = Self::fts5_search(&conn, q, fetch_limit * 2).unwrap_or_default();
+                per_ranker_lists.push(fts);
 
                 if let Some(Some(ref emb)) = query_embeddings.get(i) {
-                    let vec_hits = Self::vector_search(&conn, emb, limit * 2, None, session_ref)
-                        .unwrap_or_default();
-                    all_vec_results.extend(vec_hits);
+                    let vec_hits =
+                        Self::vector_search(&conn, emb, fetch_limit * 2, None, session_ref)
+                            .unwrap_or_default();
+                    if !vec_hits.is_empty() {
+                        any_vec_hit = true;
+                    }
+                    per_ranker_lists.push(vec_hits);
                 }
             }
 
-            // Deduplicate by keeping the best score per id for each ranker
-            let dedup_vec = dedup_ranked_list(&all_vec_results);
-            let dedup_fts = dedup_ranked_list(&all_fts_results);
-
-            // Merge via configured strategy
-            let merged = if dedup_vec.is_empty() {
-                dedup_fts
-                    .iter()
-                    .map(|(id, score)| super::vector::ScoredResult {
-                        id: id.clone(),
-                        vector_score: None,
-                        keyword_score: Some(*score),
-                        final_score: *score,
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                match search_mode {
-                    SearchMode::Rrf => {
-                        super::vector::rrf_merge(&dedup_vec, &dedup_fts, rrf_k, limit)
+            let merged: Vec<super::vector::ScoredResult> = match search_mode {
+                SearchMode::Rrf => {
+                    if !any_vec_hit {
+                        // FTS-only fallback: skip fusion when vectors are
+                        // unavailable (e.g. NoopEmbedding); preserve BM25
+                        // order directly.
+                        let flat = dedup_ranked_list(
+                            &per_ranker_lists
+                                .iter()
+                                .flatten()
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        );
+                        flat.into_iter()
+                            .take(fetch_limit)
+                            .map(|(id, score)| super::vector::ScoredResult {
+                                id,
+                                vector_score: None,
+                                keyword_score: Some(score),
+                                final_score: score,
+                            })
+                            .collect()
+                    } else {
+                        let ranker_refs: Vec<&[(String, f32)]> = per_ranker_lists
+                            .iter()
+                            .map(std::vec::Vec::as_slice)
+                            .collect();
+                        let fused = super::search::k_way_rrf(
+                            &ranker_refs,
+                            super::search::RrfSettings {
+                                k: rrf_k,
+                                limit: fetch_limit,
+                            },
+                        );
+                        fused
+                            .into_iter()
+                            .map(|f| super::vector::ScoredResult {
+                                id: f.id,
+                                vector_score: None,
+                                keyword_score: None,
+                                final_score: f.score,
+                            })
+                            .collect()
                     }
-                    SearchMode::Weighted => super::vector::hybrid_merge(
-                        &dedup_vec,
-                        &dedup_fts,
-                        vector_weight,
-                        keyword_weight,
-                        limit,
-                    ),
+                }
+                SearchMode::Weighted => {
+                    // Weighted mode keeps the legacy 2-way collapse — its
+                    // linear score blend assumes a single vector and a
+                    // single keyword list, so we still dedup-then-merge.
+                    let mut all_vec: Vec<(String, f32)> = Vec::new();
+                    let mut all_fts: Vec<(String, f32)> = Vec::new();
+                    for (idx, list) in per_ranker_lists.iter().enumerate() {
+                        // Even-numbered slots are fts (see push order above);
+                        // odd slots are vec. This pairing is local to this
+                        // legacy branch only.
+                        if idx % 2 == 0 {
+                            all_fts.extend(list.iter().cloned());
+                        } else {
+                            all_vec.extend(list.iter().cloned());
+                        }
+                    }
+                    let dedup_vec = dedup_ranked_list(&all_vec);
+                    let dedup_fts = dedup_ranked_list(&all_fts);
+                    if dedup_vec.is_empty() {
+                        dedup_fts
+                            .into_iter()
+                            .map(|(id, score)| super::vector::ScoredResult {
+                                id,
+                                vector_score: None,
+                                keyword_score: Some(score),
+                                final_score: score,
+                            })
+                            .collect()
+                    } else {
+                        super::vector::hybrid_merge(
+                            &dedup_vec,
+                            &dedup_fts,
+                            vector_weight,
+                            keyword_weight,
+                            fetch_limit,
+                        )
+                    }
                 }
             };
 
@@ -1186,7 +1299,65 @@ impl SqliteMemory {
 
             Ok(results)
         })
-        .await?
+        .await
+        .map_err(|e| anyhow::anyhow!("recall_with_variations blocking task panicked: {e}"))?;
+
+        // PR #4 — cross-encoder rerank pass. Runs off the blocking pool so
+        // the ONNX call can own its own tokio::spawn_blocking internally.
+        let fused_entries = results?;
+        let final_entries: Vec<MemoryEntry> = match (reranker, rerank_cfg.enabled) {
+            (Some(reranker), true) if !fused_entries.is_empty() => {
+                let window = rerank_cfg.top_k_before.min(fused_entries.len());
+                let (rerank_slice, rest) = fused_entries.split_at(window);
+                let candidates: Vec<super::search::RerankCandidate> = rerank_slice
+                    .iter()
+                    .map(|e| super::search::RerankCandidate {
+                        id: e.id.clone(),
+                        text: e.content.clone(),
+                        #[allow(clippy::cast_possible_truncation)]
+                        prior_score: e.score.map(|s| s as f32).unwrap_or(0.0),
+                    })
+                    .collect();
+                match reranker.rerank(original_query, candidates).await {
+                    Ok(reordered) => {
+                        let keep = rerank_cfg.top_k_after.min(reordered.len());
+                        let mut by_id: std::collections::HashMap<String, MemoryEntry> =
+                            rerank_slice
+                                .iter()
+                                .cloned()
+                                .map(|e| (e.id.clone(), e))
+                                .collect();
+                        let mut out = Vec::with_capacity(keep);
+                        for c in reordered.into_iter().take(keep) {
+                            if let Some(mut entry) = by_id.remove(&c.id) {
+                                entry.score = Some(f64::from(c.prior_score));
+                                out.push(entry);
+                            }
+                        }
+                        // If the reranker trimmed below the caller's limit
+                        // (because top_k_after < window), tail the RRF
+                        // overflow so we don't hand back fewer results than
+                        // `limit` requested.
+                        if out.len() < limit {
+                            for entry in rest.iter().take(limit - out.len()) {
+                                out.push(entry.clone());
+                            }
+                        }
+                        out
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "rerank pass failed; returning RRF-only results"
+                        );
+                        fused_entries.into_iter().take(limit).collect()
+                    }
+                }
+            }
+            _ => fused_entries.into_iter().take(limit).collect(),
+        };
+
+        Ok(final_entries)
     }
 }
 

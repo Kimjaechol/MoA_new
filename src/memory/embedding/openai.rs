@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 
-use super::{EmbeddingProvider, EMBEDDING_SCHEMA_VERSION, PROVIDER_OPENAI};
+use super::{EmbeddingProvider, EMBEDDING_SCHEMA_VERSION};
 
 /// OpenAI-compatible embedder. Pairs with a `provider_family` label stored in
 /// `vault_documents.embedding_provider` so downstream code can distinguish
@@ -146,6 +146,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::PROVIDER_OPENAI;
 
     fn openai(base: &str) -> OpenAiEmbedding {
         OpenAiEmbedding::new(base, "key", "text-embedding-3-small", 1536, PROVIDER_OPENAI)
