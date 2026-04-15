@@ -1,0 +1,5 @@
+{"query":"주택임대차보호법 대항력 요건","gold_keys":["corpus_law_001"],"domain":"law"}
+{"query":"상가건물임대차보호법 환산보증금 초과","gold_keys":["corpus_law_002"],"domain":"law"}
+{"query":"대법원 2023다12345 갱신거절","gold_keys":["corpus_law_003"],"domain":"law"}
+{"query":"민법 제621조 임차물 전대","gold_keys":["corpus_law_004"],"domain":"law"}
+{"query":"부동산 명도 강제집행 절차","gold_keys":["corpus_law_005"],"domain":"law"}

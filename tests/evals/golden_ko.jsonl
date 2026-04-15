@@ -1,0 +1,10 @@
+{"query":"사용자 직업과 전담팀","gold_keys":["corpus_ko_001"],"domain":"ko"}
+{"query":"월요일 상담 일정","gold_keys":["corpus_ko_002"],"domain":"ko"}
+{"query":"서울중앙지방법원 변론기일","gold_keys":["corpus_ko_003"],"domain":"ko"}
+{"query":"아이 학교 담임선생님","gold_keys":["corpus_ko_004"],"domain":"ko"}
+{"query":"정기 검진 주치의","gold_keys":["corpus_ko_005"],"domain":"ko"}
+{"query":"디카페인 커피 이유","gold_keys":["corpus_ko_006"],"domain":"ko"}
+{"query":"주말 테니스 수영","gold_keys":["corpus_ko_007"],"domain":"ko"}
+{"query":"장모님 생신 가족 모임","gold_keys":["corpus_ko_008"],"domain":"ko"}
+{"query":"애완견 보리 사료","gold_keys":["corpus_ko_009"],"domain":"ko"}
+{"query":"운전면허 갱신일","gold_keys":["corpus_ko_010"],"domain":"ko"}

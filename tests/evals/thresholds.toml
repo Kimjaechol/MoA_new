@@ -1,0 +1,24 @@
+# PR #8 eval thresholds — CI reads this to decide pass/fail.
+#
+# Each domain entry defines minimum acceptable values. Missing metrics
+# fall back to "warn only" (no build fail). Raise as the corpus grows;
+# see tests/evals/README.md.
+
+[law]
+context_recall_min    = 0.60
+context_precision_min = 0.20
+mrr_min               = 0.30
+
+[ko]
+context_recall_min    = 0.50
+mrr_min               = 0.30
+
+[en]
+context_recall_min    = 0.50
+mrr_min               = 0.30
+
+[overall]
+# Regression guard: fail the job if overall context_recall drops by
+# more than this fraction vs. the previous main-branch baseline.
+# The baseline file is fetched by the CI workflow.
+max_regression_fraction = 0.05

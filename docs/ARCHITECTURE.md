@@ -3649,6 +3649,7 @@ SourceType::ChatPaste char_count:
 | **#7 Credit TOCTOU** | ✅ 완료 | `src/billing/payment.rs`에 `ReservationId` 타입 + `reserve_credits(user, max)` / `commit_reservation(rid, actual)` / `cancel_reservation(rid)` 추가. `credit_reservations` 테이블 신설 (open/committed/cancelled). 예약은 원자적 `UPDATE … WHERE balance >= ?`으로 음수 잔액 불가능. 10스레드 fuzz 테스트 (`fuzz_concurrent_reservations_never_go_negative`)로 동시성 검증. 10개 신규 테스트 pass. | `src/billing/payment.rs::{reserve_credits,commit_reservation,cancel_reservation}` |
 | **#4 RRF + Reranker (아키텍처)** | ✅ 완료 (실측은 feature build 필요) | 신설 `src/memory/search/{mod,fusion,rerank}.rs`. `k_way_rrf` 진정한 k-way 구현 — 이전 "flatten→2way" 손실을 복구(다중 쿼리에서 한 번이라도 rank-1 찍는 문서가 과잉 가중되지 않음). 11 fusion 테스트 (score-scale invariance, 교집합 부스트, 중복 처리 등). `Reranker` trait + `NoopReranker` + `BgeReranker` (fastembed 5 `TextRerank` via `embedding-local` feature, off 시 stub가 안내 에러). `[memory.rerank]` config 추가(enabled/model/top_k_before/top_k_after). `SqliteMemory`에 `set_reranker()`/`set_rerank_config()` interior-mutable 주입 지점. `recall_with_variations`가 k-way RRF + top-50 후보 → rerank → top-10로 일원화. 15 신규 테스트 pass. | `src/memory/search/{mod,fusion,rerank}.rs` · `src/memory/sqlite.rs::recall_with_variations` · `src/config/schema.rs::RerankConfig` |
 | **#5 Embedding sync + vec2text 방어 (수신측)** | ✅ 완료 (SQLCipher at-rest 잔여) | `DeltaOperation::{Store,VaultDocUpsert}`에 `embedding: Option<EmbeddingBlob>` 추가 — `#[serde(skip_serializing_if = "Option::is_none")]`로 pre-PR#5 피어와 와이어 호환. `EmbeddingBlob::pack/unpack` LE-f32 직렬화(6 테스트). `Memory::accept_remote_embedding` trait 디폴트 `Ok(false)`, `SqliteMemory`가 모델 드리프트(provider/model/version/dim) 검출 시 embedding 폐기 + `embedding_backfill_queue` 등록, 일치 시 `embedding_cache` 시드(5 테스트). 기존 sync ChaCha20-Poly1305 암호화가 wire 상 float 평문 노출을 차단. 신설 `docs/security/embedding-privacy.md`에 vec2text EMNLP 2023 공격 원리 + 방어 수단 + 잔여 위협 명시. 11 신규 테스트 pass. | `src/memory/sync.rs::{EmbeddingBlob,DeltaOperation}` · `src/memory/sqlite.rs::accept_remote_embedding` · `src/memory/traits.rs::Memory::accept_remote_embedding` · `docs/security/embedding-privacy.md` |
+| **#8 RAGAS 평가 harness** | ✅ 완료 (LLM 판정 metric은 후속 Python 훅) | `tests/evals/`에 corpus(20행) + golden_ko(10) + golden_en(5) + golden_law(5) JSONL + `thresholds.toml`. `src/bin/moa_eval.rs` 신설 — context_precision@k / context_recall@k / MRR 계산, `--set ko/en/law`, `--top-k`, `--output JSON` 지원, threshold 위반 시 exit 1. 신설 `.github/workflows/eval.yml` — `src/memory/**`·`src/vault/**`·`tests/evals/**` 변경 PR에서 자동 실행, 결과를 PR 코멘트로 idempotent 게시(이전 코멘트 자리에 update), 임계값 위반 시 잡 실패. 현재 baseline: 모든 도메인 recall=1.0 / law precision=0.9 / overall MRR=1.0. faithfulness/answer_relevance은 LLM judge 필요 — 후속 `scripts/eval_rag_llm.py`. | `tests/evals/{corpus,golden_*,thresholds,README}.{jsonl,toml,md}` · `src/bin/moa_eval.rs` · `.github/workflows/eval.yml` |
 
 #### 후속 세션 실행 스펙 (PR #1 실데이터 검증 · #4 · #5 · #6 · #7 나머지 · #8 · #9)
 
@@ -3678,11 +3679,9 @@ SourceType::ChatPaste char_count:
 - **잔여 2 — HLC 스키마 통합**: `memories.updated_at` / `vault_documents.updated_at` / sync delta 타임스탬프를 `TEXT NOT NULL` HLC 문자열로 교체. 스키마 마이그레이션 + sync protocol version bump 동반 필요 — 장애 복구 경로 검증 후 진행.
 - **수락 기준 (잔여분)**: r2d2 8스레드 읽기 데드락 없음, 마이그레이션 후 기존 시간 비교 API 호환.
 
-##### PR #8 — RAGAS Evaluation Harness
-- **목표**: `faithfulness / answer_relevance / context_precision / context_recall` 자동 측정 + CI 통합.
-- **파일**: 신설 `evals/` 디렉토리. `golden_set_ko.jsonl` 100 · `_en.jsonl` 50 · `law_domain.jsonl` 30. `scripts/eval_rag.py` (RAGAS 파이썬) or `evals/runner.rs`.
-- **CI**: `.github/workflows/eval.yml` — PR마다 실행, 임계값 미달 시 빌드 실패, 결과 PR 코멘트.
-- **수락 기준**: `make eval` 한 줄 실행 / 법률 도메인 faithfulness ≥0.9 / 기준선 대비 ±5% 자동 알림.
+##### PR #8 (잔여 확장) — Golden 코퍼스 확장 + LLM judge
+- **완료 범위 요약**: Rust-native `moa_eval` 바이너리 + JSONL goldens(20 cases) + `tests/evals/thresholds.toml` + CI 워크플로우 (PR 코멘트 + artifact). 회귀 0.
+- **남은 작업**: (a) 코퍼스 확장 — 스펙 목표(ko 100 / en 50 / law 30)까지 큐레이션. 사용자/팀의 도메인 데이터 입력 필요. (b) `scripts/eval_rag_llm.py` 추가 — RAGAS 파이썬 + LLM judge로 faithfulness/answer_relevance 계산. CI에서는 옵션 잡으로 두고 코퍼스가 충분히 커진 뒤 합류. (c) baseline 비교 — `eval-report.json`을 main 브랜치 artifact로 보관 + 회귀 5% 시 PR 차단(`thresholds.toml::overall.max_regression_fraction` 활용). (d) 임계값 점진 강화 — 코퍼스 30+/도메인 도달 시 law `context_recall_min`을 0.6 → 0.9.
 
 ##### PR #9 — GraphRAG Community Layer (Phase 5)
 - **목표**: 온톨로지에 Leiden clustering → 커뮤니티별 요약 → 5th Phase Cross-Search.

@@ -1,0 +1,5 @@
+{"query":"weekly retrospective schedule","gold_keys":["corpus_en_001"],"domain":"en"}
+{"query":"production incident escalation policy","gold_keys":["corpus_en_002"],"domain":"en"}
+{"query":"staging database refresh cadence","gold_keys":["corpus_en_003"],"domain":"en"}
+{"query":"feature flag naming convention LaunchDarkly","gold_keys":["corpus_en_004"],"domain":"en"}
+{"query":"performance review self-review deadline","gold_keys":["corpus_en_005"],"domain":"en"}
