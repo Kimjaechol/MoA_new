@@ -9,6 +9,7 @@
 > - §3b **Patent 3 — Dual-Brain Second Memory** (new): compiled_truth + append-only timeline + Dream Cycle.
 > - §3c **Sync Journal v3** (new): `TimelineAppend`, `PhoneCallRecord`, `CompiledTruthUpdate` delta operations + inbound `apply_remote_v3_delta` hook with LWW on `truth_version`.
 > - §6★★ updated: hybrid search now defaults to weighted but `search_mode = "rrf"` unlocks Reciprocal Rank Fusion (k=60) via `Memory::recall` and `Memory::recall_with_variations` for multi-query expansion.
+> - **§6D MoA Vault (Second Brain)** (new): full implementation of v6 plan — 7-step wikilink extraction pipeline, 16 vault tables, self-evolving vocabulary, `VaultDocUpsert` sync delta, unified first+second brain parallel search with mandatory `chat_retrieval_logs` audit. Phase 1 MVP shipped + Phase 2–5 hooks (hub notes / health / briefings / folder watcher) scaffolded. Patent 4 claims 23–29 formalised here.
 > - §3 §6★★ §6A already existed; only wording/integration points refreshed to match `src/memory/*` as of commit `831d070e`.
 
 ---
@@ -3175,6 +3176,273 @@ converted without an explicit allowlist.
   collection. Operators concerned about disk usage can periodically
   clean `{workspace}/documents_cache/` and the cache will rebuild on
   next access.
+
+---
+
+## 6D. MoA Vault — Second Brain (v6, 구조 매핑형 허브노트 기반)
+
+> **Status legend**: 각 서브섹션 끝에 **[구현 · Implemented]** / **[계획 · Planned]** 태그로 명시.
+> **특허 관련**: §6D는 Patent 4 (Vault Second Brain) 청구항의 아키텍처 근거.
+> **Source of truth**: `.planning/vault-v6/SUMMARY.md` — 코드-우선 단일 지침 문서.
+> **원칙**: Patent 1 (E2E 동기화), Patent 2 (이중 저장소 교차참조), Patent 3 (Dual-Brain v3)
+> 위에 **additive** 레이어로 통합. 기존 특허 청구항은 훼손하지 않는다.
+
+### 6D-0. 배경 — 왜 세컨드브레인인가
+
+| 브레인 | 역할 | 저장 내용 |
+|---|---|---|
+| **퍼스트브레인** (§3, §6★★) | 에피소드 + 온톨로지 (개인 기억/지식) | `memories`, `memory_timeline`, `ontology_*` |
+| **세컨드브레인 (v6, this §)** | 참조 지식 (법조문/판례/매뉴얼/외부 자료) | `vault_documents`, `vault_links`, `vault_tags`, … |
+
+세컨드브레인은 **이용자가 연결한 로컬 폴더** + **채팅 첨부/붙여넣기(≥2000자)**
+를 입력으로 받아, 카파시의 LLM Wiki 아이디어(컴파일 레이어)를 구조 매핑형
+허브노트로 진화시킨 형태로 쌓인다. 카파시 원안 대비 MoA의 4가지 차별:
+
+| 카파시 원안 | MoA 세컨드브레인 |
+|---|---|
+| 컴파일 페이지 (하향식 LLM 정의) | **구조 매핑형 허브노트** (상향식 백링크 축적, 뼈대+편직) |
+| 린팅/자기감사 | **볼트 헬스체크** (고아/미생성링크/모순/태그위생 → 0~100점) |
+| 지식 축적형 질의 | **4원 하이브리드 RAG** (허브+벡터+그래프+메타) |
+| 임시 지식베이스 | **사건별 포커스 브리핑** (Ephemeral Wiki) |
+
+### 6D-1. 저장 계층 + DB 스키마
+
+**파일시스템 레이아웃 (Phase 2+)** — 사용자 연결 폴더 루트에 아래 생성:
+```
+<연결 폴더>/
+  원본문서/                    ← read-only, 파일 감시 대상
+  .moa-vault/
+    converted/  *.md + *.html  ← 동일 basename 듀얼 포맷
+    hubs/                      ← 구조 매핑형 허브노트
+    moc/                       ← 자동 MOC
+    briefings/                 ← 포커스 브리핑
+    health-reports/
+    .index/                    ← SQLite shards (선택; 현재는 brain.db 공유)
+    vault-config.json
+```
+
+**DB 테이블 (전부 `brain.db` 단일 SQLite 공유, v6 마이그레이션으로 추가)**:
+
+| 테이블 | 역할 | 상태 |
+|---|---|---|
+| `vault_documents` | 본문(md) + html_content + source_type/source_device_id/original_path/checksum | **[구현]** `src/vault/schema.rs:17–35` |
+| `vault_links` | `[[]]` 위키링크 레코드; `target_doc_id`/`is_resolved`로 백링크·미생성링크 관리 | **[구현]** `:40–56` |
+| `vault_tags`, `vault_aliases`, `vault_frontmatter`, `vault_blocks` | 프론트매터 + 별칭 + 블록 참조 | **[구현]** `:62–94` |
+| `vault_docs_fts` + triggers | FTS5 미러 (`memories_fts`와 **분리**) | **[구현]** `:97–119` |
+| `co_pairs`, `vocabulary_relations`, `boilerplate_words` | 자기진화 어휘 사전 | **[구현]** `:122–142` |
+| `hub_notes`, `co_occurrences` | 허브노트 엔진 (Phase 2 구현용 스키마) | **[계획]** 테이블만 존재 |
+| `health_reports`, `briefings` | 헬스체크, 포커스 브리핑 (Phase 4) | **[계획]** 테이블만 존재 |
+| `entity_registry` | 퍼스트↔세컨드 브레인 공용 엔티티 레지스트리 | **[구현]** `:191–199` |
+| `chat_retrieval_logs` | 모든 대화 turn의 first/second hits + latency 로그 | **[구현]** `:202–210` |
+
+모든 CREATE는 `IF NOT EXISTS` — idempotent (테스트 `init_schema_idempotent`).
+**[구현]**
+
+### 6D-2. 7단계 위키링크 추출 파이프라인
+
+**“위키링크의 품질 = 전체 시스템의 품질.”** 7단계는 `src/vault/wikilink/` 아래
+파일 단위로 분리되어 있으며 각 Step은 독립 테스트된다. AI 호출 Step
+(2a, 4)는 `AIEngine` trait 뒤에 배치 — P1 기본 구현 `HeuristicAIEngine`는
+provider 없이 작동(오프라인/테스트 환경).
+
+| Step | 파일 | 로직 | AI | 상태 |
+|---|---|---|---|---|
+| **0. 복합 토큰 인식** | `wikilink/tokens.rs` | regex: 대법원 판례(`대법원 YYYY.MM.DD. 선고 XXXX다YYYYY 판결`), 사건번호(`YYYY가합 등`), 법조문(`민법 제X조 제Y항`), ㈜/법무법인 등 기관명 | ❌ | **[구현]** 5 유닛테스트 |
+| **1. 정량 점수** | `wikilink/frequency.rs` | TF + H1×3.0/H2×2.0/H3×1.5/frontmatter×2.5 가산 + 복합 토큰 mask + synonym collapse + 한국어 조사(은/는/를/에/과/와/…) 자동 strip | ❌ | **[구현]** 5 테스트 |
+| **2a. 정성 AI** | `wikilink/ai_stub.rs::extract_key_concepts` | 복합토큰→중요도 8~9, H1→10. 프로덕션 `LlmAIEngine`는 Haiku 호출 (Phase 3에서 고도화) | ✅ | **[구현]** heuristic 3 테스트; LLM 드라이버 Phase 3 |
+| **2b. 상용구 필터** | `wikilink/boilerplate.rs` | `boilerplate_words` 조회 → 후보 리스트에서 제거. 도메인별 + 도메인 무관 통합 | ❌ | **[구현]** 2 테스트 |
+| **3. 교차 검증** | `wikilink/cross_validate.rs` | Group A (양축 합의)=무조건, Group B (한쪽)=TF≥3.0 또는 AI≥7, Group C=제외. 분량 기반 상한 5/10/15/20 | ❌ | **[구현]** 4 테스트 |
+| **4. AI 게이트키퍼** | `wikilink/ai_stub.rs::gatekeep` | 최종 후보 재검토 + 구조적 synonym 쌍 탐지 (`민법 제750조` ↔ `제750조`) | ✅ | **[구현]** heuristic 2 테스트 |
+| **5. 위키링크 삽입** | `wikilink/insert.rs` | 본문 walk → 기존 `[[]]` / 인라인 코드 skip → `[[]]` 및 `[[rep\|alias]]` 삽입. **longest-match-first** 규칙으로 부분 매칭 방지 | ❌ | **[구현]** 6 테스트 |
+| **6. 어휘 관계 학습** | `wikilink/vocabulary.rs` | `co_pairs.count` 증가, synonym 쌍 `vocabulary_relations` upsert (confidence=0.7 시작 → 반복 관측 시 +0.05, max 1.0) | ❌ | **[구현]** 3 테스트 |
+
+**파이프라인 조정자**: `wikilink::WikilinkPipeline::run(&markdown) → WikilinkOutput { annotated_content, links, keywords, synonyms }`. 단일 Mutex<Connection>·AIEngine·domain 3종 의존성만 받는다. **[구현]**
+
+**입력 분기** (§6D-3 인제스트에서 사용):
+- `source_type = chat_paste` 이면서 `content.chars().count() < DOCUMENT_MIN_CHARS (2000)` → 거부 (단기 대화, 세컨드브레인 편입 대상 아님).
+- `local_file` / `chat_upload` 는 길이 제약 없음.
+
+### 6D-3. 문서 인제스트 경로
+
+```
+IngestInput { source_type, source_device_id, original_path, title,
+              markdown, html_content, doc_type, domain }
+    │
+    ▼  VaultStore::ingest_markdown
+    ├─ 1. SHA256 checksum 계산
+    ├─ 2. checksum 존재 시 already_present=true 반환 (멱등)
+    ├─ 3. YAML frontmatter 파싱 (title/tags/aliases/case_number/…)
+    ├─ 4. WikilinkPipeline.run(body) → annotated md + links + keywords
+    ├─ 5. vault_documents INSERT
+    ├─ 6. vault_frontmatter / vault_tags / vault_aliases / vault_links INSERT
+    ├─ 7. FTS5 트리거가 자동 미러링
+    └─ 8. sync engine attached이면 VaultDocUpsert delta push (§6D-5)
+```
+
+**채팅 유래 문서**도 동일 경로를 탄다 — `source_type=chat_upload` 또는
+`chat_paste`. 원본 파일이 없는 경우 `original_path=NULL`, 나머지는 동일.
+`SourceType::ChatPaste`는 ≥2000자 강제 가드(`store.rs:84–93`). **[구현]**
+
+### 6D-4. 통합 검색 (Unified First + Second Brain Search)
+
+**모든** 채팅 발화/채널 멘션/슬래시 커맨드에서 **두 브레인을 병렬 조회**하는 것이
+특허 핵심 invariant. 미들웨어 계층에 위치.
+
+```
+이용자 발화
+    │
+    ▼ vault::unified_search(memory, vault, query, scope, top_k, chat_msg_id)
+    ├─ first_fut  = memory.recall(query, top_k*2, session_id)     ──┐
+    │   (300ms timeout, 실패/타임아웃 시 []; 부분 결과 허용)         │ tokio::join!
+    ├─ second_fut = vault.search_fts(query, top_k*2)              ──┘
+    ├─ RRF merge (k=60) — 두 랭킹을 reciprocal rank로 융합
+    ├─ chat_retrieval_logs INSERT (first_hits, second_hits, latency_ms, merged_refs)
+    └─ return Vec<UnifiedHit { source, ref_id, title, snippet, score, ranker_trace }>
+```
+
+| 특성 | 보장 |
+|---|---|
+| 병렬성 | `tokio::join!` — 한 쪽 실패/타임아웃이 다른 쪽을 막지 않음 |
+| 항상 기록 | `chat_retrieval_logs`에 모든 호출 로깅 → "두 브레인 동시 검색" invariant 감사 가능 |
+| 범위 제어 | `SearchScope::{Both, FirstOnly, SecondOnly}` — 이용자가 명시 요청 시만 예외 |
+| 지연 예산 | 병렬 p95 < 500ms 목표 (각 side 300ms soft) |
+
+**[구현]** `src/vault/unified_search.rs:62–127` + 2개 integration test.
+
+**4원 하이브리드 RAG 적응형 가중치** (Phase 3 완성 예정):
+
+| 질의 유형 | 허브 | 벡터 | 그래프 | 메타 |
+|---|---|---|---|---|
+| 법조문 검색 ("750조 적용 사례") | 0.5 | 0.2 | 0.1 | 0.2 |
+| 사건번호 ("2024가합12345") | 0.1 | 0.1 | 0.2 | **0.6** |
+| 개념 ("투자사기 판례 경향") | 0.3 | **0.4** | 0.2 | 0.1 |
+| 인물 ("피고 홍길동 관련") | 0.2 | 0.1 | **0.5** | 0.2 |
+
+현재 **[구현]** 은 FTS5 + RRF (2원). 벡터/그래프/메타 차원 가중치는 **[계획]**.
+
+### 6D-5. 멀티 디바이스 Vault 동기화
+
+세컨드브레인도 Patent 1의 E2E 암호화 델타 파이프라인을 **그대로** 재사용한다.
+새 전송 채널/서버 코드 **불필요**.
+
+**추가 DeltaOperation 변형** (기존 5종 위에):
+```rust
+DeltaOperation::VaultDocUpsert {
+    uuid: String,
+    source_type: String,
+    title: Option<String>,
+    checksum: String,             // 본문 무결성 + 중복 감지
+    content_sha256: String,
+    frontmatter_json: Option<String>,
+    links_json: Option<String>,   // LinkRecord[]
+}
+```
+
+| 방향 | 메커니즘 | 위치 |
+|---|---|---|
+| **Outbound** | `VaultStore::ingest_markdown` 성공 시 `SyncEngine::record_vault_doc_upsert` 자동 호출 | `vault/store.rs:167–189` |
+| **Inbound** | `SyncedMemory::apply_remote_deltas` → `VaultDocUpsert` 분기 → `SqliteMemory::apply_remote_v3_delta` → `INSERT OR IGNORE INTO vault_documents (…'(pending body sync)'…)` | `sqlite.rs:1346–1380`, `synced.rs:190–203` |
+| **무한루프 방지** | 인바운드 적용 시 delta journal 재기록 **없음** (기존 Patent 3와 동일 설계) | `sqlite.rs:1346–` |
+| **멱등성** | `uuid` UNIQUE + `checksum` UNIQUE로 중복 차단 | schema FKs |
+
+**본문 전송 전략**: 델타 저널은 shell row (메타 + checksum)만 운반. 본문(content)은
+Patent 1의 Layer 3 manifest full-sync가 기존 `build_manifest`/`export_missing_entries`
+흐름으로 전송. 이유: 긴 법률 문서가 delta journal을 비대화시키지 않도록.
+**[구현]** — shell row 인바운드 동작 확인; Layer 3 body transfer는 **[계획]** (기존
+Patent 1 메커니즘 재사용이므로 작업량 작음).
+
+### 6D-6. 허브노트 엔진 (Hub Notes)
+
+**상향식** 구조 매핑형 컴파일 — 카파시 개념페이지와 본질적으로 다름.
+
+```
+백링크 임계값 초과 (default ≥5)
+  → compile queue 등록
+    → 유휴시간 감지 (>5분 무입력)
+      → AI 컴파일:
+         ① 뼈대 생성 (엔티티 유형별 템플릿)
+            - 법조문: 조문원문 → 요건사실 → 법적효과 → 관련조문체계
+            - 인물: 프로필 → 관련인물 → 관련사건 → 행위 시계열
+            - 사건: 6하원칙 (누가/언제/어디서/무엇을/어떻게/왜) → 쟁점구조
+            - 일반개념: 정의 → 하위분류 → 장단점 → 적용사례
+         ② 구조 매핑 (편직): 각 구조 요소에 📎 문서번호 명시
+         ③ 내용 공백 경고: 매핑 0건 섹션 → Evidence Gap
+         ④ 상충정보 해소: 작성일(최신) > 문서권위(판결>서면>메모) > 출처신뢰도
+         ⑤ 영향도 적응형 갱신: Light(1 섹션) / Heavy(복수 섹션) / Full Rebuild (뼈대 변경)
+    → 사용자 활동 재개 시 즉시 중단, 우선순위 큐 유지
+```
+
+| 상태 | 범위 |
+|---|---|
+| **[구현]** | `hub_notes`, `co_occurrences` 스키마 테이블 (backlink_count 필드 포함) — Phase 2 구현 슬롯 확보 |
+| **[계획] Phase 2** | 뼈대 템플릿 엔진, 유휴 감지 + 중요도 큐, 문서번호 매핑, 내용 공백 경고, 상충 해소 3중 기준, Light/Heavy/Full 영향도 갱신 분기 |
+
+### 6D-7. 헬스체크 + 포커스 브리핑
+
+**[계획] Phase 4**. 스키마(`health_reports`, `briefings`)는 **[구현]** 완료.
+
+| 기능 | 설계 |
+|---|---|
+| 헬스체크 | (A) 고아 문서 (B) 미생성 링크 랭킹 (C) 모순 탐지 (D) 허브 갱신 필요성 (E) 태그 위생 → 종합 0~100점. 자동(1일/1주) 또는 수동 실행. |
+| 포커스 브리핑 | `case_number` 프론트매터 매칭 + 위키링크 1-depth 수집 → LLM 종합 (시계열/양측 주장/쟁점/증거/관련판례/체크리스트/전략) → `.moa-vault/briefings/*.md`. 증분 갱신 + 종결 시 자동 아카이브. |
+
+### 6D-8. 파일 감시 + 듀얼 포맷 변환
+
+**[계획] Phase 5** (일부 기초는 **[구현]**):
+
+- 이용자가 연결한 로컬 폴더 실시간 감시: **[계획]** (notify crate 기반 watcher, `src/vault/watcher.rs` 예정)
+- HWP/DOCX/PDF → MD + HTML 듀얼 변환: 변환기는 **[구현]** (`src/tools/document_pipeline.rs` — Upstage/Hancom/Gemini 기반 변환기 기존 존재). 자동 파이프라인 인제스트는 **[계획]** (watcher가 이 변환기를 호출해 `VaultStore::ingest_markdown` 주입).
+
+### 6D-9. AIEngine 추상화
+
+SLM 교체를 위해 AI 호출은 `AIEngine` trait 뒤에 배치. 기본 구현체:
+
+| 엔진 | 용도 | 호출 | 상태 |
+|---|---|---|---|
+| `HeuristicAIEngine` | 테스트/오프라인. regex·H1·구조 synonym 감지만 사용 | 없음 | **[구현]** |
+| `LlmAIEngine` (Phase 3) | 프로덕션. Step 2a/4를 Haiku로 호출 | `providers::Provider` | **[계획]** |
+| `OnDeviceSlmEngine` (Phase 5) | 온디바이스 SLM (Qwen/Gemma) | llama.cpp/ONNX | **[계획]** |
+
+### 6D-10. 특허 청구항 (Patent 4 — Vault Second Brain)
+
+- **청구항 23**: 문서 변환 결과물에 대하여, 정량적 빈도 분석과 정성적 AI 중요도 평가의 **2축**을 결합하고, 양축 합의·임계값 통과·AI 최종 게이트키퍼의 3중 검증을 거쳐 확정된 핵심 키워드에 한해 원본 마크다운 본문에 위키링크를 직접 임베딩하는 것을 특징으로 하는 AI 보조 지식베이스 구축 시스템.
+- **청구항 24**: 청구항 23에 있어서, 동일 문서 내에서 확정된 대표 키워드의 동의어 출현부에 대하여 `[[대표표현|원문표현]]` 형태의 **별칭 링크**를 삽입하여 원문 가독성을 유지하면서 백링크 집계의 정확성을 보장하는 것을 특징으로 하는 시스템.
+- **청구항 25**: 청구항 23에 있어서, 확정 키워드 쌍의 동시 출현 통계를 지속적으로 축적하여(`co_pairs`), 임계값 초과 쌍에 대하여 **동의어/유사어/반대어/상하위/연관**의 관계 유형을 판별·갱신함으로써 볼트 고유의 어휘 네트워크가 문서 누적에 따라 **자기 진화**하는 것을 특징으로 하는 시스템.
+- **청구항 26**: 청구항 23에 있어서, 상기 확정된 키워드에 대하여 백링크 임계값 초과 시, 엔티티 유형별 **뼈대 템플릿**(법조문/인물/사건/일반개념)을 기반으로 구조 요소마다 📎 매핑된 문서번호 전체 목록을 명시하고 매핑 0건 섹션을 **Evidence Gap** 경고로 표시하는 **구조 매핑형 허브노트**를 생성하는 것을 특징으로 하는 시스템.
+- **청구항 27**: 청구항 26에 있어서, 상기 허브노트의 증분 갱신은 새 백링크의 **영향도**에 따라 경량(단일 섹션)·중량(복수 섹션+종합 분석 재계산)·전면 재편(뼈대 재생성)으로 분기하며, 증분 선택은 갱신 대상을 좁히는 것이며 갱신 범위에 상한을 두지 않는 것을 특징으로 하는 시스템.
+- **청구항 28**: 이용자의 모든 대화 진입점(1:1 채팅·채널 멘션·슬래시 커맨드·음성 입력)에서 에피소드 기반 퍼스트브레인과 참조지식 기반 세컨드브레인에 대해 **벡터 검색 및 FTS5 키워드 검색을 동시(병렬) 실행**하고, 각 검색 결과를 Reciprocal Rank Fusion으로 병합하며, 모든 호출에 대해 `first_brain_hits` / `second_brain_hits` / `latency_ms`를 **감사 로그**에 강제 기록하는 것을 특징으로 하는 통합 검색 시스템.
+- **청구항 29**: 청구항 28에 있어서, 동일 이용자의 복수 디바이스 간 세컨드브레인 문서의 동기화는 Patent 1의 E2E 암호화 델타 파이프라인에 `VaultDocUpsert` 델타 변형을 **추가**하는 방식으로 통합되며, 원격 델타 수신 시 수신 측 델타 저널에 재기록하지 않음으로써 복제 루프를 방지하는 것을 특징으로 하는 시스템.
+
+### 6D-11. 테스트 커버리지 (P1 현황)
+
+`cargo test --lib vault::` → **51 passed / 0 failed** (2026-04-15 기준).
+
+| 모듈 | 테스트 수 | 대표 케이스 |
+|---|---|---|
+| `schema` | 3 | idempotency, 전 16개 테이블 존재, FTS 트리거 미러 |
+| `wikilink::tokens` | 6 | 법조문·판례·사건번호·기관·비중첩·빈입력 |
+| `wikilink::frequency` | 5 | H1 가산, 조사 strip 후 synonym collapse, 복합토큰 분절 방지, stop-words 제외, 숫자 제외 |
+| `wikilink::ai_stub` | 4 | 복합토큰→중요도, H1→10, 구조 synonym, dedup |
+| `wikilink::boilerplate` | 2 | 매칭 제거, 빈 boilerplate 통과 |
+| `wikilink::cross_validate` | 4 | 상한, 양축 합의, 약한 TF 폐기, 강한 AI 단독 채택 |
+| `wikilink::insert` | 6 | 정확 매칭, 별칭, 기존 링크 보존, 인라인 코드 skip, 다중 출현, longest-match-first |
+| `wikilink::vocabulary` | 3 | co_pairs 증가, synonym 생성, confidence 상한 |
+| `store` | 4 | chat_paste 문턱, 멱등성, FTS 매칭, frontmatter/tags/aliases |
+| `unified_search` | 2 | 두 브레인 병렬 확인 + `chat_retrieval_logs` 1회 기록, FirstOnly scope |
+
+회귀 없음: memory 328 + sync 49 + phone 20 전부 green.
+
+### 6D-12. 모듈 파일 인덱스
+
+| 파일 | 역할 | 라인 |
+|---|---|---|
+| `src/vault/mod.rs` | Public API re-exports | 25 |
+| `src/vault/schema.rs` | 16개 테이블 + FTS5 + triggers | 260 |
+| `src/vault/ingest.rs` | IngestInput/Output/SourceType | 55 |
+| `src/vault/store.rs` | VaultStore + 7단계 오케스트레이션 wrapper | 400 |
+| `src/vault/unified_search.rs` | 병렬 검색 + RRF + 감사 로그 | 330 |
+| `src/vault/wikilink/mod.rs` | WikilinkPipeline coordinator | 130 |
+| `src/vault/wikilink/{tokens,frequency,ai_stub,boilerplate,cross_validate,insert,vocabulary}.rs` | Steps 0–6 | ~800 |
 
 ---
 
