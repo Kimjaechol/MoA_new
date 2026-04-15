@@ -48,9 +48,26 @@ Acceptance (the happy path) seeds `embedding_cache` keyed on `SqliteMemory::cont
 
 ## What this PR does NOT do
 
-- **SQLCipher / per-row embedding encryption**: Deferred. The at-rest embedding bytes in `embedding_cache` remain unencrypted on disk. Mitigation: operator file-system encryption is mandatory for threat models that include local attackers.
-- **Sender-side embedding attachment**: `SyncEngine::record_store()` still emits `embedding: None`. A follow-up commit will plumb `Arc<dyn EmbeddingProvider>` into the delta recorder so outbound deltas carry pre-computed vectors — but the receive-side defence is already in place and works whether or not senders attach them.
+- **SQLCipher / per-row embedding encryption**: Deferred. The at-rest embedding bytes in `embedding_cache` remain unencrypted on disk. See "SQLCipher rollout plan" below for the staged migration.
 - **Rotating keys on model upgrade**: When an operator upgrades the embedder (e.g. from `bge-m3` → `bge-m3-v2`), existing `embedding_cache` rows become stale. This PR does not implement a sweeper; instead, `version()` bumps invalidate cache hits naturally on the next access. A cleanup pass belongs to PR #6 consolidation.
+
+## Sender-side embedding attachment (shipped in a follow-up commit)
+
+Resolved: `SyncEngine::record_store_with_embedding(key, content, category, embedding)` now exists and `SyncedMemory::store` auto-fetches the local embedder's cached blob via `Memory::current_embedding_blob(content)`. When the receiving peer's local embedder matches `(provider, model, version, dim)`, it skips the re-embed; when it doesn't, the receive-side drift logic from PR #5 discards the blob and queues re-embedding. Three tests in `memory::sqlite::tests::current_embedding_blob_*` pin the round-trip.
+
+## SQLCipher rollout plan (next session)
+
+The defence-in-depth goal is "local disk attacker can't feed stolen embedding floats into vec2text". FS-level encryption (FileVault, LUKS, BitLocker) covers the baseline today; SQLCipher closes the residual gap when the operator cannot rely on OS-level encryption.
+
+Staged rollout:
+
+1. **Dependency**: switch `rusqlite` to a build with `sqlcipher` feature enabled under a new cargo feature flag `memory-sqlcipher`. The `bundled` feature already in `Cargo.toml` is compatible; the hit is ~2 MB extra binary size.
+2. **Key material**: derive the DB key from a master secret using HKDF with a deterministic context string. The master secret itself lives in the existing secret store (`src/security/secret_store.rs`) which already handles platform keychain access. Key rotation goes through the secret-store rotation path — no new plumbing.
+3. **Migration**: on first launch with the feature enabled, the code path wraps the existing `brain.db` with `PRAGMA key = '…';` and runs `PRAGMA cipher_migrate;` to convert in place. Backups of the unencrypted DB land in `brain.db.pre-sqlcipher` and are kept for one week before a scheduled wipe.
+4. **Testing**: unit tests exercise the feature-gated path by constructing `SqliteMemory::with_options_keyed(workspace, secret, ...)`; the default path stays unchanged so existing installs see zero behaviour change.
+5. **CI**: `.github/workflows/feature-matrix.yml` adds a `memory-sqlcipher` lane mirroring the existing `whatsapp-web`/`browser-native` lanes — `cargo check --no-default-features --features memory-sqlcipher`.
+
+Scope control: the feature is intentionally opt-in. Default installs keep the current posture (fast, small, relies on FS encryption) so the SQLCipher binary bloat is paid only by operators who need it.
 
 ## How to verify
 
