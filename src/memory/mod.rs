@@ -6,7 +6,10 @@ pub mod cortex;
 pub mod document_store;
 pub mod document_summarizer;
 pub mod dream_cycle;
-pub mod embeddings;
+pub mod embedding;
+// Backwards-compatible alias so older call-sites (`memory::embeddings::…`)
+// keep working without a sweeping rename. New code should use `memory::embedding`.
+pub use embedding as embeddings;
 pub mod hot_cache;
 pub mod hybrid;
 pub mod hygiene;

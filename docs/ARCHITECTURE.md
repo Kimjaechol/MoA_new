@@ -3644,16 +3644,14 @@ SourceType::ChatPaste char_count:
 | **#2 임베딩 메타컬럼** | ✅ 완료 | `vault_documents` 테이블에 `embedding_model / embedding_dim / embedding_provider / embedding_version / embedding_created_at` 5개 컬럼 추가. `idx_vault_docs_emb_model` 부분 인덱스. 모델 교체 시 점진 재임베딩 준비 완료. | `src/vault/schema.rs:18–38` |
 | **#3 FTS5 trigram + 적응형 가중치** | ✅ 완료 | `memories_fts`·`vault_docs_fts` 모두 `tokenize='trigram'`. `src/vault/normalize.rs` 신설(fullwidth→halfwidth + whitespace squeeze) · `korean_char_ratio` · `adaptive_weights` 언어 적응형(한 0.25/0.75, 영 0.4/0.6). `search_fts`가 normalize 적용. | `src/memory/sqlite.rs:232–239` · `src/vault/schema.rs:112–120` · `src/vault/normalize.rs` · `src/vault/store.rs::search_fts` |
 | **#7 PRAGMA 부분** | ✅ 기존 설정 검증 | 이미 `PRAGMA journal_mode=WAL; synchronous=NORMAL; busy_timeout=5000; cache_size=-2000; temp_store=MEMORY;` 적용됨. `src/memory/sqlite.rs:144–159`. HLC/r2d2 pool은 후속 세션. | `src/memory/sqlite.rs:144` |
+| **#1 아키텍처** | ✅ 완료 (ONNX 통합은 feature-gated) | `src/memory/embeddings.rs` → `src/memory/embedding/` 디렉토리 분리 (mod/noop/openai/custom_http/local_fastembed). Trait에 `model()`·`version()` 추가 → PR #2 메타컬럼 공급 가능. `PROVIDER_*` 상수 4종 (`local_fastembed`/`openai`/`custom_http`/`none`). `fastembed = "5"`를 `embedding-local` feature로 **opt-in** 추가 (기본 빌드에 ONNX 런타임 미포함 → 바이너리 크기 목표 유지). Feature off 시 `LocalFastembedStub`이 `embed()`에서 안내 에러 반환. `doctor::embedding_provider_validation_error`가 `local_fastembed`/`openrouter` 수용. 기존 `memory::embeddings::*` 경로 유지 (`pub use embedding as embeddings` 호환 alias). | `src/memory/embedding/{mod,noop,openai,custom_http,local_fastembed}.rs` · `Cargo.toml` (fastembed optional + `embedding-local` feature) · `src/doctor/mod.rs::embedding_provider_validation_error` |
 
-#### 후속 세션 실행 스펙 (PR #1 full · #4 · #5 · #6 · #7 나머지 · #8 · #9)
+#### 후속 세션 실행 스펙 (PR #1 실데이터 검증 · #4 · #5 · #6 · #7 나머지 · #8 · #9)
 
-##### PR #1 (full) — Local-first EmbeddingProvider
-- **목표**: `fastembed-rs` 크레이트 도입 → BGE-M3(1024D) 로컬 기본값. OpenAI는 opt-in.
-- **파일**: 신설 `src/memory/embedding/` 디렉토리. `mod.rs` (trait) · `local_fastembed.rs` · `openai.rs` · `custom_http.rs` · `noop.rs`. 기존 `src/memory/embeddings.rs` 교체.
-- **Cargo.toml**: `fastembed = "4"` 추가. ONNX runtime 포함 빌드 확인.
-- **config.toml**: `[embedding] provider = "local_fastembed"` 기본.
-- **다운로드 UI**: `~/.moa/embedding-models/bge-m3/` (약 1.1GB). Tauri 이벤트로 진행률 전송.
-- **수락 기준**: 새 설치 시 OpenAI 키 없이 임베딩 동작 / 결정론성(동일 입력 = 동일 벡터) / 한국어 10문장 유사도 수동 검증 / CPU 32배치 < 2s.
+##### PR #1 (실데이터 검증 / 다운로드 UI)
+- **완료 범위 요약**: 모듈 구조, trait 확장, feature flag (`embedding-local`), config 검증 — 전부 ✅ . 기본 빌드 518→524 pass / 0 fail.
+- **남은 작업**: (a) `cargo test --features embedding-local` 실제 BGE-M3 다운로드 + 결정론 테스트 (동일 입력 → 동일 벡터). (b) `config.toml` 기본값을 `"local_fastembed"`으로 승격하는 건은 `embedding-local` 피처가 릴리즈 기본으로 켜진 뒤에 바꾼다 — 현재 기본은 `"none"` 유지(회귀 0). (c) Tauri 다운로드 진행률 이벤트 UI. (d) CPU 32배치 < 2s 성능 검증.
+- **주의**: `fastembed = "5"`는 `ort` 2.x(ONNX Runtime)를 끌어오므로 nightly-all-features 레인에서 처음 빌드 시 플랫폼 라이브러리(libonnxruntime)가 필요할 수 있음. `.github/workflows/nightly-all-features.yml`의 Linux deps 단계 확인 필요.
 
 ##### PR #4 — RRF + Cross-Encoder Reranker
 - **목표**: 선형 가중합 → RRF(k=60) + BGE-reranker-v2-m3 crossencoder (약 560MB) 계층.

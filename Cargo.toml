@@ -171,6 +171,12 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
 
+# Local embedding (fastembed + ONNX Runtime). Optional — enable via
+# `--features embedding-local`. Pulls in ~200MB of ONNX Runtime native
+# dependencies and downloads the BGE-M3 weights (~1.1GB) to
+# `~/.moa/embedding-models/` on first use. Default build stays lean.
+fastembed = { version = "5", optional = true }
+
 # MQTT subscriber for IoT/home-automation event ingestion via src/dispatch/.
 # Used by src/dispatch/mqtt.rs to subscribe to broker topics and publish each
 # message into the EventRouter. rustls TLS support pulls in the same backend
@@ -247,6 +253,9 @@ wasm-tools = ["dep:wasmtime", "dep:wasmtime-wasi"]
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
 # mqtt = MQTT subscriber wired to src/dispatch/EventRouter for IoT events
 mqtt = ["dep:rumqttc"]
+# embedding-local = on-device BGE-M3 via fastembed + ONNX Runtime.
+# Powers the server-non-storage E2E patent by keeping raw text off the network.
+embedding-local = ["dep:fastembed"]
 # Optional provider feature flags used by cfg(feature = "...") guards.
 # Keep disabled by default to preserve current runtime behavior.
 firecrawl = []
