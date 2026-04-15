@@ -297,7 +297,22 @@ impl SqliteMemory {
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
+
+            -- PR #5 embedding backfill queue. Populated when a remote sync
+            -- delta carries an embedding whose (provider/model/version/dim)
+            -- disagrees with the local embedder — the blob is discarded
+            -- rather than silently cached (foreign-model floats would feed
+            -- vec2text-style reconstruction attacks) and the content hash
+            -- is parked here for a background re-embedding pass.
+            CREATE TABLE IF NOT EXISTS embedding_backfill_queue (
+                content_hash TEXT PRIMARY KEY,
+                reason       TEXT NOT NULL,
+                enqueued_at  TEXT NOT NULL,
+                processed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_backfill_pending
+                ON embedding_backfill_queue(processed_at) WHERE processed_at IS NULL;",
         )?;
 
         // Migration: add session_id column if not present (safe to run repeatedly)
@@ -1413,6 +1428,101 @@ impl Memory for SqliteMemory {
         SqliteMemory::recall_with_variations(self, original_query, variations, limit, session_id).await
     }
 
+    /// PR #5 — decide whether to cache a remote-computed embedding.
+    ///
+    /// Accept iff the remote blob's (provider, model, version, dim) all match
+    /// our local embedder's. On match, seed `embedding_cache` keyed on
+    /// `content_hash` so the next local recall() skips re-computation.
+    /// On drift, enqueue the content hash into `embedding_backfill_queue`
+    /// and return an error describing the mismatch — caller logs but does
+    /// not abort delta application.
+    async fn accept_remote_embedding(
+        &self,
+        content: &str,
+        blob: &super::sync::EmbeddingBlob,
+    ) -> anyhow::Result<bool> {
+        use super::embedding::EmbeddingProvider;
+
+        let local_provider = self.embedder.name().to_string();
+        let local_model = self.embedder.model().to_string();
+        let local_version = self.embedder.version();
+        let local_dim = self.embedder.dimensions();
+
+        // Noop embedder (dim = 0) has nothing to cache; swallow silently.
+        if local_dim == 0 {
+            return Ok(false);
+        }
+
+        let drift = blob.provider != local_provider
+            || blob.model != local_model
+            || blob.version != local_version
+            || usize::try_from(blob.dim).unwrap_or(usize::MAX) != local_dim;
+
+        let content_hash = Self::content_hash(content);
+        let conn = self.conn.clone();
+        let content_hash_owned = content_hash.clone();
+
+        if drift {
+            // Drop the embedding; enqueue a backfill so decrypt+re-embed is
+            // tracked. Error return surfaces the drift reason to callers;
+            // they log but do not abort the delta apply.
+            let reason = format!(
+                "embedding drift: remote ({}:{}/v{}/dim{}) ≠ local ({}:{}/v{}/dim{})",
+                blob.provider,
+                blob.model,
+                blob.version,
+                blob.dim,
+                local_provider,
+                local_model,
+                local_version,
+                local_dim
+            );
+            let reason_for_queue = reason.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let c = conn.lock();
+                c.execute(
+                    "INSERT OR IGNORE INTO embedding_backfill_queue \
+                     (content_hash, reason, enqueued_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        content_hash_owned,
+                        reason_for_queue,
+                        chrono::Local::now().to_rfc3339()
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("backfill enqueue task panicked: {e}"))??;
+            anyhow::bail!("{reason}");
+        }
+
+        // Accept: seed embedding_cache. Vec is little-endian f32 bytes.
+        if blob.vector.len() != local_dim * 4 {
+            anyhow::bail!(
+                "embedding blob length {} ≠ expected {} (dim {} × 4 bytes)",
+                blob.vector.len(),
+                local_dim * 4,
+                local_dim
+            );
+        }
+        let bytes = blob.vector.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let c = conn.lock();
+            let now = chrono::Local::now().to_rfc3339();
+            c.execute(
+                "INSERT OR REPLACE INTO embedding_cache \
+                 (content_hash, embedding, created_at, accessed_at) \
+                 VALUES (?1, ?2, ?3, ?3)",
+                rusqlite::params![content_hash_owned, bytes, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("embedding cache seed task panicked: {e}"))??;
+
+        Ok(true)
+    }
+
     async fn apply_remote_v3_delta(
         &self,
         delta: &super::sync::DeltaOperation,
@@ -1524,6 +1634,11 @@ impl Memory for SqliteMemory {
                 content_sha256: _,
                 frontmatter_json: _,
                 links_json: _,
+                // PR #5: embedding blob is handled by the SyncedMemory layer
+                // (accept_remote_embedding) against the full content once
+                // Layer 3 transfers it. We do not cache here because we
+                // don't have the cleartext content to key on yet.
+                embedding: _,
             } => {
                 // Vault (second-brain) docs: shell row only. Full content
                 // travels via Layer 3 manifest (existing full-sync path) to
@@ -3397,6 +3512,192 @@ mod tests {
         // Row is present in local timeline.
         let timeline = mem.get_timeline(&entry.id, 10).unwrap();
         assert!(timeline.iter().any(|t| t.source_ref == "remote_msg_9"));
+    }
+
+    // ── PR #5 accept_remote_embedding ─────────────────────────
+
+    /// Deterministic 4-dim test embedder so we can exercise the drift
+    /// check without pulling ONNX. Name/model/version/dim configurable.
+    struct FakeEmbedder {
+        name: &'static str,
+        model: String,
+        version: u32,
+        dim: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::embedding::EmbeddingProvider for FakeEmbedder {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn model(&self) -> &str {
+            &self.model
+        }
+        fn version(&self) -> u32 {
+            self.version
+        }
+        fn dimensions(&self) -> usize {
+            self.dim
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.0; self.dim]).collect())
+        }
+    }
+
+    fn sqlite_with_embedder(embedder: Arc<dyn super::super::embedding::EmbeddingProvider>) -> (TempDir, SqliteMemory) {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            embedder,
+            SearchMode::Rrf,
+            0.7,
+            0.3,
+            60.0,
+            10_000,
+            None,
+        )
+        .unwrap();
+        (tmp, mem)
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_caches_when_model_matches() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        let content = "identical-model payload";
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "local_fastembed",
+            "bge-m3",
+            1,
+            &[0.1, 0.2, 0.3, 0.4],
+        );
+        let accepted = mem.accept_remote_embedding(content, &blob).await.unwrap();
+        assert!(accepted, "matching model must be accepted");
+
+        // Cache row now exists keyed on the same hash recall() would use.
+        let hash = SqliteMemory::content_hash(content);
+        let conn = mem.conn.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_cache WHERE content_hash = ?1",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_rejects_model_drift_and_enqueues() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        // Remote used a different model — vec2text defence must reject.
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "openai",
+            "text-embedding-3-small",
+            1,
+            &[0.0; 4],
+        );
+        let content = "drift payload";
+        let err = mem
+            .accept_remote_embedding(content, &blob)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drift"), "got: {err}");
+
+        // Cache must NOT be seeded.
+        let hash = SqliteMemory::content_hash(content);
+        let conn = mem.conn.lock();
+        let cached: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_cache WHERE content_hash = ?1",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cached, 0);
+        // Backfill queue must contain the content hash.
+        let queued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_backfill_queue WHERE content_hash = ?1",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_rejects_dim_mismatch() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        // Same provider/model/version — but 5-dim payload vs local's 4-dim.
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "local_fastembed",
+            "bge-m3",
+            1,
+            &[0.1, 0.2, 0.3, 0.4, 0.5],
+        );
+        let err = mem
+            .accept_remote_embedding("dim mismatch", &blob)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drift"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_rejects_version_bump() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "local_fastembed",
+            "bge-m3",
+            2, // future version
+            &[0.0; 4],
+        );
+        let err = mem
+            .accept_remote_embedding("version bump", &blob)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drift"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_is_noop_for_noop_embedder() {
+        // Default SqliteMemory uses NoopEmbedding (dim=0). We silently
+        // short-circuit because there's no local index to seed.
+        let (_tmp, mem) = temp_sqlite();
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "openai",
+            "whatever",
+            1,
+            &[0.0; 4],
+        );
+        let accepted = mem.accept_remote_embedding("noop", &blob).await.unwrap();
+        assert!(!accepted);
     }
 
     #[tokio::test]

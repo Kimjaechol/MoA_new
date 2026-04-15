@@ -64,11 +64,21 @@ impl SyncedMemory {
                     key,
                     content,
                     category,
+                    embedding,
                 } => {
                     let cat = category_from_str(category);
                     if let Err(e) = self.inner.store(key, content, cat, None).await {
                         tracing::warn!(key, "Failed to apply remote store delta: {e}");
                         continue;
+                    }
+                    // PR #5 — opportunistically seed local embedding cache
+                    // from the remote blob if model/version/dim all match.
+                    // Drift → drop + enqueue re-embed. Errors never block
+                    // the content apply (already succeeded above).
+                    if let Some(blob) = embedding {
+                        if let Err(e) = self.inner.accept_remote_embedding(content, blob).await {
+                            tracing::debug!(key, "Embedding drift on remote store: {e}");
+                        }
                     }
                     tracing::debug!(key, "Applied remote store delta");
                     applied += 1;
@@ -288,6 +298,9 @@ impl SyncedMemory {
                         key: entry.key.clone(),
                         content: entry.content.clone(),
                         category: entry.category.to_string(),
+                        // PR #5: full-sync replay of local entries; we do not
+                        // attach embeddings here because they are cache-only.
+                        embedding: None,
                     },
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -503,6 +516,7 @@ mod tests {
                 key: "remote_key".into(),
                 content: "remote_value".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 9999,
         }];
@@ -560,6 +574,7 @@ mod tests {
                 key: "dup_key".into(),
                 content: "dup_value".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 9999,
         };

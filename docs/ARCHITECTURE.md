@@ -3648,6 +3648,7 @@ SourceType::ChatPaste char_count:
 | **#7 HLC** | ✅ 완료 | 신설 `src/sync/hlc.rs` — `Hlc { wall_ms, logical, node_id }` 구조체 + `HlcClock` lock-free 시계 (packed u64 CAS). `encode()`/`parse()` 라운드트립, 5분 시계 스큐 수용 (`update_bumps_past_remote_under_5min_clock_skew` 테스트), 8스레드 800 tick 동시성에서 단조성 보장. 13 테스트 pass. 스키마 마이그레이션(`memories.updated_at` → HLC 문자열)은 sync protocol 버전 bump와 함께 별도 PR로 분리. | `src/sync/hlc.rs` · `src/sync/mod.rs` |
 | **#7 Credit TOCTOU** | ✅ 완료 | `src/billing/payment.rs`에 `ReservationId` 타입 + `reserve_credits(user, max)` / `commit_reservation(rid, actual)` / `cancel_reservation(rid)` 추가. `credit_reservations` 테이블 신설 (open/committed/cancelled). 예약은 원자적 `UPDATE … WHERE balance >= ?`으로 음수 잔액 불가능. 10스레드 fuzz 테스트 (`fuzz_concurrent_reservations_never_go_negative`)로 동시성 검증. 10개 신규 테스트 pass. | `src/billing/payment.rs::{reserve_credits,commit_reservation,cancel_reservation}` |
 | **#4 RRF + Reranker (아키텍처)** | ✅ 완료 (실측은 feature build 필요) | 신설 `src/memory/search/{mod,fusion,rerank}.rs`. `k_way_rrf` 진정한 k-way 구현 — 이전 "flatten→2way" 손실을 복구(다중 쿼리에서 한 번이라도 rank-1 찍는 문서가 과잉 가중되지 않음). 11 fusion 테스트 (score-scale invariance, 교집합 부스트, 중복 처리 등). `Reranker` trait + `NoopReranker` + `BgeReranker` (fastembed 5 `TextRerank` via `embedding-local` feature, off 시 stub가 안내 에러). `[memory.rerank]` config 추가(enabled/model/top_k_before/top_k_after). `SqliteMemory`에 `set_reranker()`/`set_rerank_config()` interior-mutable 주입 지점. `recall_with_variations`가 k-way RRF + top-50 후보 → rerank → top-10로 일원화. 15 신규 테스트 pass. | `src/memory/search/{mod,fusion,rerank}.rs` · `src/memory/sqlite.rs::recall_with_variations` · `src/config/schema.rs::RerankConfig` |
+| **#5 Embedding sync + vec2text 방어 (수신측)** | ✅ 완료 (SQLCipher at-rest 잔여) | `DeltaOperation::{Store,VaultDocUpsert}`에 `embedding: Option<EmbeddingBlob>` 추가 — `#[serde(skip_serializing_if = "Option::is_none")]`로 pre-PR#5 피어와 와이어 호환. `EmbeddingBlob::pack/unpack` LE-f32 직렬화(6 테스트). `Memory::accept_remote_embedding` trait 디폴트 `Ok(false)`, `SqliteMemory`가 모델 드리프트(provider/model/version/dim) 검출 시 embedding 폐기 + `embedding_backfill_queue` 등록, 일치 시 `embedding_cache` 시드(5 테스트). 기존 sync ChaCha20-Poly1305 암호화가 wire 상 float 평문 노출을 차단. 신설 `docs/security/embedding-privacy.md`에 vec2text EMNLP 2023 공격 원리 + 방어 수단 + 잔여 위협 명시. 11 신규 테스트 pass. | `src/memory/sync.rs::{EmbeddingBlob,DeltaOperation}` · `src/memory/sqlite.rs::accept_remote_embedding` · `src/memory/traits.rs::Memory::accept_remote_embedding` · `docs/security/embedding-privacy.md` |
 
 #### 후속 세션 실행 스펙 (PR #1 실데이터 검증 · #4 · #5 · #6 · #7 나머지 · #8 · #9)
 
@@ -3660,12 +3661,9 @@ SourceType::ChatPaste char_count:
 - **완료 범위 요약**: `k_way_rrf` 구현 + 11 unit test / `Reranker` trait + `BgeReranker` (feature-gated) + 4 rerank test / `[memory.rerank]` config / `SqliteMemory::recall_with_variations` 일원화. 기본 빌드 522→552 pass, 0 회귀.
 - **남은 작업**: (a) `cargo build --features embedding-local` 후 BGE-reranker-v2-m3 다운로드 + 실제 쿼리로 on/off 정확도 비교 (수락 기준: ≥5 point 개선). (b) p95 latency <500ms 실측(상위 50 후보 × 560MB 모델). (c) 저사양 모바일 빌드에서 `enabled=false`로 `vault::normalize::adaptive_weights` degrade가 의도대로 동작하는지 확인.
 
-##### PR #5 (full) — Embedding sync encryption + vec2text defence
-- **목표**: `SyncDelta` 암호화 페이로드에 embedding BLOB 포함. (vec2text EMNLP 2023 공격 92% 복원 방어).
-- **파일**: `src/memory/sync.rs::DeltaOperation::{Store, VaultDocUpsert}`에 embedding 필드 추가 + bincode 직렬화 → ChaCha20-Poly1305. `Memory::apply_remote_v3_delta` 복호화 경로에서 모델 불일치 시 embedding 폐기 + 로컬 재계산 큐 등록.
-- **at-rest**: `embedding_cache` 테이블도 SQLCipher 또는 keychain 파생 키로 암호화.
-- **문서**: 신설 `docs/security/embedding-privacy.md` — vec2text 원리 + 방어 전략.
-- **수락 기준**: sync 트래픽에서 float 평문 노출 없음 / 모델 불일치 delta가 content만 저장하고 재임베딩 큐 등록.
+##### PR #5 (잔여) — SQLCipher at-rest + 송신측 embedding 첨부
+- **완료 범위 요약**: 수신측 드리프트 방어 + wire 포맷 + `EmbeddingBlob` + `embedding_backfill_queue` + 보안 문서. 기본 빌드 552→569 pass / 0 회귀.
+- **남은 작업**: (a) `embedding_cache` at-rest 암호화 — SQLCipher 의존성 추가 + Keychain 파생 키 관리 설계. 현재 완화책: FS-level 암호화(FileVault/LUKS). (b) 송신측 `SyncEngine::record_store()`에 `Arc<dyn EmbeddingProvider>` 주입 — 캐시에 이미 있는 벡터를 blob으로 변환해 첨부. 수신측 방어는 이미 작동하므로 시기 조정 가능. (c) 백필 큐 처리 스케줄러(PR #6 consolidation에 합류 가능).
 
 ##### PR #6 — Consolidation (sleep cycle) + 망각 곡선
 - **목표**: 4-Stage 파이프라인 완성. `CAPTURE → PROMOTE → CONSOLIDATE → RECALL`.

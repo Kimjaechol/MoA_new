@@ -341,6 +341,25 @@ pub trait Memory: Send + Sync {
         Ok(false)
     }
 
+    /// PR #5 — decide whether to seed the local embedding cache from a
+    /// remote sync delta's precomputed vector. Returns `Ok(true)` when
+    /// the embedding was accepted, `Ok(false)` when it was silently
+    /// dropped (e.g. backend doesn't cache), and `Err` when the remote
+    /// blob's (provider, model, version, dim) disagree with this node's
+    /// embedder — drift.
+    ///
+    /// On drift the backend SHOULD enqueue a re-embedding work item so
+    /// the local representation gets rebuilt with the current model. The
+    /// default impl returns `Ok(false)` so backends without an embedding
+    /// cache are free to ignore the call.
+    async fn accept_remote_embedding(
+        &self,
+        _content: &str,
+        _blob: &crate::memory::sync::EmbeddingBlob,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Recall with a pre-expanded set of query variations (v3.0 S3).
     /// Default falls back to `recall(original_query, ...)` ignoring
     /// variations. SqliteMemory overrides to run parallel FTS+vector
