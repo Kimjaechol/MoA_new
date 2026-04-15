@@ -893,10 +893,14 @@ impl SqliteMemory {
             return Ok(Vec::new());
         }
 
+        // PR #6 wire-up: skip soft-archived rows so consolidated/decayed
+        // memories never resurface through FTS until the archive UI
+        // explicitly un-archives them.
         let sql = "SELECT m.id, bm25(memories_fts) as score
                    FROM memories_fts f
                    JOIN memories m ON m.rowid = f.rowid
                    WHERE memories_fts MATCH ?1
+                     AND m.archived = 0
                    ORDER BY score
                    LIMIT ?2";
 
@@ -930,7 +934,12 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
+        // PR #6 wire-up: archived rows excluded from vector search for the
+        // same reason fts5_search excludes them — consolidated/decayed
+        // memories must not bleed back into recall.
+        let mut sql =
+            "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL AND archived = 0"
+                .to_string();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
 
@@ -1770,6 +1779,57 @@ impl Memory for SqliteMemory {
         Ok(true)
     }
 
+    /// PR #9 Phase 5 — expose the local embedder for agent-loop community
+    /// ranking. Goes through `get_or_compute_embedding` so the cache is
+    /// shared with `recall()`.
+    async fn query_embedding(&self, query: &str) -> Option<Vec<f32>> {
+        self.get_or_compute_embedding(query).await.ok().flatten()
+    }
+
+    /// PR #5 sender-side — package the embedding we already computed
+    /// for `content` into an [`super::sync::EmbeddingBlob`] using local
+    /// embedder metadata. Returns `None` when (a) we use `NoopEmbedding`,
+    /// (b) the cache misses (the local store has not yet seen this
+    /// content), or (c) the cached blob is malformed. Cheap — single
+    /// indexed lookup against `embedding_cache`.
+    async fn current_embedding_blob(
+        &self,
+        content: &str,
+    ) -> Option<super::sync::EmbeddingBlob> {
+        use super::embedding::EmbeddingProvider;
+        let dim = self.embedder.dimensions();
+        if dim == 0 {
+            return None;
+        }
+        let provider = self.embedder.name().to_string();
+        let model = self.embedder.model().to_string();
+        let version = self.embedder.version();
+        let hash = Self::content_hash(content);
+        let conn = self.conn.clone();
+        let bytes = tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare_cached("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")
+                .ok()?;
+            stmt.query_row(rusqlite::params![hash], |row| row.get::<_, Vec<u8>>(0))
+                .ok()
+        })
+        .await
+        .ok()
+        .flatten()?;
+        if bytes.len() != dim * 4 {
+            return None;
+        }
+        Some(super::sync::EmbeddingBlob {
+            provider,
+            model,
+            version,
+            #[allow(clippy::cast_possible_truncation)]
+            dim: dim as u32,
+            vector: bytes,
+        })
+    }
+
     async fn apply_remote_v3_delta(
         &self,
         delta: &super::sync::DeltaOperation,
@@ -1992,7 +2052,7 @@ impl Memory for SqliteMemory {
         let search_mode = self.search_mode;
         let rrf_k = self.rrf_k;
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+        let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
 
@@ -2113,9 +2173,12 @@ impl Memory for SqliteMemory {
                         })
                         .collect();
                     let where_clause = conditions.join(" OR ");
+                    // PR #6 wire-up: archived rows excluded from the LIKE
+                    // fallback for the same reason FTS5 + vector exclude
+                    // them.
                     let sql = format!(
                         "SELECT id, key, content, category, created_at, session_id FROM memories
-                         WHERE {where_clause}
+                         WHERE archived = 0 AND ({where_clause})
                          ORDER BY updated_at DESC
                          LIMIT ?{}",
                         keywords.len() * 2 + 1
@@ -2157,8 +2220,22 @@ impl Memory for SqliteMemory {
 
             results.truncate(limit);
             Ok(results)
-        })
-        .await?
+        });
+
+        let results: Vec<MemoryEntry> = results
+            .await
+            .map_err(|e| anyhow::anyhow!("recall blocking task panicked: {e}"))??;
+
+        // PR #6 wire-up: bump recall metrics for every surfaced row so the
+        // decay sweep has accurate retrieval counts. Failures are
+        // swallowed — bookkeeping must never make a recall fail.
+        if !results.is_empty() {
+            let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+            if let Err(e) = self.bump_recall_metrics(&ids) {
+                tracing::debug!("bump_recall_metrics failed (non-fatal): {e}");
+            }
+        }
+        Ok(results)
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -3808,6 +3885,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_embedding_blob_returns_none_for_noop_embedder() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_blob", "anything", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Default temp_sqlite uses NoopEmbedding (dim=0).
+        assert!(mem.current_embedding_blob("anything").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn current_embedding_blob_returns_packed_blob_after_store() {
+        // PR #5 sender-side: storing a content with an active embedder
+        // populates embedding_cache; current_embedding_blob then surfaces
+        // the cached vector wrapped with provider/model metadata.
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        mem.store("k_blob", "사용자 메모", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let blob = mem
+            .current_embedding_blob("사용자 메모")
+            .await
+            .expect("blob should be present");
+        assert_eq!(blob.provider, "local_fastembed");
+        assert_eq!(blob.model, "bge-m3");
+        assert_eq!(blob.version, 1);
+        assert_eq!(blob.dim, 4);
+        assert_eq!(blob.vector.len(), 16); // 4 dim × 4 bytes
+        // unpack matches the FakeEmbedder's deterministic zero vector.
+        assert_eq!(blob.unpack().unwrap(), vec![0.0_f32; 4]);
+    }
+
+    #[tokio::test]
+    async fn current_embedding_blob_misses_when_content_not_cached() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        // Never stored — cache is empty.
+        assert!(mem.current_embedding_blob("uncached content").await.is_none());
+    }
+
+    #[tokio::test]
     async fn accept_remote_embedding_caches_when_model_matches() {
         let embedder = Arc::new(FakeEmbedder {
             name: "local_fastembed",
@@ -4098,6 +4227,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(id_archived, 0, "identity memory must survive decay");
+    }
+
+    #[tokio::test]
+    async fn recall_excludes_archived_rows() {
+        // PR #6 wire-up regression: a row flipped to archived=1 (e.g. by
+        // run_decay_sweep or apply_consolidation_outcome) must never come
+        // back through Memory::recall.
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_active", "활성 정보", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k_archived", "옛날 정보", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Hand-archive k_archived without going through the full
+        // consolidation/decay path so the test isolates the SQL filter.
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memories SET archived = 1 WHERE key = 'k_archived'",
+                [],
+            )
+            .unwrap();
+        }
+        // Both rows have NoopEmbedding (dim=0) so recall falls back to FTS.
+        let hits = mem.recall("정보", 10, None).await.unwrap();
+        let keys: Vec<&str> = hits.iter().map(|h| h.key.as_str()).collect();
+        assert!(keys.contains(&"k_active"), "got {keys:?}");
+        assert!(!keys.contains(&"k_archived"), "got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn recall_auto_bumps_recall_count_for_returned_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_metric", "내가 좋아하는 책", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let _ = mem.recall("책", 10, None).await.unwrap();
+        let _ = mem.recall("책", 10, None).await.unwrap();
+
+        let conn = mem.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT recall_count FROM memories WHERE key = 'k_metric'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Two recall calls × the row appears in each → 2 bumps.
+        assert!(count >= 2, "expected >= 2 bumps, got {count}");
     }
 
     #[tokio::test]

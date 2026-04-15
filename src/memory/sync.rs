@@ -517,6 +517,53 @@ impl SyncEngine {
         self.enabled
     }
 
+    /// PR #5 sender-side — record a store delta with an optional
+    /// pre-computed embedding attached. When the receiving peer's local
+    /// embedder matches `(provider, model, version, dim)`, this lets it
+    /// skip the re-embed; when it doesn't, the receiver's drift logic
+    /// (`Memory::accept_remote_embedding`) discards the blob and queues
+    /// re-embedding locally.
+    pub fn record_store_with_embedding(
+        &mut self,
+        key: &str,
+        content: &str,
+        category: &str,
+        embedding: Option<EmbeddingBlob>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+
+        self.version.increment(&self.device_id.0);
+        let seq = self.version.get(&self.device_id.0);
+
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::Store {
+                key: key.to_string(),
+                content: content.to_string(),
+                category: category.to_string(),
+                embedding,
+            },
+            timestamp: current_epoch_secs(),
+        };
+
+        self.journal.push(entry);
+        tracing::debug!(
+            key,
+            category,
+            seq,
+            device_id = %self.device_id.0,
+            journal_size = self.journal.len(),
+            "Sync: recorded store delta (with embedding)"
+        );
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist sync journal: {e}");
+        }
+    }
+
     /// Record a memory store operation in the delta journal.
     pub fn record_store(&mut self, key: &str, content: &str, category: &str) {
         if !self.enabled {

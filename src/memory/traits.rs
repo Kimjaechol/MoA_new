@@ -360,6 +360,34 @@ pub trait Memory: Send + Sync {
         Ok(false)
     }
 
+    /// PR #5 sender-side — produce an [`EmbeddingBlob`] for `content` so
+    /// the sync layer can attach it to outbound deltas, sparing peers a
+    /// re-embed when their (provider, model, version, dim) match. Returns
+    /// `None` when the backend has no usable embedding (`NoopEmbedding`)
+    /// or no cached vector for `content`.
+    ///
+    /// Default impl returns `None` so backends without a cache stay
+    /// wire-compatible with pre-PR#5 peers (they just don't get the
+    /// optimisation).
+    ///
+    /// [`EmbeddingBlob`]: crate::memory::sync::EmbeddingBlob
+    async fn current_embedding_blob(
+        &self,
+        _content: &str,
+    ) -> Option<crate::memory::sync::EmbeddingBlob> {
+        None
+    }
+
+    /// PR #9 Phase 5 — compute a fresh embedding for a query string, used
+    /// by the agent loop to rank community summaries against the user's
+    /// current request. Returns `None` when the backend has no embedder
+    /// (`NoopEmbedding`) or embedding fails. Default: `None` so Phase 5
+    /// degrades gracefully when running against a backend without an
+    /// embedder.
+    async fn query_embedding(&self, _query: &str) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Recall with a pre-expanded set of query variations (v3.0 S3).
     /// Default falls back to `recall(original_query, ...)` ignoring
     /// variations. SqliteMemory overrides to run parallel FTS+vector

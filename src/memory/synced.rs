@@ -363,8 +363,18 @@ impl Memory for SyncedMemory {
         //    Short-term (Conversation) memory is NOT synced across devices.
         //    Sync only triggers when data is promoted to Core/Daily or ontology.
         if category != MemoryCategory::Conversation {
+            // PR #5 sender-side — fetch the embedding the inner backend
+            // just cached so we can attach it to the outbound delta.
+            // Returns None for NoopEmbedding or cache miss; receiver
+            // falls back to local re-embed in either case.
+            let embedding_blob = self.inner.current_embedding_blob(content).await;
             let mut engine = self.sync.lock();
-            engine.record_store(key, content, &category.to_string());
+            engine.record_store_with_embedding(
+                key,
+                content,
+                &category.to_string(),
+                embedding_blob,
+            );
             tracing::trace!(key, %category, "Sync: recorded store delta");
         } else {
             tracing::trace!(key, %category, "Sync: skipped Conversation category (short-term only)");
