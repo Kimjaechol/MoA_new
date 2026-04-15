@@ -1216,6 +1216,65 @@ impl OntologyRepo {
         Ok(written)
     }
 
+    /// PR #9 LlmConsolidator share — list level-0 communities whose
+    /// summary column is empty (scheduler wrote the placeholder when no
+    /// provider was attached). Feeds the async summariser pass that
+    /// calls the LLM once per community and writes the result via
+    /// [`Self::set_community_summary`]. Returns `(community_id, level,
+    /// object_ids)` so the caller can join against `ontology_objects`
+    /// to build the LLM prompt input.
+    pub fn list_communities_needing_summary(
+        &self,
+    ) -> anyhow::Result<Vec<(u32, u32, Vec<i64>)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT community_id, level, object_ids
+               FROM ontology_communities
+              WHERE level = 0
+                AND length(summary) = 0
+              ORDER BY community_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let cid: i64 = row.get(0)?;
+            let level: i64 = row.get(1)?;
+            let object_ids_json: String = row.get(2)?;
+            Ok((
+                u32::try_from(cid).unwrap_or(u32::MAX),
+                u32::try_from(level).unwrap_or(0),
+                object_ids_json,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (cid, level, ids_json) = row?;
+            let object_ids: Vec<i64> = serde_json::from_str(&ids_json).unwrap_or_default();
+            out.push((cid, level, object_ids));
+        }
+        Ok(out)
+    }
+
+    /// PR #9 LlmConsolidator share — attach a generated summary + keywords
+    /// to one community. Invoked by the scheduler after the LLM call
+    /// completes. Keywords are stored as a JSON array to match the
+    /// existing column shape.
+    pub fn set_community_summary(
+        &self,
+        level: u32,
+        community_id: u32,
+        summary: &str,
+        keywords: &[String],
+    ) -> anyhow::Result<()> {
+        let keywords_json = serde_json::to_string(keywords)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE ontology_communities
+                SET summary = ?1, keywords = ?2
+              WHERE level = ?3 AND community_id = ?4",
+            params![summary, keywords_json, level as i64, community_id as i64],
+        )?;
+        Ok(())
+    }
+
     /// PR #9 wire-up — list every level-0 community that has a non-empty
     /// summary but no embedding yet. Feeds the backfill pass that runs
     /// inside the dream cycle: for each row, compute an embedding from

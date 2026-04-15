@@ -32,6 +32,12 @@ pub struct VaultScheduler {
     /// `ontology_communities`) during idle time. Kept optional so
     /// vault-only deployments (no ontology layer) still work.
     ontology: Option<Arc<crate::ontology::OntologyRepo>>,
+    /// PR #9 follow-up — optional LLM provider + model for real community
+    /// summaries. When absent the scheduler falls back to a deterministic
+    /// title-concat placeholder so community rows are still useful
+    /// (the Phase-5 backfill will embed whatever summary exists — an empty
+    /// summary is filtered out).
+    community_summarizer: Option<CommunitySummarizer>,
     last_activity: Arc<Mutex<Instant>>,
     last_health_check: Arc<Mutex<Option<Instant>>>,
     /// PR #9 — tracks when the last community-detection pass ran. Bumped
@@ -45,6 +51,15 @@ pub struct VaultScheduler {
     hub_batch_size: usize,
     /// Max concurrent hub compiles per batch.
     hub_concurrency: usize,
+}
+
+/// Internal config for the community summariser. Holds a provider handle
+/// + model name. `community_prompt_system` is the prompt fed to the LLM;
+/// it's small and stable so we build it once.
+#[derive(Clone)]
+struct CommunitySummarizer {
+    provider: Arc<dyn crate::providers::traits::Provider>,
+    model: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -62,6 +77,7 @@ impl VaultScheduler {
         Self {
             vault,
             ontology: None,
+            community_summarizer: None,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             last_health_check: Arc::new(Mutex::new(None)),
             last_community_detection: Arc::new(Mutex::new(None)),
@@ -71,6 +87,22 @@ impl VaultScheduler {
             hub_batch_size: 4,
             hub_concurrency: 2,
         }
+    }
+
+    /// PR #9 LlmConsolidator share — attach a Provider + model so the
+    /// weekly community detection writes real LLM summaries instead of
+    /// empty placeholders. Mirrors the dream-cycle `recompile_model`
+    /// pattern for consistency.
+    pub fn with_community_summarizer(
+        mut self,
+        provider: Arc<dyn crate::providers::traits::Provider>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.community_summarizer = Some(CommunitySummarizer {
+            provider,
+            model: model.into(),
+        });
+        self
     }
 
     /// PR #9 — attach an OntologyRepo so the weekly community-detection
@@ -224,6 +256,19 @@ impl VaultScheduler {
                                     nodes = graph.nodes.len(),
                                     "scheduler ran weekly community detection"
                                 );
+                                // PR #9 LlmConsolidator share — fill empty
+                                // summaries with LLM-generated text when
+                                // a provider is attached. Failures are
+                                // per-community and never abort the tick.
+                                if let Some(summ) = &self.community_summarizer {
+                                    if let Err(e) =
+                                        fill_community_summaries(onto.as_ref(), summ).await
+                                    {
+                                        tracing::warn!(
+                                            "community summariser pass failed: {e}"
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("community detection write failed: {e}")
@@ -267,6 +312,89 @@ impl VaultScheduler {
             }
         }
     }
+}
+
+/// PR #9 LlmConsolidator share — generate a summary for every community
+/// that currently has an empty summary. Uses one LLM call per community
+/// with the attached provider/model. Failures are logged and skipped so
+/// the scheduler keeps running.
+async fn fill_community_summaries(
+    repo: &crate::ontology::OntologyRepo,
+    summariser: &CommunitySummarizer,
+) -> Result<()> {
+    let pending = repo.list_communities_needing_summary()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let system_prompt = "You are an ontology community summariser. \
+         Given the titles of a set of related objects (people, tasks, \
+         documents, places, etc.) in the user's personal knowledge \
+         graph, write ONE concise (≤2 sentence) summary capturing what \
+         this cluster is about. On a second line, output a \
+         comma-separated list of up to 5 keyword tags for the cluster. \
+         Output ONLY the summary and keywords — no meta commentary, no \
+         JSON.";
+
+    for (cid, level, object_ids) in pending {
+        // Build prompt input from object titles. Skip the community if
+        // we cannot read any title (corrupt or deleted rows).
+        let mut titles: Vec<String> = Vec::with_capacity(object_ids.len());
+        for id in &object_ids {
+            if let Ok(Some(obj)) = repo.get_object(*id) {
+                if let Some(t) = obj.title {
+                    titles.push(t);
+                }
+            }
+        }
+        if titles.is_empty() {
+            continue;
+        }
+
+        let bullets: String = titles
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("{}. {}\n", i + 1, t))
+            .collect();
+        let user_msg = format!("Cluster objects:\n{bullets}");
+
+        let resp = summariser
+            .provider
+            .chat_with_system(Some(system_prompt), &user_msg, &summariser.model, 0.2)
+            .await;
+        let text = match resp {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                tracing::warn!(cid, "community summariser LLM call failed: {e}");
+                continue;
+            }
+        };
+        if text.is_empty() {
+            continue;
+        }
+
+        // Split on first newline: first line = summary, second = keywords.
+        let mut lines = text.splitn(2, '\n');
+        let summary = lines.next().unwrap_or("").trim().to_string();
+        let keywords: Vec<String> = lines
+            .next()
+            .map(|kws| {
+                kws.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .take(5)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if summary.is_empty() {
+            continue;
+        }
+        if let Err(e) = repo.set_community_summary(level, cid, &summary, &keywords) {
+            tracing::warn!(cid, "set_community_summary failed: {e}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -380,6 +508,105 @@ mod tests {
         );
         let listed = repo.list_communities_level_zero().unwrap();
         assert!(!listed.is_empty());
+    }
+
+    // ── PR #9 LlmConsolidator share: VaultScheduler with summariser ─
+
+    struct FakeSummaryProvider {
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::traits::Provider for FakeSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _user: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn community_summariser_fills_empty_summaries_with_llm_response() {
+        use crate::ontology::OntologyRepo;
+
+        let tmp = TempDir::new().unwrap();
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let vault = Arc::new(VaultStore::with_shared_connection(conn).unwrap());
+        let repo = Arc::new(OntologyRepo::open(tmp.path()).unwrap());
+        let a = repo
+            .ensure_object("Contact", "Alice", &serde_json::json!({}), "u1")
+            .unwrap();
+        let b = repo
+            .ensure_object("Contact", "Bob", &serde_json::json!({}), "u1")
+            .unwrap();
+        repo.create_link("knows", a, b, None).unwrap();
+
+        let provider = Arc::new(FakeSummaryProvider {
+            reply: "Close contacts who know each other.\npersonal, contacts, friends".into(),
+        });
+        let sched = VaultScheduler::new(vault)
+            .with_ontology(repo.clone())
+            .with_community_summarizer(provider, "gemini-2.5-flash")
+            .with_idle_threshold(Duration::from_millis(1))
+            .with_community_cadence(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let stats = sched.tick().await.unwrap();
+        assert!(stats.communities_detected >= 1);
+
+        let listed = repo.list_communities_level_zero().unwrap();
+        assert!(!listed.is_empty());
+        let with_summary: Vec<_> = listed
+            .iter()
+            .filter(|c| !c.summary.is_empty())
+            .collect();
+        assert!(
+            !with_summary.is_empty(),
+            "expected at least one non-empty summary after LLM pass"
+        );
+        assert_eq!(
+            with_summary[0].summary,
+            "Close contacts who know each other."
+        );
+        assert_eq!(with_summary[0].keywords, vec!["personal", "contacts", "friends"]);
+    }
+
+    #[tokio::test]
+    async fn community_summariser_skipped_when_no_provider() {
+        use crate::ontology::OntologyRepo;
+
+        let tmp = TempDir::new().unwrap();
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let vault = Arc::new(VaultStore::with_shared_connection(conn).unwrap());
+        let repo = Arc::new(OntologyRepo::open(tmp.path()).unwrap());
+        let a = repo
+            .ensure_object("Contact", "Alice", &serde_json::json!({}), "u1")
+            .unwrap();
+        let b = repo
+            .ensure_object("Contact", "Bob", &serde_json::json!({}), "u1")
+            .unwrap();
+        repo.create_link("knows", a, b, None).unwrap();
+
+        let sched = VaultScheduler::new(vault)
+            .with_ontology(repo.clone())
+            .with_idle_threshold(Duration::from_millis(1))
+            .with_community_cadence(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let _ = sched.tick().await.unwrap();
+
+        // All communities should still have empty summaries.
+        let listed = repo.list_communities_level_zero().unwrap();
+        for c in &listed {
+            assert!(
+                c.summary.is_empty(),
+                "expected empty summary without provider, got '{}'",
+                c.summary
+            );
+        }
     }
 
     #[tokio::test]
