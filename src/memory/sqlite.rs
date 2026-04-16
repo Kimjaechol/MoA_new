@@ -1527,15 +1527,30 @@ impl SqliteMemory {
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         use super::traits::Memory;
 
-        if variations.len() <= 1 {
-            // No expansion — use standard recall on the original query
+        // PR #4 — only short-circuit to `recall()` when the caller has
+        // nothing to gain from the RRF+rerank path. If a reranker is
+        // attached and enabled, the single-query path still needs the
+        // cross-encoder rerank pass (which `recall()` doesn't run), so
+        // we fall through to the full pipeline.
+        let rerank_attached =
+            self.active_reranker().is_some() && self.rerank_config().enabled;
+        if variations.len() <= 1 && !rerank_attached {
+            // No expansion and no reranker — plain recall is cheaper.
             return self.recall(original_query, limit, session_id).await;
         }
 
         // Multi-query RRF: search each variation, merge all results
         let query_embedding_original = self.get_or_compute_embedding(original_query).await?;
 
-        let queries_owned: Vec<String> = variations.to_vec();
+        // PR #4 — if variations is empty (rerank-only single-query mode),
+        // seed the search with the original query so the RRF pool isn't
+        // empty. Callers with real expansion already pass original + N
+        // rewrites, so the owned vector is just `variations.to_vec()`.
+        let queries_owned: Vec<String> = if variations.is_empty() {
+            vec![original_query.to_string()]
+        } else {
+            variations.to_vec()
+        };
 
         let conn = self.conn.clone();
         let sid = session_id.map(String::from);

@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+use zeroclaw::memory::search::rerank::{create_reranker, RerankConfig};
 use zeroclaw::memory::sqlite::SqliteMemory;
 use zeroclaw::memory::traits::{Memory, MemoryCategory};
 
@@ -103,6 +104,18 @@ struct Args {
     /// retrieval-context tuples the Python judge (`eval_rag_llm.py`)
     /// consumes. One line per gold query.
     emit_retrieval: Option<PathBuf>,
+    /// PR #4 A/B switch — route queries through
+    /// `recall_with_variations(q, &[], k, None)` instead of the legacy
+    /// `recall()` path. The variations path is the only one that invokes
+    /// the cross-encoder reranker, so enabling this is a prerequisite
+    /// for `--enable-rerank`. Kept separate so off/on baselines can use
+    /// the same retrieval infrastructure and only differ on rerank.
+    use_variations_path: bool,
+    /// PR #4 — attach BGE-reranker-v2-m3 + flip rerank_config.enabled.
+    /// Implies `use_variations_path = true` since the legacy `recall()`
+    /// path ignores the reranker. Requires `--features embedding-local`
+    /// at build time; otherwise the stub reranker errors at query time.
+    enable_rerank: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -112,6 +125,8 @@ fn parse_args() -> Result<Args> {
         output: None,
         evals_dir: PathBuf::from("tests/evals"),
         emit_retrieval: None,
+        use_variations_path: false,
+        enable_rerank: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
@@ -138,6 +153,11 @@ fn parse_args() -> Result<Args> {
             "--emit-retrieval" => {
                 args.emit_retrieval = iter.next().map(PathBuf::from);
             }
+            "--variations" => args.use_variations_path = true,
+            "--enable-rerank" => {
+                args.enable_rerank = true;
+                args.use_variations_path = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -161,6 +181,8 @@ fn print_help() {
            --output <PATH>            Write JSON report to file (default: stdout text)\n  \
            --evals-dir <PATH>         Override evals dir (default: tests/evals)\n  \
            --emit-retrieval <PATH>    Emit retrieval JSONL for LLM judge\n  \
+           --variations               Route through recall_with_variations (A/B baseline)\n  \
+           --enable-rerank            Attach BGE-reranker-v2-m3 (implies --variations)\n  \
            -h, --help                 Show this help"
     );
 }
@@ -200,6 +222,7 @@ async fn evaluate_set(
     golds: &[GoldEntry],
     top_k: usize,
     emit_retrieval: Option<&Path>,
+    use_variations_path: bool,
 ) -> Result<HashMap<String, DomainScore>> {
     // Group by domain so we can report per-set numbers.
     let mut per_domain: HashMap<String, Vec<(f64, f64, f64)>> = HashMap::new();
@@ -209,10 +232,19 @@ async fn evaluate_set(
     let mut retrieval_out: Vec<serde_json::Value> = Vec::new();
 
     for g in golds {
-        let hits = mem
-            .recall(&g.query, top_k, None)
-            .await
-            .with_context(|| format!("recall query `{}`", g.query))?;
+        // PR #4 — `--variations` / `--enable-rerank` both flip the query
+        // onto the RRF+rerank-aware path. The empty variations slice means
+        // the k-way fusion just sees the one query, giving a fair A/B
+        // against the legacy `recall()` when rerank is off.
+        let hits = if use_variations_path {
+            mem.recall_with_variations(&g.query, &[], top_k, None)
+                .await
+                .with_context(|| format!("recall_with_variations query `{}`", g.query))?
+        } else {
+            mem.recall(&g.query, top_k, None)
+                .await
+                .with_context(|| format!("recall query `{}`", g.query))?
+        };
 
         let retrieved_keys: Vec<&str> = hits.iter().map(|h| h.key.as_str()).collect();
         let gold_set: HashSet<&str> = g.gold_keys.iter().map(String::as_str).collect();
@@ -384,11 +416,38 @@ async fn main() -> Result<()> {
     let mem = SqliteMemory::new(tmp.path()).context("open SqliteMemory")?;
     seed_corpus(&mem, &corpus).await?;
 
+    // PR #4 — wire the cross-encoder reranker when `--enable-rerank` is
+    // set. Initialising the reranker up front (outside the per-query loop)
+    // amortises the ONNX session setup. When the feature is off the
+    // factory returns a stub that errors from `rerank()`, so we surface a
+    // clearer message here rather than failing mid-query.
+    if args.enable_rerank {
+        let reranker = create_reranker("bge-reranker-v2-m3");
+        if reranker.name() == "bge-reranker-stub" {
+            anyhow::bail!(
+                "--enable-rerank requires the binary to be built with \
+                 `--features embedding-local`; rebuild and retry"
+            );
+        }
+        mem.set_reranker(reranker);
+        mem.set_rerank_config(RerankConfig {
+            enabled: true,
+            model: "bge-reranker-v2-m3".into(),
+            top_k_before: 50,
+            top_k_after: args.top_k,
+        });
+        eprintln!(
+            "rerank: attached bge-reranker-v2-m3 (top_k_before=50, top_k_after={})",
+            args.top_k
+        );
+    }
+
     let per_domain = evaluate_set(
         &mem,
         &goldens,
         args.top_k,
         args.emit_retrieval.as_deref(),
+        args.use_variations_path,
     )
     .await?;
 
