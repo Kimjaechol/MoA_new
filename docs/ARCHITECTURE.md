@@ -3749,7 +3749,7 @@ SourceType::ChatPaste char_count:
 | PR #1 Tauri 다운로드 UI | ⏳ 후속 (프론트엔드) | — |
 | PR #1 config 기본값 flip | ⏳ embedding-local 릴리즈 기본 전까지 의도적 유지 | — |
 | PR #1 CPU 32배치 <2s 벤치 | ✅ (release, Apple silicon CPU · median 1.665s / 32-batch · ~19 elem/s) | `46483e34` |
-| PR #4 reranker on/off 정확도 비교 | ⏳ 후속 (대형 eval 데이터셋 필요) | — |
+| PR #4 reranker on/off 정확도 비교 | ✅ (A/B 측정 완료, 수락 기준 ≥5pt MRR 미달 — 원인: law baseline 이미 0.967로 5pt 여지 없음) / ⚠️ ko 회귀 (-10pt MRR) | `d5565196` |
 | PR #4 p95 latency <500ms 실측 | ⏳ 후속 (벤치 환경 필요) | — |
 | PR #4 모바일 degrade 검증 | ⏳ 후속 (디바이스 테스트 필요) | — |
 | PR #5 SQLCipher at-rest | ✅ (feature flag + keyed constructor) | `af6b9668` |
