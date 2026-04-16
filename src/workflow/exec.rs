@@ -360,6 +360,27 @@ mod tests {
     }
 
     #[test]
+    fn render_template_unresolved_does_not_infinite_loop() {
+        // Regression: the earlier implementation wrote `{{unresolved:key}}`
+        // back into `out` and then restarted `out.find("{{")` from zero,
+        // which hit the marker and looped forever. The forward-cursor scan
+        // plus non-`{{` marker prevents that. If this test ever hangs, the
+        // bug is back.
+        let vars = HashMap::new();
+        let result =
+            render_template("a={{x}} b={{y}} c={{z}}", &vars).unwrap();
+        assert_eq!(result, "a=[[unresolved:x]] b=[[unresolved:y]] c=[[unresolved:z]]");
+    }
+
+    #[test]
+    fn render_template_mixes_resolved_and_unresolved() {
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), serde_json::json!("Alice"));
+        let result = render_template("{{name}} vs {{other}}", &vars).unwrap();
+        assert_eq!(result, "Alice vs [[unresolved:other]]");
+    }
+
+    #[test]
     fn sha256_deterministic() {
         let a = sha256_hex(b"hello");
         let b = sha256_hex(b"hello");
