@@ -7,6 +7,7 @@ use tauri_plugin_shell::ShellExt;
 use rusqlite::Connection;
 
 mod device_link;
+mod embedding_status;
 
 /// Write a session token to disk and restrict permissions to owner-only (0o600) on Unix.
 fn persist_session_token(path: &Path, token: &str) -> std::io::Result<()> {
@@ -2629,6 +2630,8 @@ pub fn run() {
             gateway_fetch,
             list_archived_memories,
             restore_archived_memory,
+            embedding_status::check_embedding_model,
+            embedding_status::monitor_embedding_download,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path

@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from "react";
 import { t, type Locale } from "../lib/i18n";
 import { apiClient, type SyncStatus, type PlatformInfo, type DeviceInfo } from "../lib/api";
 import { isTauri } from "../lib/tauri-bridge";
+import { EmbeddingStatus } from "./EmbeddingStatus";
 
 interface SettingsProps {
   locale: Locale;
@@ -732,6 +733,15 @@ export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout
           )}
 
           {/* Platform info (Tauri only) */}
+          {inTauri && (
+            <div className="settings-section">
+              <div className="settings-section-title">
+                {locale === "ko" ? "임베딩 모델" : "Embedding Model"}
+              </div>
+              <EmbeddingStatus locale={locale} />
+            </div>
+          )}
+
           {inTauri && platformInfo && (
             <div className="settings-section">
               <div className="settings-section-title">{t("platform", locale)}</div>
