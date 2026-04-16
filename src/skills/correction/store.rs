@@ -138,9 +138,9 @@ impl CorrectionStore {
 
     /// Create a new pattern.
     ///
-    /// Rejects empty original or replacement — an empty pattern would never
-    /// match (or match the entire document with substring search), polluting
-    /// the store with noise patterns.
+    /// Rejects empty/whitespace-only original or replacement — an empty pattern
+    /// would never match (or match the entire document with substring search),
+    /// polluting the store with noise patterns.
     pub fn create_pattern(
         &self,
         pattern_type: PatternType,
@@ -148,10 +148,10 @@ impl CorrectionStore {
         replacement: &str,
         scope: &str,
     ) -> Result<i64> {
-        if original_regex.is_empty() {
+        if original_regex.trim().is_empty() {
             anyhow::bail!("correction pattern original_regex must not be empty");
         }
-        if replacement.is_empty() {
+        if replacement.trim().is_empty() {
             anyhow::bail!("correction pattern replacement must not be empty");
         }
         let conn = self.conn.lock();
@@ -481,5 +481,9 @@ mod tests {
         let store = test_store();
         assert!(store.create_pattern(PatternType::Style, "", "b", "all").is_err());
         assert!(store.create_pattern(PatternType::Style, "a", "", "all").is_err());
+        // Whitespace-only must also be rejected — substring search on " "
+        // would match most documents and pollute correction stream.
+        assert!(store.create_pattern(PatternType::Style, "   ", "b", "all").is_err());
+        assert!(store.create_pattern(PatternType::Style, "a", "\t\n  ", "all").is_err());
     }
 }

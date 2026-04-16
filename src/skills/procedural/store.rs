@@ -210,7 +210,17 @@ impl SkillStore {
     }
 
     /// Full-text search across skill name, description, and content.
+    ///
+    /// The caller may pass free-form text (including FTS5 operators such as
+    /// `OR`, `NOT`, quotes, or parentheses). The query is passed through as-is
+    /// — if it fails to parse, the method returns an empty Vec rather than
+    /// propagating the error, so untrusted agent-generated queries never
+    /// panic the caller.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SkillRecord>> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT s.id, s.name, s.category, s.description, s.content_md, s.version,
@@ -221,7 +231,7 @@ impl SkillStore {
              ORDER BY rank
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
+        let rows_result = stmt.query_map(params![trimmed, limit as i64], |row| {
             Ok(SkillRecord {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -236,9 +246,17 @@ impl SkillStore {
                 created_by: row.get(10)?,
                 device_id: row.get(11)?,
             })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .context("FTS5 skill search failed")
+        });
+        match rows_result {
+            Ok(rows) => Ok(rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap_or_default()),
+            // FTS5 syntax error on user-supplied query → return empty instead of bubbling up
+            Err(e) => {
+                tracing::debug!("skill FTS5 parse error for query {:?}: {e}", trimmed);
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// Patch a specific section of a skill's content.

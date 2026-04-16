@@ -4,7 +4,7 @@
 //! and to patch them when errors or user corrections occur during use.
 
 use super::traits::{Tool, ToolResult};
-use crate::security::SecurityPolicy;
+use crate::security::{SecurityPolicy, ToolOperation};
 use crate::skills::procedural::{
     auto_create::{maybe_create_skill, SkillWorthinessVerdict},
     self_improve::{improve_after_execution, ExecutionResult},
@@ -16,13 +16,28 @@ use std::sync::Arc;
 
 pub struct SkillManageTool {
     store: Arc<SkillStore>,
-    #[allow(dead_code)]
     security: Arc<SecurityPolicy>,
 }
 
 impl SkillManageTool {
     pub fn new(store: Arc<SkillStore>, security: Arc<SecurityPolicy>) -> Self {
         Self { store, security }
+    }
+
+    /// Classify an action into a SecurityPolicy ToolOperation.
+    ///
+    /// All skill_manage actions mutate the brain.db (create / patch /
+    /// delete / usage-record) so every action is treated as an Act. The
+    /// enforcement respects read-only mode + per-hour action rate limits.
+    fn operation_for(&self, action: &str) -> ToolOperation {
+        match action {
+            // All actions write to the skill store → Act (subject to rate limit)
+            "create" | "patch_pitfall" | "patch_procedure" | "delete" | "record_usage" => {
+                ToolOperation::Act
+            }
+            // Unknown actions default to Act to stay on the safe side.
+            _ => ToolOperation::Act,
+        }
     }
 }
 
@@ -65,6 +80,18 @@ impl Tool for SkillManageTool {
             .get("action")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
+
+        // SecurityPolicy gate — respects read-only mode + hourly rate limit
+        if let Err(e) = self.security.enforce_tool_operation(
+            self.operation_for(action),
+            &format!("skill_manage:{}", action),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
+            });
+        }
 
         match action {
             "create" => {

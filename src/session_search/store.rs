@@ -104,7 +104,14 @@ impl SessionSearchStore {
     /// Search across all session transcripts using FTS5.
     ///
     /// Returns raw message hits; use `group_by_session` to aggregate.
+    /// User queries that fail to parse as FTS5 syntax return an empty Vec
+    /// rather than bubbling up the SQL error, so free-form natural-language
+    /// searches never panic the caller.
     pub fn search_raw(&self, query: &str, limit: usize) -> Result<Vec<RawHit>> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT m.id, m.session_id, m.role, m.content, m.timestamp, f.rank
@@ -114,7 +121,7 @@ impl SessionSearchStore {
              ORDER BY f.rank
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
+        let rows_result = stmt.query_map(params![trimmed, limit as i64], |row| {
             Ok(RawHit {
                 message_id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -123,9 +130,16 @@ impl SessionSearchStore {
                 timestamp: row.get(4)?,
                 rank: row.get(5)?,
             })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .context("FTS5 session search failed")
+        });
+        match rows_result {
+            Ok(rows) => Ok(rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap_or_default()),
+            Err(e) => {
+                tracing::debug!("session_search FTS5 parse error for {:?}: {e}", trimmed);
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// Get session metadata by id.
