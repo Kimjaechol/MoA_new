@@ -13,16 +13,140 @@
 //! The whole module assumes the caller's UI has obtained explicit user
 //! consent for each automated step (hardware detect → recommend → install).
 
+pub mod fallback_registry;
 pub mod installer;
+pub mod network_health;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 
+use crate::config::ReliabilityConfig;
+use fallback_registry::{register_local_fallback, RegistrationOutcome};
+use network_health::NetworkHealth;
+
 /// Default Ollama HTTP endpoint on localhost.
 pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+
+/// Result of arming the local-LLM fallback path at runtime startup.
+///
+/// Returned by [`arm_local_fallback`]. Bundles the ongoing
+/// [`NetworkHealth`] probe (which the caller should keep alive) with the
+/// outcome of the one-shot fallback registration so it can be surfaced in
+/// startup logs / UI badges.
+pub struct ArmedFallback {
+    /// Shared reachability cache. Hot-path callers query
+    /// `health.is_online()`. Refresh task is spawned automatically when
+    /// `arm_local_fallback` is called with `start_refresh: true`.
+    pub health: Arc<NetworkHealth>,
+    /// What the registration step did (or did not) do.
+    pub registration: RegistrationOutcome,
+    /// Snapshot of the local LLM model tag that was registered, if any.
+    pub local_model: Option<String>,
+}
+
+/// Arm the local-LLM fallback path: probe network health, attempt to
+/// register Ollama+Gemma 4 in `reliability`, and optionally spawn the
+/// background reachability refresh loop.
+///
+/// Idempotent — safe to call multiple times; the registry helper short-
+/// circuits if `ollama` is already in `fallback_providers`.
+///
+/// Mutates `reliability` in place when local fallback is enabled, daemon
+/// is reachable, and the configured model tag is installed.
+pub async fn arm_local_fallback(
+    reliability: &mut ReliabilityConfig,
+    base_url: &str,
+    start_refresh: bool,
+) -> ArmedFallback {
+    let health = NetworkHealth::new();
+    let _ = health.check_now().await;
+    if start_refresh {
+        let _join =
+            Arc::clone(&health).spawn_refresh_loop(network_health::DEFAULT_REFRESH_INTERVAL);
+    }
+
+    let registration = register_local_fallback(reliability, base_url).await;
+    let local_model = match &registration {
+        RegistrationOutcome::Registered { local_model } => Some(local_model.clone()),
+        _ => None,
+    };
+
+    ArmedFallback {
+        health,
+        registration,
+        local_model,
+    }
+}
+
+/// Identifies which provider MoA would route a fresh request to, given the
+/// current configuration and runtime state. Useful for stamping observability
+/// metadata onto chat responses (`X-MoA-Active-Provider` header,
+/// `active_provider` JSON field).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActiveProvider {
+    /// Configured cloud provider (e.g. `"gemini"`, `"anthropic"`).
+    Cloud { name: String },
+    /// On-device Ollama with the local Gemma 4 tag.
+    Local { model: String },
+}
+
+impl ActiveProvider {
+    /// Short label suitable for an HTTP header value.
+    pub fn label(&self) -> String {
+        match self {
+            ActiveProvider::Cloud { name } => name.clone(),
+            ActiveProvider::Local { model } => format!("ollama:{model}"),
+        }
+    }
+
+    /// Whether routing landed on the on-device path.
+    pub fn is_local(&self) -> bool {
+        matches!(self, ActiveProvider::Local { .. })
+    }
+}
+
+/// Compute the active provider given configuration, API key presence, and
+/// runtime network state. Encapsulates the patent §3.1 routing rules:
+///
+/// 1. `offline_force_local` set → always local (privacy-strict path)
+/// 2. Network offline + local fallback armed → local
+/// 3. No API key for primary cloud provider + local fallback armed → local
+/// 4. Otherwise → primary cloud provider
+pub fn decide_active_provider(
+    primary_cloud: &str,
+    has_cloud_api_key: bool,
+    network_online: bool,
+    reliability: &ReliabilityConfig,
+) -> ActiveProvider {
+    let local_armed = reliability.local_llm_fallback
+        && reliability.fallback_providers.iter().any(|p| p == "ollama");
+
+    if reliability.offline_force_local {
+        return ActiveProvider::Local {
+            model: reliability.local_llm_model.clone(),
+        };
+    }
+
+    if !network_online && local_armed {
+        return ActiveProvider::Local {
+            model: reliability.local_llm_model.clone(),
+        };
+    }
+
+    if !has_cloud_api_key && local_armed {
+        return ActiveProvider::Local {
+            model: reliability.local_llm_model.clone(),
+        };
+    }
+
+    ActiveProvider::Cloud {
+        name: primary_cloud.to_string(),
+    }
+}
 
 /// One incremental progress event emitted while pulling a model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +475,75 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn armed_reliability() -> ReliabilityConfig {
+        let mut c = ReliabilityConfig::default();
+        c.local_llm_fallback = true;
+        c.local_llm_model = "gemma4:e4b".to_string();
+        c.fallback_providers.push("ollama".to_string());
+        c
+    }
+
+    #[test]
+    fn decide_active_provider_offline_force_local_wins() {
+        let mut c = armed_reliability();
+        c.offline_force_local = true;
+        let decision = decide_active_provider("gemini", true, true, &c);
+        assert!(decision.is_local());
+        assert_eq!(decision.label(), "ollama:gemma4:e4b");
+    }
+
+    #[test]
+    fn decide_active_provider_offline_routes_local_when_armed() {
+        let c = armed_reliability();
+        let decision = decide_active_provider("gemini", true, false, &c);
+        assert!(decision.is_local());
+    }
+
+    #[test]
+    fn decide_active_provider_offline_falls_back_to_cloud_when_not_armed() {
+        // local_llm_fallback enabled but ollama not in fallback_providers
+        let mut c = ReliabilityConfig::default();
+        c.local_llm_fallback = true;
+        let decision = decide_active_provider("gemini", true, false, &c);
+        // Without armed local, the decision is still cloud — caller will
+        // discover the failure via the existing ReliableProvider retry chain.
+        match decision {
+            ActiveProvider::Cloud { name } => assert_eq!(name, "gemini"),
+            _ => panic!("expected cloud"),
+        }
+    }
+
+    #[test]
+    fn decide_active_provider_no_api_key_routes_local() {
+        let c = armed_reliability();
+        let decision = decide_active_provider("gemini", false, true, &c);
+        assert!(decision.is_local());
+    }
+
+    #[test]
+    fn decide_active_provider_happy_path_picks_cloud() {
+        let c = armed_reliability();
+        let decision = decide_active_provider("gemini", true, true, &c);
+        match decision {
+            ActiveProvider::Cloud { name } => assert_eq!(name, "gemini"),
+            _ => panic!("expected cloud, got {decision:?}"),
+        }
+    }
+
+    #[test]
+    fn active_provider_label_is_round_trippable() {
+        let cloud = ActiveProvider::Cloud {
+            name: "anthropic".to_string(),
+        };
+        assert_eq!(cloud.label(), "anthropic");
+        assert!(!cloud.is_local());
+        let local = ActiveProvider::Local {
+            model: "gemma4:e4b".to_string(),
+        };
+        assert_eq!(local.label(), "ollama:gemma4:e4b");
+        assert!(local.is_local());
+    }
 
     #[test]
     fn matches_tag_exact() {
