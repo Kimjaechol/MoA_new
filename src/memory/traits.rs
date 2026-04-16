@@ -388,6 +388,29 @@ pub trait Memory: Send + Sync {
         None
     }
 
+    /// PR #7 — HLC-guarded remote store. Applies a peer's write iff its
+    /// `remote_hlc` is strictly greater than the local row's
+    /// `updated_at_hlc`. Returns `true` when the row changed, `false`
+    /// when the local row was equal or newer (kept). Called by the sync
+    /// layer when the incoming delta carries an `hlc_stamp` (protocol
+    /// v2+); older peers' deltas skip this and continue to use plain
+    /// `store()` for v1 compat.
+    ///
+    /// Default impl falls back to plain `store()` so backends without
+    /// HLC columns (e.g. test fakes, in-memory shims) stay wire-
+    /// compatible — they lose the monotonicity guarantee but don't
+    /// drop writes.
+    async fn accept_remote_store_if_newer(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        _remote_hlc: &str,
+    ) -> anyhow::Result<bool> {
+        self.store(key, content, category, None).await?;
+        Ok(true)
+    }
+
     /// Recall with a pre-expanded set of query variations (v3.0 S3).
     /// Default falls back to `recall(original_query, ...)` ignoring
     /// variations. SqliteMemory overrides to run parallel FTS+vector

@@ -1206,6 +1206,17 @@ impl SqliteMemory {
     /// `insert_phone_call` auto-record delta journal entries.
     /// The factory calls this from `create_synced_memory` when sync is enabled.
     pub fn attach_sync(&self, engine: Arc<Mutex<super::sync::SyncEngine>>) {
+        // PR #7 — give the engine an HLC clock seeded from the device_id
+        // so outgoing deltas carry v2 `hlc_stamp`s. Existing engines
+        // without an attached clock stay v1-compatible; explicit override
+        // via `engine.attach_hlc(...)` from callers still wins.
+        {
+            let mut eng = engine.lock();
+            if eng.current_hlc_stamp().is_none() {
+                let node_id = eng.device_id().0.clone();
+                eng.attach_hlc(crate::sync::hlc::HlcClock::new(node_id));
+            }
+        }
         *self.sync.lock() = Some(engine);
     }
 
@@ -2012,6 +2023,92 @@ impl Memory for SqliteMemory {
             dim: dim as u32,
             vector: bytes,
         })
+    }
+
+    /// PR #7 — HLC-guarded remote store. Applies the write iff the
+    /// parsed remote HLC is strictly greater than the row's existing
+    /// `updated_at_hlc`. When the row has no HLC yet (pre-v2 write), we
+    /// accept the remote so v2 deltas can win conflicts after a
+    /// mixed-version rollout. On a losing comparison we return `false`
+    /// without touching the row so the caller can log the skip.
+    async fn accept_remote_store_if_newer(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        remote_hlc: &str,
+    ) -> anyhow::Result<bool> {
+        use crate::sync::hlc::Hlc;
+
+        let remote = Hlc::parse(remote_hlc).map_err(|e| {
+            anyhow::anyhow!("accept_remote_store_if_newer: malformed remote_hlc `{remote_hlc}`: {e}")
+        })?;
+        let embedding_bytes = self
+            .get_or_compute_embedding(content)
+            .await?
+            .map(|emb| vector::vec_to_bytes(&emb));
+
+        let conn = self.conn.clone();
+        let key_owned = key.to_string();
+        let content_owned = content.to_string();
+        let cat_owned = Self::category_to_str(&category);
+        let remote_stamp = remote_hlc.to_string();
+
+        let applied = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+
+            // Read the row's current stamp (if any). Null → treat as the
+            // sentinel "beats any remote" inverse: accept the remote so v1
+            // rows can be upgraded to v2-ordered ones. A row that already
+            // has an HLC only accepts strictly newer remotes.
+            let local_stamp: Option<String> = conn
+                .query_row(
+                    "SELECT updated_at_hlc FROM memories WHERE key = ?1",
+                    rusqlite::params![key_owned],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap_or(None);
+
+            if let Some(local) = local_stamp {
+                if let Ok(local_hlc) = Hlc::parse(&local) {
+                    if remote <= local_hlc {
+                        return Ok(false);
+                    }
+                }
+                // Malformed local stamp → treat as missing and accept the
+                // remote. Better to move forward than to get stuck.
+            }
+
+            // Accept. Upsert on the unique `key` — set the remote stamp so
+            // subsequent deltas compare against it.
+            let now = Local::now().to_rfc3339();
+            let id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, updated_at_hlc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
+                 ON CONFLICT(key) DO UPDATE SET
+                    content = excluded.content,
+                    category = excluded.category,
+                    embedding = excluded.embedding,
+                    updated_at = excluded.updated_at,
+                    updated_at_hlc = excluded.updated_at_hlc",
+                rusqlite::params![
+                    id,
+                    key_owned,
+                    content_owned,
+                    cat_owned,
+                    embedding_bytes,
+                    now,
+                    now,
+                    remote_stamp,
+                ],
+            )?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_remote_store_if_newer blocking task panicked: {e}"))??;
+
+        Ok(applied)
     }
 
     async fn apply_remote_v3_delta(
@@ -4798,5 +4895,69 @@ mod tests {
             "dev",
         )
         .unwrap();
+    }
+
+    /// PR #7 — five-minute clock drift between two nodes.
+    /// Node A writes at wall 10:00:00, node B writes at wall 10:05:00 (5 min
+    /// later), but A's logical counter is 1 (second tick). Under wall-clock
+    /// LWW, B's later timestamp always wins. Under HLC ordering, A wins
+    /// because its encoded HLC is strictly greater than B's despite the wall
+    /// being lower — as long as the HLC counter encodes the correct causal
+    /// ordering. This test verifies `accept_remote_store_if_newer` applies
+    /// the remote iff its HLC actually leads.
+    #[tokio::test]
+    async fn accept_remote_store_if_newer_respects_hlc_ordering_under_drift() {
+        use crate::sync::hlc::Hlc;
+
+        let (_tmp, mem) = temp_sqlite();
+
+        // Simulate node A storing first (wall 1000 ms, logical 0).
+        let hlc_a = Hlc::new(1_000, 0, "node_a").encode();
+        mem.store("shared", "from_a", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Stamp the row with A's HLC directly.
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memories SET updated_at_hlc = ?1 WHERE key = 'shared'",
+                rusqlite::params![hlc_a],
+            )
+            .unwrap();
+        }
+
+        // Node B writes "later" in wall-clock (wall 300_000 ms = +5 min)
+        // but with logical 0 — causal ordering says B is newer because its
+        // wall time is genuinely higher.
+        let hlc_b = Hlc::new(300_000, 0, "node_b").encode();
+        let applied_b = mem
+            .accept_remote_store_if_newer("shared", "from_b", MemoryCategory::Core, &hlc_b)
+            .await
+            .unwrap();
+        assert!(applied_b, "B (wall 300000) should beat A (wall 1000)");
+        let row = mem.get("shared").await.unwrap().unwrap();
+        assert_eq!(row.content, "from_b");
+
+        // Now try to apply a stale delta from A (wall 1000, logical 1).
+        // Even though A ticked its logical counter, B's wall time is still
+        // higher so A should lose.
+        let hlc_a_tick = Hlc::new(1_000, 1, "node_a").encode();
+        let applied_a = mem
+            .accept_remote_store_if_newer("shared", "from_a_retry", MemoryCategory::Core, &hlc_a_tick)
+            .await
+            .unwrap();
+        assert!(!applied_a, "A (wall 1000+1) must lose to B (wall 300000)");
+        let row = mem.get("shared").await.unwrap().unwrap();
+        assert_eq!(row.content, "from_b", "row must still hold B's write");
+
+        // Finally, A comes back with a genuinely newer HLC (wall 400_000).
+        let hlc_a_new = Hlc::new(400_000, 0, "node_a").encode();
+        let applied_final = mem
+            .accept_remote_store_if_newer("shared", "from_a_newest", MemoryCategory::Core, &hlc_a_new)
+            .await
+            .unwrap();
+        assert!(applied_final, "A (wall 400000) beats B (wall 300000)");
+        let row = mem.get("shared").await.unwrap().unwrap();
+        assert_eq!(row.content, "from_a_newest");
     }
 }
