@@ -20,7 +20,7 @@ pub mod network_health;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs;
 
@@ -30,6 +30,30 @@ use network_health::NetworkHealth;
 
 /// Default Ollama HTTP endpoint on localhost.
 pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+
+// Process-wide shared NetworkHealth so request handlers can read cached
+// reachability without each constructing their own probe. Lazily spawns the
+// background refresh loop the first time it is accessed from inside a tokio
+// runtime.
+static SHARED_HEALTH: OnceLock<Arc<NetworkHealth>> = OnceLock::new();
+
+/// Returns the process-wide shared `NetworkHealth`. Cheap on the hot path —
+/// each call is one atomic `get` plus an `Arc::clone`. The first call from
+/// inside a tokio runtime spawns a background refresh loop at
+/// [`network_health::DEFAULT_REFRESH_INTERVAL`]; before that initial spawn
+/// the cached state is the construction-time default (online).
+pub fn shared_health() -> Arc<NetworkHealth> {
+    SHARED_HEALTH
+        .get_or_init(|| {
+            let h = NetworkHealth::new();
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let _ = Arc::clone(&h)
+                    .spawn_refresh_loop(network_health::DEFAULT_REFRESH_INTERVAL);
+            }
+            h
+        })
+        .clone()
+}
 
 /// Result of arming the local-LLM fallback path at runtime startup.
 ///
@@ -482,6 +506,15 @@ mod tests {
         c.local_llm_model = "gemma4:e4b".to_string();
         c.fallback_providers.push("ollama".to_string());
         c
+    }
+
+    #[tokio::test]
+    async fn shared_health_returns_same_instance() {
+        let h1 = shared_health();
+        let h2 = shared_health();
+        assert!(Arc::ptr_eq(&h1, &h2), "shared_health must memoize");
+        // Default state is online (so first request still tries cloud).
+        assert!(h1.is_online());
     }
 
     #[test]
