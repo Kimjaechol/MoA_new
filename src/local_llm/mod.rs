@@ -1,18 +1,19 @@
-//! Local LLM lifecycle: Ollama daemon health, model installation, and pull
-//! progress reporting for the on-device Gemma 4 fallback path.
+//! Local LLM lifecycle: Ollama daemon health, model installation, model pull
+//! progress, and OS-matched runtime install for the on-device Gemma 4
+//! fallback path.
 //!
 //! Distinct from `src/providers/ollama.rs` which handles inference (chat /
-//! completion). This module covers the *setup* surface: probing whether the
-//! daemon is reachable, listing installed models, pulling a new model with
-//! NDJSON progress callbacks, and persisting the user's chosen default.
+//! completion). This module covers the *setup* surface end-to-end:
+//! - [`installer`] — detect host OS and install the Ollama runtime
+//! - [`is_ollama_running`] — daemon health probe
+//! - [`list_installed`] / [`is_installed`] — model inventory
+//! - [`pull_model`] — streaming model pull with NDJSON progress
+//! - [`LocalLlmConfig`] — persisted default-model choice
 //!
-//! Design notes:
-//! - All operations target the local Ollama HTTP API at 127.0.0.1:11434.
-//! - Pull progress uses `/api/pull` with `stream: true` (NDJSON), which is
-//!   robust against terminal-formatting drift in `ollama pull` stdout.
-//! - Daemon installation is *out of scope* for this module — installing
-//!   Ollama via `curl … | sh` requires elevated trust and is handled in a
-//!   separate, opt-in installer flow (see plan §2.3 step 3).
+//! The whole module assumes the caller's UI has obtained explicit user
+//! consent for each automated step (hardware detect → recommend → install).
+
+pub mod installer;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
