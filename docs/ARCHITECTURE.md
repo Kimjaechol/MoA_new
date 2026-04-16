@@ -3758,7 +3758,7 @@ SourceType::ChatPaste char_count:
 | PR #6 dream_cycle 통합 | ✅ (Task 4 decay + Task 5 consolidate + Task 6 community) | `f774b6ef` · `c3ea3524` |
 | PR #6 recall archived 필터 | ✅ (FTS5 / vector / LIKE 전부) | `f774b6ef` |
 | PR #6 auto bump_recall | ✅ | `f774b6ef` |
-| PR #6 아카이브 UI | ⏳ 후속 (프론트엔드) | — |
+| PR #6 아카이브 UI | ✅ (리스트 뷰 + 복구 버튼 + 통합 요약 배지 + Tauri 커맨드 + ko/en 로케일) | `a7ec703d` |
 | PR #7 r2d2 pool | ✅ (8-conn 읽기 풀) | `6bbd5f83` |
 | PR #7 HLC 스키마 마이그레이션 | ✅ (updated_at_hlc additive) | `1db6b714` |
 | PR #7 sync protocol version bump (HLC 정렬 전환) | ✅ (v2: DeltaEntry.hlc_stamp + HLC-guarded upsert + v1↔v2 interop + 5min drift 테스트) | `aff2f11e` |
