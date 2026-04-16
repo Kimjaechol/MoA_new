@@ -2488,6 +2488,65 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+// ── PR #6 Archive UI Commands ────────────────────────────────────
+
+fn open_memory_db() -> Result<Connection, String> {
+    let home = dirs_next::home_dir()
+        .ok_or_else(|| "Cannot find home directory".to_string())?;
+    let db_path = home.join(".moa").join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Err("Memory database not found — start the agent first".into());
+    }
+    Connection::open(&db_path)
+        .map_err(|e| format!("Failed to open memory database: {e}"))
+}
+
+#[tauri::command]
+fn list_archived_memories() -> Result<serde_json::Value, String> {
+    let conn = open_memory_db()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.key, m.content, m.category, m.updated_at,
+                    cm.summary, cm.fact_type
+             FROM memories m
+             LEFT JOIN consolidated_memories cm
+               ON cm.source_ids LIKE '%' || m.id || '%'
+             WHERE m.archived = 1
+             ORDER BY m.updated_at DESC",
+        )
+        .map_err(|e| format!("Failed to prepare archive query: {e}"))?;
+
+    let rows: Vec<serde_json::Value> = stmt
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "key": row.get::<_, String>(1)?,
+                "content": row.get::<_, String>(2)?,
+                "category": row.get::<_, String>(3)?,
+                "updated_at": row.get::<_, String>(4)?,
+                "consolidated_summary": row.get::<_, Option<String>>(5)?,
+                "consolidated_fact_type": row.get::<_, Option<String>>(6)?,
+            }))
+        })
+        .map_err(|e| format!("Failed to query archived memories: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(serde_json::json!({ "archived": rows }))
+}
+
+#[tauri::command]
+fn restore_archived_memory(memory_id: String) -> Result<bool, String> {
+    let conn = open_memory_db()?;
+    let changed = conn
+        .execute(
+            "UPDATE memories SET archived = 0 WHERE id = ?1 AND archived = 1",
+            rusqlite::params![memory_id],
+        )
+        .map_err(|e| format!("Failed to restore memory: {e}"))?;
+    Ok(changed > 0)
+}
+
 // ── Entry Point ──────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2568,6 +2627,8 @@ pub fn run() {
             generate_channel_pairing_code,
             get_channel_pairing_status,
             gateway_fetch,
+            list_archived_memories,
+            restore_archived_memory,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path

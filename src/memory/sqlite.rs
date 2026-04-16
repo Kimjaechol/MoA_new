@@ -549,6 +549,50 @@ impl SqliteMemory {
         Ok(archived)
     }
 
+    // ── PR #6: archive UI backend ──────────────────────────────
+
+    /// PR #6 — list archived memories with optional consolidation context.
+    /// Returns rows where `archived = 1`, joined against
+    /// `consolidated_memories` so the UI can show "merged into community X".
+    pub fn list_archived(&self) -> anyhow::Result<Vec<ArchivedMemoryInfo>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.key, m.content, m.category, m.updated_at,
+                    cm.summary, cm.fact_type
+             FROM memories m
+             LEFT JOIN consolidated_memories cm
+               ON cm.source_ids LIKE '%' || m.id || '%'
+             WHERE m.archived = 1
+             ORDER BY m.updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ArchivedMemoryInfo {
+                id: row.get(0)?,
+                key: row.get(1)?,
+                content: row.get(2)?,
+                category: row.get(3)?,
+                updated_at: row.get(4)?,
+                consolidated_summary: row.get(5)?,
+                consolidated_fact_type: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// PR #6 — un-archive a single memory by id.
+    pub fn restore_archived(&self, memory_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE memories SET archived = 0 WHERE id = ?1 AND archived = 1",
+            rusqlite::params![memory_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     // ── PR #4: reranker plumbing ─────────────────────────────────
 
     /// PR #4 — attach a cross-encoder reranker. The reranker is consulted by
@@ -1843,6 +1887,20 @@ fn dedup_ranked_list(items: &[(String, f32)]) -> Vec<(String, f32)> {
     let mut result: Vec<(String, f32)> = best.into_iter().collect();
     result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     result
+}
+
+/// PR #6 — row returned by `list_archived` for the archive UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArchivedMemoryInfo {
+    pub id: String,
+    pub key: String,
+    pub content: String,
+    pub category: String,
+    pub updated_at: String,
+    /// Summary of the consolidated fact this memory was folded into, if any.
+    pub consolidated_summary: Option<String>,
+    /// Fact type (e.g. "preference", "fact") from the consolidation record.
+    pub consolidated_fact_type: Option<String>,
 }
 
 /// A timeline evidence entry (read from `memory_timeline`).

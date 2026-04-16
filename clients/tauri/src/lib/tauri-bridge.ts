@@ -301,6 +301,38 @@ export async function gatewayFetch(
   }) as Promise<GatewayFetchResult>;
 }
 
+// ── PR #6 Archive UI ──────────────────────────────────────────────
+
+export interface ArchivedMemory {
+  id: string;
+  key: string;
+  content: string;
+  category: string;
+  updated_at: string;
+  consolidated_summary: string | null;
+  consolidated_fact_type: string | null;
+}
+
+export async function listArchivedMemories(): Promise<{
+  archived: ArchivedMemory[];
+} | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("list_archived_memories") as Promise<{
+    archived: ArchivedMemory[];
+  }>;
+}
+
+export async function restoreArchivedMemory(
+  memoryId: string,
+): Promise<boolean | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("restore_archived_memory", {
+    memoryId,
+  }) as Promise<boolean>;
+}
+
 // ── Mobile lifecycle event listeners ─────────────────────────────
 
 /** Register a handler for Tauri lifecycle events. Returns an unlisten fn. */
