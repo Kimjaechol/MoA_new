@@ -59,8 +59,9 @@ pub const INPUT_CHANNELS: u16 = 1;
 /// 16-bit signed little-endian.
 pub const INPUT_BITS_PER_SAMPLE: u16 = 16;
 
-/// Default Ollama HTTP endpoint.
-pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+/// Default Ollama HTTP endpoint — re-exported from `crate::local_llm` so the
+/// constant has exactly one definition across the codebase (QA fix).
+pub use crate::local_llm::DEFAULT_OLLAMA_URL;
 /// Default Gemma 4 audio-capable tag (E4B effective 4B).
 pub const DEFAULT_MODEL: &str = "gemma4:e4b";
 
