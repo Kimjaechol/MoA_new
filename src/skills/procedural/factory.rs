@@ -1,20 +1,13 @@
-//! Factory helpers — wire a SkillStore against the shared brain.db.
+//! Factory helper — wire a SkillStore against the shared brain.db.
+//!
+//! Uses the common `brain_db::open_brain_db` helper so all four
+//! self-learning stores share the same PRAGMA tuning and path.
 
 use super::store::SkillStore;
+use crate::skills::brain_db;
 use anyhow::Result;
-use parking_lot::Mutex;
-use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Arc;
-
-/// Default brain.db path inside the workspace.
-///
-/// This mirrors `memory::sqlite::SqliteMemory`'s DB location so skills,
-/// memories, and timeline entries share the same SQLite file when the
-/// deployment uses the SQLite memory backend.
-pub fn brain_db_path(workspace_dir: &Path) -> std::path::PathBuf {
-    workspace_dir.join("memory").join("brain.db")
-}
 
 /// Open (or create) brain.db and build a SkillStore rooted in it.
 ///
@@ -22,16 +15,8 @@ pub fn brain_db_path(workspace_dir: &Path) -> std::path::PathBuf {
 /// the skill tables coexist with memory_entries/timeline_entries in the
 /// same SQLite file.
 pub fn build_store(workspace_dir: &Path, device_id: &str) -> Result<Arc<SkillStore>> {
-    let path = brain_db_path(workspace_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let conn = Connection::open(&path)?;
-    // Set WAL + busy_timeout to play nicely with other readers/writers.
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "busy_timeout", 5000i64)?;
-
-    let store = SkillStore::new(Arc::new(Mutex::new(conn)), device_id.to_string());
+    let conn = brain_db::open_brain_db(workspace_dir)?;
+    let store = SkillStore::new(conn, device_id.to_string());
     store.migrate()?;
     Ok(Arc::new(store))
 }
@@ -45,7 +30,6 @@ mod tests {
     fn build_store_creates_db_and_migrates() {
         let dir = TempDir::new().unwrap();
         let store = build_store(dir.path(), "test-dev").unwrap();
-        // Should be able to create a skill immediately.
         store
             .create("s1", Some("coding"), "desc", "# content", "agent")
             .unwrap();
