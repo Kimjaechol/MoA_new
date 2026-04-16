@@ -22,6 +22,8 @@ pub mod deepgram_simul;
 pub mod deepgram_stt;
 pub mod events;
 pub mod gemini_live;
+pub mod gemma_asr;
+pub mod gemma_simul;
 pub mod openai_realtime;
 pub mod pipeline;
 pub mod simul;
@@ -62,6 +64,8 @@ pub use gemini_live::{ConnectionState, GeminiLiveSession, VadConfig, VadSensitiv
 pub use deepgram_simul::{DeepgramSimulConfig, DeepgramSimulSession};
 #[allow(unused_imports)]
 pub use deepgram_stt::{DeepgramConfig, DeepgramSttSession, SttEvent};
+#[allow(unused_imports)]
+pub use gemma_asr::{GemmaAsrConfig, GemmaAsrSession};
 #[allow(unused_imports)]
 pub use openai_realtime::OpenAiRealtimeSession;
 #[allow(unused_imports)]
