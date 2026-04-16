@@ -468,7 +468,7 @@ async fn consolidate_clusters(
     provider: &dyn Provider,
     config: &DreamCycleConfig,
 ) -> Result<(usize, usize)> {
-    use super::consolidate::{consolidate_candidates, ConsolidationOutcome};
+    use super::consolidate::consolidate_candidates;
 
     let mut candidates = memory.collect_consolidation_candidates(1)?;
     if candidates.is_empty() {
