@@ -3746,7 +3746,7 @@ SourceType::ChatPaste char_count:
 | 잔여 항목 | 상태 | 커밋 |
 |---|---|---|
 | PR #1 실모델 결정론 검증 | ✅ | `07a33586` |
-| PR #1 Tauri 다운로드 UI | ⏳ 후속 (프론트엔드) | — |
+| PR #1 Tauri 다운로드 UI | ⏳ 블로커: fastembed 5.8에 progress callback API 없음 (stderr 텍스트만 출력). stderr 캡처+파싱 또는 자체 다운로드 스텝 필요 | — |
 | PR #1 config 기본값 flip | ⏳ embedding-local 릴리즈 기본 전까지 의도적 유지 | — |
 | PR #1 CPU 32배치 <2s 벤치 | ✅ (release, Apple silicon CPU · median 1.665s / 32-batch · ~19 elem/s) | `46483e34` |
 | PR #4 reranker on/off 정확도 비교 | ✅ (A/B 측정 완료, 수락 기준 ≥5pt MRR 미달 — 원인: law baseline 이미 0.967로 5pt 여지 없음) / ⚠️ ko 회귀 (-10pt MRR) | `d5565196` |
@@ -3762,7 +3762,7 @@ SourceType::ChatPaste char_count:
 | PR #7 r2d2 pool | ✅ (8-conn 읽기 풀) | `6bbd5f83` |
 | PR #7 HLC 스키마 마이그레이션 | ✅ (updated_at_hlc additive) | `1db6b714` |
 | PR #7 sync protocol version bump (HLC 정렬 전환) | ✅ (v2: DeltaEntry.hlc_stamp + HLC-guarded upsert + v1↔v2 interop + 5min drift 테스트) | `aff2f11e` |
-| PR #8 코퍼스 확장 (ko 100 / en 50 / law 30) | ✅ 부분 (ko 50 / en 30 / law 30 — 스펙 중 법률 도메인만 목표 달성, ko/en은 50/30 도달 후 추가 커뮤니티 지식 필요) | `0fd1231d` |
+| PR #8 코퍼스 확장 (ko 100 / en 50 / law 30) | ⏳ 부분 달성 (ko 50 / en 30 / law 30 완료). ko→100, en→50 확장은 사용자 실사용 패턴 기반 쿼리 입력 필요 — 블로커 | `0fd1231d` |
 | PR #8 LLM judge | ✅ (subprocess-based, dry-run verified) | `67d959ed` |
 | PR #8 baseline diff CI | ✅ (action-download-artifact + 5% 회귀 가드) | `888f51b0` |
 | PR #9 VaultScheduler weekly 잡 | ✅ (community detection + LLM summariser) | `888f51b0` · `bb67b70f` |
