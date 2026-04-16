@@ -863,6 +863,7 @@ impl Default for TranscriptionConfig {
 
 /// Calendar integration configuration (`[calendar]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default)]
 pub struct CalendarConfig {
     #[serde(default)]
     pub google: GoogleCalendarConfig,
@@ -874,16 +875,6 @@ pub struct CalendarConfig {
     pub apple: AppleCalendarConfig,
 }
 
-impl Default for CalendarConfig {
-    fn default() -> Self {
-        Self {
-            google: GoogleCalendarConfig::default(),
-            outlook: OutlookCalendarConfig::default(),
-            kakao: KakaoCalendarConfig::default(),
-            apple: AppleCalendarConfig::default(),
-        }
-    }
-}
 
 /// Google Calendar API configuration (OAuth2).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -950,6 +941,7 @@ impl Default for OutlookCalendarConfig {
 /// Requires Kakao Developers business app registration for production use.
 /// API base: `https://kapi.kakao.com/v2/api/calendar`
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default)]
 pub struct KakaoCalendarConfig {
     /// Enable KakaoTalk Calendar tools.
     #[serde(default)]
@@ -968,17 +960,6 @@ pub struct KakaoCalendarConfig {
     pub calendar_id: Option<String>,
 }
 
-impl Default for KakaoCalendarConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            rest_api_key: None,
-            access_token: None,
-            refresh_token: None,
-            calendar_id: None,
-        }
-    }
-}
 
 /// Apple Calendar (CalDAV) configuration.
 /// **Status: planned** — config schema ready, CalDAV implementation pending.
@@ -1018,6 +999,7 @@ impl Default for AppleCalendarConfig {
 /// ElevenLabs (TTS voice) integrations. Each sub-section can be
 /// individually enabled and configured with API keys.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default)]
 pub struct MediaApiConfig {
     /// Freepik API configuration for image generation, editing, upscaling,
     /// and simple image-to-video conversion.
@@ -1038,16 +1020,6 @@ pub struct MediaApiConfig {
     pub elevenlabs: ElevenLabsApiConfig,
 }
 
-impl Default for MediaApiConfig {
-    fn default() -> Self {
-        Self {
-            freepik: FreepikApiConfig::default(),
-            suno: SunoApiConfig::default(),
-            runway: RunwayApiConfig::default(),
-            elevenlabs: ElevenLabsApiConfig::default(),
-        }
-    }
-}
 
 /// Freepik API configuration.
 ///

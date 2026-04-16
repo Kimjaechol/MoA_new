@@ -271,7 +271,7 @@ impl VaultScheduler {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("community detection write failed: {e}")
+                                tracing::warn!("community detection write failed: {e}");
                             }
                         }
                     }

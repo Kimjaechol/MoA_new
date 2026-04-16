@@ -232,7 +232,7 @@ non-knowledge (confidence {:.2}): {}",
                         link.link_type,
                         link.context,
                         link.line_number,
-                        target_doc_id.is_some() as i32,
+                        i32::from(target_doc_id.is_some()),
                     ],
                 )?;
             }

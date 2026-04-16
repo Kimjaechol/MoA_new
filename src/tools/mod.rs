@@ -693,7 +693,7 @@ pub fn all_tools_with_runtime(
             if !key.is_empty() {
                 tool_arcs.push(Arc::new(ElevenLabsTtsTool::new_user_key(key)));
             }
-        } else if let Some(admin_key) = std::env::var("ADMIN_ELEVENLABS_API_KEY").ok() {
+        } else if let Ok(admin_key) = std::env::var("ADMIN_ELEVENLABS_API_KEY") {
             if !admin_key.is_empty() && media_cfg.elevenlabs.enabled {
                 tool_arcs.push(Arc::new(ElevenLabsTtsTool::new_platform_key(
                     admin_key,

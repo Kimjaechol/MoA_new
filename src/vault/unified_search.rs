@@ -67,7 +67,7 @@ impl QueryKind {
         use crate::vault::wikilink::tokens;
         let compounds = tokens::detect_compound_tokens(query);
         use crate::vault::wikilink::tokens::CompoundTokenKind;
-        for c in &compounds {
+        if let Some(c) = compounds.first() {
             match c.kind {
                 CompoundTokenKind::CaseNumber => return Self::CaseNumber,
                 CompoundTokenKind::StatuteArticle => return Self::StatuteArticle,
