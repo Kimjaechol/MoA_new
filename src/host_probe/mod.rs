@@ -420,16 +420,9 @@ async fn disk_free_mb(path: &Path) -> Result<u64> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn dirs_home() -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
-    }
-}
+// Re-export the shared helper so existing call sites (`dirs_home()`) inside
+// this module keep working without churn.
+use crate::util::home_dir as dirs_home;
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
