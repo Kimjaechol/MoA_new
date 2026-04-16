@@ -329,3 +329,7 @@ harness = false
 [[bench]]
 name = "embedding_batch"
 harness = false
+
+[[bench]]
+name = "recall_latency"
+harness = false
