@@ -31,6 +31,7 @@ pub mod pipeline;
 pub mod simul;
 pub mod simul_session;
 pub mod tts_engine;
+pub mod tts_router;
 pub mod typecast_interp;
 
 // ── Shared voice event type ──────────────────────────────────────
