@@ -18,6 +18,7 @@
 //! - `simul_session` — session manager tying Live API + segmentation + events
 
 pub mod conference;
+pub mod cosyvoice2;
 pub mod deepgram_simul;
 pub mod deepgram_stt;
 pub mod events;
