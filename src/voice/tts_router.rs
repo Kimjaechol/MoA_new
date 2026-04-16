@@ -65,6 +65,11 @@ impl Tier {
 /// Snapshot of runtime state used to decide a tier. All fields are
 /// independent — caller fills what it knows; unknown booleans default
 /// to `false`.
+// Each boolean is an independent runtime dimension (network, three engine
+// readiness flags, two user-preference toggles, hardware tier, strict mode).
+// Folding them into a bitset / typed state machine would obscure the call
+// site; keep the explicit struct.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct RoutingContext {
     /// Network reachability (typically from `local_llm::shared_health()`).
@@ -192,7 +197,7 @@ impl TtsRouter {
 
     /// Probe registered engines and update `ctx` with the latest health
     /// + readiness flags. Tier S/A readiness must be supplied by the
-    /// caller (those engines aren't owned by the router).
+    ///   caller (those engines aren't owned by the router).
     pub async fn refresh_engine_health(&self, ctx: &mut RoutingContext) {
         if let Some(k) = &self.kokoro {
             ctx.kokoro_ready = k.health_ok().await;
