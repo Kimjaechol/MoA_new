@@ -261,7 +261,7 @@ export default function ChatPage() {
       if (targetDevice && !targetDevice.is_online) {
         setMessages((prev) => [...prev, {
           id: makeMessageId(),
-          role: 'assistant',
+          role: 'agent',
           content: `'${targetDevice.device_name}' 디바이스에 연결할 수 없습니다.\n\nMoA 앱이 실행 중인지 확인해 주세요.\n다른 디바이스를 선택하거나, 디바이스를 켠 후 다시 시도해 주세요.`,
           timestamp: new Date(),
         }]);
