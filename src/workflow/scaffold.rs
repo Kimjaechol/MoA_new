@@ -242,7 +242,6 @@ fn check_steps_permissions(
 
 /// Rough cost estimate: sum of step type base costs.
 fn estimate_cost(spec: &WorkflowSpec) -> u32 {
-    use super::parser::Step;
     let mut total = 0u32;
     for step in &spec.steps {
         total += step_cost(step);

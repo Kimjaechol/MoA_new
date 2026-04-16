@@ -10,5 +10,4 @@ pub mod schema;
 pub mod store;
 
 pub use factory::build_store;
-pub use lifecycle::SessionHandle;
-pub use store::{ChatMessage, ChatSession, SessionSearchHit, SessionSearchStore};
+pub use store::SessionSearchStore;

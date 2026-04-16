@@ -14,8 +14,6 @@
 // with the lexicographically smallest device_id runs the cycle.
 // Results are written to the delta journal for cross-device sync.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 
 use super::sqlite::SqliteMemory;
