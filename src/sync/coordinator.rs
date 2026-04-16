@@ -675,6 +675,7 @@ mod tests {
                     embedding: None,
                 },
                 timestamp: 9999,
+                hlc_stamp: None,
             }],
             has_more: false,
         };

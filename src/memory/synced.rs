@@ -52,13 +52,15 @@ impl SyncedMemory {
         ontology: Option<&OntologyRepo>,
     ) -> usize {
         // Let the sync engine filter duplicates / already-seen entries.
+        // PR #7 — use the v2 path that preserves hlc_stamp so we can route
+        // Store conflicts through HLC-guarded upsert.
         let ops = {
             let mut engine = self.sync.lock();
-            engine.apply_deltas(deltas)
+            engine.apply_deltas_with_stamps(deltas)
         };
 
         let mut applied = 0;
-        for op in &ops {
+        for (op, hlc_stamp) in &ops {
             match op {
                 DeltaOperation::Store {
                     key,
@@ -67,7 +69,32 @@ impl SyncedMemory {
                     embedding,
                 } => {
                     let cat = category_from_str(category);
-                    if let Err(e) = self.inner.store(key, content, cat, None).await {
+                    // PR #7 — when the delta carries an HLC stamp (v2+
+                    // producer), route through accept_remote_store_if_newer
+                    // so the row's updated_at_hlc wins ties regardless of
+                    // wall-clock drift. v1 peers omit hlc_stamp and fall
+                    // back to the legacy `store()` (last-write-wins).
+                    let store_result = if let Some(stamp) = hlc_stamp {
+                        match self
+                            .inner
+                            .accept_remote_store_if_newer(key, content, cat.clone(), stamp)
+                            .await
+                        {
+                            Ok(true) => Ok(()),
+                            Ok(false) => {
+                                tracing::debug!(
+                                    key,
+                                    remote_hlc = %stamp,
+                                    "Sync: remote store older than local; skipped"
+                                );
+                                continue;
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        self.inner.store(key, content, cat, None).await
+                    };
+                    if let Err(e) = store_result {
                         tracing::warn!(key, "Failed to apply remote store delta: {e}");
                         continue;
                     }
@@ -306,6 +333,11 @@ impl SyncedMemory {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
+                    // PR #7 — full-sync replay has no fresh HLC context;
+                    // downstream peers with v2 semantics will still pick
+                    // a winner via their own `updated_at_hlc` on the row
+                    // that was stamped at the original write time.
+                    hlc_stamp: None,
                 };
                 let encrypted = engine.encrypt_deltas(&[delta])?;
                 result.push(FullSyncEntry {
@@ -529,6 +561,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 9999,
+            hlc_stamp: None,
         }];
 
         let applied = synced.apply_remote_deltas(remote_deltas, None).await;
@@ -560,6 +593,7 @@ mod tests {
                 key: "to_delete".into(),
             },
             timestamp: 9999,
+            hlc_stamp: None,
         }];
 
         let applied = synced.apply_remote_deltas(remote_deltas, None).await;
@@ -587,6 +621,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 9999,
+            hlc_stamp: None,
         };
 
         let applied1 = synced.apply_remote_deltas(vec![delta.clone()], None).await;

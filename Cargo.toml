@@ -321,3 +321,15 @@ scopeguard = "1.2"
 [[bench]]
 name = "agent_benchmarks"
 harness = false
+
+[[bench]]
+name = "community_detection"
+harness = false
+
+[[bench]]
+name = "embedding_batch"
+harness = false
+
+[[bench]]
+name = "recall_latency"
+harness = false

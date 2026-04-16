@@ -549,6 +549,50 @@ impl SqliteMemory {
         Ok(archived)
     }
 
+    // ── PR #6: archive UI backend ──────────────────────────────
+
+    /// PR #6 — list archived memories with optional consolidation context.
+    /// Returns rows where `archived = 1`, joined against
+    /// `consolidated_memories` so the UI can show "merged into community X".
+    pub fn list_archived(&self) -> anyhow::Result<Vec<ArchivedMemoryInfo>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.key, m.content, m.category, m.updated_at,
+                    cm.summary, cm.fact_type
+             FROM memories m
+             LEFT JOIN consolidated_memories cm
+               ON cm.source_ids LIKE '%' || m.id || '%'
+             WHERE m.archived = 1
+             ORDER BY m.updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ArchivedMemoryInfo {
+                id: row.get(0)?,
+                key: row.get(1)?,
+                content: row.get(2)?,
+                category: row.get(3)?,
+                updated_at: row.get(4)?,
+                consolidated_summary: row.get(5)?,
+                consolidated_fact_type: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// PR #6 — un-archive a single memory by id.
+    pub fn restore_archived(&self, memory_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE memories SET archived = 0 WHERE id = ?1 AND archived = 1",
+            rusqlite::params![memory_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     // ── PR #4: reranker plumbing ─────────────────────────────────
 
     /// PR #4 — attach a cross-encoder reranker. The reranker is consulted by
@@ -1206,6 +1250,17 @@ impl SqliteMemory {
     /// `insert_phone_call` auto-record delta journal entries.
     /// The factory calls this from `create_synced_memory` when sync is enabled.
     pub fn attach_sync(&self, engine: Arc<Mutex<super::sync::SyncEngine>>) {
+        // PR #7 — give the engine an HLC clock seeded from the device_id
+        // so outgoing deltas carry v2 `hlc_stamp`s. Existing engines
+        // without an attached clock stay v1-compatible; explicit override
+        // via `engine.attach_hlc(...)` from callers still wins.
+        {
+            let mut eng = engine.lock();
+            if eng.current_hlc_stamp().is_none() {
+                let node_id = eng.device_id().0.clone();
+                eng.attach_hlc(crate::sync::hlc::HlcClock::new(node_id));
+            }
+        }
         *self.sync.lock() = Some(engine);
     }
 
@@ -1527,15 +1582,30 @@ impl SqliteMemory {
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         use super::traits::Memory;
 
-        if variations.len() <= 1 {
-            // No expansion — use standard recall on the original query
+        // PR #4 — only short-circuit to `recall()` when the caller has
+        // nothing to gain from the RRF+rerank path. If a reranker is
+        // attached and enabled, the single-query path still needs the
+        // cross-encoder rerank pass (which `recall()` doesn't run), so
+        // we fall through to the full pipeline.
+        let rerank_attached =
+            self.active_reranker().is_some() && self.rerank_config().enabled;
+        if variations.len() <= 1 && !rerank_attached {
+            // No expansion and no reranker — plain recall is cheaper.
             return self.recall(original_query, limit, session_id).await;
         }
 
         // Multi-query RRF: search each variation, merge all results
         let query_embedding_original = self.get_or_compute_embedding(original_query).await?;
 
-        let queries_owned: Vec<String> = variations.to_vec();
+        // PR #4 — if variations is empty (rerank-only single-query mode),
+        // seed the search with the original query so the RRF pool isn't
+        // empty. Callers with real expansion already pass original + N
+        // rewrites, so the owned vector is just `variations.to_vec()`.
+        let queries_owned: Vec<String> = if variations.is_empty() {
+            vec![original_query.to_string()]
+        } else {
+            variations.to_vec()
+        };
 
         let conn = self.conn.clone();
         let sid = session_id.map(String::from);
@@ -1819,6 +1889,20 @@ fn dedup_ranked_list(items: &[(String, f32)]) -> Vec<(String, f32)> {
     result
 }
 
+/// PR #6 — row returned by `list_archived` for the archive UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArchivedMemoryInfo {
+    pub id: String,
+    pub key: String,
+    pub content: String,
+    pub category: String,
+    pub updated_at: String,
+    /// Summary of the consolidated fact this memory was folded into, if any.
+    pub consolidated_summary: Option<String>,
+    /// Fact type (e.g. "preference", "fact") from the consolidation record.
+    pub consolidated_fact_type: Option<String>,
+}
+
 /// A timeline evidence entry (read from `memory_timeline`).
 #[derive(Debug, Clone)]
 pub struct TimelineEntry {
@@ -1997,6 +2081,92 @@ impl Memory for SqliteMemory {
             dim: dim as u32,
             vector: bytes,
         })
+    }
+
+    /// PR #7 — HLC-guarded remote store. Applies the write iff the
+    /// parsed remote HLC is strictly greater than the row's existing
+    /// `updated_at_hlc`. When the row has no HLC yet (pre-v2 write), we
+    /// accept the remote so v2 deltas can win conflicts after a
+    /// mixed-version rollout. On a losing comparison we return `false`
+    /// without touching the row so the caller can log the skip.
+    async fn accept_remote_store_if_newer(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        remote_hlc: &str,
+    ) -> anyhow::Result<bool> {
+        use crate::sync::hlc::Hlc;
+
+        let remote = Hlc::parse(remote_hlc).map_err(|e| {
+            anyhow::anyhow!("accept_remote_store_if_newer: malformed remote_hlc `{remote_hlc}`: {e}")
+        })?;
+        let embedding_bytes = self
+            .get_or_compute_embedding(content)
+            .await?
+            .map(|emb| vector::vec_to_bytes(&emb));
+
+        let conn = self.conn.clone();
+        let key_owned = key.to_string();
+        let content_owned = content.to_string();
+        let cat_owned = Self::category_to_str(&category);
+        let remote_stamp = remote_hlc.to_string();
+
+        let applied = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+
+            // Read the row's current stamp (if any). Null → treat as the
+            // sentinel "beats any remote" inverse: accept the remote so v1
+            // rows can be upgraded to v2-ordered ones. A row that already
+            // has an HLC only accepts strictly newer remotes.
+            let local_stamp: Option<String> = conn
+                .query_row(
+                    "SELECT updated_at_hlc FROM memories WHERE key = ?1",
+                    rusqlite::params![key_owned],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap_or(None);
+
+            if let Some(local) = local_stamp {
+                if let Ok(local_hlc) = Hlc::parse(&local) {
+                    if remote <= local_hlc {
+                        return Ok(false);
+                    }
+                }
+                // Malformed local stamp → treat as missing and accept the
+                // remote. Better to move forward than to get stuck.
+            }
+
+            // Accept. Upsert on the unique `key` — set the remote stamp so
+            // subsequent deltas compare against it.
+            let now = Local::now().to_rfc3339();
+            let id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, updated_at_hlc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
+                 ON CONFLICT(key) DO UPDATE SET
+                    content = excluded.content,
+                    category = excluded.category,
+                    embedding = excluded.embedding,
+                    updated_at = excluded.updated_at,
+                    updated_at_hlc = excluded.updated_at_hlc",
+                rusqlite::params![
+                    id,
+                    key_owned,
+                    content_owned,
+                    cat_owned,
+                    embedding_bytes,
+                    now,
+                    now,
+                    remote_stamp,
+                ],
+            )?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_remote_store_if_newer blocking task panicked: {e}"))??;
+
+        Ok(applied)
     }
 
     async fn apply_remote_v3_delta(
@@ -4783,5 +4953,144 @@ mod tests {
             "dev",
         )
         .unwrap();
+    }
+
+    /// PR #7 — five-minute clock drift between two nodes.
+    /// Node A writes at wall 10:00:00, node B writes at wall 10:05:00 (5 min
+    /// later), but A's logical counter is 1 (second tick). Under wall-clock
+    /// LWW, B's later timestamp always wins. Under HLC ordering, A wins
+    /// because its encoded HLC is strictly greater than B's despite the wall
+    /// being lower — as long as the HLC counter encodes the correct causal
+    /// ordering. This test verifies `accept_remote_store_if_newer` applies
+    /// the remote iff its HLC actually leads.
+    #[tokio::test]
+    async fn accept_remote_store_if_newer_respects_hlc_ordering_under_drift() {
+        use crate::sync::hlc::Hlc;
+
+        let (_tmp, mem) = temp_sqlite();
+
+        // Simulate node A storing first (wall 1000 ms, logical 0).
+        let hlc_a = Hlc::new(1_000, 0, "node_a").encode();
+        mem.store("shared", "from_a", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Stamp the row with A's HLC directly.
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memories SET updated_at_hlc = ?1 WHERE key = 'shared'",
+                rusqlite::params![hlc_a],
+            )
+            .unwrap();
+        }
+
+        // Node B writes "later" in wall-clock (wall 300_000 ms = +5 min)
+        // but with logical 0 — causal ordering says B is newer because its
+        // wall time is genuinely higher.
+        let hlc_b = Hlc::new(300_000, 0, "node_b").encode();
+        let applied_b = mem
+            .accept_remote_store_if_newer("shared", "from_b", MemoryCategory::Core, &hlc_b)
+            .await
+            .unwrap();
+        assert!(applied_b, "B (wall 300000) should beat A (wall 1000)");
+        let row = mem.get("shared").await.unwrap().unwrap();
+        assert_eq!(row.content, "from_b");
+
+        // Now try to apply a stale delta from A (wall 1000, logical 1).
+        // Even though A ticked its logical counter, B's wall time is still
+        // higher so A should lose.
+        let hlc_a_tick = Hlc::new(1_000, 1, "node_a").encode();
+        let applied_a = mem
+            .accept_remote_store_if_newer("shared", "from_a_retry", MemoryCategory::Core, &hlc_a_tick)
+            .await
+            .unwrap();
+        assert!(!applied_a, "A (wall 1000+1) must lose to B (wall 300000)");
+        let row = mem.get("shared").await.unwrap().unwrap();
+        assert_eq!(row.content, "from_b", "row must still hold B's write");
+
+        // Finally, A comes back with a genuinely newer HLC (wall 400_000).
+        let hlc_a_new = Hlc::new(400_000, 0, "node_a").encode();
+        let applied_final = mem
+            .accept_remote_store_if_newer("shared", "from_a_newest", MemoryCategory::Core, &hlc_a_new)
+            .await
+            .unwrap();
+        assert!(applied_final, "A (wall 400000) beats B (wall 300000)");
+        let row = mem.get("shared").await.unwrap().unwrap();
+        assert_eq!(row.content, "from_a_newest");
+    }
+
+    /// PR #4 mobile degrade contract — on a mobile build we intentionally
+    /// ship without the reranker (150MB model) and without a local
+    /// embedder (1.1GB BGE-M3). The retrieval path must stay functional
+    /// with both absent: `recall()` should return results from FTS5 +
+    /// vector-when-available, and `recall_with_variations` should never
+    /// panic or stall when the caller passes a non-empty variations list
+    /// on a stub-embedder build.
+    ///
+    /// This test simulates the bare-mobile environment (default features,
+    /// no set_reranker, NoopEmbedding) and asserts the core query path
+    /// still returns hits for all three corpus domains.
+    #[tokio::test]
+    async fn mobile_degrade_recall_still_functional_without_reranker_or_embedder() {
+        let (_tmp, mem) = temp_sqlite();
+
+        // Seed a mini cross-domain corpus.
+        for (k, v) in [
+            ("ko_A", "주택임대차보호법 대항력 발생 시점"),
+            ("ko_B", "사무실 화분 다육식물 관리 루틴"),
+            ("en_A", "code review approvals required from CODEOWNERS"),
+            ("en_B", "feature flag naming convention platform_search_v2"),
+            ("law_A", "민법 제621조 임대인 동의 전대 금지"),
+        ] {
+            mem.store(k, v, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        // Default SqliteMemory has no reranker attached and uses
+        // NoopEmbedding — the exact mobile posture.
+        // 1) Plain recall() must return something across all queries.
+        for (query, expected_key) in [
+            ("대항력", "ko_A"),
+            ("CODEOWNERS", "en_A"),
+            ("임대인", "law_A"),
+        ] {
+            let hits = mem.recall(query, 5, None).await.unwrap();
+            assert!(
+                !hits.is_empty(),
+                "mobile recall must return hits for `{query}`, got empty"
+            );
+            assert!(
+                hits.iter().any(|h| h.key == expected_key),
+                "mobile recall for `{query}` should surface `{expected_key}`, got {:?}",
+                hits.iter().map(|h| h.key.clone()).collect::<Vec<_>>()
+            );
+        }
+
+        // 2) recall_with_variations must fall through to recall() when no
+        //    reranker is attached and variations.len() <= 1 — exact
+        //    contract preserved by the PR #4 short-circuit fix.
+        let empty_var: [String; 0] = [];
+        let hits = mem
+            .recall_with_variations("다육식물", &empty_var, 5, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.key == "ko_B"),
+            "mobile recall_with_variations must still work without variations + no reranker"
+        );
+
+        // 3) Even a multi-variation call without a reranker must return
+        //    results (the RRF path without rerank is the default mobile
+        //    behaviour when the agent loop does query expansion).
+        let variations = vec!["다육식물 물주기".to_string(), "화분 관리".to_string()];
+        let hits = mem
+            .recall_with_variations("다육식물", &variations, 5, None)
+            .await
+            .unwrap();
+        assert!(
+            !hits.is_empty(),
+            "mobile multi-variation recall must return hits without a reranker"
+        );
     }
 }

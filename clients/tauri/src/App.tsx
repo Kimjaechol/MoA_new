@@ -10,6 +10,7 @@ import { SetupWizard } from "./components/SetupWizard";
 import { GatewayStatus } from "./components/GatewayStatus";
 import { LockScreen } from "./components/LockScreen";
 import { DocumentEditor } from "./components/DocumentEditor";
+import { ArchiveList } from "./components/ArchiveList";
 import { apiClient, type DeviceInfo, type ToolInfo, type ChannelInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, t, type Locale } from "./lib/i18n";
 import { isTauri, onLifecycleEvent, isAuthenticated, onPythonEnvStatus, type PythonEnvStatus } from "./lib/tauri-bridge";
@@ -30,7 +31,7 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "chat" | "settings" | "interpreter" | "document";
+type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "chat" | "settings" | "interpreter" | "document" | "archive";
 
 /** Inactivity auto-lock timeout in milliseconds (default: 5 minutes). */
 const AUTO_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
@@ -641,6 +642,10 @@ function App() {
           setPage("document");
           if (window.innerWidth <= 768) setSidebarOpen(false);
         }}
+        onOpenArchive={() => {
+          setPage("archive");
+          if (window.innerWidth <= 768) setSidebarOpen(false);
+        }}
         onLogout={handleLogout}
         onToggle={() => setSidebarOpen((p) => !p)}
         currentPage={page}
@@ -668,6 +673,11 @@ function App() {
             onBack={() => setPage("chat")}
             onToggleSidebar={() => setSidebarOpen((p) => !p)}
             sidebarOpen={sidebarOpen}
+          />
+        ) : page === "archive" ? (
+          <ArchiveList
+            locale={locale}
+            onBack={() => setPage("chat")}
           />
         ) : page === "document" ? (
           <DocumentEditor

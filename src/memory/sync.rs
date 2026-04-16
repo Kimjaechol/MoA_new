@@ -28,6 +28,21 @@ const JOURNAL_RETENTION_SECS: u64 = 30 * 24 * 3600;
 /// Nonce size for ChaCha20-Poly1305 (12 bytes).
 const NONCE_SIZE: usize = 12;
 
+/// Wire-format version for cross-device sync payloads.
+///
+/// * `1` — Pre-PR#7 behaviour: ordering by `timestamp: u64` only, conflict
+///   resolution is "last delta applied wins".
+/// * `2` — PR #7: deltas carry an optional `hlc_stamp`, and receivers with
+///   the matching schema apply store deltas via HLC-guarded upsert. Peers
+///   that speak v1 simply omit `hlc_stamp` (serde default) and fall back to
+///   the wall-clock path, which keeps v1 ↔ v2 interop intact.
+///
+/// Bumped when the wire format gains new optional fields or new conflict-
+/// resolution semantics that change which delta wins. Only load-bearing
+/// schema changes (adding required fields, changing operation variants)
+/// should force a hard incompatibility break.
+pub const SYNC_PROTOCOL_VERSION: u32 = 2;
+
 /// Unique identifier for a device in the sync mesh.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeviceId(pub String);
@@ -291,6 +306,15 @@ pub struct DeltaEntry {
     pub operation: DeltaOperation,
     /// Unix timestamp (seconds) when this entry was created.
     pub timestamp: u64,
+    /// PR #7 — optional hybrid logical clock stamp. Populated when the
+    /// producing `SyncEngine` has an attached `HlcClock` (protocol v2+).
+    /// v1 peers omit the field and receivers treat `None` as "fall back
+    /// to wall-clock ordering". When both ends have HLCs, receivers use
+    /// [`crate::sync::hlc::Hlc::parse`] + `PartialOrd` to decide which
+    /// delta wins the conflict — a 5-minute clock drift between nodes
+    /// no longer flips the LWW outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hlc_stamp: Option<String>,
 }
 
 /// Encrypted sync payload for transit between devices.
@@ -318,6 +342,11 @@ pub struct SyncEngine {
     encryption_key: [u8; 32],
     /// Path to the sync state SQLite database.
     db_path: PathBuf,
+    /// PR #7 — optional HLC stamper. When present, every outgoing delta
+    /// ticks the clock and carries an `hlc_stamp` for v2-aware receivers
+    /// to use as the primary conflict-resolution key. When `None`, the
+    /// engine emits v1-compatible deltas (no stamp, timestamp-only).
+    hlc: Option<crate::sync::hlc::HlcClock>,
     /// Whether sync is enabled.
     enabled: bool,
 }
@@ -344,6 +373,27 @@ impl SyncEngine {
             CREATE INDEX IF NOT EXISTS idx_journal_timestamp ON sync_journal(timestamp);
             CREATE INDEX IF NOT EXISTS idx_journal_device ON sync_journal(device_id);",
         )?;
+
+        // PR #7 — additive column so protocol v2 stamps survive a restart.
+        // ALTER IF NOT EXISTS isn't portable across sqlite versions, so we
+        // probe PRAGMA table_info and only add when missing. The column is
+        // nullable — legacy rows stay v1-compatible.
+        let has_hlc: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info(sync_journal)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut present = false;
+            for name in rows.flatten() {
+                if name == "hlc_stamp" {
+                    present = true;
+                    break;
+                }
+            }
+            present
+        };
+        if !has_hlc {
+            conn.execute_batch("ALTER TABLE sync_journal ADD COLUMN hlc_stamp TEXT;")?;
+        }
+
         Ok(())
     }
 
@@ -370,8 +420,8 @@ impl SyncEngine {
 
         // Upsert journal entries
         let mut stmt = tx.prepare_cached(
-            "INSERT OR IGNORE INTO sync_journal (id, device_id, version_json, operation_json, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO sync_journal (id, device_id, version_json, operation_json, timestamp, hlc_stamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for entry in &self.journal {
             let version_json = serde_json::to_string(&entry.version)?;
@@ -382,6 +432,7 @@ impl SyncEngine {
                 version_json,
                 operation_json,
                 entry.timestamp as i64,
+                entry.hlc_stamp,
             ])?;
         }
         drop(stmt);
@@ -410,9 +461,11 @@ impl SyncEngine {
             self.version = serde_json::from_str(&version_json)?;
         }
 
-        // Load journal entries
+        // Load journal entries. `hlc_stamp` is a PR #7 additive column —
+        // pre-v2 rows read back as None and stay wire-compatible.
         let mut stmt = conn.prepare(
-            "SELECT id, device_id, version_json, operation_json, timestamp FROM sync_journal ORDER BY timestamp ASC",
+            "SELECT id, device_id, version_json, operation_json, timestamp, hlc_stamp
+             FROM sync_journal ORDER BY timestamp ASC",
         )?;
         let entries = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
@@ -420,12 +473,13 @@ impl SyncEngine {
             let version_json: String = row.get(2)?;
             let operation_json: String = row.get(3)?;
             let timestamp: i64 = row.get(4)?;
-            Ok((id, device_id, version_json, operation_json, timestamp))
+            let hlc_stamp: Option<String> = row.get(5).ok();
+            Ok((id, device_id, version_json, operation_json, timestamp, hlc_stamp))
         })?;
 
         self.journal.clear();
         for entry in entries {
-            let (id, device_id, version_json, operation_json, timestamp) = entry?;
+            let (id, device_id, version_json, operation_json, timestamp, hlc_stamp) = entry?;
             let version: VersionVector = serde_json::from_str(&version_json)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             let operation: DeltaOperation = serde_json::from_str(&operation_json)
@@ -436,6 +490,7 @@ impl SyncEngine {
                 version,
                 operation,
                 timestamp: u64::try_from(timestamp).unwrap_or(0),
+                hlc_stamp,
             });
         }
 
@@ -499,12 +554,30 @@ impl SyncEngine {
             encryption_key,
             db_path,
             enabled,
+            hlc: None,
         };
 
         // Load persisted state from SQLite
         engine.load()?;
 
         Ok(engine)
+    }
+
+    /// PR #7 — attach an HLC stamper so outgoing deltas carry a v2
+    /// `hlc_stamp`. Callers typically pass a clock initialised with this
+    /// device's id; two engines with different node ids still produce
+    /// totally-ordered HLCs because comparison is (wall_ms, logical,
+    /// node_id). Call this once during wiring; subsequent `record_*`
+    /// calls pick it up automatically.
+    pub fn attach_hlc(&mut self, clock: crate::sync::hlc::HlcClock) {
+        self.hlc = Some(clock);
+    }
+
+    /// Current HLC stamp string, or `None` if no clock is attached.
+    /// Exposed so tests can assert stamp monotonicity; callers in the
+    /// normal path rely on the automatic stamping in `record_*`.
+    pub fn current_hlc_stamp(&self) -> Option<String> {
+        self.hlc.as_ref().map(|c| c.tick().encode())
     }
 
     /// Get this device's ID.
@@ -548,6 +621,7 @@ impl SyncEngine {
                 embedding,
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
 
         self.journal.push(entry);
@@ -587,6 +661,7 @@ impl SyncEngine {
                 embedding: None,
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
 
         self.journal.push(entry);
@@ -623,6 +698,7 @@ impl SyncEngine {
                 key: key.to_string(),
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
 
         self.journal.push(entry);
@@ -666,6 +742,7 @@ impl SyncEngine {
                 owner_user_id: owner_user_id.to_string(),
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
         self.journal.push(entry);
         if let Err(e) = self.save() {
@@ -696,6 +773,7 @@ impl SyncEngine {
                 properties_json: properties_json.map(String::from),
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
         self.journal.push(entry);
         if let Err(e) = self.save() {
@@ -746,6 +824,7 @@ impl SyncEngine {
                 status: status.to_string(),
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
         self.journal.push(entry);
         if let Err(e) = self.save() {
@@ -786,6 +865,7 @@ impl SyncEngine {
                 metadata_json: metadata_json.map(String::from),
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
         self.journal.push(entry);
         if let Err(e) = self.save() {
@@ -831,6 +911,7 @@ impl SyncEngine {
                 memory_id: memory_id.map(String::from),
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
         self.journal.push(entry);
         if let Err(e) = self.save() {
@@ -859,6 +940,7 @@ impl SyncEngine {
                 truth_version,
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
         self.journal.push(entry);
         if let Err(e) = self.save() {
@@ -898,6 +980,7 @@ impl SyncEngine {
                 embedding: None,
             },
             timestamp: current_epoch_secs(),
+            hlc_stamp: self.hlc.as_ref().map(|c| c.tick().encode()),
         };
         self.journal.push(entry);
         if let Err(e) = self.save() {
@@ -917,9 +1000,27 @@ impl SyncEngine {
     }
 
     /// Apply incoming deltas from a remote device.
-    /// Returns the list of operations applied.
+    /// Returns the list of operations applied. Backward-compatible with
+    /// callers that don't need HLC stamps — use
+    /// [`Self::apply_deltas_with_stamps`] to preserve them for v2-aware
+    /// conflict resolution.
     pub fn apply_deltas(&mut self, deltas: Vec<DeltaEntry>) -> Vec<DeltaOperation> {
-        let mut applied = Vec::new();
+        self.apply_deltas_with_stamps(deltas)
+            .into_iter()
+            .map(|(op, _)| op)
+            .collect()
+    }
+
+    /// PR #7 v2 apply path — returns both the applied operation and the
+    /// original delta's `hlc_stamp` so the caller can route through
+    /// `Memory::accept_remote_store_if_newer` for HLC-guarded conflict
+    /// resolution. Pre-v2 deltas carry `None` and the caller falls back
+    /// to the plain-`store()` path (no regression).
+    pub fn apply_deltas_with_stamps(
+        &mut self,
+        deltas: Vec<DeltaEntry>,
+    ) -> Vec<(DeltaOperation, Option<String>)> {
+        let mut applied: Vec<(DeltaOperation, Option<String>)> = Vec::new();
         let total_incoming = deltas.len();
         let mut skipped = 0usize;
 
@@ -934,10 +1035,11 @@ impl SyncEngine {
                     remote_clock,
                     local_clock,
                     op = ?delta.operation,
+                    hlc = ?delta.hlc_stamp,
                     "Sync: applying remote delta"
                 );
                 self.version.merge(&delta.version);
-                applied.push(delta.operation.clone());
+                applied.push((delta.operation.clone(), delta.hlc_stamp.clone()));
                 self.journal.push(delta);
             } else {
                 skipped += 1;
@@ -1195,6 +1297,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 1000, // Very old
+            hlc_stamp: None,
         });
 
         engine.record_store("new_key", "new_value", "general");

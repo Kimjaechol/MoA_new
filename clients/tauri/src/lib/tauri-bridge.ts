@@ -301,6 +301,62 @@ export async function gatewayFetch(
   }) as Promise<GatewayFetchResult>;
 }
 
+// ── PR #6 Archive UI ──────────────────────────────────────────────
+
+export interface ArchivedMemory {
+  id: string;
+  key: string;
+  content: string;
+  category: string;
+  updated_at: string;
+  consolidated_summary: string | null;
+  consolidated_fact_type: string | null;
+}
+
+export async function listArchivedMemories(): Promise<{
+  archived: ArchivedMemory[];
+} | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("list_archived_memories") as Promise<{
+    archived: ArchivedMemory[];
+  }>;
+}
+
+export async function restoreArchivedMemory(
+  memoryId: string,
+): Promise<boolean | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("restore_archived_memory", {
+    memoryId,
+  }) as Promise<boolean>;
+}
+
+// ── PR #1 Embedding model download status ─────────────────────────
+
+export interface EmbeddingModelStatus {
+  cache_dir: string;
+  model_present: boolean;
+  size_bytes: number;
+  target_bytes: number;
+  installed: boolean;
+  /** Progress fraction in [0, 1]. */
+  progress: number;
+}
+
+export async function checkEmbeddingModel(): Promise<EmbeddingModelStatus | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("check_embedding_model") as Promise<EmbeddingModelStatus>;
+}
+
+export async function monitorEmbeddingDownload(): Promise<EmbeddingModelStatus | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("monitor_embedding_download") as Promise<EmbeddingModelStatus>;
+}
+
 // ── Mobile lifecycle event listeners ─────────────────────────────
 
 /** Register a handler for Tauri lifecycle events. Returns an unlisten fn. */

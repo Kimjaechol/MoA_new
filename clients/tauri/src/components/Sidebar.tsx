@@ -76,6 +76,7 @@ interface SidebarProps {
   onOpenSettings: () => void;
   onOpenInterpreter: () => void;
   onOpenDocument: () => void;
+  onOpenArchive: () => void;
   onLogout: () => void;
   onToggle: () => void;
 }
@@ -266,6 +267,7 @@ export function Sidebar({
   onOpenSettings,
   onOpenInterpreter,
   onOpenDocument,
+  onOpenArchive,
   onLogout,
   onToggle,
 }: SidebarProps) {
@@ -637,6 +639,26 @@ export function Sidebar({
                 </svg>
                 <span className="sidebar-chat-title">
                   {locale === "ko" ? "문서 편집기" : "Document Editor"}
+                </span>
+              </span>
+            </div>
+          </div>
+
+          {/* Archive nav item */}
+          <div className="sidebar-section">
+            <div
+              className={`sidebar-chat-item ${currentPage === "archive" ? "active" : ""}`}
+              onClick={onOpenArchive}
+              style={{ margin: "4px 8px" }}
+            >
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="21 8 21 21 3 21 3 8" />
+                  <rect x="1" y="3" width="22" height="5" />
+                  <line x1="10" y1="12" x2="14" y2="12" />
+                </svg>
+                <span className="sidebar-chat-title">
+                  {locale === "ko" ? "아카이브" : "Archive"}
                 </span>
               </span>
             </div>

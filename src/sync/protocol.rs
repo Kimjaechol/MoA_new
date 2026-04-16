@@ -425,6 +425,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 1000 + seq,
+            hlc_stamp: None,
         }
     }
 
@@ -581,6 +582,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 1000,
+            hlc_stamp: None,
         };
         let incoming = DeltaEntry {
             id: "d2".into(),
@@ -593,6 +595,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 2000,
+            hlc_stamp: None,
         };
 
         assert!(super::lww_resolve(&local, &incoming)); // incoming wins (higher ts)
@@ -612,6 +615,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 1000,
+            hlc_stamp: None,
         };
         let incoming = DeltaEntry {
             id: "d2".into(),
@@ -624,6 +628,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 1000,
+            hlc_stamp: None,
         };
 
         assert!(super::lww_resolve(&local, &incoming)); // zzz > aaa
@@ -643,6 +648,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 1000,
+            hlc_stamp: None,
         }];
 
         let incoming_deltas = vec![DeltaEntry {
@@ -656,6 +662,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 2000, // newer
+            hlc_stamp: None,
         }];
 
         let result = super::merge_deltas_lww(&local_deltas, &incoming_deltas);
@@ -679,6 +686,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 1000,
+            hlc_stamp: None,
         }];
 
         let incoming_deltas = vec![DeltaEntry {
@@ -692,6 +700,7 @@ mod tests {
                 embedding: None,
             },
             timestamp: 2000,
+            hlc_stamp: None,
         }];
 
         let result = super::merge_deltas_lww(&local_deltas, &incoming_deltas);

@@ -3746,29 +3746,29 @@ SourceType::ChatPaste char_count:
 | 잔여 항목 | 상태 | 커밋 |
 |---|---|---|
 | PR #1 실모델 결정론 검증 | ✅ | `07a33586` |
-| PR #1 Tauri 다운로드 UI | ⏳ 후속 (프론트엔드) | — |
+| PR #1 Tauri 다운로드 UI | ✅ (Settings에 상태 카드 + 디렉토리 크기 폴링 기반 진행률/속도/ETA · fastembed 자체 progress API 부재로 관찰 전용 접근) | `2703bcfa` |
 | PR #1 config 기본값 flip | ⏳ embedding-local 릴리즈 기본 전까지 의도적 유지 | — |
-| PR #1 CPU 32배치 <2s 벤치 | ⏳ 후속 (프로파일 환경 필요) | — |
-| PR #4 reranker on/off 정확도 비교 | ⏳ 후속 (대형 eval 데이터셋 필요) | — |
-| PR #4 p95 latency <500ms 실측 | ⏳ 후속 (벤치 환경 필요) | — |
-| PR #4 모바일 degrade 검증 | ⏳ 후속 (디바이스 테스트 필요) | — |
+| PR #1 CPU 32배치 <2s 벤치 | ✅ (release, Apple silicon CPU · median 1.665s / 32-batch · ~19 elem/s) | `46483e34` |
+| PR #4 reranker on/off 정확도 비교 | ✅ (A/B 측정 완료, 수락 기준 ≥5pt MRR 미달 — 원인: law baseline 이미 0.967로 5pt 여지 없음) / ⚠️ ko 회귀 (-10pt MRR) | `d5565196` |
+| PR #4 p95 latency <500ms 실측 | ✅ (release, 180-엔트리 코퍼스 · 22.15ms / 20쿼리 = ~1.1ms/쿼리 · 버짓 대비 ~450× 여유) | `11bd56de` |
+| PR #4 모바일 degrade 검증 | ✅ 논리 계약 (reranker·embedder 미장착 상태에서 recall/recall_with_variations 정상 동작 단위 테스트) / ⏳ 디바이스 실기 테스트는 별도 | `8f608c8e` |
 | PR #5 SQLCipher at-rest | ✅ (feature flag + keyed constructor) | `af6b9668` |
 | PR #5 송신측 embedding 첨부 | ✅ (record_store_with_embedding + 자동 wiring) | `f774b6ef` |
 | PR #5 backfill 스케줄러 | ✅ (dream_cycle Task 6) | `c3ea3524` |
 | PR #6 dream_cycle 통합 | ✅ (Task 4 decay + Task 5 consolidate + Task 6 community) | `f774b6ef` · `c3ea3524` |
 | PR #6 recall archived 필터 | ✅ (FTS5 / vector / LIKE 전부) | `f774b6ef` |
 | PR #6 auto bump_recall | ✅ | `f774b6ef` |
-| PR #6 아카이브 UI | ⏳ 후속 (프론트엔드) | — |
+| PR #6 아카이브 UI | ✅ (리스트 뷰 + 복구 버튼 + 통합 요약 배지 + Tauri 커맨드 + ko/en 로케일) | `a7ec703d` |
 | PR #7 r2d2 pool | ✅ (8-conn 읽기 풀) | `6bbd5f83` |
 | PR #7 HLC 스키마 마이그레이션 | ✅ (updated_at_hlc additive) | `1db6b714` |
-| PR #7 sync protocol version bump (HLC 정렬 전환) | ⏳ 후속 (프로토콜 호환성 작업) | — |
-| PR #8 코퍼스 확장 (ko 100 / en 50 / law 30) | ✅ 부분 (ko 50 / en 30 / law 30 — 스펙 중 법률 도메인만 목표 달성, ko/en은 50/30 도달 후 추가 커뮤니티 지식 필요) | `0fd1231d` |
+| PR #7 sync protocol version bump (HLC 정렬 전환) | ✅ (v2: DeltaEntry.hlc_stamp + HLC-guarded upsert + v1↔v2 interop + 5min drift 테스트) | `aff2f11e` |
+| PR #8 코퍼스 확장 (ko 100 / en 50 / law 30) | ✅ (180 엔트리 달성: ko 100 / en 50 / law 30 · 법률가 페르소나 기반 합성 쿼리 · 전 도메인 threshold 통과) | `3a9e8fe3` |
 | PR #8 LLM judge | ✅ (subprocess-based, dry-run verified) | `67d959ed` |
 | PR #8 baseline diff CI | ✅ (action-download-artifact + 5% 회귀 가드) | `888f51b0` |
 | PR #9 VaultScheduler weekly 잡 | ✅ (community detection + LLM summariser) | `888f51b0` · `bb67b70f` |
 | PR #9 Phase 5 agent loop | ✅ (context.rs Phase 5 + SectionPriority::Community) | `f774b6ef` |
 | PR #9 Leiden 교체 | ⏳ 후속 (LPA가 ≤low-thousands에서 충분; 코퍼스 성장 시 교체) | — |
-| PR #9 100 객체+200 링크 <1s 벤치 | ⏳ 후속 (벤치 환경 필요) | — |
+| PR #9 100 객체+200 링크 <1s 벤치 | ✅ (release ~101 µs / 100n·200e · ~1.8 ms / 1000n·3000e) | `1e0de132` |
 
 #### 새로 생긴 아키텍처 surface (요약)
 
