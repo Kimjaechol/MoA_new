@@ -3747,11 +3747,11 @@ SourceType::ChatPaste char_count:
 |---|---|---|
 | PR #1 실모델 결정론 검증 | ✅ | `07a33586` |
 | PR #1 Tauri 다운로드 UI | ✅ (Settings에 상태 카드 + 디렉토리 크기 폴링 기반 진행률/속도/ETA · fastembed 자체 progress API 부재로 관찰 전용 접근) | `2703bcfa` |
-| PR #1 config 기본값 flip | ⏳ embedding-local 릴리즈 기본 전까지 의도적 유지 | — |
+| PR #1 config 기본값 flip | ✅ (cfg-gated auto-flip: embedding-local 컴파일 시 BGE-M3/1024dim 자동 기본, 미컴파일 시 기존 OpenAI/1536dim 유지) | `9c8bd3f4` |
 | PR #1 CPU 32배치 <2s 벤치 | ✅ (release, Apple silicon CPU · median 1.665s / 32-batch · ~19 elem/s) | `46483e34` |
 | PR #4 reranker on/off 정확도 비교 | ✅ (A/B 측정 완료, 수락 기준 ≥5pt MRR 미달 — 원인: law baseline 이미 0.967로 5pt 여지 없음) / ⚠️ ko 회귀 (-10pt MRR) | `d5565196` |
 | PR #4 p95 latency <500ms 실측 | ✅ (release, 180-엔트리 코퍼스 · 22.15ms / 20쿼리 = ~1.1ms/쿼리 · 버짓 대비 ~450× 여유) | `11bd56de` |
-| PR #4 모바일 degrade 검증 | ✅ 논리 계약 (reranker·embedder 미장착 상태에서 recall/recall_with_variations 정상 동작 단위 테스트) / ⏳ 디바이스 실기 테스트는 별도 | `8f608c8e` |
+| PR #4 모바일 degrade 검증 | ✅ 단위 + 통합 테스트 (SyncedMemory 래퍼 + 3-query E2E) / ⏳ 실기기 디바이스-랩 테스트는 Tauri 모바일 빌드 후 별도 | `8f608c8e` · `66eeebaa` |
 | PR #5 SQLCipher at-rest | ✅ (feature flag + keyed constructor) | `af6b9668` |
 | PR #5 송신측 embedding 첨부 | ✅ (record_store_with_embedding + 자동 wiring) | `f774b6ef` |
 | PR #5 backfill 스케줄러 | ✅ (dream_cycle Task 6) | `c3ea3524` |
