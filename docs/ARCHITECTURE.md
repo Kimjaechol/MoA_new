@@ -4016,6 +4016,7 @@ SourceType::ChatPaste char_count:
 - **Leiden 알고리즘 swap**: 코퍼스가 low-thousands 객체 넘는 시점에 트리거.
 - **iOS/Android 디바이스-랩 실기 테스트**: Tauri 모바일 빌드 트랙 시작 시 통합.
 - **r2d2 pool 확장**: 현재 SqliteMemory만 적용 (PR #7). vault_store/billing/phone 순차 도입 예정.
+- **Skill/Profile/Pattern outbound emit 훅**: 현재 inbound 경로만 구현 (`apply_remote_v3_delta` 포워더 + `lww_resolve` version-LWW). §6F 문서가 "Library layer production complete"라고 명시하므로 본 세션 범위 외. 다음 PR에서 `SkillStore::create` / `UserProfiler::upsert` / `CorrectionStore::create_pattern` 등에 `SyncEngine::record_*` 훅을 추가해야 멀티-디바이스 자동 복제가 양방향 완결됨.
 
 ---
 

@@ -55,10 +55,24 @@ impl Tool for CorrectionRecommendTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Cap document length to prevent resource exhaustion from oversized input
+        const MAX_DOC_BYTES: usize = 1_048_576; // 1 MiB
+
         let document = args
             .get("document")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'document' parameter"))?;
+        if document.len() > MAX_DOC_BYTES {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "document exceeds {} byte limit ({} bytes provided)",
+                    MAX_DOC_BYTES,
+                    document.len()
+                )),
+            });
+        }
         let doc_type = args
             .get("doc_type")
             .and_then(|v| v.as_str())

@@ -232,25 +232,43 @@ pub fn render_template(
     tpl: &str,
     vars: &HashMap<String, serde_json::Value>,
 ) -> Result<String> {
-    let mut out = tpl.to_string();
-    // Find all {{...}} patterns
-    while let Some(start) = out.find("{{") {
-        let end = out[start..]
+    let mut out = String::with_capacity(tpl.len());
+    // Manual left-to-right scan rather than repeated `out.find("{{")`. The
+    // old implementation rescanned from the start on every iteration and,
+    // worse, replaced unresolved `{{key}}` with `{{unresolved:key}}` — which
+    // still contains `{{`, triggering an infinite loop on any missing var.
+    // A forward scan with a running cursor is O(n) and immune to the
+    // self-reinjection problem since we never re-examine what we've
+    // already written.
+    let mut cursor = 0usize;
+    let bytes = tpl.as_bytes();
+    while cursor < tpl.len() {
+        let Some(rel_start) = tpl[cursor..].find("{{") else {
+            out.push_str(&tpl[cursor..]);
+            break;
+        };
+        let start = cursor + rel_start;
+        out.push_str(&tpl[cursor..start]);
+        let end = tpl[start + 2..]
             .find("}}")
-            .map(|e| start + e + 2)
+            .map(|e| start + 2 + e + 2)
             .context("unclosed {{ in template")?;
-        let key = out[start + 2..end - 2].trim();
+        let key = tpl[start + 2..end - 2].trim();
         let replacement = match vars.get(key) {
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(v) => v.to_string(),
             None => {
-                // Allow unresolved templates to pass through (they may be resolved later)
-                // but mark them so callers can detect
-                format!("{{{{unresolved:{key}}}}}")
+                // Allow unresolved templates to pass through (callers may
+                // resolve them later in a second pass). The marker uses
+                // square brackets so it doesn't re-trigger the `{{` scan.
+                format!("[[unresolved:{key}]]")
             }
         };
-        out.replace_range(start..end, &replacement);
+        out.push_str(&replacement);
+        cursor = end;
     }
+    // `bytes` only participates in the debug_assert below — keep it alive.
+    debug_assert_eq!(bytes.len(), tpl.len());
     Ok(out)
 }
 
@@ -339,6 +357,27 @@ mod tests {
         let vars = HashMap::new();
         let result = render_template("{{missing}}", &vars).unwrap();
         assert!(result.contains("unresolved:missing"));
+    }
+
+    #[test]
+    fn render_template_unresolved_does_not_infinite_loop() {
+        // Regression: the earlier implementation wrote `{{unresolved:key}}`
+        // back into `out` and then restarted `out.find("{{")` from zero,
+        // which hit the marker and looped forever. The forward-cursor scan
+        // plus non-`{{` marker prevents that. If this test ever hangs, the
+        // bug is back.
+        let vars = HashMap::new();
+        let result =
+            render_template("a={{x}} b={{y}} c={{z}}", &vars).unwrap();
+        assert_eq!(result, "a=[[unresolved:x]] b=[[unresolved:y]] c=[[unresolved:z]]");
+    }
+
+    #[test]
+    fn render_template_mixes_resolved_and_unresolved() {
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), serde_json::json!("Alice"));
+        let result = render_template("{{name}} vs {{other}}", &vars).unwrap();
+        assert_eq!(result, "Alice vs [[unresolved:other]]");
     }
 
     #[test]

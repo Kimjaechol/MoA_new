@@ -18,10 +18,5 @@ pub mod self_improve;
 pub mod store;
 pub mod sync;
 
-pub use auto_create::maybe_create_skill;
 pub use factory::build_store;
-pub use lifecycle::{build_prompt_injection, should_trigger};
-pub use progressive::{inject_skill_index, SkillDepth, SkillSummary};
-pub use self_improve::improve_after_execution;
 pub use store::SkillStore;
-pub use sync::SkillUpsertDelta;

@@ -6,7 +6,7 @@
 // 3. Return the matched object (if any) for context injection
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::ontology::repo::OntologyRepo;
 use crate::ontology::types::OntologyObject;

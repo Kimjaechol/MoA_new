@@ -155,7 +155,7 @@ impl HlcClock {
     }
 
     /// Construct a clock seeded with explicit state — test utility.
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     pub fn with_state(node_id: impl Into<String>, wall_ms: u64, logical: u32) -> Self {
         Self {
             node_id: node_id.into(),

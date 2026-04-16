@@ -1125,7 +1125,7 @@ mod tests {
     // ── R1: AI-assisted section assignment ──────────────────────
 
     use super::super::wikilink::{
-        AIEngine, ContentClaim, Contradiction, GatekeepVerdict, HeuristicAIEngine, KeyConcept,
+        AIEngine, ContentClaim, Contradiction, GatekeepVerdict, KeyConcept,
     };
     use async_trait::async_trait;
 

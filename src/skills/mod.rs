@@ -11,6 +11,7 @@ mod templates;
 mod tool_handler;
 
 // Self-generating skill system (procedural memory) + auto-learning correction
+pub mod brain_db;
 pub mod correction;
 pub mod procedural;
 

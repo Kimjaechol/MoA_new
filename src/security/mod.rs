@@ -64,7 +64,7 @@ pub use otp::OtpValidator;
 pub use pairing::PairingGuard;
 #[allow(unused_imports)]
 pub use perplexity::{detect_adversarial_suffix, PerplexityAssessment};
-pub use policy::{AutonomyLevel, SecurityPolicy};
+pub use policy::{AutonomyLevel, SecurityPolicy, ToolOperation};
 #[allow(unused_imports)]
 pub use roles::{RoleRegistry, ToolAccess};
 #[allow(unused_imports)]

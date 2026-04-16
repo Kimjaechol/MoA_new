@@ -19,10 +19,6 @@ pub mod recommender;
 pub mod schema;
 pub mod store;
 
-pub use applier::{apply_feedback, UserAction};
 pub use factory::build_store;
-pub use grammar_checker::{validate_correction, ValidationResult, ValidationVerdict};
-pub use observer::{observe_edit, CorrectionObservation};
-pub use pattern_miner::{mine_patterns, PatternUpdate};
-pub use recommender::{scan_and_recommend, CorrectionRecommendation};
-pub use store::{CorrectionPattern, CorrectionStore, PatternType};
+pub use recommender::scan_and_recommend;
+pub use store::CorrectionStore;

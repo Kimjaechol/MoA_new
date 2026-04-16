@@ -55,7 +55,7 @@ pub fn build_call_context(
     };
 
     // Load recent timeline entries for the linked memory
-    let recent_events = if let Some(key) = linked_memory_key {
+    let recent_events = if let Some(_key) = linked_memory_key {
         // We need the memory ID, not the key — get it from the memory entry
         if let Some(entry) = tokio::runtime::Handle::try_current()
             .ok()

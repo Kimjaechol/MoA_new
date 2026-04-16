@@ -12,4 +12,3 @@ pub mod profiler;
 pub mod schema;
 
 pub use factory::build_profiler;
-pub use profiler::{ProfileConclusion, UserProfiler};

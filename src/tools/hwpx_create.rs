@@ -336,7 +336,7 @@ mod tests {
         // machines Python is normally installed, so this test asserts the
         // happy-path schema/argument parsing instead. Full execution is
         // covered by an opt-in integration test below.
-        let tool = HwpxCreateTool::new();
+        let _tool = HwpxCreateTool::new();
         let parsed: HwpxCreateArgs = serde_json::from_value(json!({
             "output_path": "/tmp/test.hwpx",
             "title": "Test",

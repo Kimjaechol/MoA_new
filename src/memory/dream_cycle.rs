@@ -14,8 +14,6 @@
 // with the lexicographically smallest device_id runs the cycle.
 // Results are written to the delta journal for cross-device sync.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 
 use super::sqlite::SqliteMemory;
@@ -468,7 +466,7 @@ async fn consolidate_clusters(
     provider: &dyn Provider,
     config: &DreamCycleConfig,
 ) -> Result<(usize, usize)> {
-    use super::consolidate::{consolidate_candidates, ConsolidationOutcome};
+    use super::consolidate::consolidate_candidates;
 
     let mut candidates = memory.collect_consolidation_candidates(1)?;
     if candidates.is_empty() {
