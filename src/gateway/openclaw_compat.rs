@@ -501,7 +501,7 @@ pub async fn handle_api_chat(
             state
                 .observer
                 .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
+                    provider: provider_label.clone(),
                     model: model_label.clone(),
                     duration,
                     tokens_used: None,
@@ -523,10 +523,23 @@ pub async fn handle_api_chat(
                 let _ = auth_store.record_usage(user_id, &category, chars);
             }
 
+            // ── Active-provider metadata (PR #3.5) ──
+            // Surfaces which provider/model actually served this request so
+            // the UI can render a "via Gemma 4 (local)" badge when the
+            // patent §1 cl. 4 fallback engaged. `network_status` reflects the
+            // most recent probe result from the process-wide
+            // `local_llm::shared_health()` cache.
+            let net_online = crate::local_llm::shared_health().is_online();
+            let is_local_path = provider_label.eq_ignore_ascii_case("ollama");
+
             let body = serde_json::json!({
                 "reply": safe_response,
                 "model": model_label,
                 "session_id": chat_body.session_id,
+                "active_provider": provider_label,
+                "active_model": model_label,
+                "is_local_path": is_local_path,
+                "network_status": if net_online { "online" } else { "offline" },
             });
             (StatusCode::OK, Json(body))
         }
