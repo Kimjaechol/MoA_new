@@ -3768,7 +3768,7 @@ SourceType::ChatPaste char_count:
 | PR #9 VaultScheduler weekly 잡 | ✅ (community detection + LLM summariser) | `888f51b0` · `bb67b70f` |
 | PR #9 Phase 5 agent loop | ✅ (context.rs Phase 5 + SectionPriority::Community) | `f774b6ef` |
 | PR #9 Leiden 교체 | ⏳ 후속 (LPA가 ≤low-thousands에서 충분; 코퍼스 성장 시 교체) | — |
-| PR #9 100 객체+200 링크 <1s 벤치 | ⏳ 후속 (벤치 환경 필요) | — |
+| PR #9 100 객체+200 링크 <1s 벤치 | ✅ (release ~101 µs / 100n·200e · ~1.8 ms / 1000n·3000e) | `1e0de132` |
 
 #### 새로 생긴 아키텍처 surface (요약)
 
