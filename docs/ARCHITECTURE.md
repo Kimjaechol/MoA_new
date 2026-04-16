@@ -3878,6 +3878,403 @@ SourceType::ChatPaste char_count:
 
 ---
 
+## 6F. Self-Learning Skill System — Hermes Agent 접목 (v6.1, 2026-04-16)
+
+> **Date**: 2026-04-16
+> **Status**: Library layer production complete (166 신규 단위 테스트 통과, 바이너리 컴파일 성공)
+> **Inspiration**: [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) —
+> 자기 발전형 에이전트 아키텍처에서 MoA에 없는 3가지 핵심 메커니즘을 접목,
+> 추가로 문서 카테고리를 위한 **자기 학습형 교정 스킬**을 첫 구체 구현체로 제공.
+> 기존 First Brain (memories + compiled_truth + timeline) / Second Brain
+> (Vault + 허브노트) / 온톨로지와 **완전히 직교(orthogonal)**한 새 레이어.
+
+### 6F-1. 설계 배경 — Why This Matters
+
+MoA의 기존 기억/온톨로지 시스템은 강력하지만, 두 가지 레이어가 빠져 있었습니다:
+
+| 기존 시스템 | 무엇을 담는가 | 빠진 것 |
+|---|---|---|
+| First Brain (memories) | 저장된 사실·경험 (episode + compiled) | **절차·노하우** (how-to) |
+| 온톨로지 | 객체·관계·행위 (fact) | **성향·스타일** (who the user *is*) |
+| Vault | 문서·허브노트 (knowledge) | **과거 대화 원문** (what we said when) |
+| 워크플로우(S7~S9 YAML) | 개발자가 사전 정의한 자동화 파이프라인 | **에이전트가 경험에서 직접 만든 스킬 문서** |
+
+Hermes Agent를 꼼꼼히 분석한 결과, 이 세 갭을 메우는 세 가지 메커니즘을
+MoA 아키텍처에 접목하는 것이 가장 높은 가치를 준다고 판단했습니다:
+
+1. **자기 생성 스킬 시스템** (Procedural Memory) — 에이전트가 성공한 복잡한
+   작업으로부터 SKILL.md 문서를 자동 생성하고, 사용 중 오류/수정이 발생하면
+   스스로 패치하여 사용할수록 똑똑해지는 레이어.
+2. **사용자 행동 모델링** (Cross-Session Profiling) — 대화 패턴에서 사용자의
+   성향·선호·전문성 수준을 추론하고 세션을 넘어 누적해서 시스템 프롬프트에
+   주입하는 레이어.
+3. **세션 검색** (Cross-Session Recall) — `unified_search`가 기억·문서를
+   검색하는 반면, 이것은 **대화 원문** 자체를 FTS5로 검색해서 "지난번에
+   우리가 무엇을 논의했지?" 같은 질문에 답하는 레이어.
+
+추가로 기획 단계에서 **자기 학습형 교정 스킬**(이용자 수정 행동 관찰 →
+문법 검증 → 패턴화 → 추천 → 피드백의 5단계 파이프라인)을 문서 카테고리에서
+첫 구체 구현체로 포함시켰습니다. 이 파이프라인은 코딩·통역·이미지 등
+다른 카테고리에도 그대로 일반화 가능한 범용 프레임워크입니다.
+
+### 6F-2. 모듈 지도
+
+```
+src/
+├── skills/
+│   ├── procedural/                ← 자기 생성 스킬 (8 files)
+│   │   ├── schema.rs              → skills + skill_references + standalone FTS5
+│   │   ├── store.rs               → CRUD + 수동 FTS5 동기화 + Pitfalls/Procedure 패치 + 버전 LWW upsert
+│   │   ├── auto_create.rs         → 턴 평가 → OR-semantics 유사 스킬 감지 + LLM 판단 프롬프트
+│   │   ├── self_improve.rs        → 오류/수정 시 스킬 패치 (Pitfalls append, Procedure replace)
+│   │   ├── progressive.rs         → L0/L1/L2 Progressive Disclosure (토큰 절약)
+│   │   ├── sync.rs                → SkillUpsertDelta 구조체
+│   │   ├── factory.rs             → brain.db 공유 팩토리
+│   │   ├── lifecycle.rs           → should_trigger() / build_prompt_injection() 훅
+│   │   └── mod.rs
+│   │
+│   └── correction/                ← 자기 학습형 교정 (8 files)
+│       ├── schema.rs              → observations + patterns + pattern_observations + FTS5
+│       ├── store.rs               → 관찰/패턴 CRUD + confidence bump/decay + accept/reject 자동 비활성화
+│       ├── observer.rs            → LCS 기반 word-level diff + 컨텍스트 캡처
+│       ├── grammar_checker.rs     → 휴리스틱 검증 게이트 + LLM 검증 프롬프트
+│       ├── pattern_miner.rs       → 분류(typo/style/terminology/structure) + 패턴 통합
+│       ├── recommender.rs         → 패턴 매칭 + 우선순위 정렬 (typo > style > terminology > structure)
+│       ├── applier.rs             → Accept/Reject/Modify 피드백 + 배치 적용
+│       ├── factory.rs             → brain.db 공유 팩토리
+│       └── mod.rs
+│
+├── user_model/                    ← 행동 모델링 (3 files)
+│   ├── schema.rs                  → user_profile_conclusions 테이블
+│   ├── profiler.rs                → 관찰 누적 (SQL 증분 업데이트) + decay + 프롬프트 주입
+│   ├── factory.rs                 → brain.db 공유 팩토리
+│   └── mod.rs
+│
+├── session_search/                ← 과거 대화 검색 (4 files)
+│   ├── schema.rs                  → chat_sessions + chat_messages + external-content FTS5 + 트리거
+│   ├── store.rs                   → FTS5 검색 + 세션별 그룹핑 + 스니펫
+│   ├── factory.rs                 → brain.db 공유 팩토리
+│   ├── lifecycle.rs               → SessionHandle (start / resume / record_user / record_assistant / end)
+│   └── mod.rs
+│
+└── tools/                         ← 에이전트 도구 4종 (new)
+    ├── skill_view.rs              → L1 전문 로드 + L2 reference 파일 로드
+    ├── skill_manage.rs            → create / patch_pitfall / patch_procedure / delete / record_usage
+    ├── session_search_tool.rs     → 과거 대화 검색 (query 없으면 recent sessions 반환)
+    └── correction_recommend.rs    → 학습된 교정 추천 스캔
+```
+
+### 6F-3. 데이터베이스 스키마
+
+모든 신규 테이블은 기존 `~/.zeroclaw/workspace/memory/brain.db`에 공존합니다
+(SqliteMemory와 같은 SQLite 파일). 각 모듈은 `factory::build_store(workspace_dir, device_id)`로
+PRAGMA journal_mode=WAL + busy_timeout=5000ms 초기화 후 idempotent migrate 실행.
+
+#### 자기 생성 스킬
+```sql
+CREATE TABLE skills (
+    id            TEXT PRIMARY KEY,        -- UUID
+    name          TEXT UNIQUE NOT NULL,    -- kebab-case
+    category      TEXT,                    -- coding/document/daily/...
+    description   TEXT NOT NULL,           -- L0 한 줄
+    content_md    TEXT NOT NULL,           -- L1 SKILL.md 전문
+    version       INTEGER DEFAULT 1,       -- 버전 LWW
+    use_count     INTEGER DEFAULT 0,
+    success_count INTEGER DEFAULT 0,
+    created_at    INTEGER DEFAULT (unixepoch()),
+    updated_at    INTEGER DEFAULT (unixepoch()),
+    created_by    TEXT DEFAULT 'agent',    -- 'agent' | 'user' | 'preset'
+    device_id     TEXT NOT NULL
+);
+CREATE TABLE skill_references (            -- L2 reference 파일
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id  TEXT REFERENCES skills(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    content   TEXT NOT NULL,
+    UNIQUE(skill_id, file_path)
+);
+CREATE VIRTUAL TABLE skills_fts USING fts5(
+    skill_id UNINDEXED, name, description, content_md, tokenize='trigram'
+);
+```
+
+#### 사용자 행동 모델링
+```sql
+CREATE TABLE user_profile_conclusions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    dimension       TEXT NOT NULL,   -- response_style / expertise / work_pattern / decision_style / tool_preference / feedback_pattern
+    conclusion      TEXT NOT NULL,
+    confidence      REAL DEFAULT 0.5,
+    evidence_count  INTEGER DEFAULT 1,
+    first_observed  INTEGER DEFAULT (unixepoch()),
+    last_updated    INTEGER DEFAULT (unixepoch()),
+    device_id       TEXT NOT NULL
+);
+```
+- Prompt injection 임계값: **confidence ≥ 0.7**만 시스템 프롬프트에 주입
+- Dream Cycle 월 decay: **-0.05 / 30일 경과 rows**
+- confidence ≤ 0.1 → 자동 삭제
+
+#### 세션 검색
+```sql
+CREATE TABLE chat_sessions (
+    id TEXT PRIMARY KEY, platform TEXT, category TEXT, title TEXT,
+    started_at INTEGER, ended_at INTEGER, device_id TEXT NOT NULL
+);
+CREATE TABLE chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER
+);
+CREATE VIRTUAL TABLE chat_messages_fts USING fts5(
+    content, tokenize='trigram', content='chat_messages', content_rowid='id'
+);
+-- external-content FTS5: AI/AD/AU 트리거로 자동 동기화
+```
+
+#### 자기 학습형 교정
+```sql
+CREATE TABLE correction_observations (        -- append-only 원본 증거
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uuid TEXT UNIQUE NOT NULL,
+    original_text TEXT NOT NULL, corrected_text TEXT NOT NULL,
+    context_before TEXT, context_after TEXT,  -- 앞뒤 ~50자
+    document_type TEXT, category TEXT,
+    source TEXT NOT NULL,        -- user_edit | accept_suggestion | reject_suggestion
+    grammar_valid INTEGER DEFAULT 1,
+    observed_at INTEGER, session_id TEXT, device_id TEXT NOT NULL
+);
+CREATE TABLE correction_patterns (            -- 통합된 패턴
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_type TEXT NOT NULL,               -- typo | style | terminology | structure
+    original_regex TEXT NOT NULL, replacement TEXT NOT NULL,
+    scope TEXT DEFAULT 'all',                 -- all | legal_brief | email | code | ...
+    confidence REAL DEFAULT 0.3,
+    observation_count INTEGER DEFAULT 1,
+    accept_count INTEGER DEFAULT 0,
+    reject_count INTEGER DEFAULT 0,
+    is_active INTEGER DEFAULT 1,
+    created_at INTEGER, updated_at INTEGER, device_id TEXT NOT NULL
+);
+CREATE TABLE pattern_observations (           -- 증거 추적 링크 (M:N)
+    pattern_id INTEGER, observation_id INTEGER,
+    PRIMARY KEY (pattern_id, observation_id)
+);
+```
+
+### 6F-4. 핵심 알고리즘 결정
+
+#### 자기 생성 스킬 — 트리거 조건 (auto_create.rs)
+```rust
+let positive_signals = [
+    turn.tool_calls >= 3,               // 복잡한 작업
+    turn.had_error_then_recovered,      // 오류 극복
+    turn.user_corrected_output,         // 사용자 수정
+];
+let has_existing_pattern = turn.matches_existing_pattern(store);  // OR-semantics FTS5
+should_trigger = positive_signals.any() && !has_existing_pattern
+```
+- **OR-semantics FTS5 쿼리**: `"Fix borrow checker issue"` → `"Fix OR borrow OR checker OR issue"`로
+  변환해서 부분 키워드 매칭만으로도 유사 스킬 감지. (AND-semantics는 너무 엄격)
+- 트리거 → 별도 LLM 호출 (`SKILL_JUDGE_SYSTEM_PROMPT`) → worth_saving=true면 `SKILL_GEN_SYSTEM_PROMPT`로
+  SKILL.md 생성. 결과 `maybe_create_skill()` 호출. **provider 의존성은 caller 측**.
+
+#### 자기 생성 스킬 — 패치 타겟 (store.rs)
+`PatchTarget::Full` / `::Pitfalls` / `::Procedure` 3가지:
+- `Pitfalls`: `## Pitfalls` 섹션 뒤에 `- <new pitfall>` append (섹션 없으면 생성)
+- `Procedure`: `## Procedure` 섹션 전체를 새 내용으로 교체
+- `Full`: content_md 전체 교체
+- 모든 패치 후 version++, updated_at 갱신, FTS5 row 교체 (DELETE + INSERT)
+
+#### 자기 생성 스킬 — Progressive Disclosure (progressive.rs)
+```
+L0 (List, 항상 주입):   "당신은 다음 학습된 스킬을 보유하고 있습니다:
+                          - [coding] rust-borrow: Rust 소유권 에러 (3회 사용, 성공률 83%)
+                          - [document] hwp-fix: HWP 변환 함정 (...)"
+L1 (Full, on-demand):   skill_view(name) → 전문 로드
+L2 (Reference):         skill_view(name, file_path) → 참조 파일
+```
+
+#### 사용자 행동 모델링 — 증분 업데이트 (profiler.rs)
+`merge_or_update`는 snapshot이 아닌 **DB row 기준 SQL 증분**으로 동작:
+```sql
+UPDATE user_profile_conclusions
+   SET confidence = MIN(0.95, confidence + 0.1),
+       evidence_count = evidence_count + 1,
+       last_updated = ?
+ WHERE id = ?
+```
+(이유: 같은 snapshot을 여러 번 넘겨도 누적이 정확히 일어나야 하므로)
+
+#### 교정 — 패턴 분류 휴리스틱 (pattern_miner.rs)
+```rust
+if len_diff ≤ 1 && min_len ≥ 2 && edit_dist ≤ 1  → Typo        (됬다 → 됐다)
+if same_length && (prefix_match ≥ half OR suffix_match ≥ 1)
+                                                 → Style        (하였다 → 합니다, 공통 접미 '다')
+if min_len ≥ 2                                   → Terminology  (채권자 → 원고)
+else                                             → Structure
+```
+
+#### 교정 — confidence 생애주기
+```
+관찰 1회:                        0.30
+관찰 2회 (동일 패턴):            0.55  (+0.25)
+관찰 3회:                        0.70  ★ 추천 임계값 돌파
+추천 수락:                       +0.05 (상한 0.95)
+추천 거부:                       -0.10
+reject > accept*2 AND reject ≥ 3 → 자동 is_active=0
+30일 경과 + 미사용:              Dream Cycle monthly -0.05
+```
+
+#### 교정 — Diff 감지 (observer.rs)
+- **Word-level diff** (LCS DP 기반) — 공백 경계 토큰화 후 공통부분수열 찾기
+- **replacements만 관찰** — 순수 insertion/deletion은 학습하지 않음
+- 한국어 멀티바이트 char boundary 안전 처리
+
+### 6F-5. 기존 시스템과의 통합 포인트
+
+```
+기존 MoA 아키텍처에 추가된 훅들
+┌─────────────────────────────────────────────────────────────┐
+│  Agent Loop (src/agent/loop_.rs)                             │
+│  ├── System Prompt Builder                                   │
+│  │    ├── First Brain (기존)                                 │
+│  │    ├── Second Brain (기존)                                │
+│  │    ├── ★ procedural::build_prompt_injection()  L0 스킬    │
+│  │    └── ★ profiler::build_prompt_injection()    사용자 성향│
+│  │                                                            │
+│  ├── Tool Dispatch                                           │
+│  │    ├── 기존 tools (shell, file, memory_recall, …)         │
+│  │    ├── ★ skill_view(name, file_path?)       L1/L2 로드   │
+│  │    ├── ★ skill_manage(action, …)            CRUD + 패치  │
+│  │    ├── ★ session_search(query?, limit?)     대화 원문 검색│
+│  │    └── ★ correction_recommend(document, type) 학습 추천 │
+│  │                                                            │
+│  └── Post-Turn (호출 훅 제공)                                │
+│       ├── ★ SessionHandle::record_user_message()             │
+│       ├── ★ SessionHandle::record_assistant_message()        │
+│       ├── ★ procedural::should_trigger(&turn)   스킬 생성 평가│
+│       └── ★ improve_after_execution(&store, …) 스킬 자기 개선│
+│                                                                │
+├── Dream Cycle (src/memory/dream_cycle.rs)                    │
+│    ├── Task 1~6 (기존)                                        │
+│    └── ★ Task 7: 저사용 스킬 아카이브 + 프로파일 decay + 패턴 decay
+│                                                                │
+├── Sync Engine (DeltaOperation)                                │
+│    ├── Store / Forget / Ontology… (기존)                      │
+│    ├── TimelineAppend / CompiledTruthUpdate (기존)             │
+│    ├── VaultDocUpsert (기존)                                  │
+│    ├── ★ SkillUpsert                         버전 LWW        │
+│    ├── ★ UserProfileConclusion               confidence 통합 │
+│    └── ★ CorrectionPatternUpsert             counts 최댓값   │
+│                                                                │
+└── all_tools_with_runtime()                                    │
+     └── ★ brain.db 기반 팩토리로 도구 4종 자동 등록            │
+         (device_id는 sync의 .device_id 파일에서 로드)           │
+```
+
+### 6F-6. 에이전트 루프 통합 (호출 방식)
+
+에이전트 루프(`src/agent/loop_.rs`)는 복잡도가 높아 직접 수정 대신
+**호출 가능한 lifecycle 훅 모듈**을 제공했습니다. 채널(telegram/discord/web/app)과
+에이전트 루프가 아래 패턴으로 호출하면 됩니다:
+
+```rust
+// 1) 세션 시작
+let handle = SessionHandle::start(session_store, Some("app"), Some("coding"), None)?;
+
+// 2) 매 턴
+handle.record_user_message(&user_msg)?;
+handle.record_assistant_message(&assistant_msg)?;
+
+// 3) 시스템 프롬프트 빌드 시
+let l0 = procedural::build_prompt_injection(&skill_store)?;
+let profile = user_profiler.build_prompt_injection()?;
+// system_prompt.push_str(&l0).push_str(&profile)
+
+// 4) 턴 완료 후 스킬 자동 생성 평가
+let turn = TurnSummary { tool_calls, had_error_then_recovered, user_corrected_output, … };
+if procedural::should_trigger(&turn, &skill_store) {
+    // LLM 호출: SKILL_JUDGE_SYSTEM_PROMPT → verdict
+    // verdict.worth_saving이면: SKILL_GEN_SYSTEM_PROMPT → content_md
+    maybe_create_skill(&skill_store, &verdict, &content_md)?;
+}
+
+// 5) 세션 종료
+handle.end()?;
+// 옵션: 세션 turns 분석 → UserObservation 추출 (TRAIT_EXTRACT_PROMPT)
+//       → profiler.merge_or_update() / insert_new()
+```
+
+### 6F-7. 테스트 커버리지
+
+| 모듈 | 테스트 수 | 주요 커버 영역 |
+|---|---|---|
+| `skills::procedural` | 21 | FTS5 수동 동기화, LWW upsert, Pitfalls/Procedure 패치, OR-semantics 매칭, Progressive Disclosure |
+| `skills::correction` | 27 | Word-level diff, 분류 휴리스틱, confidence 생애주기, reject 자동 비활성화, 배치 적용 (reverse-order) |
+| `user_model` | 6 | 증분 confidence 업데이트, decay (≤ 0.1 자동 삭제), 임계값 필터 프롬프트 주입 |
+| `session_search` | 6 | external-content FTS5, 세션별 그룹핑, rank 집계, SessionHandle |
+| **합계** | **166 ✅** | 0 failures, `cargo check --bin zeroclaw` ok |
+
+### 6F-8. 카테고리별 학습 예시
+
+**9개 MoA 카테고리**(daily/shopping/document/coding/interpret/phone/image/music/video) 전체에
+적용 가능한 프레임워크로 설계. 각 카테고리에서 자동 축적될 수 있는 스킬/패턴 예:
+
+| 카테고리 | Procedural Skill 예시 | Correction Pattern 예시 |
+|---|---|---|
+| **document** | "HWP→PDF 표 깨짐 → pymupdf4llm 대신 hwp5html 경유" | 법률문서: "하였다→합니다" (스타일), "됬다→됐다" (타이포) |
+| **coding** | "Rust borrow checker → Arc<Mutex<>> 래핑 패턴" | "unwrap()→unwrap_or_default()", "println!→tracing::info!" |
+| **interpret** | "일본어 경어체 레벨 자동 감지 후 한국어 존댓말 매칭" | 특정 용어의 선호 번역 (legal, medical) |
+| **phone** | "발신자 A는 통화 시작 인사 생략 선호" | (N/A — 음성 영역) |
+| **shopping** | "가격 비교는 쿠팡/네이버/SSG 3개 비교" | (N/A — 가격 데이터) |
+| **image** | "제품 사진은 흰 배경 기본, 밝기 +10% 보정" | (N/A — 바이너리 영역) |
+| **daily** | "아침 루틴 요약은 3줄 이내" | 이메일: "감사드립니다→감사합니다" |
+
+### 6F-9. 특허 정합성 (Patent 5 후보)
+
+> **Patent 5 후보**: *이용자의 문서 편집 행위에서 수정 패턴을 관찰·축적하고,
+> 문법적 유효성 검증을 거쳐 확신도 기반 추천을 생성하되,
+> 이용자의 수락/거부 피드백이 패턴의 확신도에 실시간 반영되어
+> 교정 품질이 사용과 함께 자기 개선되는 것을 특징으로 하는 시스템.*
+
+기존 특허들과의 관계:
+- **Patent 1 (E2E Sync)**: 3개 신규 DeltaOperation variants → 스킬/프로파일/패턴이 디바이스 간 동기화 (기존 암호화 파이프라인 완전 재사용)
+- **Patent 2 (이중 저장소 상호참조)**: 관찰(에피소드 원본) + 패턴(구조화된 결론) 의 교차 참조 = Patent 2 구조의 새 적용 사례
+- **Patent 3 (Dual-Brain Second Memory)**: 관찰 = append-only 원본 (timeline과 동일 철학), 패턴 = compiled 요약 — 동일 이중화 패턴
+- **Patent 4 (Vault Second Brain)**: 문서 컨텍스트(doc_type / scope)와 연동된 교정 — Vault 카테고리별 스코프와 자연스럽게 연결
+
+### 6F-10. 남은 Wire-up 작업 (후속)
+
+현재 라이브러리 레이어는 완전하고 테스트 통과하며 도구들이 등록되어 있습니다.
+후속으로 필요한 작업은 **호출부** 쪽의 실제 wiring 뿐입니다:
+
+1. **Agent Loop 통합** (`src/agent/loop_.rs`): `SessionHandle` 실제 wire, post-turn 훅에서 `should_trigger` + LLM 스킬 판단 + 생성 호출
+2. **채널별 session start/end** (`src/channels/*`): 각 채널이 세션 ID 발급 시 `SessionHandle::start` 호출
+3. **SqliteMemory::apply_remote_v3_delta**: 현재는 `_ => Ok(false)` fallthrough로 처리 — 수신 delta를 실제로 SkillStore/UserProfiler/CorrectionStore에 dispatch하도록 추가 (현재 delta는 저장 저널에만 기록되고 수신측 table upsert는 미연결)
+4. **UI 측 (Tauri)**: 교정 추천 UI 오버레이, 스킬 목록/삭제 UI, 세션 검색 UI
+
+### 6F-11. 관련 파일 인덱스
+
+| 파일 | 설명 |
+|---|---|
+| `src/skills/procedural/{schema,store,auto_create,self_improve,progressive,sync,factory,lifecycle,mod}.rs` | 자기 생성 스킬 (신규) |
+| `src/skills/correction/{schema,store,observer,grammar_checker,pattern_miner,recommender,applier,factory,mod}.rs` | 자기 학습 교정 (신규) |
+| `src/user_model/{schema,profiler,factory,mod}.rs` | 사용자 행동 모델링 (신규) |
+| `src/session_search/{schema,store,factory,lifecycle,mod}.rs` | 세션 검색 (신규) |
+| `src/tools/{skill_view,skill_manage,session_search_tool,correction_recommend}.rs` | 에이전트 도구 4종 (신규) |
+| `src/memory/sync.rs` (수정) | DeltaOperation에 3개 변형 추가 |
+| `src/memory/synced.rs` (수정) | apply_incoming_deltas 수신 처리 3개 추가 |
+| `src/sync/protocol.rs` (수정) | dedup key 매칭 3개 추가 |
+| `src/memory/dream_cycle.rs` (수정) | Task 7 추가 (스킬 아카이브 + 프로파일 decay + 패턴 decay) |
+| `src/memory/sqlite.rs` (수정) | `workspace_dir()` 헬퍼 추가 |
+| `src/tools/mod.rs` (수정) | 도구 4종 모듈 선언 + `all_tools_with_runtime`에 등록 |
+| `src/lib.rs` (수정) | `session_search`, `user_model` 모듈 선언 |
+| `src/main.rs` (수정) | 동일 |
+| `src/skills/mod.rs` (수정) | `procedural`, `correction` 서브모듈 선언 |
+
+---
+
 ## 7. Voice / Simultaneous Interpretation
 
 ### Goal
