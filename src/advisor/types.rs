@@ -159,6 +159,13 @@ pub struct PlanOutput {
     pub risks: Vec<String>,
     /// Single best next action — where the executor should start.
     pub first_move: String,
+    /// Tools the executor should reach for. Advisor is prompted to
+    /// favour the `smart_search` cascade (free web → Perplexity → retry)
+    /// over raw `web_search` / `perplexity_search` whenever a retrieval
+    /// step is needed, so the executor gets resilient fallback without
+    /// having to orchestrate the tiers itself.
+    #[serde(default)]
+    pub suggested_tools: Vec<String>,
 }
 
 impl PlanOutput {
@@ -177,11 +184,13 @@ impl PlanOutput {
             .ok_or_else(|| anyhow!("advisor plan missing `First Move` section"))?;
         let critical_path = extract_bullet_list(raw, &["critical path", "critical_path", "plan", "steps"]);
         let risks = extract_bullet_list(raw, &["risks", "risk"]);
+        let suggested_tools = extract_bullet_list(raw, &["suggested tools", "suggested_tools", "tools"]);
         Ok(Self {
             end_state,
             critical_path,
             risks,
             first_move,
+            suggested_tools,
         })
     }
 }

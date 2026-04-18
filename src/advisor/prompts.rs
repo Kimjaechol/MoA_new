@@ -30,7 +30,8 @@ Respond **only** with a single JSON object matching this schema:
   \"end_state\": \"one-sentence definition of 'done'\",
   \"critical_path\": [\"step 1\", \"step 2\", ...],
   \"risks\": [\"risk — mitigation\", ...],
-  \"first_move\": \"the single best action to start with\"
+  \"first_move\": \"the single best action to start with\",
+  \"suggested_tools\": [\"tool_name_1\", \"tool_name_2\", ...]
 }
 ```
 
@@ -40,6 +41,13 @@ Rules:
 - `risks` may be empty if the task is genuinely low-risk. Do not invent \
   risks for the sake of completeness.
 - `first_move` names a concrete artifact or command, not a category.
+- `suggested_tools` names specific tools the Executor should prefer. \
+  When the task needs web information, ALWAYS prefer `smart_search` \
+  (cascade: free web → Perplexity AI → reformulate retry) over the \
+  raw `web_search` or `perplexity_search` tools — smart_search handles \
+  tier escalation and retry automatically. Include `file_read` / \
+  `shell` / `file_edit` etc. when coding; `browser` for interactive \
+  navigation; leave empty only when the task genuinely requires no tools.
 - Do not wrap the JSON in prose, commentary, or code fences. The \
   response starts with `{` and ends with `}`.";
 
