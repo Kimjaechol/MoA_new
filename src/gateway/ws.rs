@@ -1047,6 +1047,59 @@ async fn handle_socket(
             continue;
         }
 
+        // ── SLM-first gatekeeper (★ MoA core workflow) ──
+        //
+        // Symmetrical to the block in openclaw_compat::handle_api_chat.
+        // Runs BEFORE the device-relay attempts so the cheapest (on-device
+        // SLM) path short-circuits the network probe / proxy-token issuance
+        // whenever the router can answer locally. Only when SLM declines
+        // does the message enter the existing Smart API Key Routing
+        // (local-key → operator-key with 2.2× credit deduction).
+        if let Some(router) = state.gatekeeper.as_ref() {
+            let result = router.process_message(&content).await;
+            if let Some(local_reply) = result.local_response {
+                tracing::info!(
+                    category = ?result.decision.category,
+                    confidence = result.decision.confidence,
+                    reason = %result.decision.reason,
+                    "WS SLM gatekeeper answered locally — skipping LLM relay"
+                );
+                history.push(ChatMessage::user(&content));
+                history.push(ChatMessage::assistant(&local_reply));
+                persist_ws_history(&state, &session_id, &history).await;
+
+                let done = serde_json::json!({
+                    "type": "done",
+                    "full_response": local_reply,
+                    "session_id": session_id.as_str(),
+                    "active_provider": "ollama",
+                    "active_model": router.model(),
+                    "is_local_path": true,
+                    "network_status": "local",
+                    "gatekeeper": {
+                        "category": format!("{:?}", result.decision.category),
+                        "confidence": result.decision.confidence,
+                        "reason": result.decision.reason,
+                    },
+                });
+                let _ = socket.send(Message::Text(done.to_string().into())).await;
+                let _ = state.event_tx.send(serde_json::json!({
+                    "type": "agent_end",
+                    "provider": "ollama",
+                    "model": router.model(),
+                    "is_local_path": true,
+                    "network_status": "local",
+                }));
+                continue;
+            }
+            tracing::debug!(
+                category = ?result.decision.category,
+                confidence = result.decision.confidence,
+                reason = %result.decision.reason,
+                "WS SLM gatekeeper summoning LLM for complex task"
+            );
+        }
+
         // ── Apply client-provided overrides (provider, model) ──
         {
             let mut config_guard = state.config.lock();
