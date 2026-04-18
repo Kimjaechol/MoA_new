@@ -80,16 +80,41 @@ mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;
-// local_llm (on-device Gemma 4 fallback: daemon health, model pull, config).
-// Must match lib.rs — shared modules (gateway/{mod,ws,openclaw_compat}.rs)
-// reference `crate::local_llm::…`, and with the dual-compilation layout
-// (main.rs declares `mod gateway` and lib.rs declares `pub mod gateway`)
-// the bin's crate root needs the same module registered.
-mod local_llm;
-// host_probe — hardware tier detection for SLM-first gatekeeper model
-// selection. Referenced from gateway::run_gateway for first-boot Gemma 4
-// tier picking. Same dual-compile symmetry reason as `local_llm` above.
+// ── Dual-compile symmetry block ─────────────────────────────────────
+// `lib.rs` and `main.rs` both declare `gateway` / `channels` / etc.,
+// so each shared module's source gets compiled twice — once for the
+// lib crate root (from lib.rs) and once for the bin crate root (from
+// main.rs). Inside the shared code, `crate::X::Y` resolves relative
+// to whichever crate root is compiling it — so if `X` is declared in
+// lib.rs only, the bin compile fails with E0433.
+//
+// The modules below are LIB-ONLY from the lib's perspective but are
+// referenced via `crate::` from modules that ARE shared. Every one
+// MUST be mirrored here in `main.rs` or the bin stops building.
+//
+// A regression test lives at `tests/dual_compile_symmetry.rs`; it
+// diffs the two crate roots and fails CI if a lib-only module is
+// referenced through `crate::` from a shared module without being
+// mirrored here.
+// Each mirror carries `#[allow(unused_imports)]` because the bin crate
+// does not consume these modules' re-exports directly — they exist in
+// this crate root only so that `crate::X` paths inside shared modules
+// resolve when they are compiled as part of the bin target.
+#[allow(unused_imports)]
+mod categories;
+#[allow(unused_imports)]
+mod economic;
+#[allow(unused_imports)]
 mod host_probe;
+#[allow(unused_imports)]
+mod local_llm;
+#[allow(unused_imports)]
+mod phone;
+#[allow(unused_imports)]
+mod vault;
+#[allow(unused_imports)]
+mod workflow;
+// ── End symmetry block ──────────────────────────────────────────────
 mod memory;
 mod migration;
 mod multimodal;
