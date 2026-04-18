@@ -93,6 +93,13 @@ impl Tool for CredentialStoreTool {
         "credential_store"
     }
 
+    // Credential storage mutates the vault — a hallucinated
+    // `credential_store` call could overwrite or corrupt secrets. Keep
+    // the SLM path read-less.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Encrypt and save a site credential (login ID, password, card number) to the LOCAL encrypted vault. Never stores plaintext. Never transmits externally."
     }

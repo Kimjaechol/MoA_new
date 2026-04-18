@@ -127,6 +127,12 @@ impl Tool for OpenClawMigrationTool {
         "openclaw_migration"
     }
 
+    // Migrates user data between schema versions — destructive on error
+    // and not something the SLM should trigger unprompted.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Preview or execute merge-first migration from OpenClaw (memory + config + agents) without overwriting existing ZeroClaw data."
     }

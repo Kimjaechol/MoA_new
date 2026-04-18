@@ -43,6 +43,13 @@ impl Tool for McpToolWrapper {
         &self.prefixed_name
     }
 
+    // MCP tools come from arbitrary external servers — each could have
+    // unbounded side effects (filesystem, APIs, shells). Until we
+    // audit each MCP server per-tool, gate them behind the cloud LLM.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         &self.description
     }

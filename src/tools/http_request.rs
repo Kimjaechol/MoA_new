@@ -249,6 +249,14 @@ impl Tool for HttpRequestTool {
         "http_request"
     }
 
+    // Raw HTTP to arbitrary endpoints — can POST / PUT / DELETE with
+    // arbitrary bodies. For web retrieval the SLM should use
+    // `smart_search` (cascaded + result-bounded); keep this one
+    // cloud-LLM-only until we have a hardened allowlist.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. \
         Security constraints: allowlist-only domains, no local/private hosts, configurable timeout/response size limits, and optional env-backed credential profiles."

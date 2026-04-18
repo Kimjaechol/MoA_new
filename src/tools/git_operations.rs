@@ -429,6 +429,12 @@ impl Tool for GitOperationsTool {
         "git_operations"
     }
 
+    // Commit / push / branch mutations affect the repository state and
+    // potentially the remote — outside the SLM executor's risk budget.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls."
     }
