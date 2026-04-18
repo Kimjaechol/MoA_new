@@ -4061,6 +4061,208 @@ SourceType::ChatPaste char_count:
 
 ---
 
+### 6E-10. Voice Pipeline + On-Device Gemma 4 Sprint (2026-04-17)
+
+> **Date**: 2026-04-17
+> **Status**: Merged to `main` via PRs #179 → #185 across 13 worktree branches (모두 origin/main에 랜딩 완료).
+> **Scope**: 음성 스택 4-tier 재편 + Gemma 4 로컬 LLM 폴백 + 하드웨어-티어 자동
+> 선택. Patent §1 cl.4 (네트워크-다운 로컬 폴백) 요구사항을 런타임에서 실제로
+> 충족.
+
+#### §6E-10-A 랜딩된 PR
+
+| PR | 제목 | 주요 surface |
+|---|---|---|
+| #179 | docs: Gemma 4 + Ollama spec v1.1 | `docs/plans/2026-04-16-moa-gemma4-ollama-v1.1.md` |
+| #180 | feat(local-llm): hardware-tiered install + offline fallback + Ollama tuning | `src/host_probe/`, `src/local_llm/`, `OllamaTuning` |
+| #181 | feat(voice): Gemma 4 STT + Kokoro/CosyVoice 2 TTS + 4-tier router | `src/voice/{gemma_asr,gemma_simul,kokoro_tts,cosyvoice2,tts_engine,tts_router}.rs` |
+| #184 | feat(integration): host_probe + QA wiring fixes (#3 fallback registry + #4 Ollama tuning) | `src/gateway/mod.rs`, `src/providers/mod.rs`, `src/providers/ollama.rs` |
+| #185 | chore(voice): dedupe `home_dir` + `now_unix_secs` into `crate::util` | `src/util.rs`, `src/voice/*` |
+
+#### §6E-10-B 하드웨어 티어 자동 선택 (`src/host_probe/`)
+
+Gemma 4는 4개 사이즈 (E2B / E4B / 26B MoE / 31B Dense)로 배포되고 메모리
+요구량이 4GB–20GB 범위를 움직입니다. `host_probe::Tier` enum과 `detect()`
+함수가 다음을 수행합니다:
+
+1. **하드웨어 탐지** — macOS `sysctl hw.memsize` + `sw_vers`, Linux
+   `/proc/meminfo` + `/sys/class/drm/card*/device/mem_info_vram_total`,
+   Windows `wmic computersystem` + `nvidia-smi`. Apple Silicon은 unified
+   memory의 70%, discrete GPU는 VRAM, CPU-only 리눅스/윈도우는
+   `system_ram − 4GB OS overhead`를 effective memory로 계산.
+2. **Tier 매핑** — 경계값 (6 / 10 / 20 GB) 기준으로 T1/T2/T3/T4 중 가장
+   큰 모델을 고르되, **경계에서 20% 이내면 한 단계 다운그레이드** (실
+   워크로드 메모리 압력 대비 보수적 OOM 회피).
+3. **지속성** — `HardwareProfile` JSON을 `~/.moa/hardware_profile.json`에
+   저장하고 네트워크 전송 금지 (patent §2.4 로컬 prior 정책).
+
+실기 검증: MacBook Air M4 / 16GB unified → effective 11.2GB → T3 경계에서
+다운그레이드 → T2 E4B 선택 (음성까지 지원).
+
+#### §6E-10-C 로컬 LLM 폴백 (`src/local_llm/`)
+
+세 서브모듈로 분리해 단일 책임 유지:
+
+- **`installer`** — OS별 Ollama 러ntime 자동 설치. macOS/Linux는
+  `ollama.com/install.sh`를 **임시 파일로 먼저 다운로드한 뒤 실행**
+  (`curl … | sh` 안티패턴 회피 — 바이트가 감사 가능함).
+  Windows는 `OllamaSetup.exe` 사일런트 설치.
+- **`network_health`** — OpenAI / Anthropic / Google 엔드포인트 3곳에
+  짧은 timeout HEAD 프로브. *어떤 HTTP 응답이든* (401 포함) 성공으로
+  간주 — 401은 "연결은 되는데 키가 없음"이라는 다른 문제로 분리.
+  `AtomicBool` 캐시로 hot path에서 동기 폴링 가능, 배경 리프레시
+  (`reliability.network_refresh_secs`, 기본 15s)로 갱신.
+- **`fallback_registry::arm_local_fallback`** — `ReliabilityConfig`를
+  부팅 시 *in-place* 뮤테이션. Ollama 데몬이 살아있고 모델이 설치되어
+  있을 때만 `fallback_providers`에 `"ollama"`를 푸시하고
+  `model_fallbacks`에 모델 리맵을 추가. 없을 때는 로그만 남기고 조용히
+  skip. `gateway::run_gateway` 초기화 직후 호출 — 이전에는 모든 서브
+  모듈이 디스크에 있지만 런타임에 아무 영향을 주지 않는 "dead wiring"
+  상태였던 것을 QA 감사로 발견해 PR #184에서 바로잡음.
+
+#### §6E-10-D Ollama 런타임 튜닝 (`OllamaTuning`)
+
+`src/providers/ollama.rs`의 `OllamaProvider`에 `OllamaTuning` 필드 추가.
+`keep_alive` / `num_ctx` / `num_predict`를 **채팅 모드별로 프로파일링**:
+
+| 프로파일 | keep_alive | num_ctx | 의도 |
+|---|---|---|---|
+| `for_app_chat()` | 30m | 8K | CLI/GUI — 짧은 컨텍스트 + cold-start 회피 |
+| `for_channel_chat()` | 30m | 32K | Telegram/Discord 등 쓰레드 히스토리 |
+| `for_web_chat()` | 30m | 128K | 장문 Q&A (Gemma 4 상한) |
+| `for_battery_saver()` | 0 | 4K | 요청 후 즉시 언로드 |
+
+`providers::create_provider_with_url_and_options`가 Ollama 빌더에 기본으로
+`for_app_chat()` 적용 — PR #184까지는 `OllamaTuning`이 정의만 되어 있고
+생성자 경로에서 호출되지 않던 또 하나의 dead wiring이었음.
+
+#### §6E-10-E 4-Tier 음성 라우터 (`src/voice/`)
+
+기존 §7 (Gemini Live simultaneous interpretation)를 **Tier S**로 보존하고,
+오프라인/프리미엄 음성 패스를 추가한 4-tier 스택:
+
+| Tier | 엔진 | 온라인 | 사용자 보이스 클론 | 모듈 |
+|---|---|---|---|---|
+| **S** | Gemini 3.1 Flash Live (S2S) | 필수 | ✗ (API 제약) | `simul_session.rs` (기존) |
+| **A** | Typecast premium TTS | 필수 | ✓ | `typecast_interp.rs` (기존 재사용) |
+| **B** | CosyVoice 2 (FunAudioLLM) | 오프라인 | ✓ (zero-shot 3–10s) | `cosyvoice2.rs` (신규) |
+| **C** | Kokoro TTS (82M, Apache 2.0) | 오프라인 | ✗ | `kokoro_tts.rs` (신규) |
+
+라우팅 규칙 (`tts_router.rs`):
+
+```text
+interpretation_mode + own_voice + online + Tier A live → A (Typecast clone)
+interpretation_mode + own_voice + offline + Tier B live → B (CosyVoice 2)
+online + Tier S live (not own_voice override)         → S (Gemini Live)
+online + Tier A live (premium voice picker)           → A
+offline + hardware T3/T4 + Tier B live                → B
+everything else                                        → C (Kokoro)
+```
+
+`TtsEngine` 트레이트 (`tts_engine.rs`)가 엔진 간 모양을 통일. Tier S만
+트레이트 외부 (S2S 직접 패스)로 남음. 하드웨어 티어 (§6E-10-B)가 offline
+기본 엔진 선택에 bias로 들어감 — T3/T4는 CosyVoice, T1/T2는 Kokoro.
+
+**보이스 레퍼런스 저장소** (CosyVoice zero-shot용):
+`~/.moa/voice_references/` 아래 3–10s 샘플을 **ChaCha20-Poly1305**로
+암호화. 키는 per-install 랜덤 시크릿 (`.key`, mode 0600). 파일시스템
+접근 권한 있는 공격자에 대한 방어는 best-effort — 패스프레이즈-유도
+키 변형 (PBKDF2)은 follow-up.
+
+#### §6E-10-F On-Device Gemma 4 STT (`src/voice/gemma_asr.rs` + `gemma_simul.rs`)
+
+Deepgram 클라우드 STT의 드롭인 대체 경로:
+
+1. 16 kHz mono PCM16 스트림 → `GemmaAsrSession::send_audio`.
+2. RMS-기반 간이 VAD가 발화를 묶고, `silence_ms` 후 end-of-utterance
+   감지.
+3. 완성된 발화를 최소 WAV 헤더로 래핑 + base64 인코딩 → Ollama
+   `/api/chat`에 **`images` 필드**로 POST (Ollama 0.20.x 멀티모달의
+   quirk — `audio` 필드는 조용히 드롭됨. 실기 검증 완료).
+4. 응답 텍스트를 `SttEvent::Final`로 emit — Deepgram과 동일 이벤트
+   타입이라 gateway 쪽 변경 無.
+
+**Latency 특성**: Deepgram은 ~200ms 내 partial, Gemma는 request/response
+모델이라 end-of-utterance *후* 1.5–3s (5s 발화 기준, Apple Silicon).
+Partial은 emit하지 않으며 UI는 "listening → transcribing" 스피너를
+이 구간 동안 표시. Overlapping-window partials는 follow-up 트랙.
+
+`gemma_simul.rs`가 `DeepgramSimulSession`과 동일 `audio_tx` / `event_rx` /
+`stop` 인터페이스를 제공해 `handle_voice_socket`이 `match`로 provider를
+스왑 가능.
+
+#### §6E-10-G Active-Provider Metadata on HTTP (`src/gateway/ws.rs` + `openclaw_compat.rs`)
+
+HTTP chat 응답에 새 메타데이터 블록:
+
+- `active_provider`: 실제로 응답을 생성한 provider 이름 (폴백 발생 시
+  원래 default와 다를 수 있음)
+- `is_local_path`: `ollama` 등 로컬 실행 여부
+- `network_state`: `online` / `offline` / `degraded` (network_health
+  캐시에서 읽음)
+
+클라이언트 UI가 이 정보로 "현재 로컬 Gemma 4로 답변 중" 배지를 표시
+가능. `SharedHealth` (OnceLock 기반 singleton)로 멀티 요청 간
+상태 공유. 기존 `AgentEnd` 옵저버빌리티 이벤트도 동일 메타 공급.
+
+#### §6E-10-H 설정 스키마 변경
+
+`ReliabilityConfig` (src/config/schema.rs)에 3개 키 추가:
+
+```toml
+[reliability]
+local_llm_fallback = true       # patent §1 cl.4 요구사항 기본 활성화
+offline_force_local = false     # privacy-strict 사용자: 모든 LLM을 로컬로 강제
+local_llm_model = "gemma4:e4b"  # host_probe Tier가 첫 부팅에 자동 기입
+```
+
+기본값은 보수적 — `local_llm_fallback = true`는 클라우드 실패 시에만
+활성, `offline_force_local = false`는 기본 클라우드 우선.
+
+#### §6E-10-I 워크트리 정리 (본 세션)
+
+본 2026-04-17 스프린트는 13개의 분산 워크트리(각 PR 별도 브랜치)로
+작업되었고, 전부 main에 랜딩 완료:
+
+| 워크트리 | 브랜치 | 소속 PR |
+|---|---|---|
+| wt-gemma4-plan | `docs/moa-gemma4-ollama-plan` | #179 |
+| wt-host-probe | `feat/host-probe-gemma4-tier` | #180 |
+| wt-auto-pull | `feat/gemma4-auto-pull` | #180 |
+| wt-routing | `feat/gemma4-routing-fallback` | #180 |
+| wt-meta | `feat/active-provider-metadata` | #180 |
+| wt-ollama-tune | `feat/ollama-tuning` | #180 |
+| wt-gemma-stt | `feat/gemma4-stt` | #181 |
+| wt-kokoro | `feat/kokoro-tts` | #181 |
+| wt-cosy | `feat/cosyvoice2` | #181 |
+| wt-router | `feat/voice-4tier-router` | #181 |
+| wt-qa | `qa/integration-all-prs` | #184 |
+| wt-qa-fix | `chore/qa-wiring-followup` | #184 |
+| wt-voice-dedup | `chore/voice-dedup-followup` | #185 |
+
+2026-04-18 세션에서 iCloud Drive 워크트리를 로컬 볼륨(`~/dev/`)으로
+마이그레이션하는 과정에서 상태를 재점검 — 모든 브랜치 tip이 origin과
+일치하며 working tree drift 없음을 확인. 워크트리 물리 디렉토리는
+`git worktree remove` / `git worktree prune`으로 정리 예정 (본 커밋의
+스코프 밖 — 로컬 환경 관리).
+
+#### §6E-10-J Follow-up 트랙 (후속 PR 후보)
+
+- **Kokoro in-process ONNX** — `ort` 크레이트 feature flag로 FastAPI
+  사이드카 hop 제거 (~30MB native, ~3min cold build 영향).
+- **Gemma STT overlapping-window partials** — 250ms 중첩 buffer로
+  mid-utterance partial emit.
+- **CosyVoice voice-ref passphrase 모드** — PBKDF2 유도 키로 파일시스템
+  레벨 best-effort → 패스프레이즈 기반 confidentiality 승격.
+- **Host_probe AMD/Intel iGPU 대응** — 현재는 NVIDIA dGPU + Apple
+  Silicon unified만 분기. AMD/Intel iGPU는 CPU-only fallback 경로로
+  보내짐.
+- **Reliability 폴백 체인 observability** — 현재 `arm_local_fallback`
+  outcome 로그만 존재. 메트릭(프로메테우스 게이지)과 게이트웨이
+  `/healthz`에 fallback-armed 상태 노출.
+
+---
+
 ## 6F. Self-Learning Skill System — Hermes Agent 접목 (v6.1, 2026-04-16)
 
 > **Date**: 2026-04-16
