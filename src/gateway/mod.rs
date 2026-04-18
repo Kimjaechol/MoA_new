@@ -398,6 +398,17 @@ pub struct AppState {
     pub r2_config: Option<crate::storage::r2::R2Config>,
     /// Shared model pricing registry for accurate cost calculation and admin management.
     pub pricing_registry: crate::billing::SharedPricingRegistry,
+    /// SLM gatekeeper for local-first message classification and response.
+    ///
+    /// When configured (`config.gatekeeper.enabled = true`) and the local Ollama
+    /// daemon is reachable, every `/api/chat` and `/ws` message is classified
+    /// by this router **before** hitting the cloud LLM path. Messages the
+    /// router decides it can handle locally (greetings, simple queries) get
+    /// served directly from the on-device SLM; everything else (classified as
+    /// Complex/Specialized) falls through to the existing agent loop which
+    /// summons the LLM using the user's own API key first, then the operator
+    /// proxy with 2.2× credit deduction (see ARCHITECTURE.md §528 & §626).
+    pub gatekeeper: Option<Arc<crate::gatekeeper::GatekeeperRouter>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -475,6 +486,50 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         local_model = ?armed.local_model,
         "Armed local Gemma 4 fallback path"
     );
+
+    // ── SLM-first gatekeeper: classify every message before LLM ───────
+    // "로그인 후 무조건 SLM이 먼저 작동 → 고도의 작업이면 SLM이 스스로 LLM
+    // 소환" (user spec, 2026-04-18). host_probe::probe() picks the optimal
+    // Gemma 4 tier for this hardware on first boot; on subsequent boots we
+    // trust the persisted model choice in `config.gatekeeper.model`. If the
+    // daemon is unreachable at boot the router is still constructed with
+    // slm_available=false — `process_message` will then return
+    // local_response=None and handlers fall through to the cloud LLM path
+    // without any regression for users who don't have Ollama installed.
+    let gatekeeper = if config.gatekeeper.enabled {
+        // First-boot auto-pick of the Gemma 4 variant. We only override the
+        // model string when it's still the pre-Gemma default ("qwen3:0.6b")
+        // so that user-authored overrides in config.toml always win.
+        if config.gatekeeper.model == "qwen3:0.6b" {
+            match crate::host_probe::probe(true).await {
+                Ok(profile) => {
+                    let tag = profile.recommended_tier.ollama_tag();
+                    tracing::info!(
+                        tier = %profile.recommended_tier,
+                        tag,
+                        "host_probe picked Gemma 4 tier for SLM gatekeeper"
+                    );
+                    config.gatekeeper.model = tag.to_string();
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "host_probe failed — keeping default gatekeeper model"
+                ),
+            }
+        }
+        let mut router = crate::gatekeeper::GatekeeperRouter::from_config(&config.gatekeeper);
+        let healthy = router.check_slm_health().await;
+        tracing::info!(
+            healthy,
+            model = router.model(),
+            url = router.ollama_url(),
+            "SLM gatekeeper initialized"
+        );
+        Some(Arc::new(router))
+    } else {
+        tracing::debug!("SLM gatekeeper disabled in config — skipping");
+        None
+    };
 
     let config_state = Arc::new(Mutex::new(config.clone()));
 
@@ -1105,6 +1160,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         supabase,
         r2_config: crate::storage::r2::R2Config::from_env(),
         pricing_registry: crate::billing::SharedPricingRegistry::new(&config.workspace_dir),
+        gatekeeper,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -3900,6 +3956,7 @@ mod tests {
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3974,6 +4031,7 @@ mod tests {
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -4031,6 +4089,7 @@ mod tests {
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -4089,6 +4148,7 @@ mod tests {
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let unauthorized =
@@ -4591,6 +4651,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4677,6 +4738,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_webhook(
@@ -4744,6 +4806,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_webhook(
@@ -4812,6 +4875,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_webhook(
@@ -4889,6 +4953,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_node_control(
@@ -4958,6 +5023,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_node_control(
@@ -5032,6 +5098,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let headers = HeaderMap::new();
@@ -5132,6 +5199,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_webhook(
@@ -5202,6 +5270,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5277,6 +5346,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5366,6 +5436,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_github_webhook(
@@ -5434,6 +5505,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let body = r#"{
@@ -5513,6 +5585,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let body = r#"{
@@ -5597,6 +5670,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -5671,6 +5745,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5738,6 +5813,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let response = handle_qq_webhook(
@@ -5804,6 +5880,7 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
         };
 
         let mut headers = HeaderMap::new();

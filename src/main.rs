@@ -86,6 +86,10 @@ mod integrations;
 // (main.rs declares `mod gateway` and lib.rs declares `pub mod gateway`)
 // the bin's crate root needs the same module registered.
 mod local_llm;
+// host_probe — hardware tier detection for SLM-first gatekeeper model
+// selection. Referenced from gateway::run_gateway for first-boot Gemma 4
+// tier picking. Same dual-compile symmetry reason as `local_llm` above.
+mod host_probe;
 mod memory;
 mod migration;
 mod multimodal;

@@ -211,6 +211,54 @@ pub async fn handle_api_chat(
             .await;
     }
 
+    // ── SLM-first gatekeeper (★ MoA core workflow) ──
+    //
+    // Every post-login chat message is classified by the on-device SLM
+    // before the pipeline even looks at cloud credentials. The router's
+    // `process_message` returns:
+    //   * `local_response = Some(..)` → SLM judged the task simple enough
+    //     to answer on-device → short-circuit and return, no cloud cost.
+    //   * `local_response = None`     → SLM decided the task needs a
+    //     full LLM (advanced reasoning / document generation / tools) →
+    //     fall through to the agent loop, which in turn summons the LLM
+    //     using the user's own API key first, then the operator proxy
+    //     with 2.2× credit billing (see billing/llm_router.rs).
+    //
+    // If the gatekeeper is disabled or the Ollama daemon is unreachable,
+    // this block is a no-op — behaviour matches the pre-SLM pipeline.
+    if let Some(router) = state.gatekeeper.as_ref() {
+        let result = router.process_message(message).await;
+        if let Some(local_reply) = result.local_response {
+            tracing::info!(
+                category = ?result.decision.category,
+                confidence = result.decision.confidence,
+                reason = %result.decision.reason,
+                "SLM gatekeeper answered locally — skipping LLM"
+            );
+            let body = serde_json::json!({
+                "reply": local_reply,
+                "model": router.model(),
+                "session_id": chat_body.session_id,
+                "active_provider": "ollama",
+                "active_model": router.model(),
+                "is_local_path": true,
+                "network_status": "local",
+                "gatekeeper": {
+                    "category": format!("{:?}", result.decision.category),
+                    "confidence": result.decision.confidence,
+                    "reason": result.decision.reason,
+                },
+            });
+            return (StatusCode::OK, Json(body));
+        }
+        tracing::debug!(
+            category = ?result.decision.category,
+            confidence = result.decision.confidence,
+            reason = %result.decision.reason,
+            "SLM gatekeeper summoning LLM for complex task"
+        );
+    }
+
     // ── Build enriched message with optional context ──
     let mut enriched_message = if chat_body.context.is_empty() {
         message.to_string()

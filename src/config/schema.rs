@@ -17087,8 +17087,19 @@ pub struct GatekeeperConfig {
 impl Default for GatekeeperConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // SLM-first routing is on by default per product spec
+            // (ARCHITECTURE.md ★ MoA Core Workflow). When Ollama is not
+            // running at boot, the gatekeeper stays constructed but marked
+            // unhealthy and `process_message` returns local_response=None,
+            // letting the pipeline fall through to the cloud LLM without
+            // any visible regression.
+            enabled: true,
             ollama_url: "http://127.0.0.1:11434/v1".to_string(),
+            // Sentinel — first-boot hardware probe swaps this for the
+            // optimal Gemma 4 variant (T1 E2B … T4 31B Dense) before the
+            // router is constructed. Explicit user overrides in config.toml
+            // always take precedence since this default only fires when no
+            // key is set.
             model: "qwen3:0.6b".to_string(),
             timeout_secs: 10,
         }
