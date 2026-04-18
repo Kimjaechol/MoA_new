@@ -1,9 +1,49 @@
 # MoA — Architecture & Product Vision
 
-> **Date**: 2026-04-17
-> **Version**: v6.1 (Dual-Brain v3.0 + Self-Learning Skill System — Hermes Agent-inspired procedural memory + user profiling + session search + self-learning correction)
+> **Date**: 2026-04-18
+> **Version**: v7.0 (SLM-First Gatekeeper + Advisor Strategy + On-device Executor — Gemma 4 SLM 1차 응답 + 이용자 최고사양 LLM 을 PLAN/REVIEW/ADVISE advisor 로 호출 + Phase 3 SLM-as-executor tool loop)
 > **Status**: Living document — updated with each major feature milestone
 > **Audience**: AI reviewers (Gemini, Claude), human contributors, future maintainers
+>
+> **v7 changes** (2026-04-18 session — "SLM-first + Advisor + on-device executor"):
+>
+> This session rewired the core chat pipeline around three principles:
+> (1) on-device SLM (Gemma 4) is the first responder to every post-login
+> message, (2) when SLM defers, an advisor-class LLM (the user's top-tier
+> model) is consulted at 3 regular checkpoints, and (3) tool-using tasks
+> run on the SLM's own prompt-guided tool loop with cloud LLM fallback.
+>
+> **Entry points**:
+> - §"MoA Core Workflow" (§66–333) rewritten around SLM-first routing.
+> - §"Advisor Strategy" subsection (§Advisor) describes PLAN/REVIEW/
+>   ADVISE checkpoints, category-based policy, and 2.2× key routing.
+> - §"Phase 2" / §"Phase 3" subsections cover revision loop, WS wiring,
+>   smart_search cascade, PLAN suggested_tools, and the SLM-as-executor
+>   loop (prompt-guided XML tool-call protocol).
+>
+> **Shipped tracks (commits on `feat/document-pipeline-overhaul`)**:
+>
+> | Track | Commit | Summary |
+> | --- | --- | --- |
+> | bin compile fix | `fef995fa` | `main.rs` 에 `mod local_llm` 추가 — 4 개 E0433 복구 (SLM-first 기능이 shipped 바이너리에서 실제 코드 경로로 실행되지 않던 버그) |
+> | SLM-first REST | `312ac26a` | `GatekeeperRouter` 를 `AppState.gatekeeper` 로 wire, `host_probe` 가 Gemma 4 티어 자동 선정, `/api/chat` 은 SLM 분류 → Local 이면 Ollama 즉답 / Cloud 면 agent loop fall-through |
+> | SkillForge 제거 | `be189e07` | 1,122 LOC 고아 모듈 삭제 (CLI/API/스케줄러 어디에서도 호출 안 됨) |
+> | SLM-first WS | `cb865990` | `/ws/chat` 에 동일 SLM-first 배선 |
+> | dual-compile 가드 | `902d9b32` | `main.rs` / `lib.rs` 간 모듈 symmetry 회귀를 CI에서 잡는 `tests/dual_compile_symmetry.rs`, lib-only 모듈 5 개 mirror |
+> | Phase 1 Advisor | `22c1535e` | `AdvisorClient::{plan,review,advise}`, `AdvisorPolicy::for_category`, `top_tier_model_for` (provider → Opus/GPT/Gemini 최고사양 매핑), AppState 연결, REST `/api/chat` PLAN+REVIEW wiring |
+> | Phase 2 | `e9b63785` | 자동 revision 루프 (`RevisionNeeded → 1 재실행 → 재리뷰`) · `/ws/chat` advisor · `smart_search` cascade (무료 → Perplexity → 4 회 재조합) · `PlanOutput.suggested_tools` |
+> | Phase 3 executor | `c11e86af` | `SlmExecutor` (프롬프트-가이드 XML tool loop, max 8 iters, cloud fallback) — Medium / tool_hint task 를 Gemma 4 가 직접 실행, 실패 시 cloud LLM 으로 자동 폴백 |
+> | safe_for_slm 큐레이션 | `3e817a73` | `Tool::safe_for_slm()` trait 메서드; `shell` / `delegate` / `apply_patch` / `file_write` / `file_edit` / `cron_*` 는 `false` override → SLM executor 에는 안 넘김, cloud LLM agent loop 는 변경 없음 |
+>
+> **Validation** (HEAD `3e817a73`):
+> - `cargo check --all-targets` — 0 errors
+> - `cargo test --lib` — **5,716 passed / 0 failed / 10 ignored**
+>   (v6.1 baseline 5,586 → +130 new tests across advisor + slm_executor + smart_search + symmetry guard)
+> - `cargo test --test dual_compile_symmetry` — 2 / 0
+>
+> **Phase 3 의도적 비포함**:
+> - SLM 스트리밍 (XML 태그 경계 버퍼링 + WS 통합 필요 — 별도 PR)
+> - 멀티 모델 SLM executor (T3/T4 Gemma 티어 자동 선택 — 현재는 단일 모델)
 >
 > **Doc sync sweep** (2026-04-17, post-code-verify):
 > - §6 High-Level Module Map refreshed to match current `src/lib.rs` (previous map omitted `approval/`, `auth/`, `bin/`, `categories/`, `coordination/`, `cost/`, `cron/`, `daemon/`, `desktop/`, `dispatch/`, `doctor/`, `economic/`, `goals/`, `hardware/`, `health/`, `heartbeat/`, `hooks/`, `integrations/`, `onboard/`, `phone/`, `rag/`, `service/`, `services/`, `session_search/`, `skillforge/`, `skills/`, `storage/`, `tunnel/`, `user_model/`, `vault/`, `workflow/`, and the root files `identity.rs`, `migration.rs`, `multimodal.rs`, `update.rs`, `util.rs`).
