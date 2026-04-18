@@ -490,6 +490,8 @@ mod tests {
         }
     }
 
+    // Async kept for signature symmetry with sibling test helpers.
+    #[allow(clippy::unused_async)]
     async fn setup() -> (tempfile::TempDir, std::sync::Arc<SqliteMemory>, VaultStore) {
         let tmp = tempfile::TempDir::new().unwrap();
         let mem = std::sync::Arc::new(SqliteMemory::new(tmp.path()).unwrap());

@@ -4150,9 +4150,9 @@ mod tests {
 
     #[tokio::test]
     async fn timeline_append_records_sync_delta_when_attached() {
-        let (_tmp, mem) = temp_sqlite();
+        let (tmp, mem) = temp_sqlite();
         let engine = Arc::new(Mutex::new(
-            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+            super::super::sync::SyncEngine::new(tmp.path(), true).unwrap(),
         ));
         mem.attach_sync(engine.clone());
 
@@ -4211,8 +4211,8 @@ mod tests {
             Some("010-0000-0000"),
             Some("+821000000000"),
             None,
-            1700000000,
-            Some(1700000300),
+            1_700_000_000,
+            Some(1_700_000_300),
             Some(300_000),
             None,
             None,

@@ -805,7 +805,10 @@ mod tests {
     // Note: More comprehensive tests would require mocking the OpenCode process
     // which is beyond the scope of basic unit tests.
 
+    // Async kept for signature symmetry with the other #[tokio::test] helpers,
+    // even though spawn+stdio setup doesn't await. Avoids rewriting all callers.
     #[cfg(unix)]
+    #[allow(clippy::unused_async)]
     async fn spawn_test_process(command: &str, args: &[&str]) -> AcpProcess {
         let mut child = Command::new(command)
             .args(args)
