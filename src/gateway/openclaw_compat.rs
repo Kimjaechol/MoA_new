@@ -671,11 +671,19 @@ pub async fn handle_api_chat(
             // Borrow the registered executable tools without reallocating.
             // `tools_registry_exec: Arc<Vec<Box<dyn Tool>>>` maps cleanly
             // to `&[&dyn Tool]` which is what the SLM executor accepts.
+            // Filter out tools the individual impls have flagged as
+            // unsafe for the on-device SLM (Tool::safe_for_slm=false) —
+            // shell, delegate, file_write, file_edit, apply_patch, cron_*
+            // currently. The cloud LLM agent loop (fallback) still sees
+            // every tool.
             let tool_refs: Vec<&dyn crate::tools::Tool> = state
                 .tools_registry_exec
                 .as_ref()
                 .iter()
-                .map(|boxed| boxed.as_ref())
+                .filter_map(|boxed| {
+                    let t = boxed.as_ref();
+                    t.safe_for_slm().then_some(t)
+                })
                 .collect();
             match executor.run(&enriched_message, &tool_refs).await {
                 Ok(outcome) if !outcome.exceeded_iterations => {

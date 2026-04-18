@@ -1427,11 +1427,16 @@ async fn handle_socket(
                 crate::gatekeeper::router::TaskCategory::Medium
             ) || decision.tool_needed.is_some();
             if eligible {
+                // Same safe_for_slm filtering as the REST path — the
+                // on-device SLM never sees shell/delegate/file_write etc.
                 let tool_refs: Vec<&dyn crate::tools::Tool> = state
                     .tools_registry_exec
                     .as_ref()
                     .iter()
-                    .map(|boxed| boxed.as_ref())
+                    .filter_map(|boxed| {
+                        let t = boxed.as_ref();
+                        t.safe_for_slm().then_some(t)
+                    })
                     .collect();
                 match executor.run(&enriched_content, &tool_refs).await {
                     Ok(outcome) if !outcome.exceeded_iterations => {
