@@ -230,6 +230,7 @@ mod tests {
 
     #[test]
     fn test_home_dir_returns_some_when_env_set() {
+        // Test environments always have HOME on unix or USERPROFILE on windows.
         let h = home_dir();
         assert!(h.is_some(), "home_dir should resolve in CI/dev shells");
     }
@@ -243,11 +244,12 @@ mod tests {
     }
 }
 
-// ── Cross-module helpers (also added to PR #184 for main; mirrored here so
-// the voice files on this branch can converge) ──
+// ── Cross-module helpers (PR #1/#2/#3/#8 used to duplicate these) ──
 
 /// Resolve the user's home directory from the platform-appropriate env var.
-/// `None` only when the var is unset (sandboxed environments).
+/// `None` only when the var is unset (sandboxed environments). Centralised
+/// here in QA so PR #1 host_probe / PR #2 local_llm / PR #8 cosyvoice2 all
+/// agree on a single implementation.
 pub fn home_dir() -> Option<std::path::PathBuf> {
     #[cfg(unix)]
     {
@@ -259,7 +261,8 @@ pub fn home_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Wall-clock seconds since the Unix epoch.
+/// Wall-clock seconds since the Unix epoch. Returns 0 if the system clock
+/// is set before the epoch (impossible in practice but gracefully handled).
 pub fn now_unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

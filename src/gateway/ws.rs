@@ -1302,10 +1302,20 @@ async fn handle_socket(
                 history.push(ChatMessage::assistant(&safe_response));
                 persist_ws_history(&state, &session_id, &history).await;
 
+                // ── Active-provider metadata (PR #3.5) ──
+                // Same shape as `handle_api_chat` so the same client-side
+                // badge logic works for both REST and WebSocket flows.
+                let net_online = crate::local_llm::shared_health().is_online();
+                let is_local_path = provider_label.eq_ignore_ascii_case("ollama");
+
                 // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": safe_response,
+                    "active_provider": provider_label,
+                    "active_model": state.model,
+                    "is_local_path": is_local_path,
+                    "network_status": if net_online { "online" } else { "offline" },
                 });
                 let _ = socket.send(Message::Text(done.to_string().into())).await;
 
@@ -1314,6 +1324,8 @@ async fn handle_socket(
                     "type": "agent_end",
                     "provider": provider_label,
                     "model": state.model,
+                    "is_local_path": is_local_path,
+                    "network_status": if net_online { "online" } else { "offline" },
                 }));
             }
             Err(e) => {

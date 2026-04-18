@@ -1108,12 +1108,15 @@ fn create_provider_with_url_and_options(
                 options.max_tokens_override,
             ),
         )),
-        // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
-        "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-            api_url,
-            key,
-            options.reasoning_enabled,
-        ))),
+        // Ollama uses api_url for custom base URL (e.g. remote Ollama instance).
+        // QA fix: apply the PR #4 app-chat tuning profile (30 m keep_alive,
+        // 8 K context) by default so cold-start cost vanishes between
+        // consecutive prompts. Callers needing a different profile can swap
+        // via OllamaProvider::with_tuning at the construction site.
+        "ollama" => Ok(Box::new(
+            ollama::OllamaProvider::new_with_reasoning(api_url, key, options.reasoning_enabled)
+                .with_tuning(ollama::OllamaTuning::for_app_chat()),
+        )),
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
                 directories::UserDirs::new().map_or_else(
@@ -2845,6 +2848,9 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            local_llm_fallback: true,
+            offline_force_local: false,
+            local_llm_model: "gemma4:e4b".to_string(),
         };
 
         let provider = create_resilient_provider(
@@ -2884,6 +2890,9 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            local_llm_fallback: true,
+            offline_force_local: false,
+            local_llm_model: "gemma4:e4b".to_string(),
         };
 
         // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
@@ -2906,6 +2915,9 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            local_llm_fallback: true,
+            offline_force_local: false,
+            local_llm_model: "gemma4:e4b".to_string(),
         };
 
         let provider =
@@ -2932,6 +2944,9 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            local_llm_fallback: true,
+            offline_force_local: false,
+            local_llm_model: "gemma4:e4b".to_string(),
         };
 
         let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
@@ -2964,6 +2979,9 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            local_llm_fallback: true,
+            offline_force_local: false,
+            local_llm_model: "gemma4:e4b".to_string(),
         };
 
         let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
@@ -3435,6 +3453,9 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            local_llm_fallback: true,
+            offline_force_local: false,
+            local_llm_model: "gemma4:e4b".to_string(),
         };
 
         // openai-codex resolves its own OAuth credential; it should not
@@ -3464,6 +3485,9 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            local_llm_fallback: true,
+            offline_force_local: false,
+            local_llm_model: "gemma4:e4b".to_string(),
         };
 
         let provider = create_resilient_provider("ollama", None, None, &reliability);

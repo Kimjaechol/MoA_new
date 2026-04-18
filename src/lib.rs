@@ -60,11 +60,17 @@ pub mod gateway;
 pub mod goals;
 pub(crate) mod hardware;
 pub(crate) mod health;
+// `host_probe` (host hardware capabilities for Gemma 4 tier auto-selection).
+// Distinct from `hardware` (USB peripheral discovery).
+pub mod host_probe;
 pub(crate) mod heartbeat;
 pub mod hooks;
 pub(crate) mod identity;
 // Intentionally unused re-export — public API surface for plugin authors.
 pub(crate) mod integrations;
+// `local_llm` (on-device Gemma 4 fallback: daemon health, model pull, config).
+// Distinct from `providers::ollama` which handles inference (chat/completion).
+pub mod local_llm;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;

@@ -5298,10 +5298,37 @@ pub struct ReliabilityConfig {
     /// Max retries for cron job execution attempts.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
+
+    /// Enable automatic fallback to a local Ollama+Gemma 4 instance when
+    /// configured cloud providers are unreachable or have no API key.
+    /// Wired by `crate::local_llm::fallback_registry::register_local_fallback`.
+    /// Default: `true`. Patent §1 cl. 4 mandates the network-down fallback.
+    #[serde(default = "default_local_llm_fallback")]
+    pub local_llm_fallback: bool,
+
+    /// Force the local LLM regardless of network state or API key presence.
+    /// Used by privacy-strict users who want zero outbound LLM traffic.
+    /// Default: `false`.
+    #[serde(default)]
+    pub offline_force_local: bool,
+
+    /// Local LLM model tag (Ollama). Default: `"gemma4:e4b"`.
+    /// Tier-aware installers (see `crate::host_probe`) typically write the
+    /// detected tier's tag here at first run.
+    #[serde(default = "default_local_llm_model")]
+    pub local_llm_model: String,
 }
 
 fn default_provider_retries() -> u32 {
     2
+}
+
+fn default_local_llm_fallback() -> bool {
+    true
+}
+
+fn default_local_llm_model() -> String {
+    "gemma4:e4b".to_string()
 }
 
 fn default_provider_backoff_ms() -> u64 {
@@ -5336,6 +5363,9 @@ impl Default for ReliabilityConfig {
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
+            local_llm_fallback: default_local_llm_fallback(),
+            offline_force_local: false,
+            local_llm_model: default_local_llm_model(),
         }
     }
 }
