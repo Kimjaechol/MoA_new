@@ -1,9 +1,14 @@
 # MoA — Architecture & Product Vision
 
-> **Date**: 2026-04-16
+> **Date**: 2026-04-17
 > **Version**: v6.1 (Dual-Brain v3.0 + Self-Learning Skill System — Hermes Agent-inspired procedural memory + user profiling + session search + self-learning correction)
 > **Status**: Living document — updated with each major feature milestone
 > **Audience**: AI reviewers (Gemini, Claude), human contributors, future maintainers
+>
+> **Doc sync sweep** (2026-04-17, post-code-verify):
+> - §6 High-Level Module Map refreshed to match current `src/lib.rs` (previous map omitted `approval/`, `auth/`, `bin/`, `categories/`, `coordination/`, `cost/`, `cron/`, `daemon/`, `desktop/`, `dispatch/`, `doctor/`, `economic/`, `goals/`, `hardware/`, `health/`, `heartbeat/`, `hooks/`, `integrations/`, `onboard/`, `phone/`, `rag/`, `service/`, `services/`, `session_search/`, `skillforge/`, `skills/`, `storage/`, `tunnel/`, `user_model/`, `vault/`, `workflow/`, and the root files `identity.rs`, `migration.rs`, `multimodal.rs`, `update.rs`, `util.rs`).
+> - §6F-10 Item #3 (`SqliteMemory::apply_remote_v3_delta` fallthrough) marked ✅ DONE — dispatch for `SkillUpsert` / `UserProfileConclusion` / `CorrectionPatternUpsert` shipped in `24c7009c` (2026-04-16) and lives at `src/memory/sqlite.rs:2340–2409` with forwarding tests `apply_remote_v3_delta_forwards_{skill_upsert,user_profile_conclusion,correction_pattern}` (lines 4945/4968/4990).
+> - Items #1 (Agent Loop `SessionHandle` wire), #2 (channel session start/end), and #4 (Tauri UI) of §6F-10 re-verified as still pending: no references to `SessionHandle`, `procedural::`, `user_model::`, or `session_search::` in `src/agent/loop_.rs` as of HEAD `fd0b42fa`.
 >
 > **v6.1 changes** (2026-04-16):
 > - §6F **Self-Learning Skill System** (new): Hermes Agent 레포(NousResearch/hermes-agent) 분석 후 MoA에 없는 3가지 핵심 기능을 접목 — 자기 생성 스킬 시스템 (procedural memory), 사용자 행동 모델링 (cross-session profiling), 세션 검색 (FTS5 대화 원문 recall). 추가로 기획 단계에서 도출된 **자기 학습형 교정 스킬**(이용자 수정 행동 관찰 → 검증 → 패턴화 → 추천 → 피드백 5단계 파이프라인)을 문서 카테고리의 첫 구체 구현체로 포함. 22개 신규 파일, ~3,400 LOC, **166 신규 단위 테스트 전체 통과**. 기존 동기화 엔진(Patent 1)·Dream Cycle·도구 레지스트리와 매끄럽게 통합.
@@ -1704,28 +1709,64 @@ MoA:  calendar_create_event(title="치과 예약", start_time="2026-03-31T15:00:
 src/
 ├── main.rs              # CLI entrypoint, command routing
 ├── lib.rs               # Module exports, shared enums
-├── config/              # Schema + config loading/merging
-├── agent/               # Orchestration loop
-├── gateway/             # Webhook/gateway server
-├── security/            # Policy, pairing, secret store, E2E encryption
-├── memory/              # SQLite + sqlite-vec + FTS5 long-term memory
-├── providers/           # Model providers (Gemini, Claude, OpenAI, Ollama, etc.)
-├── channels/            # KakaoTalk, Telegram, Discord, Slack, LINE, Web chat
-├── tools/               # Tool execution (shell, file, memory, browser, media, calendar, credential vault)
-├── coding/              # Multi-model code review pipeline ← MoA addition
-├── voice/               # Real-time voice interpretation  ← MoA addition
-├── sandbox/             # Coding sandbox (run→observe→fix loop)
+├── identity.rs          # Device/user identity helpers
+├── migration.rs         # Migration entrypoints (OpenClaw → ZeroClaw)
+├── multimodal.rs        # Multimodal input plumbing
 ├── task_category.rs     # Category definitions + tool routing ← MoA addition
-├── gatekeeper/          # Local SLM intent classification  ← MoA addition
+├── update.rs            # Self-update logic
+├── util.rs              # Small cross-module utilities
+│
+├── agent/               # Orchestration loop
+├── approval/            # Approval flows (privileged tool gate)
+├── auth/                # Auth primitives
 ├── billing/             # Credit-based billing system      ← MoA addition
-├── ontology/            # Structured relational memory — digital twin graph ← MoA addition
-├── sync/                # E2E encrypted memory sync engine (patent impl)
-├── peripherals/         # Hardware peripherals (STM32, RPi GPIO)
-├── runtime/             # Runtime adapters
+├── bin/                 # Auxiliary binaries
+├── categories/          # Task category registries
+├── channels/            # KakaoTalk, Telegram, Discord, Slack, LINE, Web chat
+├── coding/              # Multi-model code review pipeline ← MoA addition
+├── config/              # Schema + config loading/merging
+├── coordination/        # Multi-agent / cross-device coordination
+├── cost/                # Cost accounting for LLM / tool calls
+├── cron/                # Scheduled tasks
+├── daemon/              # Daemon service wrapper
+├── desktop/             # Desktop integration helpers
+├── dispatch/            # Generic event dispatch (§15A.6)
+├── doctor/              # Health/doctor CLI
+├── economic/            # Economic policy (pricing, quotas)
+├── gatekeeper/          # Local SLM intent classification  ← MoA addition
+├── gateway/             # Webhook/gateway server
+├── goals/               # Goal / task planning primitives
+├── hardware/            # USB/host-side hardware discovery
+├── health/              # Service health checks
+├── heartbeat/           # Heartbeat / liveness
+├── hooks/               # Hook pipeline
+├── integrations/        # Integration catalog + pluggable registry
+├── memory/              # SQLite + sqlite-vec + FTS5 long-term memory
 ├── observability/       # Tracing, metrics
-├── telemetry/           # Telemetry collection
+├── onboard/             # Onboarding / first-run
+├── ontology/            # Structured relational memory — digital twin graph ← MoA addition
+├── peripherals/         # Hardware peripherals (STM32, RPi GPIO)
+├── phone/               # Phone call / SMS flows                ← MoA addition
 ├── plugins/             # Plugin loader
-└── ...                  # (auth, hooks, rag, etc.)
+├── providers/           # Model providers (Gemini, Claude, OpenAI, Ollama, etc.)
+├── rag/                 # Retrieval-augmented generation helpers
+├── runtime/             # Runtime adapters
+├── sandbox/             # Coding sandbox (run→observe→fix loop)
+├── security/            # Policy, pairing, secret store, E2E encryption
+├── service/             # Service installer (systemd/launchd)
+├── services/            # Long-running service impls (voice relay, etc.)
+├── session_search/      # Past-conversation FTS5 search        ← MoA v6.1 addition
+├── skillforge/          # Skill authoring / scaffold
+├── skills/              # Procedural (self-generated) + correction skills ← MoA v6.1 addition
+├── storage/             # Low-level storage helpers
+├── sync/                # E2E encrypted memory sync engine (patent impl)
+├── telemetry/           # Telemetry collection
+├── tools/               # Tool execution (shell, file, memory, browser, media, calendar, credential vault, skill_view/manage, session_search_tool, correction_recommend)
+├── tunnel/              # Tunnel / relay client
+├── user_model/          # Cross-session user profiling         ← MoA v6.1 addition
+├── vault/               # Second Brain (Vault) — docs, hub notes, wikilinks
+├── voice/               # Real-time voice interpretation       ← MoA addition
+└── workflow/            # YAML-defined workflow engine (S7~S9)
 
 clients/tauri/               # Native desktop/mobile app (Tauri 2.x + React + TypeScript) ← MoA primary
 ├── src/App.tsx              # Main app shell — page routing, sidebar, auth flow
@@ -4391,10 +4432,10 @@ handle.end()?;
 현재 라이브러리 레이어는 완전하고 테스트 통과하며 도구들이 등록되어 있습니다.
 후속으로 필요한 작업은 **호출부** 쪽의 실제 wiring 뿐입니다:
 
-1. **Agent Loop 통합** (`src/agent/loop_.rs`): `SessionHandle` 실제 wire, post-turn 훅에서 `should_trigger` + LLM 스킬 판단 + 생성 호출
-2. **채널별 session start/end** (`src/channels/*`): 각 채널이 세션 ID 발급 시 `SessionHandle::start` 호출
-3. **SqliteMemory::apply_remote_v3_delta**: 현재는 `_ => Ok(false)` fallthrough로 처리 — 수신 delta를 실제로 SkillStore/UserProfiler/CorrectionStore에 dispatch하도록 추가 (현재 delta는 저장 저널에만 기록되고 수신측 table upsert는 미연결)
-4. **UI 측 (Tauri)**: 교정 추천 UI 오버레이, 스킬 목록/삭제 UI, 세션 검색 UI
+1. **Agent Loop 통합** (`src/agent/loop_.rs`): `SessionHandle` 실제 wire, post-turn 훅에서 `should_trigger` + LLM 스킬 판단 + 생성 호출 — 미구현 (2026-04-17 확인: `loop_.rs`에 `SessionHandle`·`procedural::`·`user_model::`·`session_search::` 참조 없음)
+2. **채널별 session start/end** (`src/channels/*`): 각 채널이 세션 ID 발급 시 `SessionHandle::start` 호출 — 미구현 (2026-04-17 확인)
+3. ~~**SqliteMemory::apply_remote_v3_delta**: 현재는 `_ => Ok(false)` fallthrough로 처리~~ — **✅ DONE** (commit `24c7009c feat(sync,skills): v6.1 self-learning delta apply + version/HLC LWW + validation`, 2026-04-16). `src/memory/sqlite.rs:2340–2409`에서 `SkillUpsert` / `UserProfileConclusion` / `CorrectionPatternUpsert` 세 variant를 각각 `skills::procedural::build_store(...).upsert_from_sync()`, `user_model::build_profiler(...).upsert_from_sync()`, `skills::correction::build_store(...).upsert_from_sync()`로 dispatch하며, workspace_dir 미해결 시 `Ok(false)` 반환(테스트 픽스처 안전). 비-v3 연산은 최후 `_ => Ok(false)`로 SyncedMemory 계층에 위임. 전용 테스트: `apply_remote_v3_delta_forwards_{skill_upsert,user_profile_conclusion,correction_pattern}` (`src/memory/sqlite.rs:4945/4968/4990`).
+4. **UI 측 (Tauri)**: 교정 추천 UI 오버레이, 스킬 목록/삭제 UI, 세션 검색 UI — 미구현
 
 ### 6F-11. 관련 파일 인덱스
 
