@@ -3,8 +3,10 @@ pub mod chunk_semantic;
 pub mod chunker;
 pub mod cli;
 pub mod cortex;
+pub mod cross_recall;
 pub mod document_store;
 pub mod document_summarizer;
+pub mod diary_backfill;
 pub mod dream_cycle;
 pub mod embedding;
 // Backwards-compatible alias so older call-sites (`memory::embeddings::…`)

@@ -39,6 +39,20 @@ pub struct DreamCycleConfig {
     pub duplicate_threshold: f32,
     /// Model for compiled truth rewrite.
     pub recompile_model: String,
+    /// Q1 Commit #9 — diary backfill target user. When `None`, the
+    /// nightly 5W1H + narrative diary task is skipped entirely (single-
+    /// user deployments not yet wired to the multi-user catchup loop).
+    pub diary_backfill_user_id: Option<String>,
+    /// Maximum days a single cycle will catch up after long offline
+    /// periods. Defaults to [`super::diary_backfill::DEFAULT_MAX_CATCHUP_DAYS`].
+    pub diary_max_catchup_days: u32,
+    /// Timezone offset (seconds east of UTC) used to compute "yesterday"
+    /// when picking pending days. Defaults to UTC (`0`).
+    pub diary_tz_offset_secs: i32,
+    /// Hours of grace before raw `memories.content` is purged after a
+    /// successful diary backfill. Defaults to
+    /// [`super::diary_backfill::DEFAULT_RAW_RETENTION_HOURS`].
+    pub diary_raw_retention_hours: u32,
 }
 
 impl Default for DreamCycleConfig {
@@ -52,6 +66,10 @@ impl Default for DreamCycleConfig {
             max_duplicate_checks: 100,
             duplicate_threshold: 0.95,
             recompile_model: "claude-haiku-4-5-20251001".to_string(),
+            diary_backfill_user_id: None,
+            diary_max_catchup_days: super::diary_backfill::DEFAULT_MAX_CATCHUP_DAYS,
+            diary_tz_offset_secs: 0,
+            diary_raw_retention_hours: super::diary_backfill::DEFAULT_RAW_RETENTION_HOURS,
         }
     }
 }
@@ -88,6 +106,16 @@ pub struct DreamCycleReport {
     pub consolidated: usize,
     /// PR #6 wire-up — number of clusters whose summariser flagged a conflict.
     pub conflicts_flagged: usize,
+    /// Q1 Commit #9 — number of local-calendar days the diary backfill
+    /// successfully processed in this cycle.
+    pub diary_days_processed: usize,
+    /// Q1 Commit #9 — total memory rows whose 5W1H + narrative columns
+    /// were populated by the diary backfill in this cycle.
+    pub diary_memories_filled: usize,
+    /// Q1 Commit #9 — count of `memories.content` cells the post-backfill
+    /// purge sweep cleared (rows older than the retention window whose
+    /// narrative was already filled).
+    pub diary_raw_purged: u64,
     /// Errors encountered (non-fatal).
     pub errors: Vec<String>,
 }
@@ -347,9 +375,82 @@ pub async fn run_dream_cycle_with_ontology(
         }
     }
 
+    // Task 8 (Q1 Commit #9): Dream-Cycle diary backfill.
+    // Processes one local calendar day per cycle (catches up to
+    // `diary_max_catchup_days` after long offline periods), then purges
+    // raw `memories.content` for rows whose narrative is filled and
+    // whose grace window (default 72h) has elapsed.
+    //
+    // Skipped entirely when `diary_backfill_user_id` is None — multi-user
+    // deployments wire one cycle per user themselves.
+    if let Some(user_id) = config.diary_backfill_user_id.as_deref() {
+        let now_utc = chrono::Utc::now();
+        let default_start = super::diary_backfill::local_yesterday(
+            now_utc,
+            config.diary_tz_offset_secs,
+        );
+        match super::diary_backfill::run_diary_backfill_catchup(
+            memory,
+            provider,
+            user_id,
+            &config.recompile_model,
+            config.diary_max_catchup_days,
+            config.diary_tz_offset_secs,
+            now_utc,
+            default_start,
+            super::diary_backfill::DEFAULT_MAX_RETRIES,
+        )
+        .await
+        {
+            Ok((days, filled)) => {
+                report.diary_days_processed = days;
+                report.diary_memories_filled = filled;
+                if days > 0 {
+                    tracing::info!(
+                        days,
+                        filled,
+                        "Dream Cycle: diary backfill processed {days} day(s), filled {filled} row(s)"
+                    );
+                }
+            }
+            Err(e) => {
+                let msg = format!("Dream Cycle diary backfill failed: {e}");
+                tracing::warn!("{msg}");
+                report.errors.push(msg);
+            }
+        }
+
+        // Purge stale raw content regardless of whether catchup did
+        // anything this cycle — backfilled rows from previous cycles may
+        // now be past the retention grace window.
+        match super::diary_backfill::purge_stale_raw_content(
+            memory,
+            now_utc.timestamp(),
+            config.diary_raw_retention_hours,
+        ) {
+            Ok(purged) => {
+                report.diary_raw_purged = purged;
+                if purged > 0 {
+                    tracing::info!(
+                        purged,
+                        "Dream Cycle: purged {purged} stale raw memory content cells"
+                    );
+                }
+            }
+            Err(e) => {
+                let msg = format!("Dream Cycle raw purge failed: {e}");
+                tracing::warn!("{msg}");
+                report.errors.push(msg);
+            }
+        }
+    }
+
     tracing::info!(
         recompiled = report.recompiled,
         duplicates = report.duplicates_found,
+        diary_days = report.diary_days_processed,
+        diary_filled = report.diary_memories_filled,
+        diary_purged = report.diary_raw_purged,
         errors = report.errors.len(),
         "Dream Cycle completed on device {device_id}"
     );

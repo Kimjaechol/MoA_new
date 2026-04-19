@@ -366,6 +366,43 @@ pub fn merge_deltas_lww(
                 replacement,
                 ..
             } => format!("correction_{original_regex}_{replacement}"),
+            // ── Q1 Commit #8 dedup keys ──
+            // 5W1H updates key on memory_key so the latest diary backfill
+            // wins regardless of producer device.
+            crate::memory::sync::DeltaOperation::Memory5W1HUpdate {
+                memory_key, ..
+            } => format!("5w1h_{memory_key}"),
+            // Ontology action detail rows dedupe per (action, kind/role).
+            // Mobile + PC might each record their own observed time/place;
+            // LWW picks the highest-confidence / latest HLC record.
+            crate::memory::sync::DeltaOperation::OntologyActionTimeLog {
+                action_id, time_kind, ..
+            } => format!("onto_action_time_{action_id}_{time_kind}"),
+            crate::memory::sync::DeltaOperation::OntologyActionPlaceLog {
+                action_id, place_role, ..
+            } => format!("onto_action_place_{action_id}_{place_role}"),
+            // Theme taxonomy: one row per name (hierarchical tree).
+            crate::memory::sync::DeltaOperation::OntologyThemeUpsert {
+                theme_name, ..
+            } => format!("onto_theme_{theme_name}"),
+            crate::memory::sync::DeltaOperation::OntologyActionThemeLog {
+                action_id, theme_name, ..
+            } => format!("onto_action_theme_{action_id}_{theme_name}"),
+            crate::memory::sync::DeltaOperation::OntologyObjectThemeLog {
+                object_id, theme_name, ..
+            } => format!("onto_object_theme_{object_id}_{theme_name}"),
+            // First-Brain wiki pages: one row per slug.
+            crate::memory::sync::DeltaOperation::FirstBrainPageUpsert {
+                slug, ..
+            }
+            | crate::memory::sync::DeltaOperation::FirstBrainPageForget { slug } => {
+                format!("fb_page_{slug}")
+            }
+            // Wiki links: dedupe per (source, target) pair — same slug-to-slug
+            // edge from either device is the same logical link.
+            crate::memory::sync::DeltaOperation::FirstBrainLinkCreate {
+                source_slug, target_slug, ..
+            } => format!("fb_link_{source_slug}__{target_slug}"),
         };
 
         match winners.get(&key) {

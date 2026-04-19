@@ -1,3 +1,4 @@
+use super::cross_recall as cross_recall_mod;
 use super::embeddings::EmbeddingProvider;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
@@ -106,6 +107,21 @@ impl SqliteMemory {
     /// `post_call::insert_phone_call`).
     pub fn connection(&self) -> parking_lot::MutexGuard<'_, Connection> {
         self.conn.lock()
+    }
+
+    /// Provider identifier of the configured embedder (e.g. `"local_fastembed"`,
+    /// `"openai"`, `"none"`). Cross-recall uses this to auto-select between the
+    /// Mobile (vector-free) and Desktop (vector-enabled) recall profiles.
+    pub fn embedder_name(&self) -> &str {
+        self.embedder.name()
+    }
+
+    /// Whether the embedder can actually produce vectors. Returns false for
+    /// the noop provider or when dimensions() == 0 (e.g. stub when
+    /// `embedding-local` feature is disabled). Cross-recall skips the vector
+    /// dimension silently when this returns false.
+    pub fn embedder_is_active(&self) -> bool {
+        self.embedder.dimensions() > 0
     }
 
     /// Alias for tests — same as `connection()`.
@@ -302,7 +318,8 @@ impl SqliteMemory {
              PRAGMA busy_timeout = 5000;
              {mmap_pragma}
              PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;"
+             PRAGMA temp_store   = MEMORY;
+             PRAGMA foreign_keys = ON;"
         ))?;
 
         Self::init_schema(&conn)?;
@@ -328,7 +345,8 @@ impl SqliteMemory {
                  PRAGMA synchronous  = NORMAL;
                  PRAGMA busy_timeout = 5000;
                  PRAGMA cache_size   = -2000;
-                 PRAGMA temp_store   = MEMORY;",
+                 PRAGMA temp_store   = MEMORY;
+                 PRAGMA foreign_keys = ON;",
             )
         });
         let read_pool = Pool::builder()
@@ -662,18 +680,46 @@ impl SqliteMemory {
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
-            "-- Core memories table
+            "-- Core memories table.
+            -- 5W1H columns (who/when/where/what/how/why + narrative) are populated
+            -- by the nightly Dream-Cycle diary backfill job; raw chat content stays
+            -- in `content` until the 72-hour retention window passes.
             CREATE TABLE IF NOT EXISTS memories (
-                id          TEXT PRIMARY KEY,
-                key         TEXT NOT NULL UNIQUE,
-                content     TEXT NOT NULL,
-                category    TEXT NOT NULL DEFAULT 'core',
-                embedding   BLOB,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
+                id              TEXT PRIMARY KEY,
+                key             TEXT NOT NULL UNIQUE,
+                content         TEXT NOT NULL,
+                category        TEXT NOT NULL DEFAULT 'core',
+                embedding       BLOB,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                -- 5W1H structured fields
+                who_actor       TEXT,
+                who_target      TEXT,
+                when_at         INTEGER,
+                when_at_hlc     TEXT,
+                where_location  TEXT,
+                where_geohash   TEXT,
+                what_subject    TEXT,
+                how_action      TEXT,
+                why_reason      TEXT,
+                narrative       TEXT,
+                narrative_filled INTEGER NOT NULL DEFAULT 0,
+                narrative_failures INTEGER NOT NULL DEFAULT 0,
+                tier             INTEGER NOT NULL DEFAULT 1
+                                   CHECK(tier IN (1, 2, 3))
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memories_when_at ON memories(when_at)
+                WHERE when_at IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_memories_where_geohash ON memories(where_geohash)
+                WHERE where_geohash IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_memories_narrative_pending
+                ON memories(created_at) WHERE narrative_filled = 0;
+            CREATE INDEX IF NOT EXISTS idx_memories_tier_when
+                ON memories(tier, when_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memories_tier_created
+                ON memories(tier, created_at DESC);
             -- Note: no explicit index on `key` — the UNIQUE constraint already
             -- creates an implicit unique B-tree index, so a second one would
             -- waste space and slow inserts.
@@ -785,6 +831,244 @@ impl SqliteMemory {
             )?;
         }
 
+        // ── Q1 5W1H Migration — add diary fields to pre-existing DBs ─
+        // The CREATE TABLE above already includes these for new DBs.
+        // For migrating test DBs created before this change, ALTER in each
+        // column individually so partial upgrades are safe to re-run.
+        let add_cols: &[(&str, &str)] = &[
+            ("who_actor", "TEXT"),
+            ("who_target", "TEXT"),
+            ("when_at", "INTEGER"),
+            ("when_at_hlc", "TEXT"),
+            ("where_location", "TEXT"),
+            ("where_geohash", "TEXT"),
+            ("what_subject", "TEXT"),
+            ("how_action", "TEXT"),
+            ("why_reason", "TEXT"),
+            ("narrative", "TEXT"),
+            ("narrative_filled", "INTEGER NOT NULL DEFAULT 0"),
+            ("narrative_failures", "INTEGER NOT NULL DEFAULT 0"),
+            // ── Q1 Commit #7: Tiered storage (50-year scale) ──
+            // tier 1=hot (<2yr, full detail, default query surface),
+            //      2=warm (2-10yr, same detail, indexed but queried only on request),
+            //      3=cold (>10yr, compressed into "life chunks", original in archive).
+            ("tier", "INTEGER NOT NULL DEFAULT 1"),
+        ];
+        for (col, ty) in add_cols {
+            if !memories_sql.contains(col) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE memories ADD COLUMN {col} {ty};"
+                ))?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_when_at ON memories(when_at)
+                 WHERE when_at IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_memories_where_geohash ON memories(where_geohash)
+                 WHERE where_geohash IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_memories_narrative_pending
+                 ON memories(created_at) WHERE narrative_filled = 0;
+             -- Q1 Commit #7 tiered storage indexes (partial — zero cost on hot tier).
+             CREATE INDEX IF NOT EXISTS idx_memories_tier_when
+                 ON memories(tier, when_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_memories_tier_created
+                 ON memories(tier, created_at DESC);
+
+             -- Q1 Commit #9: Dream-Cycle diary backfill state tracker.
+             -- One row per user (we run per user_id on multi-profile devices).
+             -- The cycle reads last_completed_date, catches up any missed
+             -- days sequentially (max 14/night), and updates the row at the
+             -- end of each day's successful backfill.
+             CREATE TABLE IF NOT EXISTS backfill_state (
+                 user_id              TEXT PRIMARY KEY,
+                 last_completed_date  TEXT NOT NULL,    -- 'YYYY-MM-DD' local
+                 last_run_utc         INTEGER,
+                 cumulative_days      INTEGER NOT NULL DEFAULT 0,
+                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                 last_error           TEXT,
+                 updated_at           INTEGER NOT NULL
+             );
+
+             -- Cold-tier archive: original full-detail rows compressed into
+             -- life-chunks and moved here. Dream-Cycle writes a synthesized
+             -- summary back to memories with tier=3, and preserves the raw
+             -- originals here so audit + on-demand restore remain possible.
+             CREATE TABLE IF NOT EXISTS memories_archive (
+                 id                   TEXT PRIMARY KEY,
+                 key                  TEXT NOT NULL,
+                 content              TEXT NOT NULL,
+                 category             TEXT NOT NULL,
+                 created_at           TEXT NOT NULL,
+                 archived_at          INTEGER NOT NULL,
+                 archive_chunk_key    TEXT,   -- the compressed life-chunk this feeds
+                 who_actor            TEXT,
+                 who_target           TEXT,
+                 when_at              INTEGER,
+                 where_location       TEXT,
+                 where_geohash        TEXT,
+                 what_subject         TEXT,
+                 how_action           TEXT,
+                 why_reason           TEXT,
+                 narrative            TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_memories_archive_chunk
+                 ON memories_archive(archive_chunk_key)
+                 WHERE archive_chunk_key IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_memories_archive_when
+                 ON memories_archive(when_at)
+                 WHERE when_at IS NOT NULL;",
+        )?;
+
+        // ── Q1 Commit #6b — First Brain Wiki (mobile-friendly LLM wiki layer)
+        // Karpathy-style LLM wiki: SLM-authored markdown pages for people,
+        // places, events, topics, and daily diaries with wikilink graph.
+        // On mobile (no embedder), this layer plus FTS5 content + narrative
+        // + ontology structured query gives a strong 4-dim text search.
+        // Vector search becomes an optional 5th dim only on capable devices.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS first_brain_pages (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                page_kind           TEXT NOT NULL
+                                      CHECK(page_kind IN
+                                        ('person','place','event','topic','diary')),
+                slug                TEXT NOT NULL UNIQUE,
+                title               TEXT NOT NULL,
+                markdown            TEXT NOT NULL,
+                ontology_object_id  INTEGER,
+                memory_id           TEXT,
+                -- HLC for cross-device LWW during sync.
+                updated_at_hlc      TEXT,
+                updated_at          INTEGER NOT NULL,
+                updated_by          TEXT NOT NULL DEFAULT 'dream_cycle',
+                tier                INTEGER NOT NULL DEFAULT 1
+                                      CHECK(tier IN (1, 2, 3)),
+                FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_kind
+                ON first_brain_pages(page_kind);
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_tier_updated
+                ON first_brain_pages(tier, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_updated
+                ON first_brain_pages(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_ontology
+                ON first_brain_pages(ontology_object_id)
+                WHERE ontology_object_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_memory
+                ON first_brain_pages(memory_id)
+                WHERE memory_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS first_brain_links (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_page_id      INTEGER NOT NULL
+                                      REFERENCES first_brain_pages(id) ON DELETE CASCADE,
+                target_slug         TEXT NOT NULL,
+                target_page_id      INTEGER
+                                      REFERENCES first_brain_pages(id) ON DELETE SET NULL,
+                context_snippet     TEXT,
+                char_offset         INTEGER,
+                created_at          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fb_links_source
+                ON first_brain_links(source_page_id);
+            CREATE INDEX IF NOT EXISTS idx_fb_links_target
+                ON first_brain_links(target_page_id)
+                WHERE target_page_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_fb_links_target_slug
+                ON first_brain_links(target_slug);
+            CREATE INDEX IF NOT EXISTS idx_fb_links_unresolved
+                ON first_brain_links(target_slug)
+                WHERE target_page_id IS NULL;
+
+            -- FTS5 over wiki page title + markdown body.
+            CREATE VIRTUAL TABLE IF NOT EXISTS first_brain_pages_fts USING fts5(
+                title, markdown,
+                content='first_brain_pages', content_rowid='id',
+                tokenize='trigram'
+            );
+            CREATE TRIGGER IF NOT EXISTS first_brain_pages_fts_ai
+                AFTER INSERT ON first_brain_pages BEGIN
+                INSERT INTO first_brain_pages_fts(rowid, title, markdown)
+                VALUES (new.id, new.title, new.markdown);
+            END;
+            CREATE TRIGGER IF NOT EXISTS first_brain_pages_fts_ad
+                AFTER DELETE ON first_brain_pages BEGIN
+                INSERT INTO first_brain_pages_fts(
+                    first_brain_pages_fts, rowid, title, markdown
+                ) VALUES ('delete', old.id, old.title, old.markdown);
+            END;
+            CREATE TRIGGER IF NOT EXISTS first_brain_pages_fts_au
+                AFTER UPDATE ON first_brain_pages BEGIN
+                INSERT INTO first_brain_pages_fts(
+                    first_brain_pages_fts, rowid, title, markdown
+                ) VALUES ('delete', old.id, old.title, old.markdown);
+                INSERT INTO first_brain_pages_fts(rowid, title, markdown)
+                VALUES (new.id, new.title, new.markdown);
+            END;
+
+            -- Auto-resolution trigger: when a new page is created,
+            -- resolve any pending (unresolved) links whose target_slug
+            -- matches the new page's slug.
+            CREATE TRIGGER IF NOT EXISTS first_brain_links_resolve_on_page_ai
+                AFTER INSERT ON first_brain_pages BEGIN
+                UPDATE first_brain_links
+                    SET target_page_id = NEW.id
+                  WHERE target_slug = NEW.slug AND target_page_id IS NULL;
+            END;",
+        )?;
+
+        // Narrative FTS5 — separate virtual table dedicated to 5W1H-structured
+        // search. Kept separate from `memories_fts` (which indexes raw `content`)
+        // so that cross-search disambiguation can score against Dream-Cycle-
+        // distilled narratives without noise from unprocessed raw text.
+        // Trigram tokenizer matches `memories_fts` for Korean morphology.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memories_narrative_fts USING fts5(
+                narrative, who_target, what_subject, how_action, why_reason,
+                content='memories', content_rowid=rowid,
+                tokenize='trigram'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS memories_narrative_ai
+            AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_narrative_fts(
+                    rowid, narrative, who_target, what_subject, how_action, why_reason
+                ) VALUES (
+                    new.rowid, new.narrative, new.who_target,
+                    new.what_subject, new.how_action, new.why_reason
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memories_narrative_ad
+            AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_narrative_fts(
+                    memories_narrative_fts, rowid,
+                    narrative, who_target, what_subject, how_action, why_reason
+                ) VALUES (
+                    'delete', old.rowid,
+                    old.narrative, old.who_target,
+                    old.what_subject, old.how_action, old.why_reason
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memories_narrative_au
+            AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_narrative_fts(
+                    memories_narrative_fts, rowid,
+                    narrative, who_target, what_subject, how_action, why_reason
+                ) VALUES (
+                    'delete', old.rowid,
+                    old.narrative, old.who_target,
+                    old.what_subject, old.how_action, old.why_reason
+                );
+                INSERT INTO memories_narrative_fts(
+                    rowid, narrative, who_target, what_subject, how_action, why_reason
+                ) VALUES (
+                    new.rowid, new.narrative, new.who_target,
+                    new.what_subject, new.how_action, new.why_reason
+                );
+            END;",
+        )?;
+
         // PR #6 — consolidated semantic facts. Each row is the LLM-summary
         // of a cluster of near-duplicate memories; source_ids is a JSON
         // array of memories.id values that were archived in its favour.
@@ -808,7 +1092,10 @@ impl SqliteMemory {
                 ON consolidated_memories(created_at DESC);",
         )?;
 
-        // memory_timeline — append-only evidence store
+        // memory_timeline — append-only evidence store.
+        // `location` (free text) is used by cross-search disambiguation to verify
+        // that an episode and an ontology action refer to the same event / same
+        // person when keywords alone are ambiguous (same time + same place ⇒ same event).
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS memory_timeline (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -823,6 +1110,7 @@ impl SqliteMemory {
                 content_sha256  TEXT NOT NULL,
                 metadata_json   TEXT,
                 device_id       TEXT NOT NULL,
+                location        TEXT,
                 created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
                 FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
             );
@@ -831,8 +1119,22 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_timeline_source_ref
                 ON memory_timeline(source_ref);
             CREATE INDEX IF NOT EXISTS idx_timeline_event_type
-                ON memory_timeline(event_type, event_at DESC);",
+                ON memory_timeline(event_type, event_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_timeline_location
+                ON memory_timeline(location) WHERE location IS NOT NULL;",
         )?;
+
+        // Migration: add location column for pre-existing DBs created before this change.
+        let timeline_sql: String = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_timeline'")?
+            .query_row([], |row| row.get::<_, String>(0))?;
+        if !timeline_sql.contains("location") {
+            conn.execute_batch(
+                "ALTER TABLE memory_timeline ADD COLUMN location TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_timeline_location
+                     ON memory_timeline(location) WHERE location IS NOT NULL;",
+            )?;
+        }
 
         // Append-only enforcement: block UPDATE on memory_timeline
         conn.execute_batch(
@@ -1251,6 +1553,251 @@ impl SqliteMemory {
         Ok(count)
     }
 
+    // ── Q1 5W1H diary fields ─────────────────────────────────────
+
+    /// Write the Dream-Cycle-extracted 5W1H fields and canonical narrative
+    /// for a memory. Any field left as `None` is left untouched — this is an
+    /// UPDATE, not a REPLACE, so partial backfills are safe.
+    ///
+    /// On success, marks `narrative_filled = 1` if `fields.narrative.is_some()`
+    /// so the nightly backfill sweep skips this row on subsequent runs.
+    pub fn set_5w1h(&self, key: &str, fields: &Memory5W1H) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE memories SET
+                who_actor      = COALESCE(?1,  who_actor),
+                who_target     = COALESCE(?2,  who_target),
+                when_at        = COALESCE(?3,  when_at),
+                when_at_hlc    = COALESCE(?4,  when_at_hlc),
+                where_location = COALESCE(?5,  where_location),
+                where_geohash  = COALESCE(?6,  where_geohash),
+                what_subject   = COALESCE(?7,  what_subject),
+                how_action     = COALESCE(?8,  how_action),
+                why_reason     = COALESCE(?9,  why_reason),
+                narrative      = COALESCE(?10, narrative),
+                narrative_filled = CASE
+                    WHEN ?10 IS NOT NULL THEN 1
+                    ELSE narrative_filled
+                END
+             WHERE key = ?11",
+            params![
+                fields.who_actor,
+                fields.who_target,
+                fields.when_at,
+                fields.when_at_hlc,
+                fields.where_location,
+                fields.where_geohash,
+                fields.what_subject,
+                fields.how_action,
+                fields.why_reason,
+                fields.narrative,
+                key,
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Increment the narrative backfill failure counter for a memory.
+    /// Used by the Dream-Cycle retry policy.
+    pub fn bump_narrative_failure(&self, key: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE memories SET narrative_failures = narrative_failures + 1 WHERE key = ?1",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    // ── Q1 Commit #10 — 5-dimensional cross-recall ───────────────
+
+    /// Fan a query across the five First-Brain search dimensions and fuse
+    /// the per-dim rankings via Reciprocal Rank Fusion. See
+    /// [`cross_recall`](super::cross_recall) for the dimension catalogue
+    /// and the profile-selection rules.
+    ///
+    /// The vector dimension is silently skipped when [`Self::embedder_is_active`]
+    /// returns `false` (mobile / `NoopEmbedding` deployments). The four
+    /// remaining text dimensions still produce a usable ranking because
+    /// the Dream Cycle has already distilled raw turns into narrative,
+    /// 5W1H, and wiki pages.
+    pub async fn cross_recall(
+        &self,
+        query: &str,
+        limit: usize,
+        profile: cross_recall_mod::RecallProfile,
+    ) -> anyhow::Result<Vec<cross_recall_mod::CrossRecallResult>> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let resolved = cross_recall_mod::resolve_profile(profile, self.embedder_is_active());
+
+        // Vector dim needs the query embedding BEFORE we drop into the
+        // blocking section; mobile profile skips it entirely so callers
+        // with no embedder (or stub one) pay zero cost.
+        let query_embedding = match resolved {
+            cross_recall_mod::RecallProfile::Desktop => {
+                self.get_or_compute_embedding(trimmed).await?
+            }
+            cross_recall_mod::RecallProfile::Mobile => None,
+            cross_recall_mod::RecallProfile::Auto => {
+                unreachable!("resolve_profile always returns Mobile or Desktop")
+            }
+        };
+
+        let conn = self.conn.clone();
+        let q_owned = trimmed.to_string();
+        let lim = limit.max(1);
+        let depth = cross_recall_mod::per_dim_depth(lim);
+
+        let results: anyhow::Result<Vec<cross_recall_mod::CrossRecallResult>> =
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.lock();
+
+                // Fan-out — each dim is independent and tolerant to its own
+                // failure (returns empty list); we never let one dim's
+                // misconfiguration kill the whole query.
+                let raw = cross_recall_mod::dim_raw_fts(&conn, &q_owned, depth)
+                    .unwrap_or_default();
+                let narrative = cross_recall_mod::dim_narrative_fts(&conn, &q_owned, depth)
+                    .unwrap_or_default();
+                let wiki = cross_recall_mod::dim_wiki_bfs(&conn, &q_owned, depth)
+                    .unwrap_or_default();
+                let structured = cross_recall_mod::dim_structured_fts(&conn, &q_owned, depth)
+                    .unwrap_or_default();
+                let vector = match query_embedding {
+                    Some(ref qe) => cross_recall_mod::dim_vector(&conn, qe, depth)
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+
+                let fused = cross_recall_mod::fuse_five_way(
+                    &raw, &narrative, &wiki, &structured, &vector, lim,
+                );
+                if fused.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                // Hydrate full MemoryEntry rows in one shot.
+                let placeholders: String = (1..=fused.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT id, key, content, category, created_at, session_id,
+                            recall_count, last_recalled
+                       FROM memories WHERE id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = fused
+                    .iter()
+                    .map(|f| Box::new(f.id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                    .collect();
+                let p_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    id_params.iter().map(AsRef::as_ref).collect();
+                let rows = stmt.query_map(p_refs.as_slice(), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, i64>(6).unwrap_or(0),
+                        r.get::<_, Option<String>>(7).ok().flatten(),
+                    ))
+                })?;
+
+                let mut by_id: std::collections::HashMap<
+                    String,
+                    (String, String, String, String, Option<String>, i64, Option<String>),
+                > = std::collections::HashMap::with_capacity(fused.len());
+                for row in rows {
+                    let (id, key, content, cat, ts, sid, rc, lr) = row?;
+                    by_id.insert(id, (key, content, cat, ts, sid, rc, lr));
+                }
+
+                let mut out = Vec::with_capacity(fused.len());
+                for fused_row in fused {
+                    if let Some((key, content, cat, ts, sid, rc, lr)) =
+                        by_id.remove(&fused_row.id)
+                    {
+                        let entry = MemoryEntry {
+                            id: fused_row.id.clone(),
+                            key,
+                            content,
+                            category: Self::str_to_category(&cat),
+                            timestamp: ts,
+                            session_id: sid,
+                            score: Some(f64::from(fused_row.final_score)),
+                            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                            recall_count: rc.max(0) as u32,
+                            last_recalled: lr,
+                        };
+                        out.push(cross_recall_mod::CrossRecallResult {
+                            entry,
+                            final_score: fused_row.final_score,
+                            dim_scores: fused_row.dims,
+                        });
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("cross_recall blocking task panicked: {e}"))?;
+
+        results
+    }
+
+    // ── Q1 Commit #7 tiered storage helpers ──────────────────────
+
+    /// Count memories per tier (1=hot, 2=warm, 3=cold). Useful for Dream-Cycle
+    /// reporting and for UI statistics. Returns (hot, warm, cold).
+    pub fn tier_counts(&self) -> anyhow::Result<(u64, u64, u64)> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT tier, COUNT(*) FROM memories GROUP BY tier",
+        )?;
+        let mut hot = 0u64;
+        let mut warm = 0u64;
+        let mut cold = 0u64;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (tier, count) = row?;
+            match tier {
+                1 => hot = count as u64,
+                2 => warm = count as u64,
+                3 => cold = count as u64,
+                _ => {}
+            }
+        }
+        Ok((hot, warm, cold))
+    }
+
+    /// Promote memories whose `when_at` crosses the tier boundary. Returns
+    /// (hot_to_warm, warm_to_cold_candidates). The "candidates" count is for
+    /// cold because actual compression into life-chunks happens in the
+    /// Dream-Cycle consolidation job (commit #9) — here we only move the
+    /// flag so queries naturally skip cold-tier rows by default.
+    pub fn migrate_tier_by_age(&self, now_unix: i64) -> anyhow::Result<(u64, u64)> {
+        const TWO_YEARS_SEC: i64 = 2 * 365 * 86_400;
+        const TEN_YEARS_SEC: i64 = 10 * 365 * 86_400;
+        let warm_cutoff = now_unix - TWO_YEARS_SEC;
+        let cold_cutoff = now_unix - TEN_YEARS_SEC;
+        let conn = self.conn.lock();
+        let hot_to_warm = conn.execute(
+            "UPDATE memories SET tier = 2
+             WHERE tier = 1 AND when_at IS NOT NULL AND when_at < ?1",
+            params![warm_cutoff],
+        )?;
+        let warm_to_cold = conn.execute(
+            "UPDATE memories SET tier = 3
+             WHERE tier = 2 AND when_at IS NOT NULL AND when_at < ?1",
+            params![cold_cutoff],
+        )?;
+        Ok((hot_to_warm as u64, warm_to_cold as u64))
+    }
+
     // ── v3.0 Compiled Truth + Timeline methods ───────────────────
 
     /// Attach a sync engine for v3.0 dual-brain cross-device replication.
@@ -1370,6 +1917,10 @@ impl SqliteMemory {
     /// Append an evidence entry to `memory_timeline` (append-only).
     /// Returns the generated UUID for the entry.
     /// Auto-records a `TimelineAppend` delta if a sync engine is attached.
+    ///
+    /// `location` is optional free-text. Cross-search disambiguation uses it
+    /// alongside `event_at` to confirm that an episode and an ontology action
+    /// refer to the same real-world event.
     #[allow(clippy::too_many_arguments)]
     pub fn append_timeline(
         &self,
@@ -1380,6 +1931,7 @@ impl SqliteMemory {
         content: &str,
         metadata_json: Option<&str>,
         device_id: &str,
+        location: Option<&str>,
     ) -> anyhow::Result<String> {
         use sha2::{Digest, Sha256};
         let uuid = Uuid::new_v4().to_string();
@@ -1388,8 +1940,8 @@ impl SqliteMemory {
             let conn = self.conn.lock();
             conn.execute(
                 "INSERT INTO memory_timeline
-                    (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id, location)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     uuid,
                     memory_id,
@@ -1400,6 +1952,7 @@ impl SqliteMemory {
                     content_sha256,
                     metadata_json,
                     device_id,
+                    location,
                 ],
             )?;
         }
@@ -1895,6 +2448,36 @@ fn dedup_ranked_list(items: &[(String, f32)]) -> Vec<(String, f32)> {
     let mut result: Vec<(String, f32)> = best.into_iter().collect();
     result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     result
+}
+
+/// Q1 5W1H diary fields written by the nightly Dream-Cycle SLM.
+///
+/// All fields are `Option<T>` so the backfill job can fill them incrementally.
+/// `narrative` is the canonical diary-format sentence used for vector embedding
+/// and FTS5 semantic search (format: `"[YYYY-MM-DD HH:MM @ <location>] <actor>
+/// <target>와(과) <subject>를 <action> — <reason>"`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Memory5W1H {
+    /// 행위자 (일반적으로 "user"; 전화 수신 등은 상대방일 수 있음).
+    pub who_actor: Option<String>,
+    /// 대상 — JSON array of strings (여러 명 가능, 순서 보존).
+    pub who_target: Option<String>,
+    /// 사건 발생 unix 시각 (created_at 과 다름: 사건의 시점).
+    pub when_at: Option<i64>,
+    /// HLC stamp for cross-device ordering.
+    pub when_at_hlc: Option<String>,
+    /// 장소 문자열 (free text; e.g. "제주 ** 골프장").
+    pub where_location: Option<String>,
+    /// Geohash (5-char default; ~5km precision) for spatial disambiguation.
+    pub where_geohash: Option<String>,
+    /// 무엇을 (사건/주제).
+    pub what_subject: Option<String>,
+    /// 어떻게 했나 (액션 상세).
+    pub how_action: Option<String>,
+    /// 왜 (맥락·동기).
+    pub why_reason: Option<String>,
+    /// 일기장 스타일 canonical 서술문 (임베딩 대상).
+    pub narrative: Option<String>,
 }
 
 /// PR #6 — row returned by `list_archived` for the archive UI.
@@ -4049,7 +4632,9 @@ mod tests {
 
         // Append timeline entries
         let uuid1 = mem
-            .append_timeline(memory_id, "chat", 1000, "msg_001", "first evidence", None, "device_a")
+            .append_timeline(
+                memory_id, "chat", 1000, "msg_001", "first evidence", None, "device_a", None,
+            )
             .unwrap();
         let uuid2 = mem
             .append_timeline(
@@ -4060,6 +4645,7 @@ mod tests {
                 "second evidence from call",
                 Some(r#"{"duration":120}"#),
                 "device_a",
+                Some("Seoul office"),
             )
             .unwrap();
 
@@ -4075,6 +4661,455 @@ mod tests {
 
         // Content SHA256 should be populated
         assert!(!timeline[0].content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_5w1h_roundtrip_and_narrative_fts() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "diary_golf",
+            "지난주 김필순 김말똥 이운이랑 제주 ** 골프장 가서 18홀 라운딩. 샷 45타.",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Before backfill: narrative_filled = 0, narrative NULL.
+        {
+            let conn = mem.conn.lock();
+            let (filled, narrative): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT narrative_filled, narrative FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(filled, 0);
+            assert!(narrative.is_none());
+        }
+
+        // Simulate Dream-Cycle SLM extraction.
+        let fields = Memory5W1H {
+            who_actor: Some("user".to_string()),
+            who_target: Some(r#"["김필순","김말똥","이운"]"#.to_string()),
+            when_at: Some(1_744_000_000),
+            where_location: Some("제주 ** 골프장".to_string()),
+            where_geohash: Some("wy74b".to_string()),
+            what_subject: Some("친목 골프 라운딩".to_string()),
+            how_action: Some("18홀 완주, 샷 45타".to_string()),
+            why_reason: Some("사교·휴식".to_string()),
+            narrative: Some(
+                "[2026-04-07 09:00 @ 제주 ** 골프장] 이용자가 김필순·김말똥·이운과 \
+                 골프 18홀을 라운딩했다 (샷 45타) — 친목 모임"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        assert!(mem.set_5w1h("diary_golf", &fields).unwrap());
+
+        // After backfill: narrative_filled = 1, columns populated.
+        {
+            let conn = mem.conn.lock();
+            let (filled, narrative, actor, geo): (i64, String, String, String) = conn
+                .query_row(
+                    "SELECT narrative_filled, narrative, who_actor, where_geohash
+                     FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(filled, 1);
+            assert!(narrative.contains("제주 ** 골프장"));
+            assert_eq!(actor, "user");
+            assert_eq!(geo, "wy74b");
+        }
+
+        // Narrative FTS5 virtual table should now find it by a keyword from `narrative`.
+        {
+            let conn = mem.conn.lock();
+            // First confirm the narrative is actually stored on the base row.
+            let stored_narrative: String = conn
+                .query_row(
+                    "SELECT narrative FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(stored_narrative.contains("골프"));
+
+            // Count rows in narrative FTS5 shadow index (should match base rows with narrative).
+            let total_fts: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memories_narrative_fts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                total_fts, 1,
+                "narrative FTS5 should contain exactly one row after UPDATE trigger"
+            );
+
+            // trigram tokenizer needs 3-byte ngrams — use a 3-char search phrase.
+            let hit_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories_narrative_fts
+                     WHERE memories_narrative_fts MATCH '골프장'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                hit_count >= 1,
+                "narrative FTS5 index should surface the diary entry for '골프장'"
+            );
+        }
+
+        // Partial update: only adjust why_reason; other fields must remain.
+        let partial = Memory5W1H {
+            why_reason: Some("사교, 스트레스 해소".to_string()),
+            ..Default::default()
+        };
+        mem.set_5w1h("diary_golf", &partial).unwrap();
+        {
+            let conn = mem.conn.lock();
+            let (actor, why): (String, String) = conn
+                .query_row(
+                    "SELECT who_actor, why_reason FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            // actor kept, why_reason updated.
+            assert_eq!(actor, "user");
+            assert_eq!(why, "사교, 스트레스 해소");
+        }
+
+        // Failure counter increments on demand.
+        mem.bump_narrative_failure("diary_golf").unwrap();
+        mem.bump_narrative_failure("diary_golf").unwrap();
+        {
+            let conn = mem.conn.lock();
+            let fails: i64 = conn
+                .query_row(
+                    "SELECT narrative_failures FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(fails, 2);
+        }
+    }
+
+    /// Q1 Commit #7 — tiered storage (hot/warm/cold) for 50-year scale.
+    /// Covers: default tier on insert + age-based tier migration + counts helper.
+    #[tokio::test]
+    async fn tiered_storage_age_based_migration() {
+        let (_tmp, mem) = temp_sqlite();
+        const NOW: i64 = 1_900_000_000; // ~2030-03
+
+        // Three memories with different event ages: recent (1 year),
+        // 5-years ago, 15-years ago.
+        for (key, when_at) in [
+            ("recent", NOW - 365 * 86_400),         // 1 yr
+            ("mid",    NOW - 5 * 365 * 86_400),     // 5 yr (warm candidate)
+            ("old",    NOW - 15 * 365 * 86_400),    // 15 yr (cold candidate)
+        ] {
+            mem.store(key, "content", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.set_5w1h(
+                key,
+                &Memory5W1H {
+                    when_at: Some(when_at),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        // Initially all rows are tier 1 (hot).
+        let (hot, warm, cold) = mem.tier_counts().unwrap();
+        assert_eq!((hot, warm, cold), (3, 0, 0));
+
+        // Migrate: recent stays hot, mid→warm, old→cold
+        // (cold migration requires going through warm first in our simple
+        //  two-pass model, which the helper does in a single call).
+        let (to_warm, to_cold) = mem.migrate_tier_by_age(NOW).unwrap();
+        assert_eq!(to_warm, 2, "recent stays hot; mid and old both cross 2y");
+        assert_eq!(to_cold, 1, "old (15y) also crosses the 10y boundary");
+
+        let (hot, warm, cold) = mem.tier_counts().unwrap();
+        assert_eq!(hot, 1, "only recent remains hot");
+        assert_eq!(warm, 1, "mid is warm");
+        assert_eq!(cold, 1, "old is cold");
+
+        // tier check constraint rejects out-of-range values.
+        let conn = mem.conn.lock();
+        let bad = conn.execute(
+            "UPDATE memories SET tier = 99 WHERE key = 'recent'",
+            [],
+        );
+        assert!(bad.is_err(), "CHECK(tier IN (1,2,3)) should reject tier=99");
+
+        // memories_archive table exists and accepts a row.
+        conn.execute(
+            "INSERT INTO memories_archive
+                (id, key, content, category, created_at, archived_at,
+                 archive_chunk_key, when_at, narrative)
+             VALUES (
+                'arch-id-1', 'old', 'original content',
+                'core', '2015-01-01', ?1, 'life-chunk/2015-Q1',
+                ?2, 'archived narrative'
+             )",
+            rusqlite::params![NOW, NOW - 15 * 365 * 86_400],
+        )
+        .unwrap();
+        let archived_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories_archive
+                 WHERE archive_chunk_key = 'life-chunk/2015-Q1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived_count, 1);
+    }
+
+    /// Q1 Commit #6b — First Brain Wiki schema smoke test.
+    /// Exercises: page kinds + FTS5 search + link resolution on page INSERT
+    /// + BFS-style graph traversal via wikilinks.
+    #[tokio::test]
+    async fn first_brain_wiki_roundtrip_and_link_resolution() {
+        let (_tmp, mem) = temp_sqlite();
+        let conn = mem.conn.lock();
+
+        // Step 1: create a diary page that wikilinks to a person who
+        // does NOT yet have a page. Expect link row to be UNRESOLVED.
+        conn.execute(
+            "INSERT INTO first_brain_pages
+                (page_kind, slug, title, markdown, updated_at, updated_by)
+             VALUES (
+                'diary', 'diary/2026-04-12',
+                '2026-04-12 일기',
+                '## 2026-04-12 @ [[place/jeju-golf]]\n\n[[person/kim-pilsoon]]과 라운딩',
+                1_744_000_000, 'dream_cycle'
+             )",
+            [],
+        )
+        .unwrap();
+        let diary_id: i64 = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO first_brain_links
+                (source_page_id, target_slug, target_page_id, context_snippet, created_at)
+             VALUES
+                (?1, 'place/jeju-golf',    NULL, '## 2026-04-12 @', 1_744_000_000),
+                (?1, 'person/kim-pilsoon', NULL, '와 라운딩',        1_744_000_000)",
+            rusqlite::params![diary_id],
+        )
+        .unwrap();
+
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE target_page_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 2);
+
+        // Step 2: create the person page — auto-resolve trigger should
+        // backfill one of the pending links.
+        conn.execute(
+            "INSERT INTO first_brain_pages
+                (page_kind, slug, title, markdown, updated_at)
+             VALUES (
+                'person', 'person/kim-pilsoon', '김필순',
+                '# 김필순\n- 관계: 여자친구\n## 에피소드\n- [[diary/2026-04-12]]',
+                1_744_000_100
+             )",
+            [],
+        )
+        .unwrap();
+        let pilsoon_id: i64 = conn.last_insert_rowid();
+
+        let resolved_to_pilsoon: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE target_page_id = ?1",
+                rusqlite::params![pilsoon_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_to_pilsoon, 1,
+                   "auto-resolve trigger should hook the diary→person link");
+
+        // place/jeju-golf is still missing → 1 unresolved link.
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE target_page_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 1);
+
+        // Step 3: FTS5 search on wiki markdown.
+        // Trigram tokenizer needs 3+ bytes; use '골프장' (9 UTF-8 bytes).
+        // '라운딩' also suitable. Test both title + body hits.
+        let hits_by_body: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_pages_fts
+                 WHERE first_brain_pages_fts MATCH '라운딩'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            hits_by_body >= 1,
+            "FTS5 should match wiki body content"
+        );
+
+        let hits_by_title: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_pages_fts
+                 WHERE first_brain_pages_fts MATCH '김필순'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            hits_by_title >= 1,
+            "FTS5 should match title '김필순'"
+        );
+
+        // Step 4: graph-style traversal — find every page linked FROM
+        // the person page (outgoing edges).
+        conn.execute(
+            "INSERT INTO first_brain_links
+                (source_page_id, target_slug, target_page_id, context_snippet, created_at)
+             VALUES (?1, 'diary/2026-04-12', ?2, '에피소드', 1_744_000_100)",
+            rusqlite::params![pilsoon_id, diary_id],
+        )
+        .unwrap();
+
+        let pilsoon_outgoing: Vec<i64> = conn
+            .prepare(
+                "SELECT target_page_id FROM first_brain_links
+                 WHERE source_page_id = ?1 AND target_page_id IS NOT NULL",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![pilsoon_id], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(pilsoon_outgoing, vec![diary_id]);
+
+        // Step 5: CHECK constraint on page_kind rejects unknown kinds.
+        let bad = conn.execute(
+            "INSERT INTO first_brain_pages
+                (page_kind, slug, title, markdown, updated_at)
+             VALUES ('notebook', 'topic/foo', 'foo', '', 1_744_000_200)",
+            [],
+        );
+        assert!(bad.is_err(), "CHECK should reject unknown page_kind");
+
+        // Step 6: CASCADE delete — removing the diary page should also
+        // purge all outbound links from it.
+        let diary_outgoing_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE source_page_id = ?1",
+                rusqlite::params![diary_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(diary_outgoing_before, 2);
+
+        conn.execute(
+            "DELETE FROM first_brain_pages WHERE id = ?1",
+            rusqlite::params![diary_id],
+        )
+        .unwrap();
+
+        let diary_outgoing_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE source_page_id = ?1",
+                rusqlite::params![diary_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            diary_outgoing_after, 0,
+            "CASCADE should drop outbound links"
+        );
+
+        // Incoming links to the diary page should be nulled (SET NULL).
+        let incoming_null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE target_slug = 'diary/2026-04-12' AND target_page_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            incoming_null_count, 1,
+            "SET NULL should keep the link row but unset target_page_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_location_persists() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("tl_loc_mem", "memory with location", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("tl_loc_mem").await.unwrap().unwrap();
+
+        mem.append_timeline(
+            &entry.id,
+            "chat",
+            1700000000,
+            "msg_golf",
+            "played 18 holes",
+            None,
+            "dev_a",
+            Some("Jeju ** Golf Course"),
+        )
+        .unwrap();
+        mem.append_timeline(
+            &entry.id,
+            "chat",
+            1700000100,
+            "msg_noloc",
+            "no location entry",
+            None,
+            "dev_a",
+            None,
+        )
+        .unwrap();
+
+        let conn = mem.conn.lock();
+        let rows: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT source_ref, location FROM memory_timeline
+                 WHERE memory_id = ?1 ORDER BY event_at",
+            )
+            .unwrap()
+            .query_map([&entry.id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "msg_golf");
+        assert_eq!(rows[0].1.as_deref(), Some("Jeju ** Golf Course"));
+        assert_eq!(rows[1].0, "msg_noloc");
+        assert_eq!(rows[1].1, None);
     }
 
     #[test]
@@ -4118,7 +5153,7 @@ mod tests {
         }
 
         for i in 0..10 {
-            mem.append_timeline("m2", "chat", i * 100, &format!("ref_{i}"), &format!("content_{i}"), None, "dev1")
+            mem.append_timeline("m2", "chat", i * 100, &format!("ref_{i}"), &format!("content_{i}"), None, "dev1", None)
                 .unwrap();
         }
 
@@ -4162,7 +5197,7 @@ mod tests {
         let entry = mem.get("m_ts").await.unwrap().unwrap();
 
         let before = engine.lock().journal_len();
-        mem.append_timeline(&entry.id, "chat", 1000, "msg_sync_1", "evidence", None, "dev_local")
+        mem.append_timeline(&entry.id, "chat", 1000, "msg_sync_1", "evidence", None, "dev_local", None)
             .unwrap();
         let after = engine.lock().journal_len();
         assert_eq!(
@@ -5081,7 +6116,7 @@ mod tests {
         let entry = mem.get("m_nosync").await.unwrap().unwrap();
 
         // All three typed mutations must succeed without a sync engine.
-        mem.append_timeline(&entry.id, "chat", 1, "r", "c", None, "d").unwrap();
+        mem.append_timeline(&entry.id, "chat", 1, "r", "c", None, "d", None).unwrap();
         mem.set_compiled_truth("m_nosync", "summary").unwrap();
         mem.insert_phone_call(
             "call_nosync",
