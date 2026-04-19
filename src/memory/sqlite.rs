@@ -858,6 +858,21 @@ impl SqliteMemory {
              CREATE INDEX IF NOT EXISTS idx_memories_tier_created
                  ON memories(tier, created_at DESC);
 
+             -- Q1 Commit #9: Dream-Cycle diary backfill state tracker.
+             -- One row per user (we run per user_id on multi-profile devices).
+             -- The cycle reads last_completed_date, catches up any missed
+             -- days sequentially (max 14/night), and updates the row at the
+             -- end of each day's successful backfill.
+             CREATE TABLE IF NOT EXISTS backfill_state (
+                 user_id              TEXT PRIMARY KEY,
+                 last_completed_date  TEXT NOT NULL,    -- 'YYYY-MM-DD' local
+                 last_run_utc         INTEGER,
+                 cumulative_days      INTEGER NOT NULL DEFAULT 0,
+                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                 last_error           TEXT,
+                 updated_at           INTEGER NOT NULL
+             );
+
              -- Cold-tier archive: original full-detail rows compressed into
              -- life-chunks and moved here. Dream-Cycle writes a synthesized
              -- summary back to memories with tier=3, and preserves the raw
