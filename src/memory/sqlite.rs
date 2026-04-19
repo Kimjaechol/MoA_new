@@ -843,6 +843,99 @@ impl SqliteMemory {
                  ON memories(created_at) WHERE narrative_filled = 0;",
         )?;
 
+        // ── Q1 Commit #6b — First Brain Wiki (mobile-friendly LLM wiki layer)
+        // Karpathy-style LLM wiki: SLM-authored markdown pages for people,
+        // places, events, topics, and daily diaries with wikilink graph.
+        // On mobile (no embedder), this layer plus FTS5 content + narrative
+        // + ontology structured query gives a strong 4-dim text search.
+        // Vector search becomes an optional 5th dim only on capable devices.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS first_brain_pages (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                page_kind           TEXT NOT NULL
+                                      CHECK(page_kind IN
+                                        ('person','place','event','topic','diary')),
+                slug                TEXT NOT NULL UNIQUE,
+                title               TEXT NOT NULL,
+                markdown            TEXT NOT NULL,
+                ontology_object_id  INTEGER,
+                memory_id           TEXT,
+                -- HLC for cross-device LWW during sync.
+                updated_at_hlc      TEXT,
+                updated_at          INTEGER NOT NULL,
+                updated_by          TEXT NOT NULL DEFAULT 'dream_cycle',
+                FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_kind
+                ON first_brain_pages(page_kind);
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_updated
+                ON first_brain_pages(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_ontology
+                ON first_brain_pages(ontology_object_id)
+                WHERE ontology_object_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_memory
+                ON first_brain_pages(memory_id)
+                WHERE memory_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS first_brain_links (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_page_id      INTEGER NOT NULL
+                                      REFERENCES first_brain_pages(id) ON DELETE CASCADE,
+                target_slug         TEXT NOT NULL,
+                target_page_id      INTEGER
+                                      REFERENCES first_brain_pages(id) ON DELETE SET NULL,
+                context_snippet     TEXT,
+                char_offset         INTEGER,
+                created_at          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fb_links_source
+                ON first_brain_links(source_page_id);
+            CREATE INDEX IF NOT EXISTS idx_fb_links_target
+                ON first_brain_links(target_page_id)
+                WHERE target_page_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_fb_links_target_slug
+                ON first_brain_links(target_slug);
+            CREATE INDEX IF NOT EXISTS idx_fb_links_unresolved
+                ON first_brain_links(target_slug)
+                WHERE target_page_id IS NULL;
+
+            -- FTS5 over wiki page title + markdown body.
+            CREATE VIRTUAL TABLE IF NOT EXISTS first_brain_pages_fts USING fts5(
+                title, markdown,
+                content='first_brain_pages', content_rowid='id',
+                tokenize='trigram'
+            );
+            CREATE TRIGGER IF NOT EXISTS first_brain_pages_fts_ai
+                AFTER INSERT ON first_brain_pages BEGIN
+                INSERT INTO first_brain_pages_fts(rowid, title, markdown)
+                VALUES (new.id, new.title, new.markdown);
+            END;
+            CREATE TRIGGER IF NOT EXISTS first_brain_pages_fts_ad
+                AFTER DELETE ON first_brain_pages BEGIN
+                INSERT INTO first_brain_pages_fts(
+                    first_brain_pages_fts, rowid, title, markdown
+                ) VALUES ('delete', old.id, old.title, old.markdown);
+            END;
+            CREATE TRIGGER IF NOT EXISTS first_brain_pages_fts_au
+                AFTER UPDATE ON first_brain_pages BEGIN
+                INSERT INTO first_brain_pages_fts(
+                    first_brain_pages_fts, rowid, title, markdown
+                ) VALUES ('delete', old.id, old.title, old.markdown);
+                INSERT INTO first_brain_pages_fts(rowid, title, markdown)
+                VALUES (new.id, new.title, new.markdown);
+            END;
+
+            -- Auto-resolution trigger: when a new page is created,
+            -- resolve any pending (unresolved) links whose target_slug
+            -- matches the new page's slug.
+            CREATE TRIGGER IF NOT EXISTS first_brain_links_resolve_on_page_ai
+                AFTER INSERT ON first_brain_pages BEGIN
+                UPDATE first_brain_links
+                    SET target_page_id = NEW.id
+                  WHERE target_slug = NEW.slug AND target_page_id IS NULL;
+            END;",
+        )?;
+
         // Narrative FTS5 — separate virtual table dedicated to 5W1H-structured
         // search. Kept separate from `memories_fts` (which indexes raw `content`)
         // so that cross-search disambiguation can score against Dream-Cycle-
@@ -4433,6 +4526,193 @@ mod tests {
                 .unwrap();
             assert_eq!(fails, 2);
         }
+    }
+
+    /// Q1 Commit #6b — First Brain Wiki schema smoke test.
+    /// Exercises: page kinds + FTS5 search + link resolution on page INSERT
+    /// + BFS-style graph traversal via wikilinks.
+    #[tokio::test]
+    async fn first_brain_wiki_roundtrip_and_link_resolution() {
+        let (_tmp, mem) = temp_sqlite();
+        let conn = mem.conn.lock();
+
+        // Step 1: create a diary page that wikilinks to a person who
+        // does NOT yet have a page. Expect link row to be UNRESOLVED.
+        conn.execute(
+            "INSERT INTO first_brain_pages
+                (page_kind, slug, title, markdown, updated_at, updated_by)
+             VALUES (
+                'diary', 'diary/2026-04-12',
+                '2026-04-12 일기',
+                '## 2026-04-12 @ [[place/jeju-golf]]\n\n[[person/kim-pilsoon]]과 라운딩',
+                1_744_000_000, 'dream_cycle'
+             )",
+            [],
+        )
+        .unwrap();
+        let diary_id: i64 = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO first_brain_links
+                (source_page_id, target_slug, target_page_id, context_snippet, created_at)
+             VALUES
+                (?1, 'place/jeju-golf',    NULL, '## 2026-04-12 @', 1_744_000_000),
+                (?1, 'person/kim-pilsoon', NULL, '와 라운딩',        1_744_000_000)",
+            rusqlite::params![diary_id],
+        )
+        .unwrap();
+
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE target_page_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 2);
+
+        // Step 2: create the person page — auto-resolve trigger should
+        // backfill one of the pending links.
+        conn.execute(
+            "INSERT INTO first_brain_pages
+                (page_kind, slug, title, markdown, updated_at)
+             VALUES (
+                'person', 'person/kim-pilsoon', '김필순',
+                '# 김필순\n- 관계: 여자친구\n## 에피소드\n- [[diary/2026-04-12]]',
+                1_744_000_100
+             )",
+            [],
+        )
+        .unwrap();
+        let pilsoon_id: i64 = conn.last_insert_rowid();
+
+        let resolved_to_pilsoon: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE target_page_id = ?1",
+                rusqlite::params![pilsoon_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_to_pilsoon, 1,
+                   "auto-resolve trigger should hook the diary→person link");
+
+        // place/jeju-golf is still missing → 1 unresolved link.
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE target_page_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 1);
+
+        // Step 3: FTS5 search on wiki markdown.
+        // Trigram tokenizer needs 3+ bytes; use '골프장' (9 UTF-8 bytes).
+        // '라운딩' also suitable. Test both title + body hits.
+        let hits_by_body: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_pages_fts
+                 WHERE first_brain_pages_fts MATCH '라운딩'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            hits_by_body >= 1,
+            "FTS5 should match wiki body content"
+        );
+
+        let hits_by_title: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_pages_fts
+                 WHERE first_brain_pages_fts MATCH '김필순'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            hits_by_title >= 1,
+            "FTS5 should match title '김필순'"
+        );
+
+        // Step 4: graph-style traversal — find every page linked FROM
+        // the person page (outgoing edges).
+        conn.execute(
+            "INSERT INTO first_brain_links
+                (source_page_id, target_slug, target_page_id, context_snippet, created_at)
+             VALUES (?1, 'diary/2026-04-12', ?2, '에피소드', 1_744_000_100)",
+            rusqlite::params![pilsoon_id, diary_id],
+        )
+        .unwrap();
+
+        let pilsoon_outgoing: Vec<i64> = conn
+            .prepare(
+                "SELECT target_page_id FROM first_brain_links
+                 WHERE source_page_id = ?1 AND target_page_id IS NOT NULL",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![pilsoon_id], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(pilsoon_outgoing, vec![diary_id]);
+
+        // Step 5: CHECK constraint on page_kind rejects unknown kinds.
+        let bad = conn.execute(
+            "INSERT INTO first_brain_pages
+                (page_kind, slug, title, markdown, updated_at)
+             VALUES ('notebook', 'topic/foo', 'foo', '', 1_744_000_200)",
+            [],
+        );
+        assert!(bad.is_err(), "CHECK should reject unknown page_kind");
+
+        // Step 6: CASCADE delete — removing the diary page should also
+        // purge all outbound links from it.
+        let diary_outgoing_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE source_page_id = ?1",
+                rusqlite::params![diary_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(diary_outgoing_before, 2);
+
+        conn.execute(
+            "DELETE FROM first_brain_pages WHERE id = ?1",
+            rusqlite::params![diary_id],
+        )
+        .unwrap();
+
+        let diary_outgoing_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE source_page_id = ?1",
+                rusqlite::params![diary_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            diary_outgoing_after, 0,
+            "CASCADE should drop outbound links"
+        );
+
+        // Incoming links to the diary page should be nulled (SET NULL).
+        let incoming_null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM first_brain_links
+                 WHERE target_slug = 'diary/2026-04-12' AND target_page_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            incoming_null_count, 1,
+            "SET NULL should keep the link row but unset target_page_id"
+        );
     }
 
     #[tokio::test]
