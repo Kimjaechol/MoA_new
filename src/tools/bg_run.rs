@@ -247,6 +247,12 @@ impl Tool for BgRunTool {
         "bg_run"
     }
 
+    // Spawns detached background commands — same risk class as `shell`.
+    // Keep the SLM executor on read-only / scoped tools only.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Execute a tool in the background and return a job ID immediately. \
          Use this for long-running operations where you don't want to block. \

@@ -24,6 +24,12 @@ impl Tool for MemoryForgetTool {
         "memory_forget"
     }
 
+    // Permanently deletes memory entries — destructive on hallucinated
+    // match. Keep on the cloud-LLM path which has tighter reasoning.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Remove memories by exact key or by keyword pattern. \
          Supports bulk deletion for '망각 요청' — e.g. delete all memories about a topic/person. \
