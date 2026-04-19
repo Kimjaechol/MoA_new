@@ -290,6 +290,73 @@ impl SyncedMemory {
                         }
                     }
                 }
+
+                // ── Q1 Commit #8 new delta variants ──
+                // These carry the wire-protocol but the backend apply
+                // path lands in commit #9 (Dream Cycle + wiki generator).
+                // For now, accept + log without applying so sync pipelines
+                // stay forward-compatible and deltas don't accumulate as
+                // "unknown" failures on the receiver.
+                DeltaOperation::Memory5W1HUpdate { memory_key, .. } => {
+                    tracing::debug!(
+                        memory_key = memory_key.as_str(),
+                        "queued 5W1H update (apply wired in commit #9)"
+                    );
+                }
+                DeltaOperation::OntologyActionTimeLog { action_id, time_kind, .. } => {
+                    tracing::debug!(
+                        action_id = *action_id,
+                        time_kind = time_kind.as_str(),
+                        "queued ontology action time (apply wired in commit #9)"
+                    );
+                }
+                DeltaOperation::OntologyActionPlaceLog { action_id, place_role, .. } => {
+                    tracing::debug!(
+                        action_id = *action_id,
+                        place_role = place_role.as_str(),
+                        "queued ontology action place (apply wired in commit #9)"
+                    );
+                }
+                DeltaOperation::OntologyThemeUpsert { theme_name, .. } => {
+                    tracing::debug!(
+                        theme_name = theme_name.as_str(),
+                        "queued ontology theme upsert (apply wired in commit #9)"
+                    );
+                }
+                DeltaOperation::OntologyActionThemeLog { action_id, theme_name, .. } => {
+                    tracing::debug!(
+                        action_id = *action_id,
+                        theme_name = theme_name.as_str(),
+                        "queued ontology action-theme link (apply wired in commit #9)"
+                    );
+                }
+                DeltaOperation::OntologyObjectThemeLog { object_id, theme_name, .. } => {
+                    tracing::debug!(
+                        object_id = *object_id,
+                        theme_name = theme_name.as_str(),
+                        "queued ontology object-theme link (apply wired in commit #9)"
+                    );
+                }
+                DeltaOperation::FirstBrainPageUpsert { slug, page_kind, .. } => {
+                    tracing::debug!(
+                        slug = slug.as_str(),
+                        kind = page_kind.as_str(),
+                        "queued first-brain page upsert (apply wired in commit #9)"
+                    );
+                }
+                DeltaOperation::FirstBrainLinkCreate { source_slug, target_slug, .. } => {
+                    tracing::debug!(
+                        source = source_slug.as_str(),
+                        target = target_slug.as_str(),
+                        "queued first-brain wiki link (apply wired in commit #9)"
+                    );
+                }
+                DeltaOperation::FirstBrainPageForget { slug } => {
+                    tracing::debug!(
+                        slug = slug.as_str(),
+                        "queued first-brain page deletion (apply wired in commit #9)"
+                    );
+                }
             }
         }
 

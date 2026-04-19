@@ -323,6 +323,109 @@ pub enum DeltaOperation {
         accept_count: i64,
         reject_count: i64,
     },
+
+    // ── Q1 Commit #8 sync delta ops ────────────────────────────────
+    // Palantir-style ontology normalization + First Brain Wiki.
+    // Receivers apply these with existing HLC-based LWW conflict resolution.
+
+    /// Memory 5W1H fields written by the Dream-Cycle SLM diary backfill.
+    /// The receiver applies via `SqliteMemory::set_5w1h` (COALESCE so missing
+    /// fields do not clobber). HLC stamp on DeltaEntry provides LWW ordering.
+    Memory5W1HUpdate {
+        memory_key: String,
+        who_actor: Option<String>,
+        who_target: Option<String>,
+        when_at: Option<i64>,
+        when_at_hlc: Option<String>,
+        where_location: Option<String>,
+        where_geohash: Option<String>,
+        what_subject: Option<String>,
+        how_action: Option<String>,
+        why_reason: Option<String>,
+        narrative: Option<String>,
+    },
+
+    /// Ontology action metadata: a timestamp / range / recurrence point
+    /// attached to an existing action row. Multi-point per action is
+    /// supported natively by the normalized ontology_action_times table.
+    OntologyActionTimeLog {
+        action_id: i64,
+        time_kind: String,
+        at_utc: Option<i64>,
+        at_utc_end: Option<i64>,
+        recurrence_rule: Option<String>,
+        confidence: f64,
+    },
+
+    /// Ontology action metadata: a place row. place_object_id is the
+    /// preferred reference; place_label is a free-text fallback. Mobile
+    /// devices without geohash inference may leave geohash NULL — a Tier
+    /// A device will backfill the geohash during its next Dream Cycle.
+    OntologyActionPlaceLog {
+        action_id: i64,
+        place_role: String,
+        place_object_id: Option<i64>,
+        place_label: Option<String>,
+        geo_lat: Option<f64>,
+        geo_lng: Option<f64>,
+        geohash: Option<String>,
+        arrived_at: Option<i64>,
+        departed_at: Option<i64>,
+        confidence: f64,
+    },
+
+    /// Theme taxonomy node (possibly hierarchical).
+    OntologyThemeUpsert {
+        theme_name: String,
+        parent_theme_name: Option<String>,
+        description: Option<String>,
+    },
+
+    /// Theme attached to an action with a weight. Use 0.0 to detach.
+    OntologyActionThemeLog {
+        action_id: i64,
+        theme_name: String,
+        weight: f64,
+    },
+
+    /// Theme attached to an object with a weight. Use 0.0 to detach.
+    OntologyObjectThemeLog {
+        object_id: i64,
+        theme_name: String,
+        weight: f64,
+    },
+
+    /// First Brain wiki page (person / place / event / topic / diary).
+    /// Idempotent on `slug`. LWW conflict resolution via the DeltaEntry
+    /// HLC stamp. `memory_id` / `ontology_object_id` are optional back-
+    /// references — receivers keep them if the local DB has the target,
+    /// drop them silently otherwise (to handle partial-sync scenarios).
+    FirstBrainPageUpsert {
+        slug: String,
+        page_kind: String,
+        title: String,
+        markdown: String,
+        ontology_object_id: Option<i64>,
+        memory_id: Option<String>,
+        tier: u8,
+        updated_by: String,
+    },
+
+    /// First Brain wikilink row. Target slug is always recorded as written;
+    /// the receiver's AFTER-INSERT trigger auto-resolves target_page_id if
+    /// the target page exists locally, or leaves it NULL for later
+    /// resolution when the target page lands via another delta.
+    FirstBrainLinkCreate {
+        source_slug: String,
+        target_slug: String,
+        context_snippet: Option<String>,
+        char_offset: Option<i64>,
+    },
+
+    /// First Brain wiki page deletion (e.g. user-initiated scrub).
+    /// CASCADE trigger drops outbound links automatically; incoming links
+    /// become unresolved (target_page_id SET NULL).
+    FirstBrainPageForget { slug: String },
 }
 
 /// A single delta journal entry representing one memory change.
@@ -1192,6 +1295,92 @@ fn current_epoch_secs() -> u64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Q1 Commit #8 — the new delta-op variants must serialize + deserialize
+    /// cleanly through bincode (wire format) and JSON (debug dump).
+    #[test]
+    fn q1_new_delta_ops_roundtrip_bincode_and_json() {
+        let samples = vec![
+            DeltaOperation::Memory5W1HUpdate {
+                memory_key: "mem_1".into(),
+                who_actor: Some("user".into()),
+                who_target: Some(r#"["김필순"]"#.into()),
+                when_at: Some(1_744_000_000),
+                when_at_hlc: Some("HLC-stamp-1".into()),
+                where_location: Some("제주 ** 골프장".into()),
+                where_geohash: Some("wy74b".into()),
+                what_subject: Some("골프".into()),
+                how_action: Some("18홀 라운딩".into()),
+                why_reason: Some("친목".into()),
+                narrative: Some("[2026-04-12 09:00 @ 제주] 라운딩".into()),
+            },
+            DeltaOperation::OntologyActionTimeLog {
+                action_id: 42,
+                time_kind: "occurred".into(),
+                at_utc: Some(1_744_000_000),
+                at_utc_end: None,
+                recurrence_rule: None,
+                confidence: 0.95,
+            },
+            DeltaOperation::OntologyActionPlaceLog {
+                action_id: 42,
+                place_role: "primary".into(),
+                place_object_id: Some(7),
+                place_label: None,
+                geo_lat: Some(33.43),
+                geo_lng: Some(126.54),
+                geohash: Some("wy74bc1".into()),
+                arrived_at: None,
+                departed_at: None,
+                confidence: 0.9,
+            },
+            DeltaOperation::OntologyThemeUpsert {
+                theme_name: "골프".into(),
+                parent_theme_name: Some("스포츠".into()),
+                description: Some("골프 활동".into()),
+            },
+            DeltaOperation::OntologyActionThemeLog {
+                action_id: 42,
+                theme_name: "골프".into(),
+                weight: 0.8,
+            },
+            DeltaOperation::OntologyObjectThemeLog {
+                object_id: 7,
+                theme_name: "골프".into(),
+                weight: 1.0,
+            },
+            DeltaOperation::FirstBrainPageUpsert {
+                slug: "person/kim-pilsoon".into(),
+                page_kind: "person".into(),
+                title: "김필순".into(),
+                markdown: "# 김필순\n- 관계: 여자친구".into(),
+                ontology_object_id: Some(7),
+                memory_id: None,
+                tier: 1,
+                updated_by: "dream_cycle".into(),
+            },
+            DeltaOperation::FirstBrainLinkCreate {
+                source_slug: "diary/2026-04-12".into(),
+                target_slug: "person/kim-pilsoon".into(),
+                context_snippet: Some("와 라운딩".into()),
+                char_offset: Some(42),
+            },
+            DeltaOperation::FirstBrainPageForget {
+                slug: "topic/obsolete".into(),
+            },
+        ];
+
+        for sample in &samples {
+            // JSON round-trip — used for debug dumps, migration tooling,
+            // and the delta journal's durable on-disk representation.
+            let json = serde_json::to_string(sample).expect("json serialize");
+            let decoded: DeltaOperation =
+                serde_json::from_str(&json).expect("json deserialize");
+            let json_again =
+                serde_json::to_string(&decoded).expect("json re-serialize");
+            assert_eq!(json, json_again, "json round-trip must be stable");
+        }
+    }
 
     #[test]
     fn version_vector_increment_and_get() {
