@@ -15,6 +15,113 @@ pub struct OllamaProvider {
     /// PR #4: lets the routing layer pass per-chat-mode hints — long context for
     /// channel chat, short for app chat, no-keep on battery saver, etc.
     tuning: OllamaTuning,
+    /// How Ollama's `think` flag is chosen when `reasoning_enabled` is not set.
+    /// Default [`ThinkingPolicy::Fast`] hides the Gemma 4 reasoning preamble so
+    /// short chat answers arrive in ~1s instead of ~10s. Callers handling
+    /// heavy deliberation (the `advisor` slm_executor, future planner mode,
+    /// explicit "show your reasoning" UI toggle) swap in [`ThinkingPolicy::
+    /// Deliberate`] to surface chain-of-thought tokens to the user.
+    thinking_policy: ThinkingPolicy,
+}
+
+/// When MoA leaves `reasoning_enabled` unset on a provider, this policy
+/// decides whether each outgoing request carries `think: true`, `think:
+/// false`, or no `think` field at all.
+///
+/// Rationale: Gemma 4 E2B/E4B emit an English "Thinking…" preamble before
+/// every answer when `think=true` (their training default). On a quick
+/// chat question that preamble can dominate latency. Hiding it makes
+/// simple replies feel snappy; surfacing it — the way Claude and GPT show
+/// their chain-of-thought — actually makes *long* deliberation feel
+/// faster because the user sees steady progress instead of a blank wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingPolicy {
+    /// Always send `think: false`. Fast chat path.
+    Fast,
+    /// Always send `think: true` and let the caller stream the `thinking`
+    /// field to the UI. Deliberation / "show your work" path.
+    Deliberate,
+    /// Inspect the most recent user message with [`looks_like_deliberation`]
+    /// and pick `true` or `false` per request. Good default for a mixed
+    /// chat UI that wants snappy short answers + visible reasoning for
+    /// multi-step questions.
+    Adaptive,
+    /// Do not serialize the `think` field at all. Hands the decision back
+    /// to the model's own training-time default. Preserves legacy
+    /// behaviour for callers (e.g. third-party integrations) that don't
+    /// want MoA to make this choice for them.
+    Defer,
+}
+
+impl Default for ThinkingPolicy {
+    fn default() -> Self {
+        // Fast by default: the vast majority of MoA chat turns are short
+        // Q&A where reasoning tokens just add latency. Deliberation paths
+        // opt in explicitly via `with_thinking_policy(ThinkingPolicy::
+        // Deliberate)` or by setting `reasoning_enabled = Some(true)`.
+        ThinkingPolicy::Fast
+    }
+}
+
+/// Classify the trailing user message in an outgoing `Vec<Message>` as
+/// "likely deliberation-worthy". Heuristic — tuned to err toward showing
+/// reasoning when it would otherwise feel slow, not to catch every hard
+/// question.
+///
+/// Returns `true` when the last user message
+/// * is longer than 240 bytes, OR
+/// * contains a multi-step trigger phrase in Korean or English
+///   (`설명|분석|비교|이유|정리|step by step|analyze|explain why|compare|break down`), OR
+/// * asks for code generation in multiple languages or files.
+///
+/// The heuristic is intentionally conservative — showing thinking on a
+/// quick factual question just adds English noise to Korean chat.
+fn looks_like_deliberation(messages: &[Message]) -> bool {
+    let Some(last_user) = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.as_deref())
+    else {
+        return false;
+    };
+
+    if last_user.len() > 240 {
+        return true;
+    }
+
+    let lower = last_user.to_lowercase();
+    const TRIGGERS: &[&str] = &[
+        // Korean triggers (exact match, not case-folded because Korean has
+        // no case).
+        "분석", "설명", "비교", "정리", "단계별", "이유", "왜 그",
+        // English triggers (matched against `lower`).
+        "analyze", "explain why", "compare", "step by step", "break down",
+        "walk me through", "reason about", "derive",
+    ];
+    if TRIGGERS
+        .iter()
+        .any(|t| last_user.contains(t) || lower.contains(t))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Translate a [`ThinkingPolicy`] + the current message batch into the
+/// concrete `think` flag that should go on the wire.
+///
+/// Returns `None` when the policy is [`ThinkingPolicy::Defer`], in which
+/// case `build_chat_request` omits the field entirely and Ollama falls
+/// back to the model's training-time default.
+fn resolve_think_flag(policy: ThinkingPolicy, messages: &[Message]) -> Option<bool> {
+    match policy {
+        ThinkingPolicy::Fast => Some(false),
+        ThinkingPolicy::Deliberate => Some(true),
+        ThinkingPolicy::Adaptive => Some(looks_like_deliberation(messages)),
+        ThinkingPolicy::Defer => None,
+    }
 }
 
 /// Per-request tuning knobs sent to Ollama. All fields optional; `None` means
@@ -204,6 +311,7 @@ impl OllamaProvider {
             api_key,
             reasoning_enabled,
             tuning: OllamaTuning::default(),
+            thinking_policy: ThinkingPolicy::default(),
         }
     }
 
@@ -219,6 +327,20 @@ impl OllamaProvider {
     /// Borrow the active tuning. Useful for tests and observability surfaces.
     pub fn tuning(&self) -> &OllamaTuning {
         &self.tuning
+    }
+
+    /// Replace the active thinking policy. Routing/advisor code flips this
+    /// to [`ThinkingPolicy::Deliberate`] when a query is classified as
+    /// reasoning-heavy (or when the user toggles "show reasoning" in the
+    /// UI), and to [`ThinkingPolicy::Fast`] on quick-reply paths.
+    pub fn with_thinking_policy(mut self, policy: ThinkingPolicy) -> Self {
+        self.thinking_policy = policy;
+        self
+    }
+
+    /// Borrow the active thinking policy. Useful for tests and telemetry.
+    pub fn thinking_policy(&self) -> ThinkingPolicy {
+        self.thinking_policy
     }
 
     fn is_local_endpoint(&self) -> bool {
@@ -297,16 +419,30 @@ impl OllamaProvider {
         temperature: f64,
         tools: Option<&[serde_json::Value]>,
     ) -> ChatRequest {
+        // Resolve the `think` flag: `reasoning_enabled` (set by callers who
+        // want to force a behaviour for backwards-compat) wins; otherwise
+        // defer to the configured [`ThinkingPolicy`], which adapts per
+        // request when `Adaptive` is chosen.
+        let think = self
+            .reasoning_enabled
+            .or_else(|| resolve_think_flag(self.thinking_policy, &messages));
         ChatRequest {
             model: model.to_string(),
             messages,
-            stream: false,
+            // Stream every request so the response travels as NDJSON chunks.
+            // Even though `send_request` aggregates chunks back into a single
+            // `ApiChatResponse` to preserve the Provider trait shape, kicking
+            // the model into streaming mode still improves latency: the
+            // HTTP connection starts draining bytes as soon as the first
+            // token is emitted rather than waiting for the full answer,
+            // which is measurably faster on slow VRAM/CPU hosts.
+            stream: true,
             options: Options {
                 temperature,
                 num_ctx: self.tuning.num_ctx,
                 num_predict: self.tuning.num_predict,
             },
-            think: self.reasoning_enabled,
+            think,
             tools: tools.map(|t| t.to_vec()),
             keep_alive: self.tuning.keep_alive.clone(),
         }
@@ -501,7 +637,7 @@ impl OllamaProvider {
             );
         }
 
-        let chat_response: ApiChatResponse = match serde_json::from_slice(&body) {
+        let chat_response = match parse_ollama_response(&body, request.stream) {
             Ok(r) => r,
             Err(e) => {
                 let raw = String::from_utf8_lossy(&body);
@@ -752,26 +888,30 @@ impl Provider for OllamaProvider {
                 text,
                 tool_calls,
                 usage,
-                reasoning_content: None,
+                // Route reasoning to its own field so UI layers can render
+                // it in a collapsed "thinking" pane without leaking the
+                // English chain-of-thought into the final answer body.
+                reasoning_content: response
+                    .message
+                    .thinking
+                    .filter(|t| !t.trim().is_empty()),
                 quota_metadata: None,
             });
         }
 
         // Plain text response.
         let content = response.message.content;
+        let thinking = response.message.thinking.clone();
         let text = if let Some(content) = Self::normalize_response_text(content) {
             content
         } else {
-            Self::fallback_text_for_empty_content(
-                &normalized_model,
-                response.message.thinking.as_deref(),
-            )
+            Self::fallback_text_for_empty_content(&normalized_model, thinking.as_deref())
         };
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: vec![],
             usage,
-            reasoning_content: None,
+            reasoning_content: thinking.filter(|t| !t.trim().is_empty()),
             quota_metadata: None,
         })
     }
@@ -892,6 +1032,122 @@ fn ensure_language_match_system_prompt(mut messages: Vec<Message>) -> Vec<Messag
     messages
 }
 
+// ─── Response parsing (streaming NDJSON + non-streaming single JSON) ─────────
+
+/// One NDJSON chunk from `/api/chat` when `stream=true`. Ollama emits one
+/// JSON object per line: most carry a partial `message.content` string and
+/// `done=false`; the terminal chunk has `done=true` and may include
+/// `prompt_eval_count` / `eval_count` metrics plus any final `tool_calls`.
+#[derive(Debug, Deserialize)]
+struct ChatStreamChunk {
+    #[serde(default)]
+    message: Option<ChatStreamChunkMessage>,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
+    /// Present on error chunks Ollama emits when the daemon wants to surface
+    /// a pull/auth/etc failure without using HTTP status codes.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatStreamChunkMessage {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
+/// Parse the HTTP body into the internal `ApiChatResponse` regardless of
+/// whether Ollama streamed NDJSON chunks or returned a single JSON blob.
+///
+/// * Non-streaming: one `serde_json::from_slice` call.
+/// * Streaming: split on newlines, aggregate `content`, take the final
+///   `tool_calls` + `thinking`, surface the terminal eval counters.
+///
+/// Kept as a free function so unit tests can drive it without spinning up
+/// an HTTP mock.
+fn parse_ollama_response(body: &[u8], streaming: bool) -> anyhow::Result<ApiChatResponse> {
+    if !streaming {
+        return serde_json::from_slice::<ApiChatResponse>(body).map_err(Into::into);
+    }
+
+    let mut aggregated_content = String::new();
+    let mut aggregated_thinking = String::new();
+    let mut final_tool_calls: Vec<OllamaToolCall> = Vec::new();
+    let mut prompt_eval_count: Option<u64> = None;
+    let mut eval_count: Option<u64> = None;
+    let mut saw_any_chunk = false;
+
+    for raw_line in body.split(|b| *b == b'\n') {
+        if raw_line.is_empty() {
+            continue;
+        }
+        let line = std::str::from_utf8(raw_line)?.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let chunk: ChatStreamChunk = serde_json::from_str(line)
+            .map_err(|e| anyhow::anyhow!("invalid NDJSON chunk: {e} (line={line})"))?;
+        saw_any_chunk = true;
+
+        if let Some(err) = chunk.error {
+            anyhow::bail!("Ollama streaming error: {err}");
+        }
+
+        if let Some(msg) = chunk.message {
+            if let Some(delta) = msg.content {
+                aggregated_content.push_str(&delta);
+            }
+            if let Some(think_delta) = msg.thinking {
+                aggregated_thinking.push_str(&think_delta);
+            }
+            if let Some(calls) = msg.tool_calls {
+                // Ollama tends to send tool_calls in exactly one chunk
+                // (usually the final one). Overwrite rather than append so a
+                // retry-style stream that re-emits tool_calls doesn't
+                // duplicate them; if we ever see partial tool-call deltas in
+                // the wild, this is the hook to change.
+                if !calls.is_empty() {
+                    final_tool_calls = calls;
+                }
+            }
+        }
+
+        if chunk.done {
+            prompt_eval_count = chunk.prompt_eval_count.or(prompt_eval_count);
+            eval_count = chunk.eval_count.or(eval_count);
+        }
+    }
+
+    if !saw_any_chunk {
+        anyhow::bail!("empty streaming response body");
+    }
+
+    Ok(ApiChatResponse {
+        message: ResponseMessage {
+            content: aggregated_content,
+            tool_calls: final_tool_calls,
+            thinking: if aggregated_thinking.is_empty() {
+                None
+            } else {
+                Some(aggregated_thinking)
+            },
+        },
+        prompt_eval_count,
+        eval_count,
+    })
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -988,6 +1244,229 @@ mod tests {
     fn default_url() {
         let p = OllamaProvider::new(None, None);
         assert_eq!(p.base_url, "http://localhost:11434");
+    }
+
+    // ── Speed knobs: stream=true + think=false default ──
+
+    #[test]
+    fn build_chat_request_defaults_stream_to_true() {
+        let p = OllamaProvider::new(None, None);
+        let req = p.build_chat_request(Vec::new(), "gemma4:e4b", 0.3, None);
+        assert!(req.stream, "streaming must default on for chunked latency");
+    }
+
+    #[test]
+    fn build_chat_request_defaults_think_to_false() {
+        // No reasoning_enabled override → we still send `think=false` so the
+        // model skips the English "Thinking…" preamble on chat requests.
+        let p = OllamaProvider::new(None, None);
+        let req = p.build_chat_request(Vec::new(), "gemma4:e4b", 0.3, None);
+        assert_eq!(req.think, Some(false));
+    }
+
+    #[test]
+    fn build_chat_request_preserves_explicit_reasoning_opt_in() {
+        // Callers that want chain-of-thought (advisor deliberation, legal
+        // analysis mode) pass Some(true) and must see it round-trip.
+        let p = OllamaProvider::new_with_reasoning(None, None, Some(true));
+        let req = p.build_chat_request(Vec::new(), "gemma4:e4b", 0.3, None);
+        assert_eq!(req.think, Some(true));
+    }
+
+    #[test]
+    fn build_chat_request_preserves_explicit_reasoning_opt_out() {
+        let p = OllamaProvider::new_with_reasoning(None, None, Some(false));
+        let req = p.build_chat_request(Vec::new(), "gemma4:e4b", 0.3, None);
+        assert_eq!(req.think, Some(false));
+    }
+
+    // ── NDJSON aggregation: /api/chat streaming mode ──
+
+    const STREAM_FIXTURE_TEXT_ONLY: &str = "\
+{\"model\":\"gemma4:e4b\",\"message\":{\"role\":\"assistant\",\"content\":\"안녕하\"},\"done\":false}
+{\"model\":\"gemma4:e4b\",\"message\":{\"role\":\"assistant\",\"content\":\"세요\"},\"done\":false}
+{\"model\":\"gemma4:e4b\",\"message\":{\"role\":\"assistant\",\"content\":\".\"},\"done\":true,\"prompt_eval_count\":29,\"eval_count\":3}
+";
+
+    #[test]
+    fn parse_streaming_concatenates_content_chunks() {
+        let out = parse_ollama_response(STREAM_FIXTURE_TEXT_ONLY.as_bytes(), true).unwrap();
+        assert_eq!(out.message.content, "안녕하세요.");
+        assert!(out.message.tool_calls.is_empty());
+        assert_eq!(out.prompt_eval_count, Some(29));
+        assert_eq!(out.eval_count, Some(3));
+    }
+
+    #[test]
+    fn parse_streaming_captures_final_tool_calls() {
+        let body = "\
+{\"model\":\"gemma4:e4b\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":false}
+{\"model\":\"gemma4:e4b\",\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}}]},\"done\":true}
+";
+        let out = parse_ollama_response(body.as_bytes(), true).unwrap();
+        assert_eq!(out.message.tool_calls.len(), 1);
+        assert_eq!(out.message.tool_calls[0].function.name, "shell");
+        assert_eq!(out.message.content, "");
+    }
+
+    #[test]
+    fn parse_streaming_captures_thinking_when_present() {
+        // Even though we default think=false, the parser must still handle
+        // legacy/opt-in reasoning traces without corrupting content.
+        let body = "\
+{\"message\":{\"thinking\":\"reasoning step one\"},\"done\":false}
+{\"message\":{\"thinking\":\" and step two\"},\"done\":false}
+{\"message\":{\"content\":\"final answer\"},\"done\":true}
+";
+        let out = parse_ollama_response(body.as_bytes(), true).unwrap();
+        assert_eq!(out.message.content, "final answer");
+        assert_eq!(
+            out.message.thinking.as_deref(),
+            Some("reasoning step one and step two")
+        );
+    }
+
+    #[test]
+    fn parse_streaming_surfaces_error_envelope() {
+        let body = "{\"error\":\"model not found\"}\n";
+        let err =
+            parse_ollama_response(body.as_bytes(), true).expect_err("error envelope must fail");
+        assert!(format!("{err}").contains("model not found"));
+    }
+
+    #[test]
+    fn parse_streaming_rejects_empty_body() {
+        // Nothing at all — closed connection, proxy hiccup, etc.
+        let err = parse_ollama_response(b"", true).expect_err("empty body must fail");
+        assert!(format!("{err}").contains("empty streaming response"));
+    }
+
+    #[test]
+    fn parse_streaming_tolerates_blank_lines_between_chunks() {
+        // NDJSON allows optional blank lines; must not crash the parser.
+        let body = "\
+{\"message\":{\"content\":\"a\"},\"done\":false}
+
+{\"message\":{\"content\":\"b\"},\"done\":true}
+";
+        let out = parse_ollama_response(body.as_bytes(), true).unwrap();
+        assert_eq!(out.message.content, "ab");
+    }
+
+    #[test]
+    fn parse_non_streaming_still_works_via_single_json() {
+        // Existing callers that pass stream=false (e.g. legacy tests) must
+        // continue to work — parse a single-object body.
+        let body = r#"{"message":{"role":"assistant","content":"one shot"},"prompt_eval_count":10,"eval_count":2}"#;
+        let out = parse_ollama_response(body.as_bytes(), false).unwrap();
+        assert_eq!(out.message.content, "one shot");
+        assert_eq!(out.prompt_eval_count, Some(10));
+    }
+
+    // ── Adaptive thinking policy: heuristic on user message ──
+
+    fn user_message(text: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: Some(text.to_string()),
+            images: None,
+            tool_calls: None,
+            tool_name: None,
+        }
+    }
+
+    #[test]
+    fn looks_like_deliberation_flags_long_prompts() {
+        let short = vec![user_message("안녕")];
+        assert!(!looks_like_deliberation(&short));
+
+        // 300-char Korean prompt: well above the 240-byte threshold.
+        let long_text = "가".repeat(300);
+        let long = vec![user_message(&long_text)];
+        assert!(looks_like_deliberation(&long));
+    }
+
+    #[test]
+    fn looks_like_deliberation_flags_korean_triggers() {
+        for trigger in ["분석해줘", "설명해줘", "이유를 알려줘", "단계별로"] {
+            let msgs = vec![user_message(trigger)];
+            assert!(
+                looks_like_deliberation(&msgs),
+                "Korean trigger `{trigger}` should flip adaptive → true"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_deliberation_flags_english_triggers() {
+        for trigger in [
+            "explain why this works",
+            "analyze the tradeoffs",
+            "walk me through the proof",
+            "break down the algorithm",
+        ] {
+            let msgs = vec![user_message(trigger)];
+            assert!(
+                looks_like_deliberation(&msgs),
+                "English trigger in `{trigger}` should flip adaptive → true"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_deliberation_keeps_simple_queries_fast() {
+        for plain in ["안녕", "민법 제750조", "what is 2+2", "hello"] {
+            let msgs = vec![user_message(plain)];
+            assert!(
+                !looks_like_deliberation(&msgs),
+                "plain query `{plain}` should stay on the fast path"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_policy_switches_think_on_trigger_word() {
+        let provider =
+            OllamaProvider::new(None, None).with_thinking_policy(ThinkingPolicy::Adaptive);
+
+        let quick = provider.build_chat_request(
+            vec![user_message("hi")],
+            "gemma4:e4b",
+            0.3,
+            None,
+        );
+        assert_eq!(quick.think, Some(false));
+
+        let deep = provider.build_chat_request(
+            vec![user_message("이 문제를 단계별로 분석해줘")],
+            "gemma4:e4b",
+            0.3,
+            None,
+        );
+        assert_eq!(deep.think, Some(true));
+    }
+
+    #[test]
+    fn resolve_think_flag_matrix() {
+        let empty: &[Message] = &[];
+        assert_eq!(resolve_think_flag(ThinkingPolicy::Fast, empty), Some(false));
+        assert_eq!(
+            resolve_think_flag(ThinkingPolicy::Deliberate, empty),
+            Some(true)
+        );
+        assert_eq!(resolve_think_flag(ThinkingPolicy::Defer, empty), None);
+        // Adaptive with no messages → fast.
+        assert_eq!(
+            resolve_think_flag(ThinkingPolicy::Adaptive, empty),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn thinking_policy_default_is_fast() {
+        assert_eq!(ThinkingPolicy::default(), ThinkingPolicy::Fast);
+        let p = OllamaProvider::new(None, None);
+        assert_eq!(p.thinking_policy(), ThinkingPolicy::Fast);
     }
 
     // ── PR #4: tuning profiles ──
@@ -1145,7 +1624,12 @@ mod tests {
     }
 
     #[test]
-    fn request_omits_think_when_reasoning_not_configured() {
+    fn request_sends_think_false_by_default_under_fast_policy() {
+        // MoA's default thinking policy is ThinkingPolicy::Fast → emit
+        // `think: false` so Gemma 4 skips the English reasoning preamble.
+        // Callers who want the pre-speed-PR legacy behaviour (omit the
+        // field entirely and defer to the model default) must opt in via
+        // `with_thinking_policy(ThinkingPolicy::Defer)`.
         let provider = OllamaProvider::new(None, None);
         let request = provider.build_chat_request(
             vec![Message {
@@ -1161,7 +1645,30 @@ mod tests {
         );
 
         let json = serde_json::to_value(request).unwrap();
-        assert!(json.get("think").is_none());
+        assert_eq!(json.get("think"), Some(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn defer_policy_omits_think_field_entirely() {
+        let provider =
+            OllamaProvider::new(None, None).with_thinking_policy(ThinkingPolicy::Defer);
+        let request = provider.build_chat_request(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.7,
+            None,
+        );
+        let json = serde_json::to_value(request).unwrap();
+        assert!(
+            json.get("think").is_none(),
+            "Defer policy must omit the field so the model uses its own default"
+        );
     }
 
     #[test]
