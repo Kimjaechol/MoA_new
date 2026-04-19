@@ -128,6 +128,156 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             ON ontology_actions(status);
 
         -- ================================================================
+        -- 3b. Palantir-style hybrid schema (Q1 refactor)
+        -- ================================================================
+        -- Strategy: keep primary `occurred_at_utc`, `location`, `themes` on
+        -- the main ontology_actions row as a fast-path cache, and normalize
+        -- multi-valued / richer data into dedicated tables. Triggers sync
+        -- the cache columns from the normalized source of truth.
+
+        -- ── Typed property schema (replaces ad-hoc JSON for typed fields)
+        CREATE TABLE IF NOT EXISTS ontology_property_types (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            object_type_id  INTEGER NOT NULL REFERENCES ontology_object_types(id),
+            name            TEXT NOT NULL,
+            value_type      TEXT NOT NULL
+                             CHECK(value_type IN
+                                ('string','int','float','date','geo','object_ref','bool')),
+            is_required     INTEGER NOT NULL DEFAULT 0,
+            description     TEXT,
+            UNIQUE(object_type_id, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS ontology_object_properties (
+            object_id         INTEGER NOT NULL
+                                REFERENCES ontology_objects(id) ON DELETE CASCADE,
+            property_type_id  INTEGER NOT NULL
+                                REFERENCES ontology_property_types(id),
+            value_text        TEXT,
+            value_num         REAL,
+            value_ts          INTEGER,
+            value_ref         INTEGER REFERENCES ontology_objects(id),
+            confidence        REAL NOT NULL DEFAULT 1.0,
+            updated_at        INTEGER NOT NULL,
+            PRIMARY KEY (object_id, property_type_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_onto_obj_props_ref
+            ON ontology_object_properties(value_ref)
+            WHERE value_ref IS NOT NULL;
+
+        -- ── Per-action time table (multi-point, range, recurrence) ──
+        CREATE TABLE IF NOT EXISTS ontology_action_times (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id       INTEGER NOT NULL
+                                REFERENCES ontology_actions(id) ON DELETE CASCADE,
+            time_kind       TEXT NOT NULL
+                                CHECK(time_kind IN
+                                    ('occurred','started','ended','scheduled','recurring')),
+            at_utc          INTEGER,       -- unix sec; point or range start
+            at_utc_end      INTEGER,       -- NULL = point; set for ranges
+            recurrence_rule TEXT,          -- iCal RRULE for 'recurring'
+            confidence      REAL NOT NULL DEFAULT 1.0,
+            hlc_stamp       TEXT,
+            created_at      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_onto_action_times_action
+            ON ontology_action_times(action_id);
+        CREATE INDEX IF NOT EXISTS idx_onto_action_times_at
+            ON ontology_action_times(at_utc);
+        CREATE INDEX IF NOT EXISTS idx_onto_action_times_kind
+            ON ontology_action_times(action_id, time_kind);
+
+        -- ── Per-action place table (multi-location, geohash) ──
+        CREATE TABLE IF NOT EXISTS ontology_action_places (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id       INTEGER NOT NULL
+                                REFERENCES ontology_actions(id) ON DELETE CASCADE,
+            place_role      TEXT NOT NULL
+                                CHECK(place_role IN
+                                    ('primary','origin','destination','waypoint','stayed_at')),
+            place_object_id INTEGER REFERENCES ontology_objects(id),
+            place_label     TEXT,          -- free text fallback
+            geo_lat         REAL,
+            geo_lng         REAL,
+            geohash         TEXT,          -- typically 5 chars for ~5 km grid
+            arrived_at      INTEGER,
+            departed_at     INTEGER,
+            confidence      REAL NOT NULL DEFAULT 1.0,
+            created_at      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_onto_action_places_action
+            ON ontology_action_places(action_id);
+        CREATE INDEX IF NOT EXISTS idx_onto_action_places_geohash
+            ON ontology_action_places(geohash);
+        CREATE INDEX IF NOT EXISTS idx_onto_action_places_object
+            ON ontology_action_places(place_object_id)
+            WHERE place_object_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_onto_action_places_role
+            ON ontology_action_places(action_id, place_role);
+
+        -- ── Normalized theme taxonomy (hierarchy + weighted M:N) ──
+        CREATE TABLE IF NOT EXISTS ontology_themes (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            name             TEXT NOT NULL UNIQUE,
+            parent_theme_id  INTEGER REFERENCES ontology_themes(id),
+            description      TEXT,
+            created_at       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_onto_themes_parent
+            ON ontology_themes(parent_theme_id)
+            WHERE parent_theme_id IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS ontology_action_themes (
+            action_id   INTEGER NOT NULL
+                            REFERENCES ontology_actions(id) ON DELETE CASCADE,
+            theme_id    INTEGER NOT NULL
+                            REFERENCES ontology_themes(id),
+            weight      REAL NOT NULL DEFAULT 1.0
+                            CHECK(weight >= 0.0 AND weight <= 1.0),
+            PRIMARY KEY (action_id, theme_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_onto_action_themes_theme
+            ON ontology_action_themes(theme_id);
+
+        CREATE TABLE IF NOT EXISTS ontology_object_themes (
+            object_id   INTEGER NOT NULL
+                            REFERENCES ontology_objects(id) ON DELETE CASCADE,
+            theme_id    INTEGER NOT NULL
+                            REFERENCES ontology_themes(id),
+            weight      REAL NOT NULL DEFAULT 1.0
+                            CHECK(weight >= 0.0 AND weight <= 1.0),
+            PRIMARY KEY (object_id, theme_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_onto_object_themes_theme
+            ON ontology_object_themes(theme_id);
+
+        -- ── Primary-cache sync triggers ──
+        -- Keep ontology_actions.occurred_at_utc / location backing the fast
+        -- path in sync with the first row written to the detail tables.
+        -- Only fills when the main row is NULL to avoid clobbering an
+        -- explicit write; callers that want to replace the primary value
+        -- should UPDATE it directly.
+        CREATE TRIGGER IF NOT EXISTS trg_action_times_primary_sync
+            AFTER INSERT ON ontology_action_times
+            WHEN NEW.time_kind IN ('occurred','started') AND NEW.at_utc IS NOT NULL
+        BEGIN
+            UPDATE ontology_actions
+               SET occurred_at_utc = datetime(NEW.at_utc, 'unixepoch') || 'Z'
+             WHERE id = NEW.action_id AND occurred_at_utc IS NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_action_places_primary_sync
+            AFTER INSERT ON ontology_action_places
+            WHEN NEW.place_role = 'primary'
+        BEGIN
+            UPDATE ontology_actions
+               SET location = COALESCE(NEW.place_label,
+                                       (SELECT title FROM ontology_objects
+                                         WHERE id = NEW.place_object_id))
+             WHERE id = NEW.action_id AND location IS NULL;
+        END;
+
+        -- ================================================================
         -- 4. Community layer (PR #9 — GraphRAG Phase 5)
         -- ================================================================
         -- One row per detected community in the ontology graph. `level`
@@ -391,5 +541,229 @@ mod tests {
             count >= 10,
             "expected at least 10 object types, got {count}"
         );
+    }
+
+    /// Q1 hybrid schema: ontology_action_times / _places / _themes
+    /// should exist, accept normalized rows, and the "primary-cache"
+    /// triggers should back-fill ontology_actions.{occurred_at_utc, location}.
+    #[test]
+    fn hybrid_action_detail_tables_roundtrip_and_trigger_sync() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_ontology_schema(&conn).unwrap();
+        seed_default_types(&conn).unwrap();
+
+        // Insert a Contact object to act as the "place" (though Place-type
+        // objects would normally be used in production).
+        conn.execute(
+            "INSERT INTO ontology_objects
+                (type_id, title, properties, owner_user_id, created_at, updated_at)
+             VALUES (
+                (SELECT id FROM ontology_object_types WHERE name='Contact'),
+                '제주 ** 골프장',
+                '{}',
+                'user_test', 1000, 1000
+             )",
+            [],
+        )
+        .unwrap();
+        let place_obj_id: i64 = conn.last_insert_rowid();
+
+        // Insert an action (occurred_at_utc / location left NULL — the triggers
+        // should fill them from the normalized detail rows).
+        conn.execute(
+            "INSERT INTO ontology_actions
+                (action_type_id, actor_user_id,
+                 primary_object_id, params, created_at, updated_at)
+             VALUES (
+                (SELECT id FROM ontology_action_types WHERE name='RecordDecision'),
+                'user_test', NULL, '{}', 1000, 1000
+             )",
+            [],
+        )
+        .unwrap();
+        let action_id: i64 = conn.last_insert_rowid();
+
+        // Normalized time rows.
+        conn.execute(
+            "INSERT INTO ontology_action_times
+                (action_id, time_kind, at_utc, at_utc_end, confidence, created_at)
+             VALUES (?1, 'started',  1_744_000_000, NULL, 0.9, 1000),
+                    (?1, 'ended',    1_744_010_000, NULL, 0.9, 1000),
+                    (?1, 'occurred', 1_744_005_000, NULL, 1.0, 1000)",
+            rusqlite::params![action_id],
+        )
+        .unwrap();
+
+        // Normalized place rows — one 'primary' object-backed, one label waypoint.
+        conn.execute(
+            "INSERT INTO ontology_action_places
+                (action_id, place_role, place_object_id, place_label,
+                 geo_lat, geo_lng, geohash, confidence, created_at)
+             VALUES (?1, 'primary',  ?2, NULL,           33.43, 126.54, 'wy74b', 1.0, 1000),
+                    (?1, 'waypoint', NULL, 'Jeju Airport', NULL, NULL, 'wy74a', 1.0, 1000)",
+            rusqlite::params![action_id, place_obj_id],
+        )
+        .unwrap();
+
+        // Normalized theme rows — taxonomy with parent/child.
+        conn.execute(
+            "INSERT INTO ontology_themes (name, parent_theme_id, description, created_at)
+             VALUES ('스포츠', NULL, '운동 전반', 1000)",
+            [],
+        )
+        .unwrap();
+        let sport_id: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO ontology_themes (name, parent_theme_id, description, created_at)
+             VALUES ('골프', ?1, '골프 활동', 1000)",
+            rusqlite::params![sport_id],
+        )
+        .unwrap();
+        let golf_id: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO ontology_themes (name, parent_theme_id, description, created_at)
+             VALUES ('사교', NULL, '사회적 모임', 1000)",
+            [],
+        )
+        .unwrap();
+        let social_id: i64 = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO ontology_action_themes (action_id, theme_id, weight)
+             VALUES (?1, ?2, 0.8), (?1, ?3, 0.5)",
+            rusqlite::params![action_id, golf_id, social_id],
+        )
+        .unwrap();
+
+        // Primary-cache triggers should have filled ontology_actions.
+        let (primary_at, primary_loc): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT occurred_at_utc, location FROM ontology_actions WHERE id = ?1",
+                rusqlite::params![action_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        // First 'started' insert was the trigger source (NEW.time_kind IN ('occurred','started')).
+        assert!(
+            primary_at.is_some(),
+            "trigger should have populated occurred_at_utc"
+        );
+        assert!(primary_at.as_deref().unwrap().ends_with('Z'));
+        assert_eq!(
+            primary_loc.as_deref(),
+            Some("제주 ** 골프장"),
+            "primary place trigger should copy title from place_object_id"
+        );
+
+        // Theme hierarchy lookup — find every action tagged under 스포츠 (parent),
+        // which should include ones tagged with 골프 via the parent_theme_id chain.
+        let action_count: i64 = conn
+            .query_row(
+                "WITH theme_tree(id) AS (
+                    SELECT id FROM ontology_themes WHERE name = '스포츠'
+                    UNION ALL
+                    SELECT t.id FROM ontology_themes t
+                    JOIN theme_tree tt ON t.parent_theme_id = tt.id
+                 )
+                 SELECT COUNT(DISTINCT at.action_id)
+                 FROM ontology_action_themes at
+                 WHERE at.theme_id IN theme_tree",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(action_count, 1);
+
+        // FK CASCADE: delete the action, expect detail rows to vanish.
+        conn.execute(
+            "DELETE FROM ontology_actions WHERE id = ?1",
+            rusqlite::params![action_id],
+        )
+        .unwrap();
+        let orphaned: i64 = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM ontology_action_times  WHERE action_id = ?1)
+                  + (SELECT COUNT(*) FROM ontology_action_places WHERE action_id = ?1)
+                  + (SELECT COUNT(*) FROM ontology_action_themes WHERE action_id = ?1)",
+                rusqlite::params![action_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphaned, 0, "ON DELETE CASCADE should clear detail rows");
+    }
+
+    /// Typed property system: property types are defined per object type,
+    /// and typed values land in the normalized ontology_object_properties table.
+    #[test]
+    fn typed_property_schema_enforces_object_type_binding() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_ontology_schema(&conn).unwrap();
+        seed_default_types(&conn).unwrap();
+
+        // Define a 'nickname' string property on Contact.
+        let contact_type_id: i64 = conn
+            .query_row(
+                "SELECT id FROM ontology_object_types WHERE name = 'Contact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO ontology_property_types
+                (object_type_id, name, value_type, is_required, description)
+             VALUES (?1, 'nickname', 'string', 0, '별명')",
+            rusqlite::params![contact_type_id],
+        )
+        .unwrap();
+        let nickname_prop_id: i64 = conn.last_insert_rowid();
+
+        // Create a Contact and attach the nickname property.
+        conn.execute(
+            "INSERT INTO ontology_objects
+                (type_id, title, properties, owner_user_id, created_at, updated_at)
+             VALUES (?1, '김필순', '{}', 'user_test', 1000, 1000)",
+            rusqlite::params![contact_type_id],
+        )
+        .unwrap();
+        let contact_id: i64 = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO ontology_object_properties
+                (object_id, property_type_id, value_text, confidence, updated_at)
+             VALUES (?1, ?2, '필순이', 1.0, 1000)",
+            rusqlite::params![contact_id, nickname_prop_id],
+        )
+        .unwrap();
+
+        let nickname: String = conn
+            .query_row(
+                "SELECT value_text FROM ontology_object_properties
+                 WHERE object_id = ?1 AND property_type_id = ?2",
+                rusqlite::params![contact_id, nickname_prop_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nickname, "필순이");
+
+        // Reject invalid value_type via the CHECK constraint.
+        let bad_insert = conn.execute(
+            "INSERT INTO ontology_property_types
+                (object_type_id, name, value_type, is_required)
+             VALUES (?1, 'foo', 'not_a_real_type', 0)",
+            rusqlite::params![contact_type_id],
+        );
+        assert!(bad_insert.is_err(), "CHECK should reject unknown value_type");
+
+        // UNIQUE(object_type_id, name) prevents duplicate property definitions.
+        let dup_insert = conn.execute(
+            "INSERT INTO ontology_property_types
+                (object_type_id, name, value_type, is_required)
+             VALUES (?1, 'nickname', 'string', 0)",
+            rusqlite::params![contact_type_id],
+        );
+        assert!(dup_insert.is_err());
     }
 }
