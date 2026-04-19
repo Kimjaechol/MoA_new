@@ -108,6 +108,21 @@ impl SqliteMemory {
         self.conn.lock()
     }
 
+    /// Provider identifier of the configured embedder (e.g. `"local_fastembed"`,
+    /// `"openai"`, `"none"`). Cross-recall uses this to auto-select between the
+    /// Mobile (vector-free) and Desktop (vector-enabled) recall profiles.
+    pub fn embedder_name(&self) -> &str {
+        self.embedder.name()
+    }
+
+    /// Whether the embedder can actually produce vectors. Returns false for
+    /// the noop provider or when dimensions() == 0 (e.g. stub when
+    /// `embedding-local` feature is disabled). Cross-recall skips the vector
+    /// dimension silently when this returns false.
+    pub fn embedder_is_active(&self) -> bool {
+        self.embedder.dimensions() > 0
+    }
+
     /// Alias for tests — same as `connection()`.
     #[cfg(test)]
     pub fn conn_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
