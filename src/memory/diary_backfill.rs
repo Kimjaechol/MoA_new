@@ -33,6 +33,7 @@ use anyhow::Result;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use super::sqlite::{Memory5W1H, SqliteMemory};
+use crate::providers::traits::Provider;
 
 // ── Configuration ──────────────────────────────────────────────────
 
@@ -286,6 +287,217 @@ pub fn purge_stale_raw_content(
     Ok(updated as u64)
 }
 
+// ── Provider-driven backfill ──────────────────────────────────────
+
+/// Per-day backfill outcome.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DayBackfillReport {
+    /// How many `narrative_filled = 0` rows were considered for this day.
+    pub considered: usize,
+    /// How many of those rows had their 5W1H + narrative columns
+    /// populated (i.e. the SLM emitted a parseable entry for them).
+    pub filled: usize,
+    /// How many rows were marked with one more narrative_failure because
+    /// the SLM didn't return an entry for them in this run.
+    pub failed: usize,
+}
+
+/// Read raw memories created during the local calendar day `date` (in
+/// the user's timezone, expressed as `tz_offset_secs` east of UTC),
+/// hand them to `provider`, parse the SLM's diary JSON, and persist the
+/// 5W1H + narrative columns via [`SqliteMemory::set_5w1h`].
+///
+/// Skips rows where:
+/// - `narrative_filled = 1` already (idempotent)
+/// - `narrative_failures >= max_retries` (gives up + flags for review)
+/// - `archived = 1` (decay sweep already retired the row)
+/// - `content` is empty (already purged or deliberately blank)
+///
+/// On a successful SLM call but missing entry for some considered row,
+/// the missing row's `narrative_failures` is incremented by one so the
+/// retry policy eventually escalates it.
+pub async fn run_diary_backfill_for_day(
+    mem: &SqliteMemory,
+    provider: &dyn Provider,
+    date: NaiveDate,
+    tz_offset_secs: i32,
+    model: &str,
+    max_retries: u32,
+) -> Result<DayBackfillReport> {
+    // Compute the UTC range covering the local-day boundaries:
+    //   local_midnight - tz_offset → local_midnight + 86400 - tz_offset
+    let local_midnight = NaiveDate::from_ymd_opt(date.year(), date.month(), date.day())
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .ok_or_else(|| anyhow::anyhow!("invalid date {date}"))?;
+    let start_utc = local_midnight.and_utc().timestamp() - i64::from(tz_offset_secs);
+    let end_utc = start_utc + 86_400;
+    let start_iso = DateTime::<Utc>::from_timestamp(start_utc, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
+    let end_iso = DateTime::<Utc>::from_timestamp(end_utc, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
+
+    // Pull candidate rows (key + raw content) in one query.
+    let candidates: Vec<(String, String)> = {
+        let conn = mem.connection();
+        let mut stmt = conn.prepare(
+            "SELECT key, content
+               FROM memories
+              WHERE narrative_filled = 0
+                AND narrative_failures < ?1
+                AND archived = 0
+                AND content != ''
+                AND created_at >= ?2
+                AND created_at <  ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![max_retries as i64, start_iso, end_iso],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        out
+    };
+
+    if candidates.is_empty() {
+        return Ok(DayBackfillReport::default());
+    }
+
+    // Build the JSON array the prompt template expects. We use the
+    // memory's `key` as the prompt's `memory_id` so the SLM round-trip
+    // gives us back the same identifier that `set_5w1h(key, ...)` needs.
+    let payload: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|(key, content)| {
+            serde_json::json!({
+                "memory_id": key,
+                "content": content,
+            })
+        })
+        .collect();
+    let payload_json = serde_json::to_string(&payload)?;
+
+    let date_label = date.format("%Y-%m-%d").to_string();
+    let (system, user) = build_diary_prompt(&date_label, &payload_json);
+
+    // Fixed low temperature — we want deterministic structured extraction,
+    // not creative writing. The SLM is just transcribing/structuring, not
+    // generating new content.
+    let response = provider
+        .chat_with_system(Some(&system), &user, model, 0.2)
+        .await?;
+    let parsed = parse_diary_response(&response);
+
+    // Apply each parsed entry; track which input keys were filled so the
+    // remainder can have their failure counter bumped.
+    let mut filled_keys = std::collections::HashSet::with_capacity(parsed.len());
+    let mut filled = 0usize;
+    for (memory_key, fields) in parsed {
+        match mem.set_5w1h(&memory_key, &fields) {
+            Ok(true) => {
+                filled += 1;
+                filled_keys.insert(memory_key);
+            }
+            Ok(false) => {
+                // Key didn't match a row — likely an SLM hallucination
+                // (made-up id). Don't count it; don't bump anyone.
+                tracing::debug!(
+                    memory_key,
+                    "diary backfill: SLM returned unknown memory_id, ignoring"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(memory_key, "diary backfill: set_5w1h failed: {e}");
+            }
+        }
+    }
+
+    let mut failed = 0usize;
+    for (key, _) in &candidates {
+        if !filled_keys.contains(key) {
+            if let Err(e) = mem.bump_narrative_failure(key) {
+                tracing::warn!(key, "diary backfill: bump_narrative_failure failed: {e}");
+            } else {
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(DayBackfillReport {
+        considered: candidates.len(),
+        filled,
+        failed,
+    })
+}
+
+/// Catch-up sweep: process every pending day from `state.last_completed_date + 1`
+/// through `local_yesterday(now_utc, tz_offset_secs)`, bounded by
+/// `max_catchup_days`. Persists `BackfillState` after each successful
+/// day so a mid-sweep crash resumes cleanly the next night.
+///
+/// Returns (days_processed, total_memories_filled). On the first SLM
+/// failure for a day, the sweep aborts so a single API outage doesn't
+/// cascade into N consecutive failure bumps for every memory of every
+/// pending day; the next cycle picks up where we left off.
+pub async fn run_diary_backfill_catchup(
+    mem: &SqliteMemory,
+    provider: &dyn Provider,
+    user_id: &str,
+    model: &str,
+    max_catchup_days: u32,
+    tz_offset_secs: i32,
+    now_utc: DateTime<Utc>,
+    default_start_date: NaiveDate,
+    max_retries: u32,
+) -> Result<(usize, usize)> {
+    let mut state = BackfillState::load_or_init(mem, user_id, default_start_date)?;
+    let yesterday = local_yesterday(now_utc, tz_offset_secs);
+    let pending = state.pending_days(yesterday, max_catchup_days);
+
+    if pending.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut days_done = 0usize;
+    let mut total_filled = 0usize;
+    let now_unix = now_utc.timestamp();
+
+    for day in pending {
+        match run_diary_backfill_for_day(mem, provider, day, tz_offset_secs, model, max_retries)
+            .await
+        {
+            Ok(report) => {
+                days_done += 1;
+                total_filled += report.filled;
+                state.last_completed_date = day;
+                state.cumulative_days = state.cumulative_days.saturating_add(1);
+                state.last_run_utc = Some(now_unix);
+                state.consecutive_failures = 0;
+                state.last_error = None;
+                if let Err(e) = state.save(mem, now_unix) {
+                    tracing::warn!("diary catchup: state.save failed: {e}");
+                }
+            }
+            Err(e) => {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                state.last_error = Some(format!("{e}"));
+                state.last_run_utc = Some(now_unix);
+                let _ = state.save(mem, now_unix);
+                tracing::warn!(
+                    day = %day,
+                    "diary catchup: aborting at day {day} after SLM failure: {e}"
+                );
+                break;
+            }
+        }
+    }
+
+    Ok((days_done, total_filled))
+}
+
 // ── Day-of-week / local date helpers ──────────────────────────────
 
 /// Return the local calendar date that is "yesterday" for the given
@@ -308,12 +520,58 @@ pub fn local_yesterday(now_utc: DateTime<Utc>, tz_offset_secs: i32) -> NaiveDate
 mod tests {
     use super::*;
     use crate::memory::traits::{Memory, MemoryCategory};
+    use crate::providers::traits::Provider;
+    use async_trait::async_trait;
     use chrono::TimeZone;
+    use std::sync::{Arc, Mutex};
 
     fn temp_mem() -> (tempfile::TempDir, SqliteMemory) {
         let tmp = tempfile::TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    /// Scriptable mock Provider — returns a queued response per call,
+    /// records the (system, user, model) tuple so tests can assert on
+    /// what the diary backfill actually sent to the SLM.
+    struct ScriptedProvider {
+        responses: Mutex<Vec<String>>,
+        calls: Arc<Mutex<Vec<(Option<String>, String, String)>>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(responses: Vec<&str>) -> (Self, Arc<Mutex<Vec<(Option<String>, String, String)>>>) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    responses: Mutex::new(responses.iter().map(|s| (*s).to_string()).collect()),
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.lock().unwrap().push((
+                system_prompt.map(String::from),
+                message.to_string(),
+                model.to_string(),
+            ));
+            let mut q = self.responses.lock().unwrap();
+            if q.is_empty() {
+                anyhow::bail!("scripted provider: no more queued responses");
+            }
+            Ok(q.remove(0))
+        }
     }
 
     #[test]
@@ -514,5 +772,333 @@ mod tests {
         let utc_now = Utc.with_ymd_and_hms(2026, 4, 12, 16, 30, 0).unwrap();
         let y = local_yesterday(utc_now, la_offset);
         assert_eq!(y, NaiveDate::from_ymd_opt(2026, 4, 11).unwrap());
+    }
+
+    // ── Provider-driven backfill tests ────────────────────────────
+
+    /// Insert a memory whose `created_at` is a specific UTC instant. The
+    /// public `store()` API stamps `created_at = Local::now()`, which we
+    /// can't control from a test, so we rewrite the column directly after
+    /// the row exists.
+    async fn insert_memory_at(
+        mem: &SqliteMemory,
+        key: &str,
+        content: &str,
+        created_at_utc: i64,
+    ) {
+        mem.store(key, content, MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let iso = DateTime::<Utc>::from_timestamp(created_at_utc, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let conn = mem.connection();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1 WHERE key = ?2",
+            rusqlite::params![iso, key],
+        )
+        .unwrap();
+    }
+
+    fn narrative_filled_for(mem: &SqliteMemory, key: &str) -> bool {
+        let conn = mem.connection();
+        let v: i64 = conn
+            .query_row(
+                "SELECT narrative_filled FROM memories WHERE key = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        v == 1
+    }
+
+    fn narrative_failures_for(mem: &SqliteMemory, key: &str) -> i64 {
+        let conn = mem.connection();
+        conn.query_row(
+            "SELECT narrative_failures FROM memories WHERE key = ?1",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn run_diary_backfill_for_day_fills_all_returned_entries() {
+        let (_tmp, mem) = temp_mem();
+        // Apr 12 2026 09:00 UTC == 18:00 local in Seoul (+9h). The local
+        // calendar date is 2026-04-12.
+        let utc_at = Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).unwrap().timestamp();
+        insert_memory_at(&mem, "memo_a", "오늘 골프 쳤음", utc_at).await;
+        insert_memory_at(&mem, "memo_b", "회사 미팅", utc_at + 1).await;
+
+        let scripted_response = serde_json::json!([
+            {
+                "memory_id": "memo_a",
+                "who_actor": "user",
+                "where_location": "제주 골프장",
+                "what_subject": "골프 라운딩",
+                "how_action": "친구들과 화기애애",
+                "narrative": "[2026-04-12 @ 제주] 골프"
+            },
+            {
+                "memory_id": "memo_b",
+                "who_actor": "user",
+                "what_subject": "분기 미팅",
+                "narrative": "[2026-04-12 @ 회사] 분기 미팅"
+            }
+        ])
+        .to_string();
+        let (provider, calls) = ScriptedProvider::new(vec![&scripted_response]);
+
+        let report = run_diary_backfill_for_day(
+            &mem,
+            &provider,
+            NaiveDate::from_ymd_opt(2026, 4, 12).unwrap(),
+            9 * 3600, // Seoul tz
+            "gemma-4-it",
+            DEFAULT_MAX_RETRIES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.considered, 2);
+        assert_eq!(report.filled, 2);
+        assert_eq!(report.failed, 0);
+        assert!(narrative_filled_for(&mem, "memo_a"));
+        assert!(narrative_filled_for(&mem, "memo_b"));
+
+        // Verify the SLM was called once with the 2026-04-12 date label.
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let (sys, user_msg, model) = &recorded[0];
+        assert!(sys.as_deref().unwrap_or("").contains("how_action"));
+        assert!(user_msg.contains("2026-04-12"));
+        assert!(user_msg.contains("memo_a"));
+        assert_eq!(model, "gemma-4-it");
+    }
+
+    #[tokio::test]
+    async fn run_diary_backfill_for_day_bumps_failure_for_missing_entries() {
+        let (_tmp, mem) = temp_mem();
+        let utc_at = Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).unwrap().timestamp();
+        insert_memory_at(&mem, "memo_a", "골프", utc_at).await;
+        insert_memory_at(&mem, "memo_b", "미팅", utc_at + 1).await;
+
+        // SLM only returned an entry for memo_a — memo_b should get its
+        // failure counter bumped.
+        let response = r#"[{"memory_id":"memo_a","narrative":"a"}]"#;
+        let (provider, _calls) = ScriptedProvider::new(vec![response]);
+
+        let report = run_diary_backfill_for_day(
+            &mem,
+            &provider,
+            NaiveDate::from_ymd_opt(2026, 4, 12).unwrap(),
+            9 * 3600,
+            "gemma-4-it",
+            DEFAULT_MAX_RETRIES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.considered, 2);
+        assert_eq!(report.filled, 1);
+        assert_eq!(report.failed, 1);
+        assert!(narrative_filled_for(&mem, "memo_a"));
+        assert!(!narrative_filled_for(&mem, "memo_b"));
+        assert_eq!(narrative_failures_for(&mem, "memo_b"), 1);
+        assert_eq!(narrative_failures_for(&mem, "memo_a"), 0);
+    }
+
+    #[tokio::test]
+    async fn run_diary_backfill_for_day_skips_already_filled_and_capped_rows() {
+        let (_tmp, mem) = temp_mem();
+        let utc_at = Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).unwrap().timestamp();
+        insert_memory_at(&mem, "memo_done", "이미 채워짐", utc_at).await;
+        insert_memory_at(&mem, "memo_capped", "이미 3번 실패", utc_at + 1).await;
+        insert_memory_at(&mem, "memo_fresh", "처리 대상", utc_at + 2).await;
+
+        // Pre-fill memo_done; bump memo_capped to threshold.
+        mem.set_5w1h(
+            "memo_done",
+            &Memory5W1H {
+                narrative: Some("done".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..DEFAULT_MAX_RETRIES {
+            mem.bump_narrative_failure("memo_capped").unwrap();
+        }
+
+        let response = r#"[{"memory_id":"memo_fresh","narrative":"f"}]"#;
+        let (provider, calls) = ScriptedProvider::new(vec![response]);
+
+        let report = run_diary_backfill_for_day(
+            &mem,
+            &provider,
+            NaiveDate::from_ymd_opt(2026, 4, 12).unwrap(),
+            9 * 3600,
+            "gemma-4-it",
+            DEFAULT_MAX_RETRIES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.considered, 1, "only memo_fresh should be in scope");
+        assert_eq!(report.filled, 1);
+        assert!(narrative_filled_for(&mem, "memo_fresh"));
+
+        // Provider was called exactly once, carrying only memo_fresh.
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let user_msg = &recorded[0].1;
+        assert!(user_msg.contains("memo_fresh"));
+        assert!(!user_msg.contains("memo_done"));
+        assert!(!user_msg.contains("memo_capped"));
+    }
+
+    #[tokio::test]
+    async fn run_diary_backfill_for_day_returns_empty_when_no_candidates() {
+        let (_tmp, mem) = temp_mem();
+        // No rows inserted for the target date.
+        let response = "[]";
+        let (provider, calls) = ScriptedProvider::new(vec![response]);
+
+        let report = run_diary_backfill_for_day(
+            &mem,
+            &provider,
+            NaiveDate::from_ymd_opt(2026, 4, 12).unwrap(),
+            9 * 3600,
+            "gemma-4-it",
+            DEFAULT_MAX_RETRIES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.considered, 0);
+        assert_eq!(report.filled, 0);
+        // SLM should NOT have been called since there were zero candidates.
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_diary_backfill_catchup_walks_pending_days_and_persists_state() {
+        let (_tmp, mem) = temp_mem();
+        // Three days of memories: Apr 10, 11, 12 (each at 09:00 UTC).
+        for (key, day) in [("d10", 10_i64), ("d11", 11), ("d12", 12)] {
+            let utc_at = Utc
+                .with_ymd_and_hms(2026, 4, day as u32, 9, 0, 0)
+                .unwrap()
+                .timestamp();
+            insert_memory_at(&mem, key, &format!("memo {key}"), utc_at).await;
+        }
+
+        // Three days × one row each = three SLM calls.
+        let r10 = r#"[{"memory_id":"d10","narrative":"x"}]"#;
+        let r11 = r#"[{"memory_id":"d11","narrative":"x"}]"#;
+        let r12 = r#"[{"memory_id":"d12","narrative":"x"}]"#;
+        let (provider, calls) = ScriptedProvider::new(vec![r10, r11, r12]);
+
+        // "now" = 2026-04-13 14:00 UTC, Seoul tz → local = 2026-04-13 23:00,
+        // local_yesterday = 2026-04-12. Default start = 2026-04-10 (so the
+        // first eligible day is 2026-04-10).
+        let now_utc = Utc.with_ymd_and_hms(2026, 4, 13, 14, 0, 0).unwrap();
+        let (days, filled) = run_diary_backfill_catchup(
+            &mem,
+            &provider,
+            "user_1",
+            "gemma-4-it",
+            DEFAULT_MAX_CATCHUP_DAYS,
+            9 * 3600,
+            now_utc,
+            NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(),
+            DEFAULT_MAX_RETRIES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(days, 3);
+        assert_eq!(filled, 3);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert!(narrative_filled_for(&mem, "d10"));
+        assert!(narrative_filled_for(&mem, "d11"));
+        assert!(narrative_filled_for(&mem, "d12"));
+
+        // BackfillState should now point at Apr 12 (== local_yesterday).
+        let reloaded = BackfillState::load_or_init(
+            &mem,
+            "user_1",
+            NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reloaded.last_completed_date,
+            NaiveDate::from_ymd_opt(2026, 4, 12).unwrap()
+        );
+        assert_eq!(reloaded.cumulative_days, 3);
+        assert_eq!(reloaded.consecutive_failures, 0);
+
+        // Re-running catchup immediately is a no-op — state is current.
+        let (provider2, _) = ScriptedProvider::new(vec![]);
+        let (days2, filled2) = run_diary_backfill_catchup(
+            &mem,
+            &provider2,
+            "user_1",
+            "gemma-4-it",
+            DEFAULT_MAX_CATCHUP_DAYS,
+            9 * 3600,
+            now_utc,
+            NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(),
+            DEFAULT_MAX_RETRIES,
+        )
+        .await
+        .unwrap();
+        assert_eq!(days2, 0);
+        assert_eq!(filled2, 0);
+    }
+
+    #[tokio::test]
+    async fn run_diary_backfill_catchup_aborts_on_provider_failure_and_records_error() {
+        let (_tmp, mem) = temp_mem();
+        let utc_at = Utc.with_ymd_and_hms(2026, 4, 11, 9, 0, 0).unwrap().timestamp();
+        insert_memory_at(&mem, "d11", "memo", utc_at).await;
+        insert_memory_at(
+            &mem,
+            "d12",
+            "memo",
+            Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).unwrap().timestamp(),
+        )
+        .await;
+
+        // Empty queue → first chat_with_system call errors out.
+        let (provider, _) = ScriptedProvider::new(vec![]);
+        let now_utc = Utc.with_ymd_and_hms(2026, 4, 13, 14, 0, 0).unwrap();
+        let (days, filled) = run_diary_backfill_catchup(
+            &mem,
+            &provider,
+            "user_1",
+            "gemma-4-it",
+            DEFAULT_MAX_CATCHUP_DAYS,
+            9 * 3600,
+            now_utc,
+            NaiveDate::from_ymd_opt(2026, 4, 11).unwrap(),
+            DEFAULT_MAX_RETRIES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(days, 0, "abort before completing any day");
+        assert_eq!(filled, 0);
+
+        // Failure was recorded in BackfillState.
+        let reloaded = BackfillState::load_or_init(
+            &mem,
+            "user_1",
+            NaiveDate::from_ymd_opt(2026, 4, 11).unwrap(),
+        )
+        .unwrap();
+        assert!(reloaded.consecutive_failures >= 1);
+        assert!(reloaded.last_error.is_some());
     }
 }
