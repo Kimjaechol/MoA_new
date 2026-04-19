@@ -28,6 +28,7 @@ pub mod gemma_simul;
 pub mod kokoro_tts;
 pub mod openai_realtime;
 pub mod pipeline;
+pub mod secretary_migrator;
 pub mod simul;
 pub mod simul_session;
 pub mod tts_engine;
