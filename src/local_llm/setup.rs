@@ -22,13 +22,13 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::host_probe::{self, HardwareProfile, Tier};
+use crate::host_probe::{self, GpuType, HardwareProfile, Tier};
 use crate::local_llm::installer::{
     self, detect_install_method, install_ollama, is_ollama_installed, InstallMethod,
     InstallProgress,
 };
 use crate::local_llm::{
-    is_ollama_running, pull_model, LocalLlmConfig, PullProgress, DEFAULT_OLLAMA_URL,
+    is_installed, is_ollama_running, pull_model, LocalLlmConfig, PullProgress, DEFAULT_OLLAMA_URL,
 };
 
 /// Minimum free disk space before setup is allowed to start (MB).
@@ -118,11 +118,19 @@ pub struct SetupReport {
     pub ollama_installed_now: bool,
     /// Number of pull attempts until the first success.
     pub pull_attempts: u32,
+    /// Whether the hardware probe produced a real snapshot. When `false`,
+    /// [`Self::profile`] is a synthesized fallback that forced `T2E4B`.
+    pub probe_succeeded: bool,
     /// Path where the hardware profile was written.
     pub hardware_profile_path: PathBuf,
     /// Path where the local-LLM config was written.
     pub local_llm_config_path: PathBuf,
 }
+
+/// Default local-LLM tag used when hardware detection fails or
+/// [`ensure_ready`] synthesizes a fallback decision. Matches
+/// `fallback_registry.rs` so the two agree on the same tag.
+pub const DEFAULT_FALLBACK_TAG: &str = "gemma4:e4b";
 
 /// Progress callbacks. Keep them `FnMut` so callers can accumulate into their
 /// own buffers without an extra `Arc<Mutex<_>>` layer.
@@ -155,11 +163,16 @@ pub async fn run_setup(
         .unwrap_or(DEFAULT_OLLAMA_URL)
         .to_string();
 
-    // 1. Probe host hardware.
+    // 1. Probe host hardware. A probe failure MUST NOT abort setup — the
+    //    on-device Gemma 4 path is a hard requirement for MoA chat, so we
+    //    synthesize a conservative profile (T2 E4B) and keep going. The
+    //    caller sees `probe_succeeded = false` in the final report so a UI
+    //    can show a "hardware detection failed — using default" badge.
     (callbacks.on_stage)(SetupStage::Probing);
-    let profile = host_probe::probe(opts.conservative_downgrade)
-        .await
-        .context("host hardware probe failed")?;
+    let (profile, probe_succeeded) = match host_probe::probe(opts.conservative_downgrade).await {
+        Ok(p) => (p, true),
+        Err(_) => (fallback_profile(), false),
+    };
 
     // Pick the tier. Respect an explicit override from the UI, otherwise use
     // the probe's recommendation, subject to the mobile T1/T2 cap.
@@ -222,9 +235,34 @@ pub async fn run_setup(
         model_tag: tag,
         ollama_installed_now,
         pull_attempts,
+        probe_succeeded,
         hardware_profile_path,
         local_llm_config_path,
     })
+}
+
+/// Synthesize a conservative [`HardwareProfile`] when real probing fails.
+///
+/// The caller [`run_setup`] always maps this through [`select_tier`], so the
+/// mobile cap still applies on iOS/Android hosts (probe failure on a phone
+/// still yields `T2E4B`, matching the §2.2 mobile constraint).
+fn fallback_profile() -> HardwareProfile {
+    HardwareProfile {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        total_ram_mb: 0,
+        available_ram_mb: 0,
+        cpu_cores: std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1),
+        gpu: GpuType::None,
+        // Zero is the sentinel for "unknown" — `check_disk` already treats it
+        // as a pass-through rather than a hard stop.
+        disk_free_mb: 0,
+        recommended_tier: Tier::T2E4B,
+        downgraded: false,
+        probed_at: chrono::Utc::now().to_rfc3339(),
+    }
 }
 
 /// Enforce the `T1|T2` mobile cap and honour caller overrides.
@@ -331,6 +369,134 @@ async fn pull_with_retries(
 // Re-export for callers who build `SetupCallbacks` with default no-ops.
 pub use installer::InstallProgress as InstallerProgress;
 
+// ── ensure_ready: idempotent bootstrap for app startup ──────────────────
+
+/// Outcome of [`ensure_ready`]. Lets callers show a user-visible banner
+/// only on the first-install path and stay silent on warm starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EnsureOutcome {
+    /// `~/.moa/local_llm.toml` already existed and the configured model was
+    /// already pulled into Ollama. No work was done.
+    AlreadyReady {
+        /// Ollama tag MoA will use (from the persisted config).
+        model: String,
+    },
+    /// The daemon was reachable but the configured model was missing, so
+    /// only the pull step ran. Ollama runtime was not re-installed.
+    ModelPulled {
+        /// Ollama tag that was pulled.
+        model: String,
+    },
+    /// Full first-time setup ran: Ollama was installed and/or the model
+    /// was pulled and config files were written.
+    Installed {
+        /// The finished setup report.
+        report: Box<SetupReport>,
+    },
+}
+
+impl EnsureOutcome {
+    /// Whether any actual work was done (install or pull). Callers use this
+    /// to decide if they should show a success toast.
+    pub fn did_work(&self) -> bool {
+        !matches!(self, EnsureOutcome::AlreadyReady { .. })
+    }
+
+    /// Final Ollama tag MoA will route local requests to.
+    pub fn model_tag(&self) -> &str {
+        match self {
+            EnsureOutcome::AlreadyReady { model } | EnsureOutcome::ModelPulled { model } => model,
+            EnsureOutcome::Installed { report } => &report.model_tag,
+        }
+    }
+}
+
+/// Idempotent startup hook: guarantee that the on-device Gemma 4 path is
+/// ready before MoA tries to use it.
+///
+/// Semantics:
+/// * **Fast path** — if `~/.moa/local_llm.toml` exists, the Ollama daemon is
+///   reachable at `base_url`, and the configured model is already pulled,
+///   return [`EnsureOutcome::AlreadyReady`] without touching the network.
+/// * **Pull-only path** — if config exists and the daemon is up but the
+///   tagged model is missing, only run the pull step with exponential
+///   backoff and return [`EnsureOutcome::ModelPulled`].
+/// * **Full setup path** — otherwise run the complete [`run_setup`] flow
+///   (probe → disk check → install Ollama → wait for daemon → pull model →
+///   persist config) and return [`EnsureOutcome::Installed`].
+///
+/// Callers pass `callbacks` so the same function can drive a CLI spinner,
+/// a Tauri event stream, or stay silent via [`silent_callbacks`].
+pub async fn ensure_ready(
+    base_url: &str,
+    callbacks: &mut SetupCallbacks<'_>,
+) -> Result<EnsureOutcome> {
+    // ── Fast path: persisted config + daemon up + model installed ──
+    if let Ok(cfg_path) = LocalLlmConfig::default_path() {
+        if cfg_path.exists() {
+            if let Ok(cfg) = LocalLlmConfig::load(&cfg_path).await {
+                if is_ollama_running(base_url).await
+                    && is_installed(base_url, &cfg.default_model)
+                        .await
+                        .unwrap_or(false)
+                {
+                    return Ok(EnsureOutcome::AlreadyReady {
+                        model: cfg.default_model,
+                    });
+                }
+
+                // ── Pull-only path: daemon is up, model is missing ──
+                if is_ollama_running(base_url).await {
+                    let attempts = pull_with_retries(base_url, &cfg.default_model, callbacks)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "model pull for already-configured tag `{}` failed",
+                                cfg.default_model
+                            )
+                        })?;
+                    let _ = attempts; // Retained in the `pull_with_retries` return for tests.
+                    return Ok(EnsureOutcome::ModelPulled {
+                        model: cfg.default_model,
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Full setup path ──
+    let opts = SetupOptions {
+        base_url: Some(base_url.to_string()),
+        // try_start_daemon is intentionally false on the ensure path: the
+        // platform installer (Ollama.app on macOS, OllamaSetup.exe on
+        // Windows, systemd unit on Linux) is expected to manage the daemon.
+        // Flipping this to true would fork an `ollama serve` the app cannot
+        // reap cleanly on shutdown.
+        ..SetupOptions::default()
+    };
+    let report = run_setup(opts, callbacks).await?;
+    Ok(EnsureOutcome::Installed {
+        report: Box::new(report),
+    })
+}
+
+/// Run [`ensure_ready`] with every callback dropped on the floor.
+///
+/// Convenience wrapper for background contexts (Tauri `setup()` hook,
+/// headless daemons) that don't surface progress. Prefer [`ensure_ready`]
+/// with real callbacks when the caller has a UI to drive.
+pub async fn ensure_ready_silent(base_url: &str) -> Result<EnsureOutcome> {
+    let mut stage_sink: fn(SetupStage) = |_| {};
+    let mut install_sink: fn(InstallProgress) = |_| {};
+    let mut pull_sink: fn(PullProgress) = |_| {};
+    let mut callbacks = SetupCallbacks {
+        on_stage: &mut stage_sink,
+        on_install_progress: &mut install_sink,
+        on_pull_progress: &mut pull_sink,
+    };
+    ensure_ready(base_url, &mut callbacks).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +598,43 @@ mod tests {
         // Sanity: we waited roughly the configured timeout (allow +/- 5s slack
         // for slow CI). Lower bound is what matters — we must not return fast.
         assert!(start.elapsed() >= DAEMON_READY_TIMEOUT.saturating_sub(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn fallback_profile_targets_e4b_and_carries_current_os() {
+        let p = fallback_profile();
+        assert_eq!(p.recommended_tier, Tier::T2E4B);
+        assert_eq!(p.disk_free_mb, 0, "unknown sentinel so disk gate passes");
+        assert_eq!(p.total_ram_mb, 0);
+        assert!(!p.os.is_empty(), "OS must be populated from the host");
+        assert!(!p.probed_at.is_empty());
+    }
+
+    #[test]
+    fn fallback_profile_on_phone_keeps_e4b_after_mobile_cap() {
+        // select_tier must NOT upgrade the fallback past E4B even if the OS
+        // is iOS/Android. E4B is already the mobile ceiling.
+        let mut p = fallback_profile();
+        p.os = "iOS".to_string();
+        assert_eq!(select_tier(&p, None), Tier::T2E4B);
+        p.os = "Android".to_string();
+        assert_eq!(select_tier(&p, None), Tier::T2E4B);
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_silent_returns_fast_when_daemon_unreachable_but_no_config() {
+        // Point at a closed port and make sure we surface the underlying
+        // install/wait failure rather than hanging. The exact error depends
+        // on whether Ollama is installed on the test host, but the call
+        // must terminate.
+        let base = "http://127.0.0.1:1";
+        let result =
+            tokio::time::timeout(Duration::from_secs(90), ensure_ready_silent(base)).await;
+        assert!(
+            result.is_ok(),
+            "ensure_ready_silent should not hang beyond the daemon-wait budget"
+        );
+        // We don't assert Ok vs Err here because CI hosts without network
+        // will Err, while a fresh host with Ollama installed may succeed.
     }
 }

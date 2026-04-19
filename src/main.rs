@@ -1044,6 +1044,7 @@ async fn main() -> Result<()> {
             compact_context,
             memory_backend,
         } => {
+            maybe_auto_bootstrap_local_llm("agent").await;
             if let Some(level) = autonomy_level {
                 config.autonomy.level = level;
             }
@@ -1085,6 +1086,7 @@ async fn main() -> Result<()> {
             host,
             new_pairing,
         } => {
+            maybe_auto_bootstrap_local_llm("gateway").await;
             if new_pairing {
                 // Persist token reset from raw config so env-derived overrides are not written to disk.
                 let mut persisted_config = Config::load_or_init().await?;
@@ -1104,6 +1106,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            maybe_auto_bootstrap_local_llm("daemon").await;
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -1608,6 +1611,109 @@ async fn run_setup_local_llm(
         report.local_llm_config_path.display()
     );
     Ok(())
+}
+
+/// Environment variable consulted by [`maybe_auto_bootstrap_local_llm`].
+/// Set to a non-empty value (e.g. `1`, `true`) to skip the first-launch
+/// auto-install. Useful in CI and in tests that spin up the gateway
+/// without wanting to touch the network.
+const AUTO_BOOTSTRAP_SKIP_ENV: &str = "ZEROCLAW_SKIP_LOCAL_LLM_BOOTSTRAP";
+
+/// First-launch hook fired from every command that actually serves users
+/// (`agent`, `gateway`, `daemon`). Guarantees the on-device Gemma 4 path
+/// is ready — if it is already installed this returns fast, otherwise it
+/// runs the full installer + pull silently in the foreground so the user
+/// sees the app "take a minute on first start" rather than a cryptic
+/// routing failure later.
+///
+/// Non-fatal by design: if install/pull fails (e.g. offline, unsupported
+/// OS), we log a warning and let the command proceed. A user with a valid
+/// BYOK API key can still chat via the cloud path; the local fallback
+/// simply won't arm until the next launch succeeds.
+async fn maybe_auto_bootstrap_local_llm(command_name: &str) {
+    if std::env::var_os(AUTO_BOOTSTRAP_SKIP_ENV).is_some_and(|v| !v.is_empty()) {
+        tracing::debug!(
+            command = command_name,
+            env = AUTO_BOOTSTRAP_SKIP_ENV,
+            "skipping local-LLM auto-bootstrap (env opt-out set)"
+        );
+        return;
+    }
+
+    use local_llm::setup::{ensure_ready, EnsureOutcome, SetupCallbacks, SetupStage};
+    use local_llm::DEFAULT_OLLAMA_URL;
+
+    let mut stage_printed_header = false;
+    let mut on_stage = |stage: SetupStage| {
+        if !stage_printed_header {
+            eprintln!();
+            eprintln!("🦙 First-launch setup: preparing the on-device Gemma 4 model…");
+            eprintln!("   (this runs once; skip with {AUTO_BOOTSTRAP_SKIP_ENV}=1)");
+            stage_printed_header = true;
+        }
+        match stage {
+            SetupStage::Probing => eprintln!("   · probing hardware"),
+            SetupStage::CheckingDisk => eprintln!("   · checking free disk"),
+            SetupStage::InstallingOllama => eprintln!("   · installing Ollama runtime"),
+            SetupStage::WaitingForDaemon => eprintln!("   · waiting for Ollama daemon"),
+            SetupStage::PullingModel { attempt } => {
+                eprintln!("   · pulling Gemma 4 model (attempt {attempt})");
+            }
+            SetupStage::Persisting => eprintln!("   · saving local-LLM config"),
+            SetupStage::Done => {}
+        }
+    };
+    let mut on_install = |_: local_llm::installer::InstallProgress| {};
+    let mut on_pull = |p: local_llm::PullProgress| {
+        if let Some(frac) = p.fraction() {
+            // Only print the milestone every 25 % to keep stderr readable.
+            let pct = (frac * 100.0) as u32;
+            if pct == 25 || pct == 50 || pct == 75 {
+                eprintln!("   · pull progress: {pct}%");
+            }
+        }
+    };
+
+    let mut callbacks = SetupCallbacks {
+        on_stage: &mut on_stage,
+        on_install_progress: &mut on_install,
+        on_pull_progress: &mut on_pull,
+    };
+
+    match ensure_ready(DEFAULT_OLLAMA_URL, &mut callbacks).await {
+        Ok(EnsureOutcome::AlreadyReady { model }) => {
+            tracing::debug!(
+                command = command_name,
+                %model,
+                "local-LLM already installed — skipping bootstrap"
+            );
+        }
+        Ok(EnsureOutcome::ModelPulled { model }) => {
+            eprintln!("✅ Local Gemma 4 model is ready: {model}");
+        }
+        Ok(EnsureOutcome::Installed { report }) => {
+            eprintln!(
+                "✅ Local Gemma 4 model is ready: {}{}",
+                report.model_tag,
+                if report.probe_succeeded {
+                    ""
+                } else {
+                    " (hardware detection unavailable — default tier used)"
+                }
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                command = command_name,
+                error = %format!("{e:#}"),
+                "local-LLM auto-bootstrap failed; continuing without on-device fallback"
+            );
+            eprintln!(
+                "⚠️  Local Gemma 4 setup failed: {e:#}\n\
+                 (MoA will still work with a cloud API key; rerun `zeroclaw setup local-llm` to retry.)"
+            );
+        }
+    }
 }
 
 /// Keys whose values are masked in `config show` / `config get` output.
