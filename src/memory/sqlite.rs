@@ -1,3 +1,4 @@
+use super::cross_recall as cross_recall_mod;
 use super::embeddings::EmbeddingProvider;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
@@ -1605,6 +1606,147 @@ impl SqliteMemory {
             params![key],
         )?;
         Ok(())
+    }
+
+    // ── Q1 Commit #10 — 5-dimensional cross-recall ───────────────
+
+    /// Fan a query across the five First-Brain search dimensions and fuse
+    /// the per-dim rankings via Reciprocal Rank Fusion. See
+    /// [`cross_recall`](super::cross_recall) for the dimension catalogue
+    /// and the profile-selection rules.
+    ///
+    /// The vector dimension is silently skipped when [`Self::embedder_is_active`]
+    /// returns `false` (mobile / `NoopEmbedding` deployments). The four
+    /// remaining text dimensions still produce a usable ranking because
+    /// the Dream Cycle has already distilled raw turns into narrative,
+    /// 5W1H, and wiki pages.
+    pub async fn cross_recall(
+        &self,
+        query: &str,
+        limit: usize,
+        profile: cross_recall_mod::RecallProfile,
+    ) -> anyhow::Result<Vec<cross_recall_mod::CrossRecallResult>> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let resolved = cross_recall_mod::resolve_profile(profile, self.embedder_is_active());
+
+        // Vector dim needs the query embedding BEFORE we drop into the
+        // blocking section; mobile profile skips it entirely so callers
+        // with no embedder (or stub one) pay zero cost.
+        let query_embedding = match resolved {
+            cross_recall_mod::RecallProfile::Desktop => {
+                self.get_or_compute_embedding(trimmed).await?
+            }
+            cross_recall_mod::RecallProfile::Mobile => None,
+            cross_recall_mod::RecallProfile::Auto => {
+                unreachable!("resolve_profile always returns Mobile or Desktop")
+            }
+        };
+
+        let conn = self.conn.clone();
+        let q_owned = trimmed.to_string();
+        let lim = limit.max(1);
+        let depth = cross_recall_mod::per_dim_depth(lim);
+
+        let results: anyhow::Result<Vec<cross_recall_mod::CrossRecallResult>> =
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.lock();
+
+                // Fan-out — each dim is independent and tolerant to its own
+                // failure (returns empty list); we never let one dim's
+                // misconfiguration kill the whole query.
+                let raw = cross_recall_mod::dim_raw_fts(&conn, &q_owned, depth)
+                    .unwrap_or_default();
+                let narrative = cross_recall_mod::dim_narrative_fts(&conn, &q_owned, depth)
+                    .unwrap_or_default();
+                let wiki = cross_recall_mod::dim_wiki_bfs(&conn, &q_owned, depth)
+                    .unwrap_or_default();
+                let structured = cross_recall_mod::dim_structured_fts(&conn, &q_owned, depth)
+                    .unwrap_or_default();
+                let vector = match query_embedding {
+                    Some(ref qe) => cross_recall_mod::dim_vector(&conn, qe, depth)
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+
+                let fused = cross_recall_mod::fuse_five_way(
+                    &raw, &narrative, &wiki, &structured, &vector, lim,
+                );
+                if fused.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                // Hydrate full MemoryEntry rows in one shot.
+                let placeholders: String = (1..=fused.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT id, key, content, category, created_at, session_id,
+                            recall_count, last_recalled
+                       FROM memories WHERE id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = fused
+                    .iter()
+                    .map(|f| Box::new(f.id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                    .collect();
+                let p_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    id_params.iter().map(AsRef::as_ref).collect();
+                let rows = stmt.query_map(p_refs.as_slice(), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, i64>(6).unwrap_or(0),
+                        r.get::<_, Option<String>>(7).ok().flatten(),
+                    ))
+                })?;
+
+                let mut by_id: std::collections::HashMap<
+                    String,
+                    (String, String, String, String, Option<String>, i64, Option<String>),
+                > = std::collections::HashMap::with_capacity(fused.len());
+                for row in rows {
+                    let (id, key, content, cat, ts, sid, rc, lr) = row?;
+                    by_id.insert(id, (key, content, cat, ts, sid, rc, lr));
+                }
+
+                let mut out = Vec::with_capacity(fused.len());
+                for fused_row in fused {
+                    if let Some((key, content, cat, ts, sid, rc, lr)) =
+                        by_id.remove(&fused_row.id)
+                    {
+                        let entry = MemoryEntry {
+                            id: fused_row.id.clone(),
+                            key,
+                            content,
+                            category: Self::str_to_category(&cat),
+                            timestamp: ts,
+                            session_id: sid,
+                            score: Some(f64::from(fused_row.final_score)),
+                            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                            recall_count: rc.max(0) as u32,
+                            last_recalled: lr,
+                        };
+                        out.push(cross_recall_mod::CrossRecallResult {
+                            entry,
+                            final_score: fused_row.final_score,
+                            dim_scores: fused_row.dims,
+                        });
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("cross_recall blocking task panicked: {e}"))?;
+
+        results
     }
 
     // ── Q1 Commit #7 tiered storage helpers ──────────────────────
