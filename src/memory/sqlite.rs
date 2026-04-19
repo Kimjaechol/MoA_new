@@ -664,18 +664,40 @@ impl SqliteMemory {
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
-            "-- Core memories table
+            "-- Core memories table.
+            -- 5W1H columns (who/when/where/what/how/why + narrative) are populated
+            -- by the nightly Dream-Cycle diary backfill job; raw chat content stays
+            -- in `content` until the 72-hour retention window passes.
             CREATE TABLE IF NOT EXISTS memories (
-                id          TEXT PRIMARY KEY,
-                key         TEXT NOT NULL UNIQUE,
-                content     TEXT NOT NULL,
-                category    TEXT NOT NULL DEFAULT 'core',
-                embedding   BLOB,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
+                id              TEXT PRIMARY KEY,
+                key             TEXT NOT NULL UNIQUE,
+                content         TEXT NOT NULL,
+                category        TEXT NOT NULL DEFAULT 'core',
+                embedding       BLOB,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                -- 5W1H structured fields
+                who_actor       TEXT,
+                who_target      TEXT,
+                when_at         INTEGER,
+                when_at_hlc     TEXT,
+                where_location  TEXT,
+                where_geohash   TEXT,
+                what_subject    TEXT,
+                how_action      TEXT,
+                why_reason      TEXT,
+                narrative       TEXT,
+                narrative_filled INTEGER NOT NULL DEFAULT 0,
+                narrative_failures INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memories_when_at ON memories(when_at)
+                WHERE when_at IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_memories_where_geohash ON memories(where_geohash)
+                WHERE where_geohash IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_memories_narrative_pending
+                ON memories(created_at) WHERE narrative_filled = 0;
             -- Note: no explicit index on `key` — the UNIQUE constraint already
             -- creates an implicit unique B-tree index, so a second one would
             -- waste space and slow inserts.
@@ -786,6 +808,93 @@ impl SqliteMemory {
                      ON memories(decay_score) WHERE archived = 0;",
             )?;
         }
+
+        // ── Q1 5W1H Migration — add diary fields to pre-existing DBs ─
+        // The CREATE TABLE above already includes these for new DBs.
+        // For migrating test DBs created before this change, ALTER in each
+        // column individually so partial upgrades are safe to re-run.
+        let add_cols: &[(&str, &str)] = &[
+            ("who_actor", "TEXT"),
+            ("who_target", "TEXT"),
+            ("when_at", "INTEGER"),
+            ("when_at_hlc", "TEXT"),
+            ("where_location", "TEXT"),
+            ("where_geohash", "TEXT"),
+            ("what_subject", "TEXT"),
+            ("how_action", "TEXT"),
+            ("why_reason", "TEXT"),
+            ("narrative", "TEXT"),
+            ("narrative_filled", "INTEGER NOT NULL DEFAULT 0"),
+            ("narrative_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ];
+        for (col, ty) in add_cols {
+            if !memories_sql.contains(col) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE memories ADD COLUMN {col} {ty};"
+                ))?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_when_at ON memories(when_at)
+                 WHERE when_at IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_memories_where_geohash ON memories(where_geohash)
+                 WHERE where_geohash IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_memories_narrative_pending
+                 ON memories(created_at) WHERE narrative_filled = 0;",
+        )?;
+
+        // Narrative FTS5 — separate virtual table dedicated to 5W1H-structured
+        // search. Kept separate from `memories_fts` (which indexes raw `content`)
+        // so that cross-search disambiguation can score against Dream-Cycle-
+        // distilled narratives without noise from unprocessed raw text.
+        // Trigram tokenizer matches `memories_fts` for Korean morphology.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memories_narrative_fts USING fts5(
+                narrative, who_target, what_subject, how_action, why_reason,
+                content='memories', content_rowid=rowid,
+                tokenize='trigram'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS memories_narrative_ai
+            AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_narrative_fts(
+                    rowid, narrative, who_target, what_subject, how_action, why_reason
+                ) VALUES (
+                    new.rowid, new.narrative, new.who_target,
+                    new.what_subject, new.how_action, new.why_reason
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memories_narrative_ad
+            AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_narrative_fts(
+                    memories_narrative_fts, rowid,
+                    narrative, who_target, what_subject, how_action, why_reason
+                ) VALUES (
+                    'delete', old.rowid,
+                    old.narrative, old.who_target,
+                    old.what_subject, old.how_action, old.why_reason
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memories_narrative_au
+            AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_narrative_fts(
+                    memories_narrative_fts, rowid,
+                    narrative, who_target, what_subject, how_action, why_reason
+                ) VALUES (
+                    'delete', old.rowid,
+                    old.narrative, old.who_target,
+                    old.what_subject, old.how_action, old.why_reason
+                );
+                INSERT INTO memories_narrative_fts(
+                    rowid, narrative, who_target, what_subject, how_action, why_reason
+                ) VALUES (
+                    new.rowid, new.narrative, new.who_target,
+                    new.what_subject, new.how_action, new.why_reason
+                );
+            END;",
+        )?;
 
         // PR #6 — consolidated semantic facts. Each row is the LLM-summary
         // of a cluster of near-duplicate memories; source_ids is a JSON
@@ -1269,6 +1378,61 @@ impl SqliteMemory {
         }
 
         Ok(count)
+    }
+
+    // ── Q1 5W1H diary fields ─────────────────────────────────────
+
+    /// Write the Dream-Cycle-extracted 5W1H fields and canonical narrative
+    /// for a memory. Any field left as `None` is left untouched — this is an
+    /// UPDATE, not a REPLACE, so partial backfills are safe.
+    ///
+    /// On success, marks `narrative_filled = 1` if `fields.narrative.is_some()`
+    /// so the nightly backfill sweep skips this row on subsequent runs.
+    pub fn set_5w1h(&self, key: &str, fields: &Memory5W1H) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE memories SET
+                who_actor      = COALESCE(?1,  who_actor),
+                who_target     = COALESCE(?2,  who_target),
+                when_at        = COALESCE(?3,  when_at),
+                when_at_hlc    = COALESCE(?4,  when_at_hlc),
+                where_location = COALESCE(?5,  where_location),
+                where_geohash  = COALESCE(?6,  where_geohash),
+                what_subject   = COALESCE(?7,  what_subject),
+                how_action     = COALESCE(?8,  how_action),
+                why_reason     = COALESCE(?9,  why_reason),
+                narrative      = COALESCE(?10, narrative),
+                narrative_filled = CASE
+                    WHEN ?10 IS NOT NULL THEN 1
+                    ELSE narrative_filled
+                END
+             WHERE key = ?11",
+            params![
+                fields.who_actor,
+                fields.who_target,
+                fields.when_at,
+                fields.when_at_hlc,
+                fields.where_location,
+                fields.where_geohash,
+                fields.what_subject,
+                fields.how_action,
+                fields.why_reason,
+                fields.narrative,
+                key,
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Increment the narrative backfill failure counter for a memory.
+    /// Used by the Dream-Cycle retry policy.
+    pub fn bump_narrative_failure(&self, key: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE memories SET narrative_failures = narrative_failures + 1 WHERE key = ?1",
+            params![key],
+        )?;
+        Ok(())
     }
 
     // ── v3.0 Compiled Truth + Timeline methods ───────────────────
@@ -1921,6 +2085,36 @@ fn dedup_ranked_list(items: &[(String, f32)]) -> Vec<(String, f32)> {
     let mut result: Vec<(String, f32)> = best.into_iter().collect();
     result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     result
+}
+
+/// Q1 5W1H diary fields written by the nightly Dream-Cycle SLM.
+///
+/// All fields are `Option<T>` so the backfill job can fill them incrementally.
+/// `narrative` is the canonical diary-format sentence used for vector embedding
+/// and FTS5 semantic search (format: `"[YYYY-MM-DD HH:MM @ <location>] <actor>
+/// <target>와(과) <subject>를 <action> — <reason>"`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Memory5W1H {
+    /// 행위자 (일반적으로 "user"; 전화 수신 등은 상대방일 수 있음).
+    pub who_actor: Option<String>,
+    /// 대상 — JSON array of strings (여러 명 가능, 순서 보존).
+    pub who_target: Option<String>,
+    /// 사건 발생 unix 시각 (created_at 과 다름: 사건의 시점).
+    pub when_at: Option<i64>,
+    /// HLC stamp for cross-device ordering.
+    pub when_at_hlc: Option<String>,
+    /// 장소 문자열 (free text; e.g. "제주 ** 골프장").
+    pub where_location: Option<String>,
+    /// Geohash (5-char default; ~5km precision) for spatial disambiguation.
+    pub where_geohash: Option<String>,
+    /// 무엇을 (사건/주제).
+    pub what_subject: Option<String>,
+    /// 어떻게 했나 (액션 상세).
+    pub how_action: Option<String>,
+    /// 왜 (맥락·동기).
+    pub why_reason: Option<String>,
+    /// 일기장 스타일 canonical 서술문 (임베딩 대상).
+    pub narrative: Option<String>,
 }
 
 /// PR #6 — row returned by `list_archived` for the archive UI.
@@ -4104,6 +4298,141 @@ mod tests {
 
         // Content SHA256 should be populated
         assert!(!timeline[0].content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_5w1h_roundtrip_and_narrative_fts() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "diary_golf",
+            "지난주 김필순 김말똥 이운이랑 제주 ** 골프장 가서 18홀 라운딩. 샷 45타.",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Before backfill: narrative_filled = 0, narrative NULL.
+        {
+            let conn = mem.conn.lock();
+            let (filled, narrative): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT narrative_filled, narrative FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(filled, 0);
+            assert!(narrative.is_none());
+        }
+
+        // Simulate Dream-Cycle SLM extraction.
+        let fields = Memory5W1H {
+            who_actor: Some("user".to_string()),
+            who_target: Some(r#"["김필순","김말똥","이운"]"#.to_string()),
+            when_at: Some(1_744_000_000),
+            where_location: Some("제주 ** 골프장".to_string()),
+            where_geohash: Some("wy74b".to_string()),
+            what_subject: Some("친목 골프 라운딩".to_string()),
+            how_action: Some("18홀 완주, 샷 45타".to_string()),
+            why_reason: Some("사교·휴식".to_string()),
+            narrative: Some(
+                "[2026-04-07 09:00 @ 제주 ** 골프장] 이용자가 김필순·김말똥·이운과 \
+                 골프 18홀을 라운딩했다 (샷 45타) — 친목 모임"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        assert!(mem.set_5w1h("diary_golf", &fields).unwrap());
+
+        // After backfill: narrative_filled = 1, columns populated.
+        {
+            let conn = mem.conn.lock();
+            let (filled, narrative, actor, geo): (i64, String, String, String) = conn
+                .query_row(
+                    "SELECT narrative_filled, narrative, who_actor, where_geohash
+                     FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(filled, 1);
+            assert!(narrative.contains("제주 ** 골프장"));
+            assert_eq!(actor, "user");
+            assert_eq!(geo, "wy74b");
+        }
+
+        // Narrative FTS5 virtual table should now find it by a keyword from `narrative`.
+        {
+            let conn = mem.conn.lock();
+            // First confirm the narrative is actually stored on the base row.
+            let stored_narrative: String = conn
+                .query_row(
+                    "SELECT narrative FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(stored_narrative.contains("골프"));
+
+            // Count rows in narrative FTS5 shadow index (should match base rows with narrative).
+            let total_fts: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memories_narrative_fts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                total_fts, 1,
+                "narrative FTS5 should contain exactly one row after UPDATE trigger"
+            );
+
+            // trigram tokenizer needs 3-byte ngrams — use a 3-char search phrase.
+            let hit_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories_narrative_fts
+                     WHERE memories_narrative_fts MATCH '골프장'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                hit_count >= 1,
+                "narrative FTS5 index should surface the diary entry for '골프장'"
+            );
+        }
+
+        // Partial update: only adjust why_reason; other fields must remain.
+        let partial = Memory5W1H {
+            why_reason: Some("사교, 스트레스 해소".to_string()),
+            ..Default::default()
+        };
+        mem.set_5w1h("diary_golf", &partial).unwrap();
+        {
+            let conn = mem.conn.lock();
+            let (actor, why): (String, String) = conn
+                .query_row(
+                    "SELECT who_actor, why_reason FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            // actor kept, why_reason updated.
+            assert_eq!(actor, "user");
+            assert_eq!(why, "사교, 스트레스 해소");
+        }
+
+        // Failure counter increments on demand.
+        mem.bump_narrative_failure("diary_golf").unwrap();
+        mem.bump_narrative_failure("diary_golf").unwrap();
+        {
+            let conn = mem.conn.lock();
+            let fails: i64 = conn
+                .query_row(
+                    "SELECT narrative_failures FROM memories WHERE key = ?1",
+                    params!["diary_golf"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(fails, 2);
+        }
     }
 
     #[tokio::test]
