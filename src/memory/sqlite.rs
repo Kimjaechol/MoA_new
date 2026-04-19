@@ -688,7 +688,9 @@ impl SqliteMemory {
                 why_reason      TEXT,
                 narrative       TEXT,
                 narrative_filled INTEGER NOT NULL DEFAULT 0,
-                narrative_failures INTEGER NOT NULL DEFAULT 0
+                narrative_failures INTEGER NOT NULL DEFAULT 0,
+                tier             INTEGER NOT NULL DEFAULT 1
+                                   CHECK(tier IN (1, 2, 3))
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
@@ -698,6 +700,10 @@ impl SqliteMemory {
                 WHERE where_geohash IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_memories_narrative_pending
                 ON memories(created_at) WHERE narrative_filled = 0;
+            CREATE INDEX IF NOT EXISTS idx_memories_tier_when
+                ON memories(tier, when_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memories_tier_created
+                ON memories(tier, created_at DESC);
             -- Note: no explicit index on `key` — the UNIQUE constraint already
             -- creates an implicit unique B-tree index, so a second one would
             -- waste space and slow inserts.
@@ -826,6 +832,11 @@ impl SqliteMemory {
             ("narrative", "TEXT"),
             ("narrative_filled", "INTEGER NOT NULL DEFAULT 0"),
             ("narrative_failures", "INTEGER NOT NULL DEFAULT 0"),
+            // ── Q1 Commit #7: Tiered storage (50-year scale) ──
+            // tier 1=hot (<2yr, full detail, default query surface),
+            //      2=warm (2-10yr, same detail, indexed but queried only on request),
+            //      3=cold (>10yr, compressed into "life chunks", original in archive).
+            ("tier", "INTEGER NOT NULL DEFAULT 1"),
         ];
         for (col, ty) in add_cols {
             if !memories_sql.contains(col) {
@@ -840,7 +851,41 @@ impl SqliteMemory {
              CREATE INDEX IF NOT EXISTS idx_memories_where_geohash ON memories(where_geohash)
                  WHERE where_geohash IS NOT NULL;
              CREATE INDEX IF NOT EXISTS idx_memories_narrative_pending
-                 ON memories(created_at) WHERE narrative_filled = 0;",
+                 ON memories(created_at) WHERE narrative_filled = 0;
+             -- Q1 Commit #7 tiered storage indexes (partial — zero cost on hot tier).
+             CREATE INDEX IF NOT EXISTS idx_memories_tier_when
+                 ON memories(tier, when_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_memories_tier_created
+                 ON memories(tier, created_at DESC);
+
+             -- Cold-tier archive: original full-detail rows compressed into
+             -- life-chunks and moved here. Dream-Cycle writes a synthesized
+             -- summary back to memories with tier=3, and preserves the raw
+             -- originals here so audit + on-demand restore remain possible.
+             CREATE TABLE IF NOT EXISTS memories_archive (
+                 id                   TEXT PRIMARY KEY,
+                 key                  TEXT NOT NULL,
+                 content              TEXT NOT NULL,
+                 category             TEXT NOT NULL,
+                 created_at           TEXT NOT NULL,
+                 archived_at          INTEGER NOT NULL,
+                 archive_chunk_key    TEXT,   -- the compressed life-chunk this feeds
+                 who_actor            TEXT,
+                 who_target           TEXT,
+                 when_at              INTEGER,
+                 where_location       TEXT,
+                 where_geohash        TEXT,
+                 what_subject         TEXT,
+                 how_action           TEXT,
+                 why_reason           TEXT,
+                 narrative            TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_memories_archive_chunk
+                 ON memories_archive(archive_chunk_key)
+                 WHERE archive_chunk_key IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_memories_archive_when
+                 ON memories_archive(when_at)
+                 WHERE when_at IS NOT NULL;",
         )?;
 
         // ── Q1 Commit #6b — First Brain Wiki (mobile-friendly LLM wiki layer)
@@ -864,10 +909,14 @@ impl SqliteMemory {
                 updated_at_hlc      TEXT,
                 updated_at          INTEGER NOT NULL,
                 updated_by          TEXT NOT NULL DEFAULT 'dream_cycle',
+                tier                INTEGER NOT NULL DEFAULT 1
+                                      CHECK(tier IN (1, 2, 3)),
                 FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL
             );
             CREATE INDEX IF NOT EXISTS idx_fb_pages_kind
                 ON first_brain_pages(page_kind);
+            CREATE INDEX IF NOT EXISTS idx_fb_pages_tier_updated
+                ON first_brain_pages(tier, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_fb_pages_updated
                 ON first_brain_pages(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_fb_pages_ontology
@@ -1526,6 +1575,55 @@ impl SqliteMemory {
             params![key],
         )?;
         Ok(())
+    }
+
+    // ── Q1 Commit #7 tiered storage helpers ──────────────────────
+
+    /// Count memories per tier (1=hot, 2=warm, 3=cold). Useful for Dream-Cycle
+    /// reporting and for UI statistics. Returns (hot, warm, cold).
+    pub fn tier_counts(&self) -> anyhow::Result<(u64, u64, u64)> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT tier, COUNT(*) FROM memories GROUP BY tier",
+        )?;
+        let mut hot = 0u64;
+        let mut warm = 0u64;
+        let mut cold = 0u64;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (tier, count) = row?;
+            match tier {
+                1 => hot = count as u64,
+                2 => warm = count as u64,
+                3 => cold = count as u64,
+                _ => {}
+            }
+        }
+        Ok((hot, warm, cold))
+    }
+
+    /// Promote memories whose `when_at` crosses the tier boundary. Returns
+    /// (hot_to_warm, warm_to_cold_candidates). The "candidates" count is for
+    /// cold because actual compression into life-chunks happens in the
+    /// Dream-Cycle consolidation job (commit #9) — here we only move the
+    /// flag so queries naturally skip cold-tier rows by default.
+    pub fn migrate_tier_by_age(&self, now_unix: i64) -> anyhow::Result<(u64, u64)> {
+        const TWO_YEARS_SEC: i64 = 2 * 365 * 86_400;
+        const TEN_YEARS_SEC: i64 = 10 * 365 * 86_400;
+        let warm_cutoff = now_unix - TWO_YEARS_SEC;
+        let cold_cutoff = now_unix - TEN_YEARS_SEC;
+        let conn = self.conn.lock();
+        let hot_to_warm = conn.execute(
+            "UPDATE memories SET tier = 2
+             WHERE tier = 1 AND when_at IS NOT NULL AND when_at < ?1",
+            params![warm_cutoff],
+        )?;
+        let warm_to_cold = conn.execute(
+            "UPDATE memories SET tier = 3
+             WHERE tier = 2 AND when_at IS NOT NULL AND when_at < ?1",
+            params![cold_cutoff],
+        )?;
+        Ok((hot_to_warm as u64, warm_to_cold as u64))
     }
 
     // ── v3.0 Compiled Truth + Timeline methods ───────────────────
@@ -4526,6 +4624,81 @@ mod tests {
                 .unwrap();
             assert_eq!(fails, 2);
         }
+    }
+
+    /// Q1 Commit #7 — tiered storage (hot/warm/cold) for 50-year scale.
+    /// Covers: default tier on insert + age-based tier migration + counts helper.
+    #[tokio::test]
+    async fn tiered_storage_age_based_migration() {
+        let (_tmp, mem) = temp_sqlite();
+        const NOW: i64 = 1_900_000_000; // ~2030-03
+
+        // Three memories with different event ages: recent (1 year),
+        // 5-years ago, 15-years ago.
+        for (key, when_at) in [
+            ("recent", NOW - 365 * 86_400),         // 1 yr
+            ("mid",    NOW - 5 * 365 * 86_400),     // 5 yr (warm candidate)
+            ("old",    NOW - 15 * 365 * 86_400),    // 15 yr (cold candidate)
+        ] {
+            mem.store(key, "content", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.set_5w1h(
+                key,
+                &Memory5W1H {
+                    when_at: Some(when_at),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        // Initially all rows are tier 1 (hot).
+        let (hot, warm, cold) = mem.tier_counts().unwrap();
+        assert_eq!((hot, warm, cold), (3, 0, 0));
+
+        // Migrate: recent stays hot, mid→warm, old→cold
+        // (cold migration requires going through warm first in our simple
+        //  two-pass model, which the helper does in a single call).
+        let (to_warm, to_cold) = mem.migrate_tier_by_age(NOW).unwrap();
+        assert_eq!(to_warm, 2, "recent stays hot; mid and old both cross 2y");
+        assert_eq!(to_cold, 1, "old (15y) also crosses the 10y boundary");
+
+        let (hot, warm, cold) = mem.tier_counts().unwrap();
+        assert_eq!(hot, 1, "only recent remains hot");
+        assert_eq!(warm, 1, "mid is warm");
+        assert_eq!(cold, 1, "old is cold");
+
+        // tier check constraint rejects out-of-range values.
+        let conn = mem.conn.lock();
+        let bad = conn.execute(
+            "UPDATE memories SET tier = 99 WHERE key = 'recent'",
+            [],
+        );
+        assert!(bad.is_err(), "CHECK(tier IN (1,2,3)) should reject tier=99");
+
+        // memories_archive table exists and accepts a row.
+        conn.execute(
+            "INSERT INTO memories_archive
+                (id, key, content, category, created_at, archived_at,
+                 archive_chunk_key, when_at, narrative)
+             VALUES (
+                'arch-id-1', 'old', 'original content',
+                'core', '2015-01-01', ?1, 'life-chunk/2015-Q1',
+                ?2, 'archived narrative'
+             )",
+            rusqlite::params![NOW, NOW - 15 * 365 * 86_400],
+        )
+        .unwrap();
+        let archived_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories_archive
+                 WHERE archive_chunk_key = 'life-chunk/2015-Q1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived_count, 1);
     }
 
     /// Q1 Commit #6b — First Brain Wiki schema smoke test.

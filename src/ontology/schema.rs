@@ -550,6 +550,11 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
                        "INTEGER REFERENCES ontology_object_types(id)")?;
     migrate_add_column(conn, "ontology_actions", "relationship_type_id",
                        "INTEGER REFERENCES ontology_link_types(id)")?;
+    // ── Q1 Commit #7: Tiered storage (hot/warm/cold for 50-year scale) ──
+    migrate_add_column(conn, "ontology_actions", "tier",
+                       "INTEGER NOT NULL DEFAULT 1")?;
+    migrate_add_column(conn, "ontology_objects", "tier",
+                       "INTEGER NOT NULL DEFAULT 1")?;
     // Legacy migration: rename old occurred_at → occurred_at_utc if present.
     migrate_add_column(conn, "ontology_actions", "occurred_at", "TEXT")?;
     // Copy legacy occurred_at data to occurred_at_utc (best-effort).
@@ -584,7 +589,11 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
              WHERE target_type_id IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_onto_actions_relationship
              ON ontology_actions(relationship_type_id)
-             WHERE relationship_type_id IS NOT NULL;",
+             WHERE relationship_type_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_onto_actions_tier_utc
+             ON ontology_actions(tier, occurred_at_utc);
+         CREATE INDEX IF NOT EXISTS idx_onto_objects_tier
+             ON ontology_objects(tier, updated_at);",
     );
 
     Ok(())
