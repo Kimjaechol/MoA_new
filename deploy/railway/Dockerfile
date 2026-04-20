@@ -129,6 +129,13 @@ ENV ZEROCLAW_HOST=0.0.0.0
 ENV ZEROCLAW_PORT=8080
 ENV ZEROCLAW_ALLOW_PUBLIC_BIND=true
 ENV ZEROCLAW_REQUIRE_PAIRING=false
+# Ollama cannot (and should not) be installed inside the Railway container:
+# the install script fails, and even if it succeeded there is no GPU/RAM
+# budget to serve a local model here. The bootstrap attempt only burns
+# startup seconds and pollutes logs, so skip it on Railway. Users running
+# MoA on their own device still get local Gemma 4 via the desktop/mobile
+# app's own bootstrap path — this flag is container-scoped only.
+ENV ZEROCLAW_SKIP_LOCAL_LLM_BOOTSTRAP=1
 ENV HOME=/app
 
 # Expose the gateway port.
