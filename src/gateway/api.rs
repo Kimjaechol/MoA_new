@@ -2401,6 +2401,123 @@ pub async fn handle_api_voices_list(
     .into_response()
 }
 
+/// GET /api/voices/secretary-suggest — cross-engine secretary recommendation.
+///
+/// Takes the user's current Typecast voice descriptor (gender, age_band,
+/// language, optional use_cases) and returns the highest-scoring
+/// candidate from the bundled offline catalog (Kokoro always, CosyVoice
+/// when available). Backs the `SecretaryMigrator.tsx` component so the
+/// React table can swap its hardcoded mapping for a live fetch.
+///
+/// Query params:
+///   gender=male|female                    (required)
+///   age=teenager|young_adult|middle_age|elder   (required)
+///   language=ko|en|ja|...                 (required; BCP-47-style tag)
+///   use_cases=A,B,C                       (optional, comma-separated)
+///   include_cosyvoice=true|false          (optional, default false —
+///                                          set true only on T3/T4
+///                                          hosts that downloaded the
+///                                          optional CosyVoice pack)
+///
+/// Response: 200 { voice_id, engine, display_name, language, rationale,
+/// score }, or 400 on bad params, or 404 when no candidate scores > 0.
+pub async fn handle_api_voices_secretary_suggest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    use crate::voice::secretary_migrator::{
+        offline_catalog, recommend, VoiceAgeBand, VoiceGender, VoiceProfile,
+    };
+
+    let Some(gender) = query.get("gender").and_then(|s| VoiceGender::parse(s)) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing or invalid `gender` (male|female)"})),
+        )
+            .into_response();
+    };
+
+    let Some(age_band) = query
+        .get("age")
+        .and_then(|s| VoiceAgeBand::parse_typecast(s.as_str()))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing or invalid `age` (teenager|young_adult|middle_age|elder)"
+            })),
+        )
+            .into_response();
+    };
+
+    let language = match query.get("language").map(|s| s.trim().to_string()) {
+        Some(l) if !l.is_empty() => l,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing `language`"})),
+            )
+                .into_response();
+        }
+    };
+
+    let use_cases: Vec<String> = query
+        .get("use_cases")
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let include_cosyvoice = query
+        .get("include_cosyvoice")
+        .map(|s| matches!(s.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    let source = VoiceProfile {
+        id: query
+            .get("typecast_id")
+            .cloned()
+            .unwrap_or_else(|| "typecast-unknown".to_string()),
+        engine: "typecast".to_string(),
+        display_name: query
+            .get("display_name")
+            .cloned()
+            .unwrap_or_else(|| "current".to_string()),
+        gender,
+        age_band,
+        language,
+        use_cases,
+    };
+
+    let catalog = offline_catalog(include_cosyvoice);
+    match recommend(&source, &catalog) {
+        Some(rec) => Json(serde_json::json!({
+            "voice_id": rec.voice_id,
+            "engine": rec.engine.as_str(),
+            "display_name": rec.display_name,
+            "language": rec.language,
+            "rationale": rec.rationale,
+            "score": rec.score,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no offline secretary matched the given profile"
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/health — component health snapshot
 pub async fn handle_api_health(
     State(state): State<AppState>,
