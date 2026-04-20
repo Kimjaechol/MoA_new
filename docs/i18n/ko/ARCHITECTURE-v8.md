@@ -111,7 +111,9 @@ MoA 가 제공하는 기능은 크게 **대화·응답**, **음성·통역**, **
 | **대화·응답** | 앱·웹·채널 어디서든 동일한 AI 에이전트와 대화 | `src/agent/loop_.rs`, `src/gateway/**` | §5 / §9 |
 | **음성·통역** | 실시간 25개 언어 동시통역, 음성 메모, 음성 모드 응답 | `src/voice/**`, `Gemini Live`, `OpenAI Realtime` | §6.3 / §6.4 |
 | **문서·Vault (Second Brain)** | PDF·HWP·DOCX 를 열어 읽고 편집, wikilink 기반 hub note, 4-way RAG, 포커스 브리핑 | `src/vault/**`, `clients/tauri/src/components/DocumentEditor.tsx` | §11 |
-| **코딩** | Multi-model 코드 리뷰 파이프라인, 런→관찰→수정 샌드박스 | `src/coding/**`, `src/sandbox/**` | §6.5 / §6.6 |
+| **코딩 / 코드 리뷰 (단일 카테고리)** | 작성 + 멀티 모델 리뷰 파이프라인 + 런→관찰→수정 샌드박스 (한 카테고리 내에서 작성과 리뷰가 인라인으로 함께 수행) | `src/coding/**`, `src/sandbox/**` | §6.5 / §6.6 |
+| **쇼핑** | 가격·상품 비교, 쿠폰/리뷰 수집, credential vault 기반 로그인 + 장바구니 자동화, 가격 변동 모니터링 | `src/tools/browser.rs`, `src/tools/credential_vault.rs`, `src/tools/smart_search.rs` | §6.7 / §7 / §8 |
+| **전화비서** | 수신 전화 응대, 발신 에이전트, 실시간 STT/TTS, 통화 요약, 스팸 차단, 일정/연락처 연동 | `src/phone/**`, Gemini 2.5 Flash Live API | §6.8 |
 | **미디어 생성** | 이미지/영상/음악/고품질 TTS (Freepik·Runway·Suno·ElevenLabs) | `src/tools/media_gen.rs` | §6.2 / §8 |
 | **일정 관리** | Google / Outlook / 카카오톡 톡캘린더 이벤트 조회·생성 + 크론 알림 | `src/tools/calendar.rs`, `src/cron/**` | §6.2 / §8 |
 | **기억(First Brain)** | 대화·행위·엔티티를 로컬 SQLite 에 영구 저장, 교차 검색 | `src/memory/**`, `src/ontology/**` | §10 |
@@ -265,12 +267,13 @@ MoA 는 LLM 호출 라우팅·과금·모델 사용을 결정하는 **3-Tier pro
 |---------------|----------|---------------|-----------|
 | **일반 채팅 (General Chat)** | Gemini | `gemini-3.1-flash-lite-preview` | 일상 대화에 가장 경제적 |
 | **추론/문서 (Reasoning/Document)** | Gemini | `gemini-3.1-pro-preview` | 고품질 추론·문서 분석 |
-| **코딩 (Coding)** | Anthropic | `claude-opus-4-6` | Best-in-class 코드 생성 |
-| **코드 리뷰 (Code Review)** | Gemini | `gemini-3.1-pro-preview` | 아키텍처 인지형 리뷰 |
+| **코딩 / 코드 리뷰 (Coding / Code Review)** | Anthropic + Gemini | `claude-opus-4-6` (작성) + `gemini-3.1-pro-preview` (리뷰) | Best-in-class 코드 생성 + 아키텍처 인지형 리뷰 (작성과 리뷰를 포괄하는 단일 카테고리) |
+| **쇼핑 (Shopping)** | Gemini | `gemini-3.1-pro-preview` | 가격·옵션 추론, 리뷰 종합, 판매처 비교 |
+| **전화비서 (Phone Assistant)** | Gemini | Gemini 2.5 Flash Live API | 실시간 통화 응대, 라이브 STT/TTS, 통화 요약 |
+| **통역 (Interpretation)** | Gemini | Gemini 2.5 Flash Live API | 실시간 음성 스트리밍 |
 | **이미지 (Image)** | Gemini | `gemini-3.1-flash-lite-preview` | 경제적 비전 작업 |
 | **음악 (Music)** | Gemini | `gemini-3.1-flash-lite-preview` | 경량 오케스트레이션 |
 | **비디오 (Video)** | Gemini | `gemini-3.1-flash-lite-preview` | 경량 오케스트레이션 |
-| **통역 (Interpretation)** | Gemini | Gemini 2.5 Flash Live API | 실시간 음성 스트리밍 |
 
 ##### 크레딧 시스템 & 과금 로직
 
@@ -2031,26 +2034,29 @@ handle.end()?;
 
 ## 6. 카테고리 + 프리셋 + 워크플로우 (Categories, Presets, Workflows)
 
-MoA 의 모든 사용자 상호작용은 **7 개 탑바 카테고리 + 3 개 사이드바 네비게이션** 으로 구성되며, 각 카테고리에는 **기본 도구 스코프** 가 프리셋되어 있습니다. 본 섹션은 원본 §5 Task Categories, §7 Voice, §8 Coding Pipeline, §9 Coding Sandbox 를 한 자리에 모은 것입니다.
+MoA 의 모든 사용자 상호작용은 **9 개 탑바 카테고리 + 3 개 사이드바 네비게이션** 으로 구성되며, 각 카테고리에는 **기본 도구 스코프** 가 프리셋되어 있습니다. (코딩/코드 리뷰는 한 개 카테고리로 묶여 있고, 쇼핑·전화비서가 추가되어 총 9 개입니다.) 본 섹션은 원본 §5 Task Categories, §7 Voice, §8 Coding Pipeline, §9 Coding Sandbox 를 한 자리에 모은 것입니다.
 
 <!-- CHUNK: 08_task_categories (원본 §5 Task Categories + Media Gen + Calendar) -->
 
 ### 5. Task Categories
 
-MoA organizes all user interactions into **7 top-bar categories** and
-**3 sidebar navigation items**:
+MoA 는 모든 사용자 상호작용을 **9 개 탑바 카테고리**와 **3 개 사이드바 네비게이션**으로 조직화합니다:
 
 #### Top-Bar (Task Modes)
 
+> 코딩은 코드 작성과 멀티 모델 코드 리뷰를 **단일 카테고리**로 포함합니다(두 개 별개 카테고리가 아님). 에이전트 루프가 각 코딩 단계 후에 리뷰 파이프라인을 인라인으로 실행하기 때문입니다.
+
 | Category | Korean | UI Mode | Tool Scope |
 |----------|--------|---------|------------|
-| **WebGeneral** | 웹/일반 | default chat | BASE + VISION |
-| **Document** | 문서 | `document` editor (2-layer viewer+Tiptap) | BASE + DOCUMENT |
-| **Coding** | 코딩 | `sandbox` | ALL tools (unrestricted) |
+| **WebGeneral** | 일반 채팅 (웹/일반) | default chat | BASE + VISION |
+| **Document** | 추론/문서 | `document` editor (2-layer viewer+Tiptap) | BASE + DOCUMENT |
+| **Coding** | 코딩 / 코드 리뷰 | `sandbox` | ALL tools (unrestricted) |
+| **Shopping** | 쇼핑 | default chat | BASE + VISION + BROWSER (credential vault, 가격 추적, 장바구니 자동화) |
+| **PhoneAssistant** | 전화비서 | `voice_call` (Live API) | MINIMAL + PHONE (발신자 ID, 통화 로그, 캘린더, 연락처) |
+| **Translation** | 통역 | `voice_interpret` | MINIMAL (memory + browser + file I/O) |
 | **Image** | 이미지 | default chat | BASE + VISION + MEDIA_IMAGE |
 | **Music** | 음악 | default chat | BASE + MEDIA_MUSIC |
 | **Video** | 비디오 | default chat | BASE + VISION + MEDIA_VIDEO |
-| **Translation** | 통역 | `voice_interpret` | MINIMAL (memory + browser + file I/O) |
 
 #### Sidebar (Navigation)
 
@@ -2526,9 +2532,11 @@ Agent Loop (Rust) → HTTP POST → Playwright Daemon (Node.js) ↔ Chromium (CD
 | **WebGeneral** | 웹 검색 결과 검증, 페이지 콘텐츠 추출, 실시간 정보 |
 | **Document** | 브라우저 내 PDF/문서 렌더링 검증 |
 | **Coding** | 실제 브라우저에서 테스트 결과, 스크린샷 비교, QA 자동화 |
+| **Shopping** | 판매처 비교, credential vault 로그인, 장바구니 자동화, 가격 추적, 쿠폰/리뷰 스크래핑 |
+| **PhoneAssistant** | 연락처·통화 로그 조회 페이지, 캘린더 연동 UI, 번호 차단 목록 관리 |
+| **Translation** | 웹 페이지 상의 실시간 번역 결과 검증 |
 | **Image** | 생성 이미지 미리보기·검증 |
 | **Music/Video** | 미디어 재생 테스트 |
-| **Translation** | 웹 페이지 상의 실시간 번역 결과 검증 |
 
 #### 개발 방법론: gstack 스프린트 사이클
 
