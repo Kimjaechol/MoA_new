@@ -20,7 +20,7 @@
 //!   keep their default tuning
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicU32, Ordering},
     Arc, OnceLock,
 };
 use std::time::Duration;
@@ -72,53 +72,71 @@ impl BatterySnapshot {
 /// on first access inside a tokio runtime.
 #[derive(Debug)]
 pub struct BatteryHealth {
-    // AtomicU8: 0 = unknown (no battery OR probe failed), 1..=101 means
-    // percent + 1 (so 1 = 0%, 101 = 100%). Atomics give us lock-free
-    // read from the hot path (every outgoing chat request).
-    percent_plus_one: AtomicU8,
-    on_ac_known: AtomicBool,
-    on_ac_power: AtomicBool,
+    // Single packed atomic holds all three snapshot fields so
+    // store-then-load can never observe a torn pair. Layout:
+    //   bits  0..=7  (u8)  percent_plus_one:
+    //                      0 = unknown, 1..=101 = percent + 1
+    //   bit      8   (bool) on_ac_known
+    //   bit      9   (bool) on_ac_power
+    // Upper bits are reserved / always zero.
+    //
+    // Using a single AtomicU32 instead of three separate atomics fixes a
+    // real bug flagged in code review: between `store(percent)` and
+    // `store(on_ac_power)`, another thread's `snapshot()` could see the
+    // new percent paired with the old AC state (or vice versa).
+    packed: AtomicU32,
+}
+
+// Bit layout helpers.
+const PERCENT_MASK: u32 = 0x0000_00FF;
+const ON_AC_KNOWN_BIT: u32 = 1 << 8;
+const ON_AC_POWER_BIT: u32 = 1 << 9;
+
+fn pack(snap: BatterySnapshot) -> u32 {
+    let percent_plus_one = match snap.percent {
+        Some(p) => p.saturating_add(1) as u32,
+        None => 0,
+    };
+    let (ac_known, ac_power) = match snap.on_ac_power {
+        Some(v) => (ON_AC_KNOWN_BIT, if v { ON_AC_POWER_BIT } else { 0 }),
+        None => (0, 0),
+    };
+    (percent_plus_one & PERCENT_MASK) | ac_known | ac_power
+}
+
+fn unpack(raw: u32) -> BatterySnapshot {
+    let percent_byte = (raw & PERCENT_MASK) as u8;
+    let percent = if percent_byte == 0 {
+        None
+    } else {
+        Some(percent_byte - 1)
+    };
+    let on_ac_power = if raw & ON_AC_KNOWN_BIT != 0 {
+        Some(raw & ON_AC_POWER_BIT != 0)
+    } else {
+        None
+    };
+    BatterySnapshot {
+        percent,
+        on_ac_power,
+    }
 }
 
 impl BatteryHealth {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            percent_plus_one: AtomicU8::new(0),
-            on_ac_known: AtomicBool::new(false),
-            on_ac_power: AtomicBool::new(true),
+            // Default: unknown percent + unknown AC state.
+            packed: AtomicU32::new(0),
         })
     }
 
     /// Cheap lock-free snapshot. Callers on the chat hot path call this.
     pub fn snapshot(&self) -> BatterySnapshot {
-        let raw = self.percent_plus_one.load(Ordering::Relaxed);
-        let percent = if raw == 0 { None } else { Some(raw - 1) };
-        let on_ac_power = if self.on_ac_known.load(Ordering::Relaxed) {
-            Some(self.on_ac_power.load(Ordering::Relaxed))
-        } else {
-            None
-        };
-        BatterySnapshot {
-            percent,
-            on_ac_power,
-        }
+        unpack(self.packed.load(Ordering::Relaxed))
     }
 
     fn store(&self, snap: BatterySnapshot) {
-        let raw = match snap.percent {
-            Some(p) => p.saturating_add(1),
-            None => 0,
-        };
-        self.percent_plus_one.store(raw, Ordering::Relaxed);
-        match snap.on_ac_power {
-            Some(v) => {
-                self.on_ac_power.store(v, Ordering::Relaxed);
-                self.on_ac_known.store(true, Ordering::Relaxed);
-            }
-            None => {
-                self.on_ac_known.store(false, Ordering::Relaxed);
-            }
-        }
+        self.packed.store(pack(snap), Ordering::Relaxed);
     }
 
     /// Run one probe immediately (used on startup and by tests).
@@ -392,6 +410,84 @@ mod tests {
         let read = h.snapshot();
         assert_eq!(read.percent, Some(42));
         assert_eq!(read.on_ac_power, Some(false));
+    }
+
+    #[test]
+    fn pack_unpack_roundtrip_all_variants() {
+        // Exhaustively drive every meaningful shape and confirm
+        // pack→unpack is identity. Guards against future bit-layout drift.
+        let cases = [
+            BatterySnapshot::unknown(),
+            BatterySnapshot {
+                percent: Some(0),
+                on_ac_power: Some(true),
+            },
+            BatterySnapshot {
+                percent: Some(100),
+                on_ac_power: Some(false),
+            },
+            BatterySnapshot {
+                percent: Some(42),
+                on_ac_power: None,
+            },
+            BatterySnapshot {
+                percent: None,
+                on_ac_power: Some(true),
+            },
+        ];
+        for snap in cases {
+            let round = unpack(pack(snap));
+            assert_eq!(round, snap, "roundtrip failed for {snap:?}");
+        }
+    }
+
+    #[test]
+    fn concurrent_store_read_never_sees_torn_pair() {
+        // Regression test for the race that motivated the AtomicU32
+        // packing: when two `store()` calls interleave with `snapshot()`
+        // reads, every snapshot must match EITHER the "before" or the
+        // "after" state — never a half-applied combination.
+        use std::sync::Arc;
+        use std::thread;
+        let h = BatteryHealth::new();
+        // Two possible snapshots; the reader must only ever observe one
+        // of these exact pairs.
+        let snap_a = BatterySnapshot {
+            percent: Some(80),
+            on_ac_power: Some(true),
+        };
+        let snap_b = BatterySnapshot {
+            percent: Some(15),
+            on_ac_power: Some(false),
+        };
+        h.store(snap_a);
+
+        let writer = {
+            let h = Arc::clone(&h);
+            thread::spawn(move || {
+                for i in 0..10_000 {
+                    h.store(if i % 2 == 0 { snap_a } else { snap_b });
+                }
+            })
+        };
+        let reader = {
+            let h = Arc::clone(&h);
+            thread::spawn(move || {
+                for _ in 0..10_000 {
+                    let r = h.snapshot();
+                    // Either pair is acceptable; a mixed pair
+                    // (e.g. 80% + on-battery) would indicate a torn read.
+                    let valid_a = r.percent == Some(80) && r.on_ac_power == Some(true);
+                    let valid_b = r.percent == Some(15) && r.on_ac_power == Some(false);
+                    assert!(
+                        valid_a || valid_b,
+                        "torn read detected: {r:?} is neither {snap_a:?} nor {snap_b:?}"
+                    );
+                }
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
 
     #[tokio::test]
