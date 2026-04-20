@@ -1888,6 +1888,25 @@ impl SqliteMemory {
         }
     }
 
+    /// Resolve a memory `key` to its internal `id` (sync, no async trait).
+    ///
+    /// Returns `Ok(None)` when the key does not exist. Used by cross-module
+    /// helpers that need to follow `memories.key → memory_timeline.memory_id`
+    /// without going through the async `Memory::get` path.
+    pub fn memory_id_for_key(
+        &self,
+        memory_key: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT id FROM memories WHERE key = ?1")?;
+        let result = stmt.query_row(params![memory_key], |row| row.get::<_, String>(0));
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Mark a memory as needing recompilation (e.g. after new timeline evidence).
     pub fn mark_needs_recompile(&self, memory_key: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();

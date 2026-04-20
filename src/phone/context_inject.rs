@@ -2,7 +2,7 @@
 //
 // When a known caller is matched via ontology:
 // 1. Load the caller's compiled_truth from linked memories
-// 2. Load recent timeline entries (last 5)
+// 2. Load recent timeline entries (last N)
 // 3. Build a system prompt that gives the AI phone assistant context
 //
 // The prompt is injected into Gemini Live's system instruction before
@@ -17,6 +17,8 @@ use crate::ontology::types::OntologyObject;
 const MAX_CONTEXT_TOKENS: usize = 2000;
 /// Approximate chars per token for truncation.
 const CHARS_PER_TOKEN: usize = 4;
+/// Number of most-recent timeline entries to include.
+const RECENT_TIMELINE_LIMIT: usize = 5;
 
 /// Built context for a phone call's system prompt.
 #[derive(Debug, Clone)]
@@ -45,7 +47,7 @@ pub fn build_call_context(
         .clone()
         .unwrap_or_else(|| "알 수 없는 발신자".to_string());
 
-    // Load compiled truth if we have a linked memory key
+    // Load compiled truth if we have a linked memory key.
     let compiled_truth = if let Some(key) = linked_memory_key {
         memory
             .get_compiled_truth(key)?
@@ -54,26 +56,25 @@ pub fn build_call_context(
         None
     };
 
-    // Load recent timeline entries for the linked memory
-    let recent_events = if let Some(_key) = linked_memory_key {
-        // We need the memory ID, not the key — get it from the memory entry
-        if let Some(entry) = tokio::runtime::Handle::try_current()
-            .ok()
-            .and_then(|_| None::<crate::memory::traits::MemoryEntry>) // can't block in sync context
-        {
-            let _ = entry; // unreachable
-            Vec::new()
-        } else {
-            // In sync context, we can look up timeline by searching for the memory
-            // For now, return empty — the full async integration will be done
-            // when the phone call flow is wired end-to-end
-            Vec::new()
+    // Load recent timeline entries for the linked memory.
+    //
+    // The caller supplies a memory `key` (e.g. "client_a"); we resolve it to
+    // the internal `memory_id` via `memory_id_for_key`, then query the
+    // append-only `memory_timeline` in descending `event_at` order.
+    let recent_events = if let Some(key) = linked_memory_key {
+        match memory.memory_id_for_key(key)? {
+            Some(memory_id) => memory
+                .get_timeline(&memory_id, RECENT_TIMELINE_LIMIT)?
+                .into_iter()
+                .map(format_timeline_entry)
+                .collect(),
+            None => Vec::new(),
         }
     } else {
         Vec::new()
     };
 
-    // Assemble system prompt fragment
+    // Assemble system prompt fragment.
     let max_chars = MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN;
     let system_prompt_fragment = build_prompt_fragment(
         &caller_name,
@@ -88,6 +89,29 @@ pub fn build_call_context(
         recent_events,
         system_prompt_fragment,
     })
+}
+
+/// Render a single timeline entry as one line for prompt injection.
+///
+/// Format: `YYYY-MM-DD [event_type] truncated_content`.
+fn format_timeline_entry(entry: crate::memory::sqlite::TimelineEntry) -> String {
+    // `event_at` is milliseconds-since-epoch per `append_timeline`.
+    let secs = entry.event_at / 1000;
+    let date = chrono::DateTime::from_timestamp(secs, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Keep each line compact; full content lives in the timeline, not the prompt.
+    const PER_ENTRY_CHAR_CAP: usize = 160;
+    let content = entry.content.replace('\n', " ");
+    let trimmed = if content.chars().count() > PER_ENTRY_CHAR_CAP {
+        let truncated: String = content.chars().take(PER_ENTRY_CHAR_CAP).collect();
+        format!("{truncated}...")
+    } else {
+        content
+    };
+
+    format!("{date} [{}] {trimmed}", entry.event_type)
 }
 
 /// Build context for an unknown (anonymous) caller.
@@ -216,5 +240,152 @@ mod tests {
         assert!(fragment.contains("홍길동"));
         assert!(fragment.contains("주요 의뢰인"));
         assert!(fragment.contains("이벤트1"));
+    }
+
+    #[test]
+    fn format_timeline_entry_uses_date_and_type() {
+        let entry = crate::memory::sqlite::TimelineEntry {
+            uuid: "u1".into(),
+            event_type: "call".into(),
+            // 2024-03-01T00:00:00Z in ms → 2024-03-01 (UTC)
+            event_at: 1_709_251_200_000,
+            source_ref: "call-001".into(),
+            content: "첫 상담 전화 내용".into(),
+            metadata_json: None,
+            device_id: "dev1".into(),
+            created_at: 0,
+        };
+        let line = format_timeline_entry(entry);
+        assert!(line.starts_with("2024-03-01"), "got: {line}");
+        assert!(line.contains("[call]"));
+        assert!(line.contains("첫 상담 전화 내용"));
+    }
+
+    #[test]
+    fn format_timeline_entry_truncates_long_content() {
+        let long = "가".repeat(500);
+        let entry = crate::memory::sqlite::TimelineEntry {
+            uuid: "u2".into(),
+            event_type: "doc".into(),
+            event_at: 1_709_251_200_000,
+            source_ref: "s".into(),
+            content: long,
+            metadata_json: None,
+            device_id: "d".into(),
+            created_at: 0,
+        };
+        let line = format_timeline_entry(entry);
+        assert!(line.ends_with("..."));
+        // Should be roughly ~170 bytes (160 chars + header + ellipsis).
+        // Korean chars are 3 bytes each so 160 chars ≈ 480 bytes + date/header.
+        assert!(line.contains("[doc]"));
+    }
+
+    #[test]
+    fn format_timeline_entry_collapses_newlines() {
+        let entry = crate::memory::sqlite::TimelineEntry {
+            uuid: "u3".into(),
+            event_type: "chat".into(),
+            event_at: 1_709_251_200_000,
+            source_ref: "s".into(),
+            content: "line1\nline2\nline3".into(),
+            metadata_json: None,
+            device_id: "d".into(),
+            created_at: 0,
+        };
+        let line = format_timeline_entry(entry);
+        assert!(!line.contains('\n'), "newlines should be collapsed: {line}");
+        assert!(line.contains("line1 line2 line3"));
+    }
+
+    #[test]
+    fn build_call_context_loads_timeline_by_key() {
+        use crate::memory::sqlite::SqliteMemory;
+        use crate::memory::traits::{Memory, MemoryCategory};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        // Seed a memory entry and append two timeline events.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            mem.store("client_a", "Client A notes", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        });
+        let id = mem
+            .memory_id_for_key("client_a")
+            .unwrap()
+            .expect("id lookup");
+
+        mem.append_timeline(
+            &id,
+            "call",
+            1_709_251_200_000,
+            "call-001",
+            "첫 상담",
+            None,
+            "dev1",
+            None,
+        )
+        .unwrap();
+        mem.append_timeline(
+            &id,
+            "doc",
+            1_709_337_600_000,
+            "doc-1",
+            "서류 접수",
+            None,
+            "dev1",
+            None,
+        )
+        .unwrap();
+
+        let obj = OntologyObject {
+            id: 1,
+            type_id: 1,
+            title: Some("김철수".to_string()),
+            properties: serde_json::json!({}),
+            owner_user_id: "user1".to_string(),
+            themes: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let ctx = build_call_context(&mem, &obj, Some("client_a")).unwrap();
+        assert_eq!(ctx.caller_name, "김철수");
+        assert_eq!(ctx.recent_events.len(), 2);
+        // Descending order by event_at: doc (newer) comes first.
+        assert!(ctx.recent_events[0].contains("[doc]"));
+        assert!(ctx.recent_events[0].contains("서류 접수"));
+        assert!(ctx.recent_events[1].contains("[call]"));
+        assert!(ctx.system_prompt_fragment.contains("김철수"));
+        assert!(ctx.system_prompt_fragment.contains("서류 접수"));
+    }
+
+    #[test]
+    fn build_call_context_empty_when_key_missing() {
+        use crate::memory::sqlite::SqliteMemory;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let obj = OntologyObject {
+            id: 1,
+            type_id: 1,
+            title: Some("Ghost".to_string()),
+            properties: serde_json::json!({}),
+            owner_user_id: "user1".to_string(),
+            themes: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        // Key does not exist → no compiled truth, no timeline, but still a valid ctx.
+        let ctx = build_call_context(&mem, &obj, Some("nonexistent_key")).unwrap();
+        assert_eq!(ctx.caller_name, "Ghost");
+        assert!(ctx.compiled_truth.is_none());
+        assert!(ctx.recent_events.is_empty());
+        assert!(ctx.system_prompt_fragment.contains("Ghost"));
     }
 }
