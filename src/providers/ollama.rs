@@ -22,6 +22,12 @@ pub struct OllamaProvider {
     /// explicit "show your reasoning" UI toggle) swap in [`ThinkingPolicy::
     /// Deliberate`] to surface chain-of-thought tokens to the user.
     thinking_policy: ThinkingPolicy,
+    /// When `true`, [`Self::send_request`] appends [`VOICE_MODE_DIRECTIVE`] so
+    /// the model skips reasoning tokens, emojis, and prefaces — anything a
+    /// TTS engine would otherwise read aloud and make the voice answer feel
+    /// unnatural. Defaults to `false` for text chat; flipped on by the voice
+    /// pipeline via [`Self::with_voice_mode`].
+    voice_mode: bool,
 }
 
 /// When MoA leaves `reasoning_enabled` unset on a provider, this policy
@@ -334,7 +340,21 @@ impl OllamaProvider {
             reasoning_enabled,
             tuning: OllamaTuning::default(),
             thinking_policy: ThinkingPolicy::default(),
+            voice_mode: false,
         }
+    }
+
+    /// Enable voice-mode so every outgoing request carries
+    /// [`VOICE_MODE_DIRECTIVE`]. The voice pipeline flips this on before
+    /// piping the response into a TTS engine; text chat leaves it off.
+    pub fn with_voice_mode(mut self, enabled: bool) -> Self {
+        self.voice_mode = enabled;
+        self
+    }
+
+    /// Whether this provider is configured for voice chat.
+    pub fn voice_mode(&self) -> bool {
+        self.voice_mode
     }
 
     /// Replace the active tuning. PR #4: callers (routing layer, voice
@@ -615,6 +635,15 @@ impl OllamaProvider {
         // choke point so every chat entry path (system/history/tools/plain)
         // picks it up without duplication.
         let messages = ensure_language_match_system_prompt(messages);
+        // Voice pipelines pipe the model's output into a TTS engine, so any
+        // thinking-prose, emojis, or meta-prefaces would be spoken aloud and
+        // make the assistant feel chatty and artificial. Text chat leaves
+        // the field alone.
+        let messages = if self.voice_mode {
+            ensure_voice_mode_system_prompt(messages)
+        } else {
+            messages
+        };
         let request = self.build_chat_request(messages, model, temperature, tools);
 
         let url = format!("{}/api/chat", self.base_url);
@@ -1054,6 +1083,76 @@ fn ensure_language_match_system_prompt(mut messages: Vec<Message>) -> Vec<Messag
     messages
 }
 
+// ─── Voice-mode system prompt ────────────────────────────────────────────────
+
+/// Instruction appended when MoA is answering via voice chat / TTS playback.
+///
+/// Three rules enforced in both Korean and English so Gemma 4 produces
+/// output safe for a downstream TTS engine:
+/// 1. No reasoning / planning / analysis tokens — they would be read aloud.
+/// 2. No emojis or decorative punctuation — Kokoro / CosyVoice / Typecast
+///    render emojis as descriptions ("기분 좋게 웃고", "thumbs up").
+/// 3. Answer only what was asked — no preamble ("좋은 질문이에요"), no closer
+///    ("궁금하시면 또 물어보세요").
+///
+/// Applied per-request when [`OllamaProvider::voice_mode`] is `true`.
+pub const VOICE_MODE_DIRECTIVE: &str = "\
+아래 규칙은 음성으로 답변하는 상황에서 반드시 지켜야 합니다.\n\
+1. 사고 과정, 계획, 추론, 분석 등을 절대 출력하지 마세요. TTS가 이 내용을 \
+소리로 읽지 않도록 최종 답변만 말하세요.\n\
+2. 이모지와 장식 기호(*, #, 목록 기호, 괄호 안 주석 등)를 사용하지 마세요. \
+TTS가 이모지를 \"기분 좋게 웃고\" 같은 설명으로 읽어버려 대화가 \
+부자연스러워집니다.\n\
+3. 꼭 필요한 답변만 간결하게 말하세요. \"좋은 질문이에요\", \"궁금하시면 \
+또 물어보세요\" 같은 서두나 맺음말을 붙이지 마세요.\n\
+\n\
+The following rules are REQUIRED when answering through voice / TTS.\n\
+1. Never output any thinking, planning, reasoning, or analysis tokens — \
+they would be spoken aloud. Speak only the final answer.\n\
+2. No emojis and no decorative punctuation (*, #, list bullets, \
+parenthetical asides). TTS reads emojis as spoken descriptions, which \
+breaks the conversational feel.\n\
+3. Answer only what was actually asked. Skip prefaces like \"Great \
+question\" and closers like \"Let me know if you have more questions\".";
+
+/// Ensure the outgoing message vector carries [`VOICE_MODE_DIRECTIVE`].
+///
+/// Appended AFTER any existing system message (including one added by
+/// [`ensure_language_match_system_prompt`]) so the language-match rule
+/// reads first and the voice rules follow. Idempotent via `contains`.
+fn ensure_voice_mode_system_prompt(mut messages: Vec<Message>) -> Vec<Message> {
+    let first_is_system = messages.first().is_some_and(|m| m.role == "system");
+
+    if first_is_system {
+        let already_has = messages[0]
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains(VOICE_MODE_DIRECTIVE));
+        if already_has {
+            return messages;
+        }
+        let existing = messages[0].content.take().unwrap_or_default();
+        messages[0].content = Some(if existing.trim().is_empty() {
+            VOICE_MODE_DIRECTIVE.to_string()
+        } else {
+            format!("{existing}\n\n{VOICE_MODE_DIRECTIVE}")
+        });
+        return messages;
+    }
+
+    messages.insert(
+        0,
+        Message {
+            role: "system".to_string(),
+            content: Some(VOICE_MODE_DIRECTIVE.to_string()),
+            images: None,
+            tool_calls: None,
+            tool_name: None,
+        },
+    );
+    messages
+}
+
 // ─── Response parsing (streaming NDJSON + non-streaming single JSON) ─────────
 
 /// One NDJSON chunk from `/api/chat` when `stream=true`. Ollama emits one
@@ -1267,6 +1366,102 @@ mod tests {
         let p = OllamaProvider::new(None, None);
         assert_eq!(p.base_url, "http://localhost:11434");
     }
+
+    // ── Voice-mode directive (no thinking TTS, no emoji, concise) ──
+
+    #[test]
+    fn voice_mode_off_by_default() {
+        let p = OllamaProvider::new(None, None);
+        assert!(!p.voice_mode(), "text chat must not carry voice directive");
+    }
+
+    #[test]
+    fn with_voice_mode_flips_the_flag() {
+        let p = OllamaProvider::new(None, None).with_voice_mode(true);
+        assert!(p.voice_mode());
+        let p2 = p.with_voice_mode(false);
+        assert!(!p2.voice_mode(), "flag must be toggleable");
+    }
+
+    #[test]
+    fn voice_directive_prepended_when_no_system_message() {
+        let out = ensure_voice_mode_system_prompt(vec![user_msg("안녕, 오늘 날씨 어때?")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, "system");
+        let sys = out[0].content.as_deref().unwrap();
+        assert!(sys.contains(VOICE_MODE_DIRECTIVE));
+        assert!(sys.contains("사고 과정"));
+        assert!(sys.contains("이모지"));
+        assert!(sys.contains("간결하게"));
+        assert!(sys.contains("No emojis"));
+    }
+
+    #[test]
+    fn voice_directive_appended_after_existing_system_block() {
+        let out = ensure_voice_mode_system_prompt(vec![
+            system_msg(LANGUAGE_MATCH_DIRECTIVE),
+            user_msg("hi"),
+        ]);
+        assert_eq!(out.len(), 2);
+        let sys = out[0].content.as_deref().unwrap();
+        assert!(sys.starts_with(LANGUAGE_MATCH_DIRECTIVE));
+        assert!(sys.contains(VOICE_MODE_DIRECTIVE));
+        let lang_pos = sys.find(LANGUAGE_MATCH_DIRECTIVE).unwrap();
+        let voice_pos = sys.find(VOICE_MODE_DIRECTIVE).unwrap();
+        assert!(lang_pos < voice_pos);
+    }
+
+    #[test]
+    fn voice_directive_not_duplicated_on_repeat_calls() {
+        let once = ensure_voice_mode_system_prompt(vec![user_msg("안녕")]);
+        let sys1 = once[0].content.clone();
+        let twice = ensure_voice_mode_system_prompt(vec![
+            Message {
+                role: "system".to_string(),
+                content: sys1,
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some("안녕".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            },
+        ]);
+        let sys = twice[0].content.as_deref().unwrap();
+        assert_eq!(
+            sys.matches(VOICE_MODE_DIRECTIVE).count(),
+            1,
+            "voice directive must not be appended twice on re-entry"
+        );
+    }
+
+    #[test]
+    fn voice_directive_replaces_empty_system_content() {
+        let out =
+            ensure_voice_mode_system_prompt(vec![system_msg("   "), user_msg("hi")]);
+        assert_eq!(out[0].content.as_deref(), Some(VOICE_MODE_DIRECTIVE));
+    }
+
+    #[test]
+    fn voice_directive_coexists_with_language_directive_idempotently() {
+        let msgs = vec![user_msg("오늘 점심 뭐 먹을까?")];
+        let with_lang = ensure_language_match_system_prompt(msgs);
+        let with_both = ensure_voice_mode_system_prompt(with_lang);
+        let sys = with_both[0].content.as_deref().unwrap();
+        assert_eq!(sys.matches(LANGUAGE_MATCH_DIRECTIVE).count(), 1);
+        assert_eq!(sys.matches(VOICE_MODE_DIRECTIVE).count(), 1);
+
+        let lang_again = ensure_language_match_system_prompt(with_both);
+        let voice_again = ensure_voice_mode_system_prompt(lang_again);
+        let sys2 = voice_again[0].content.as_deref().unwrap();
+        assert_eq!(sys2.matches(LANGUAGE_MATCH_DIRECTIVE).count(), 1);
+        assert_eq!(sys2.matches(VOICE_MODE_DIRECTIVE).count(), 1);
+    }
+
 
     // ── Speed knobs: stream=true + think=false default ──
 

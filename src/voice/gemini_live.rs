@@ -193,7 +193,13 @@ pub struct RealtimeInputConfig {
 
 /// Build the setup message for a voice interpretation session.
 pub fn build_setup_message(config: &InterpreterConfig, vad: &VadConfig) -> SetupMessage {
-    let system_prompt = config.build_system_prompt();
+    // Always append the MoA voice-mode directive so Gemini Live end-to-end
+    // audio skips reasoning tokens, emoji descriptions, and meta prefaces.
+    let system_prompt = format!(
+        "{}\n\n{}",
+        config.build_system_prompt(),
+        crate::providers::ollama::VOICE_MODE_DIRECTIVE,
+    );
 
     SetupMessage {
         setup: SetupPayload {
