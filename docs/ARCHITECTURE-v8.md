@@ -126,13 +126,22 @@ MoA 가 제공하는 기능은 크게 **대화·응답**, **음성·통역**, **
 
 ## 3. 장점 및 차별점 (Advantages)
 
+### 3.0 근본 차별점 — "두뇌 + 총알" 프레임
+
+**MoA 의 가장 핵심적인 차별점**은 기억 아키텍처에 있습니다: *LLM/SLM 은 사고의 총이고, First Brain 과 Second Brain 은 그 총알이다*. 자세한 설명은 [§10.0.0 핵심 개념 프레임](#1000-핵심-개념-프레임--두뇌llmslm--총알firstsecond-brain) 참조. 단순히 모델을 쓰는 AI 와 달리, MoA 는 두 종류의 독립적 · 교차 참조되는 기억을 두뇌에 동시에 공급합니다:
+
+- **총알 ①  First Brain (§10)** — 이용자의 **경험 · 사건 · 사회적 맥락** (5W1H 로 분해된 에피소드). 사회성 · 맥락 이해 · 시간 회상 강화.
+- **총알 ②  Second Brain (§11)** — 이용자가 **참고하는 지식 · 학습 자료 · 업무 문서** (태그 + wikilink + backlink). 사고력 · 추론력 · 판단력 강화.
+
+두 총알은 로컬 기기에 저장되고 E2E 암호화 동기화로 모든 기기가 공유합니다 (§12). 운영자 서버에 영구 저장되지 않습니다.
+
 ### 3.1 핵심 차별점 요약
 
 | 축 | 보통의 AI 비서 | MoA |
 |---|---|---|
 | 작동 모델 | 클라우드 단일 모델 | **SLM-First (on-device Gemma 4) + LLM advisor + on-device executor** (§5) |
 | 기억 | 서버에 저장 또는 로컬만 | **서버 비저장 E2E 동기화**(특허) — 기기마다 full copy, 릴레이는 5 분 TTL (§12) |
-| 기억 구조 | 단일 저장소 | **First Brain (episodic + ontology) + Second Brain (Vault + compiled_truth + append-only timeline)** (§10, §11) |
+| 기억 구조 | 단일 저장소 | **First Brain (경험 총알: episodic + ontology) + Second Brain (지식 총알: Vault + compiled_truth + append-only timeline)** — "두뇌 + 총알" 프레임 §10.0.0, §10, §11 |
 | 검색 | 벡터 또는 키워드 | **4-way RAG** (FTS + vector + graph BFS + meta filter) + Multi-Query + RRF (§10.4, §11.4) |
 | 도구 실행 | LLM 이 직접 | Tool 보안 티어링 + `safe_for_slm` 큐레이션; SLM 은 제한된 도구만, LLM 은 전체 (§5.3, §8) |
 | 운영자·이용자 key | 한쪽만 지원 | **이용자 key 우선 → 운영자 key 2.2× 폴백** + 하이브리드 릴레이(프록시 토큰) (§5.4) |
@@ -794,6 +803,8 @@ registration, NOT by cross-module rewrites.
 ## 5. SLM + LLM + Tool + Skill 유기적 로직 (Orchestration Logic)
 
 MoA 의 심장부에 해당하는 섹션입니다. **SLM(Gemma 4) 이 1차 응답·게이트키퍼·on-device executor** 역할을 하고, **LLM (Opus/GPT/Gemini 최고사양) 은 PLAN/REVIEW/ADVISE advisor** 역할을 하며, **Tool 은 `safe_for_slm` 큐레이션으로 위험도에 따라 SLM/LLM 에 분배**되고, **Skill 시스템은 반복 행동을 관찰·학습**합니다. 본 섹션은 원본 §★ MoA Core Workflow 와 §6F Self-Learning Skill System 을 통합한 것입니다.
+
+> **개념 프레임**: 본 섹션의 SLM 과 LLM 은 [**§10.0.0 "두뇌(LLM/SLM) + 총알(First/Second Brain)" 프레임**](#1000-핵심-개념-프레임--두뇌llmslm--총알firstsecond-brain) 에서 **두뇌** 에 해당합니다. 본 섹션이 설명하는 PLAN / REVIEW / ADVISE · tool 호출 · executor loop 는 모두 "두뇌가 사고하는 절차" 입니다. 사고에 필요한 총알(이용자 경험·지식) 은 §10 (First Brain) 과 §11 (Second Brain) 이 공급합니다. 두뇌 혼자서는 "이용자가 누군지 · 이용자가 무엇을 아는지" 모릅니다.
 
 <!-- CHUNK: 02_core_workflow (원본 §★ MoA Core Workflow) -->
 
@@ -3175,7 +3186,85 @@ via WebSocket.
 
 ## 10. 기억 아키텍처 — First Brain
 
-MoA 의 **First Brain** 은 **에피소드 기억 저장소 (Memory)** + **구조적 관계 저장소 (Ontology / Digital Twin)** 의 두 축으로 구성되며, 4 단계 양방향 교차 검색 프로토콜 (특허 2) 로 상호 보강됩니다. 본 섹션은 원본 §6★★ MoA Unified Memory Architecture 와 §6A Structured Relational Memory — Digital Twin Graph Layer 를 한 자리에 통합한 것입니다. Dual-Brain 의 **compiled_truth** 와 **append-only timeline** 은 §11 Second Brain 에서 다룹니다.
+### 10.0.0 핵심 개념 프레임 — "두뇌(LLM/SLM) + 총알(First/Second Brain)"
+
+> **MoA 기억 아키텍처를 이해하는 가장 짧은 문장**:
+> *"LLM 과 SLM 은 사고의 총이고, First Brain 과 Second Brain 은 그 총알이다."*
+
+LLM (Opus · GPT · Gemini) 과 SLM (Gemma 4) 은 **추론 · 사고 · 판단 · 응답 생성 · 도구 호출** 을 담당하는 **두뇌(brain)** 이지만, 그 자체로는 이용자에 대한 정보도, 누적된 학습 지식도 보유하지 않습니다. 모델 가중치에 새겨진 "일반 상식" 뿐입니다. **총이 있어도 총알이 없으면 쏠 수 없습니다.** 그래서 어떤 질문을 받든 맥락을 정확히 잡지 못하고, 이용자를 모르며, 이용자가 축적한 지식을 활용하지 못합니다.
+
+MoA 는 이 두뇌에게 **두 종류의 "총알" (기억 저장소)** 을 공급합니다:
+
+| | 역할 | 무엇을 담는가 | 담당 경로 | 비유 |
+|---|---|---|---|---|
+| **두뇌 (Brain)** | 추론 · 사고 · 판단 · 응답 · 도구 호출 | (이용자 데이터 없음, 가중치만) | **SLM** (Gemma 4) + **Advisor LLM** (Opus/GPT/Gemini) — §5 | 🔫 총 |
+| **총알 ① — First Brain** | 이용자 **개인 정보 · 경험 · 사회적 맥락** 공급 | 대화 · 만남 · 통화 · 약속 · 이벤트 (5W1H 로 분해) | `src/memory/**` + `src/ontology/**` — §10 | 🎯 "나를 아는" 탄약 |
+| **총알 ② — Second Brain** | 이용자가 참고하는 **외부 지식 · 학습 자료** 공급 | 논문 · 판례 · 문서 · 레퍼런스 · 노트 (원문 + 태그 + 링크) | `src/vault/**` + `src/memory/**` (compiled_truth) — §11 | 📚 "판단 근거" 탄약 |
+
+**작동 흐름** (한 번의 질문이 처리되는 전체 그림):
+
+```
+ 이용자 질문
+     │
+     ▼
+┌────────────────────────────────────────────────────────────┐
+│  두뇌 : SLM-first 게이트키퍼 → (필요 시) Advisor LLM        │
+│         (§5 오케스트레이션)                                  │
+│                                                             │
+│  "이 질문에 답하려면 어떤 정보가 필요한가?"                 │
+└────┬──────────────────────────────┬────────────────────────┘
+     │                              │
+     ├─ 이용자 · 경험 · 맥락 조회 ─▶│  [총알 ① First Brain] — §10
+     │  ("누구와 언제 어디서 무엇을") │  Episodic + Ontology 교차 검색
+     │                              │
+     └─ 지식 · 학습자료 조회 ──────▶│  [총알 ② Second Brain] — §11
+        ("이게 뭐지, 원본 어디 있지") │  Vault + wikilink + backlink + hub note
+     │                              │
+     ▼                              ▼
+┌────────────────────────────────────────────────────────────┐
+│  두뇌가 두 총알을 결합 → 사고 · 판단 · 답변 · 도구 호출     │
+│                         · 다른 디바이스와 기억 동기화 (§12)  │
+└────────────────────────────────────────────────────────────┘
+     │
+     ▼
+ 응답 (+ 필요 시 실행 결과)
+```
+
+**이 구조가 MoA 의 근본 차별점입니다.** 단순히 대규모 언어 모델을 쓰는 AI 와 달리, MoA 는 **두 종류의 독립적이면서 교차 참조되는 기억을 두뇌에 동시에 공급**하여 "이용자를 아는 · 지식을 가진 · 경험을 기억하는 · 직접 행동하는" 에이전트를 만듭니다. 총알이 기기별 로컬에 저장되고 (E2E 암호화 동기화로 모든 기기가 공유, §12), 운영자 서버에는 영구 저장되지 않는다는 점이 **서버 비저장 특허 (Patent 1)** 와 결합되어 사생활까지 보호합니다.
+
+> **§10 은 총알 ① First Brain, §11 은 총알 ② Second Brain 의 내부 설계를 각각 상세히 다룹니다. §5 는 두뇌(SLM/LLM)가 어떤 순서로 어떤 총알을 꺼내 쓰는지 — PLAN / REVIEW / ADVISE 체크포인트 포함 — 를 설명합니다.**
+
+---
+
+### 10.0 First Brain 이란 — 이용자의 에피소드(사건 · 관계 · 맥락) 뇌
+
+MoA 의 **First Brain** 은 **이용자 개인이 겪은 사건 · 인간관계 · 사회적 맥락** 의 집합을 보관하는 **에피소드 중심의 뇌**입니다. 직장 · 학교 · 커뮤니티 · 가정에서 벌어진 사건(case), 만남, 대화, 통화, 약속, 사고 경험 등을 **6 하원칙 (5W1H: Who / What / When / Where / Why / How)** 단위로 쪼개 저장하며, 야간 idle 시간에 Dream Cycle 이 누락된 메타데이터를 **자동 백필(nightly backfill)** 합니다.
+
+목적은 에이전트의 **사회성 · 맥락 파악 능력 · 시간순 회상 능력** 을 높이는 것입니다. "지난주 민수와 강남에서 만났을 때 나눈 얘기", "엄마 전화는 보통 몇 시쯤 오지?", "작년 그 고객사 미팅에서 거절됐던 조건" 같은 질문은 **지식 검색이 아니라 에피소드 회상**이며 — First Brain 이 답합니다.
+
+구성 요소:
+
+- **Episodic Store** (`src/memory/**`): SQLite + sqlite-vec + FTS5. 대화 · 이벤트 · 통화 · 약속 · 채널 메시지를 원문 그대로 + 벡터 임베딩으로 저장. 본 v8 §10.1 에서 다룸.
+- **Ontology / Digital Twin Graph** (`src/ontology/**`): 인물 · 장소 · 조직 · 사건을 typed Object / Link / Action 그래프로 구조화. 모든 Action 은 5W1H 메타데이터 필수 (UTC · 로컬 · 홈 타임존 3 중 타임스탬프 포함). 본 v8 §10.2 에서 다룸.
+- **Cross-Reference Protocol** (특허 2): 에피소드 ↔ 온톨로지 간 **4 단계 양방향 교차 검색** — 한쪽 검색 결과에서 추출한 키워드로 다른 쪽을 재검색하여 숨겨진 연관 정보를 발견.
+
+### 10.0.1 First Brain ↔ Second Brain 비교 (가장 중요한 개념 구분)
+
+| 축 | **First Brain** (에피소드 뇌) | **Second Brain** (지식 뇌, §11) |
+|---|---|---|
+| **무엇을 저장?** | 이용자가 **겪은 사건** · 만남 · 통화 · 대화 · 약속 · 채널 메시지 | 이용자가 **알고 있는 · 참고하는 지식** · 정보 · 학업 자료 · 직무 문서 |
+| **저장 단위** | "누가/언제/어디서/무엇을/왜/어떻게" (5W1H) 로 분해된 **이벤트 단위** | 원문 그대로의 **문서 · 노트 · 조각** (이벤트가 아니므로 5W1H 로 쪼개지 않음) |
+| **연결 방식** | typed Object/Link/Action 그래프 + 온톨로지 5W1H 교차 참조 | **wikilink + 태그 + backlink + hub note** — 정보·지식 간 연관 관계 |
+| **수집 경로** | 대화 · 통화 · 약속 · 채널 메시지에서 자동 추출 → 야간 Dream Cycle 이 5W1H 메타데이터 **백필** | 이용자가 붙여넣거나 Vault 폴더에 떨어뜨린 문서를 **7-step wikilink 추출 파이프라인**이 흡수 |
+| **재컴파일 / 수정** | 타임라인은 **append-only · 수정 불가** (데이터 레벨 trigger 로 강제) | 문서 원문은 보존하되, **compiled_truth** 로 LLM 이 주기적으로 요약 재컴파일 |
+| **주 용도 (인간 인지 능력 은유)** | **사회성 · 맥락 이해 · 시간 회상** — "나의 과거" | **사고력 · 통찰력 · 판단력 · 추론 · 암기** — "내가 아는 지식" |
+| **질문 예시** | "지난주 민수와 카페에서 얘기한 거 뭐였지?" · "작년 계약 협상 때 그쪽 반응은?" | "계약법 §564 조 판례 정리해줘" · "이 논문 저자가 제안한 새 구조가 뭐지?" |
+| **관련 특허** | 특허 2 (교차 참조), 특허 3 일부 (append-only timeline = 증거 레이어) | 특허 3 (compiled_truth), 특허 4 (Vault hub note engine + 4-way RAG) |
+| **상세 섹션** | §10.1 Unified Memory, §10.2 Digital Twin Graph | §11 전체 (Dual-Brain · Document Editor · Vault) |
+
+> **용어 주의**: 원본 §3b "Patent 3 — Dual-Brain Second Memory" 가 `memories` 테이블 내부에서 **append-only timeline (증거)** 과 **compiled_truth (요약)** 을 "first brain / second brain" 이라고 부르는 것은 **구현 레벨의 내부 용어**입니다. v8 §10/§11 의 "First Brain / Second Brain" 은 **제품 레벨의 구분**(에피소드 vs 지식) 입니다. 두 축은 다릅니다: 원본 §3b 의 timeline 은 사실 v8 관점에서 First Brain 에 해당하는 증거 저장소이고, compiled_truth 는 Second Brain 성격의 요약입니다. 본 v8 에서는 §3b 를 §11 에 모아두었으나, **개념적 소속**은 timeline → First Brain, compiled_truth → Second Brain 으로 이해하는 것이 제품 관점상 정확합니다.
+
+본 섹션은 원본 §6★★ MoA Unified Memory Architecture 와 §6A Structured Relational Memory — Digital Twin Graph Layer 를 한 자리에 통합한 것입니다.
 
 <!-- CHUNK: 11_unified_memory (원본 §6★★ MoA Unified Memory Architecture) -->
 
@@ -3618,7 +3707,41 @@ tables in `brain.db`.
 
 ## 11. 기억 아키텍처 — Second Brain
 
-**Second Brain** 은 MoA 의 가장 복잡한 레이어로, Dual-Brain(compiled_truth + append-only timeline), MoA Vault(wikilink 기반 허브노트 엔진), 2-Layer Document Editor(읽기 전용 viewer + Tiptap 편집기) 로 구성됩니다. 본 섹션은 원본 §3b Dual-Brain, §6C Document Processing & 2-Layer Editor, §6D MoA Vault, §6E Dual-Brain 구현 검증 매트릭스 를 한 자리에 모은 것입니다.
+> **개념 프레임**: Second Brain 은 [**§10.0.0 "두뇌(LLM/SLM) + 총알(First/Second Brain)" 프레임**](#1000-핵심-개념-프레임--두뇌llmslm--총알firstsecond-brain) 의 **총알 ②** 에 해당합니다. SLM/LLM 이 사고할 때 "내가 아는/참고하는 지식"을 공급하여 판단 · 추론 · 응답의 근거가 됩니다. First Brain 이 이용자의 "경험 총알"이라면, Second Brain 은 이용자의 "지식 총알"입니다.
+
+### 11.0 Second Brain 이란 — 이용자의 지식(정보 · 학업 · 직업) 뇌
+
+MoA 의 **Second Brain** 은 **이용자가 알고 있고 · 참고하고 · 학습하는 지식 · 정보의 집합** 을 보관하는 **지식 중심의 뇌**입니다. 학업 자료 · 논문 · 판례 · 업무 문서 · 레퍼런스 · 수집한 기사 · 작성 중인 노트 등을 **원문 그대로 보존** 하되, **태그(tags) + wikilink + backlink + hub note** 로 각 정보·지식 간 **연관 관계를 풍부히 설정**하여, 검색 시 단순 일치를 넘어 **새로운 가치를 발견**하게 합니다. (이벤트가 아니므로 5W1H 로 쪼개지 않습니다.)
+
+목적은 에이전트의 **사고력 · 통찰력 · 판단력 · 추론력 · 암기력 보완** 을 높이는 것입니다. "계약법 §564 조 판례를 정리해줘", "이 논문 저자의 핵심 주장이 뭐지?", "작년에 읽었던 그 경영학 레퍼런스 좀 찾아줘" 같은 질문은 **에피소드 회상이 아니라 지식 탐색**이며 — Second Brain 이 답합니다.
+
+구성 요소:
+
+- **Dual-Brain v3.0** (§11.1, 원본 §3b): `memories` 테이블에 **compiled_truth** (LLM 주기 재컴파일 요약) + **append-only timeline** (증거 원본) 을 공존시켜, 요약을 제공하되 증거 UUID 를 각주로 인용하여 **할루시네이션 방지 + 법적 감사 가능**.
+- **Document Processing & 2-Layer Editor** (§11.2, 원본 §6C): PDF · HWP · DOCX · PPT · 이미지 PDF 를 읽기 전용 뷰어 + Tiptap WYSIWYG Markdown 편집기의 2-layer 구조로 열어 편집. 편집 결과를 Vault 로 흘려보냄.
+- **MoA Vault — 진짜 Second Brain 코어** (§11.3, 원본 §6D): 17 개 Vault 테이블 · **7-step wikilink 추출 파이프라인** · 자체 진화형 vocabulary · **hub note engine** (4 엔티티 skeleton + priority queue + 3-tier conflict resolution) · **4-way RAG** (FTS + vector + graph BFS + meta filter) · **7-section focus briefing** · idle-time VaultScheduler.
+- **Dual-Brain 구현 검증 매트릭스** (§11.4, 원본 §6E): 위 전 구성요소의 plan ↔ code 추적 (file:line 인용 + 513 개 통과 테스트).
+
+### 11.0.1 Second Brain 의 핵심 원칙 — "쪼개지 않고, 연결한다"
+
+First Brain 이 "이벤트를 5W1H 로 **쪼개서** 저장"한다면, Second Brain 은 정반대입니다:
+
+- **원문 보존**: 지식 · 정보 · 문서는 **쪼개지 않고 원문 그대로** 저장. 5W1H 분할은 사건에나 의미 있고, 논문이나 판례 같은 지식에는 의미가 없기 때문.
+- **태그 · wikilink · backlink 로 연결**: 각 노트 · 문서 · 조각에 태그와 위키링크 부여 → 관련 hub note 가 자동 생성/업데이트 → backlink 로 역방향 탐색 → **검색 시 질문과 직접 일치하지 않아도 연관 지식이 함께 호출**되어 새로운 통찰이 발생.
+- **compiled_truth 는 접근 가속기**: 원본은 그대로 보관하되, 자주 묻는 질문에 대한 요약을 LLM 이 주기 재컴파일하여 응답 속도와 맥락 질을 향상.
+- **자체 진화형 vocabulary**: Vault 가 자라면서 반복 등장하는 개념을 vocabulary 에 편입 → 태그 제안 · 동의어 인식 · 클러스터링의 정확도가 시간에 따라 향상.
+
+### 11.0.2 First Brain vs Second Brain — 다시 한 번
+
+| 질문 유형 | 담당 | 예시 |
+|---|---|---|
+| "**누구와** 언제 어디서 무엇을" | **First Brain** (§10) | "지난주 김이사 미팅에서 뭐라던?" |
+| "**이 지식/정보가** 뭐지" | **Second Brain** (§11) | "AES-GCM 과 ChaCha20-Poly1305 차이 뭐지?" |
+| "**내가 예전에 봤던/읽었던** 그 자료 어디 있지?" | **Second Brain** (§11) | "작년에 읽은 계약법 개정 관련 논문 찾아줘" |
+| "**내가 예전에 겪었던** 그 상황이 뭐였지?" | **First Brain** (§10) | "3 년 전 유사한 이슈 있을 때 어떻게 해결했더라?" |
+| 복합 질문 (둘 다 필요) | **양쪽 동시 호출** | "민수와 논의했던 바로 그 논문 어디 갔지?" → First Brain 이 대화 맥락을, Second Brain 이 논문 본문을 반환 |
+
+본 섹션은 원본 §3b Dual-Brain, §6C Document Processing & 2-Layer Editor, §6D MoA Vault, §6E Dual-Brain 구현 검증 매트릭스 를 한 자리에 모은 것입니다.
 
 <!-- CHUNK: 05_dual_brain (원본 §3b Patent 3 Dual-Brain Second Memory v3.0) -->
 
