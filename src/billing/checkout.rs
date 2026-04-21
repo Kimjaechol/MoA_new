@@ -35,34 +35,65 @@ pub struct UsdCreditPackage {
     pub price_krw: u32,
 }
 
-/// Available credit packages.
+/// Available one-off top-up packages (spec, 2026-04-22):
+///
+/// * Manual-recharge offering: $10 / $25 / $50 / $100 / $200.
+/// * Auto-recharge offering (subset): $10 / $25 / $50 — the top three
+///   tiers are deliberately absent from auto-recharge so an unattended
+///   loop can never silently charge a user >$50 at a time.
+///
+/// Credit grants follow the 1:1000 USD-to-credit ratio strictly — NO
+/// loyalty bonus on one-off purchases. Loyalty bonuses belong on the
+/// monthly subscription plan (see `SUBSCRIPTION_PLANS`). The `price_krw`
+/// values are baseline hardcodes; the billing page recomputes them
+/// from a live FX feed before rendering.
 pub const USD_PACKAGES: &[UsdCreditPackage] = &[
     UsdCreditPackage {
-        id: "starter_10",
-        name: "Starter",
-        price_cents: 1000, // $10
-        credits: 1_500,
+        id: "topup_10",
+        name: "$10",
+        price_cents: 1_000,
+        credits: 10_000,
         price_krw: 14_000,
     },
     UsdCreditPackage {
-        id: "standard_20",
-        name: "Standard",
-        price_cents: 2000, // $20
-        credits: 3_200,
-        price_krw: 28_000,
+        id: "topup_25",
+        name: "$25",
+        price_cents: 2_500,
+        credits: 25_000,
+        price_krw: 35_000,
     },
     UsdCreditPackage {
-        id: "power_50",
-        name: "Power",
-        price_cents: 5000, // $50
-        credits: 8_500,
+        id: "topup_50",
+        name: "$50",
+        price_cents: 5_000,
+        credits: 50_000,
         price_krw: 69_000,
+    },
+    UsdCreditPackage {
+        id: "topup_100",
+        name: "$100",
+        price_cents: 10_000,
+        credits: 100_000,
+        price_krw: 138_000,
+    },
+    UsdCreditPackage {
+        id: "topup_200",
+        name: "$200",
+        price_cents: 20_000,
+        credits: 200_000,
+        price_krw: 276_000,
     },
 ];
 
-/// Auto-recharge threshold: recharge when balance drops below this.
-/// ~$1 worth of credits (1 credit ≈ $0.007).
-pub const AUTO_RECHARGE_THRESHOLD: u32 = 143;
+/// Package IDs eligible for auto-recharge (subset of `USD_PACKAGES`).
+/// Kept separate so the billing page can render a narrower dropdown
+/// without hardcoding the subset there.
+pub const AUTO_RECHARGE_PACKAGE_IDS: &[&str] = &["topup_10", "topup_25", "topup_50"];
+
+/// Fallback auto-recharge balance trigger when the user has not saved
+/// an explicit preference. Overridden per-user by
+/// `billing_preferences.auto_recharge_threshold` (values: 3_000 or 5_000).
+pub const AUTO_RECHARGE_THRESHOLD: u32 = 5_000;
 
 pub fn find_usd_package(id: &str) -> Option<&'static UsdCreditPackage> {
     USD_PACKAGES.iter().find(|p| p.id == id)

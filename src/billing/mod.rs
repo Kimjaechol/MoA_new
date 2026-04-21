@@ -23,8 +23,8 @@ pub use checkout::{
 };
 #[allow(unused_imports)]
 pub use llm_router::{
-    AdminKeys, KeySource, ProviderAccessMode, ResolvedKey, TaskCategory,
-    LOW_BALANCE_WARNING_THRESHOLD, SIGNUP_BONUS_CREDITS,
+    grant_signup_bonus, AdminKeys, KeySource, ProviderAccessMode, ResolvedKey, TaskCategory,
+    CREDITS_PER_USD, LOW_BALANCE_WARNING_THRESHOLD, SIGNUP_BONUS_CREDITS,
 };
 #[allow(unused_imports)]
 pub use payment::{CreditPackage, PaymentManager, PaymentRecord, PaymentStatus};
