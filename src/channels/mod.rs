@@ -18,6 +18,7 @@ pub(crate) mod ack_reaction;
 pub mod acp;
 pub mod bluebubbles;
 pub mod bridge;
+pub mod chat_mode;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;

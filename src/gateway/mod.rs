@@ -385,6 +385,9 @@ pub struct AppState {
     pub auth_store: Option<Arc<crate::auth::store::AuthStore>>,
     /// Channel pairing store for one-click messaging channel auth.
     pub channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>>,
+    /// Active chat mode (observer/participant) per (channel, platform_uid).
+    /// In-memory; defaults apply when the user has not issued `/mode`.
+    pub chat_modes: Arc<crate::channels::chat_mode::ChatModeStore>,
     /// Whether new user registration is allowed.
     pub auth_allow_registration: bool,
     /// Device router for cross-device remote access via web chat.
@@ -653,12 +656,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         let ollama: Arc<dyn crate::providers::Provider> = Arc::new(
             crate::providers::ollama::OllamaProvider::new(Some(&base), None),
         );
-        let executor = crate::advisor::SlmExecutor::new(
-            ollama,
-            config.gatekeeper.model.clone(),
-            0.3,
-            8,
-        );
+        let executor =
+            crate::advisor::SlmExecutor::new(ollama, config.gatekeeper.model.clone(), 0.3, 8);
         tracing::info!(
             model = executor.model(),
             url = base.as_str(),
@@ -1261,6 +1260,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         payment_manager,
         auth_store,
         channel_pairing,
+        chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
         auth_allow_registration,
         device_router,
         email_verify_service,
@@ -1484,10 +1484,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             post(auth_api::handle_auth_set_password),
         )
         .route("/api/user/profile", get(auth_api::handle_user_profile))
-        .route(
-            "/api/user/channels",
-            get(auth_api::handle_user_channels),
-        )
+        .route("/api/user/channels", get(auth_api::handle_user_channels))
         .route("/api/auth/devices", get(auth_api::handle_auth_devices_list))
         .route(
             "/api/auth/devices",
@@ -1555,11 +1552,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                     Method::DELETE,
                     Method::OPTIONS,
                 ])
-                .allow_headers([
-                    header::AUTHORIZATION,
-                    header::CONTENT_TYPE,
-                    header::ACCEPT,
-                ])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
                 .max_age(Duration::from_secs(3600));
             match std::env::var("CORS_ALLOWED_ORIGINS") {
                 Ok(origins) if !origins.is_empty() && origins != "*" => {
@@ -1936,6 +1929,7 @@ pub(super) async fn process_channel_message_rich(
     if let Some(reply) = channel_router::handle_channel_command(
         auth_store,
         device_router,
+        &state.chat_modes,
         channel_name,
         sender_platform_uid,
         content,
@@ -4068,6 +4062,7 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4145,6 +4140,7 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4205,6 +4201,7 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4266,6 +4263,7 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4771,6 +4769,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4860,6 +4859,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4930,6 +4930,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5001,6 +5002,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5081,6 +5083,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5153,6 +5156,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5230,6 +5234,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5333,6 +5338,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5406,6 +5412,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5484,6 +5491,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5576,6 +5584,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5647,6 +5656,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5729,6 +5739,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5816,6 +5827,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5893,6 +5905,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5963,6 +5976,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -6032,6 +6046,7 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
