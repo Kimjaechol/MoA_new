@@ -3890,15 +3890,19 @@ async fn handle_kakao_webhook(State(state): State<AppState>, body: Bytes) -> imp
         .as_ref()
         .map(|c| crate::channels::case_session::case_session_id("kakao", c));
 
+    // Recognise multi-select forwards and chat-export pastes and rewrite
+    // them into a structured prompt prefix before sending to the AI loop.
+    // Plain typed messages pass through unchanged.
+    let ingest = crate::channels::kakao_ingest::parse_ingest(utterance);
+    let prompt_owned = crate::channels::kakao_ingest::render_for_prompt(&ingest);
+    let prompt: &str = match &ingest {
+        crate::channels::kakao_ingest::KakaoIngest::PlainText(_) => utterance,
+        _ => prompt_owned.as_str(),
+    };
+
     // Route through the common channel routing framework
-    match process_channel_message_rich(
-        &state,
-        "kakao",
-        user_id,
-        utterance,
-        session_id.as_deref(),
-    )
-    .await
+    match process_channel_message_rich(&state, "kakao", user_id, prompt, session_id.as_deref())
+        .await
     {
         Ok(reply) => kakao_skill_json(&reply.text, &reply.buttons),
         Err(e) => {

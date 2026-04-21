@@ -29,6 +29,7 @@ pub mod github;
 pub mod imessage;
 pub mod irc;
 pub mod kakao;
+pub mod kakao_ingest;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
 pub mod line;
