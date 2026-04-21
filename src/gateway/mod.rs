@@ -10,6 +10,7 @@
 pub mod admin_api;
 pub mod api;
 pub mod auth_api;
+pub mod bootstrap_state;
 pub mod channel_router;
 pub mod llm_proxy;
 pub mod local_llm_api;
@@ -1138,6 +1139,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  Press Ctrl+C to stop.\n");
 
     crate::health::mark_component_ok("gateway");
+
+    // Kick off the first-launch local-LLM bootstrap (Gemma 4 base gun) in the
+    // background so the HTTP surface becomes responsive *while* Ollama and
+    // the model are downloading. The desktop client polls
+    // `GET /api/local-llm/bootstrap-status` to render progress. When
+    // `ZEROCLAW_SKIP_LOCAL_LLM_BOOTSTRAP=1` is set (Railway, CI, tests) the
+    // task exits immediately and marks the stage as `skipped`.
+    tokio::spawn(spawn_local_llm_bootstrap());
 
     // Fire gateway start hook
     if let Some(ref hooks) = hooks {
@@ -3939,6 +3948,88 @@ fn kakao_skill_json(
             "template": template
         })),
     )
+}
+
+/// Background task that runs the first-launch Gemma 4 bootstrap and keeps
+/// [`bootstrap_state`] up to date.
+///
+/// Structure intentionally mirrors `main::maybe_auto_bootstrap_local_llm` so
+/// the stderr narration stays consistent between the CLI and HTTP surfaces,
+/// but the progress callbacks push into the shared state the HTTP handler
+/// in `local_llm_api::handle_bootstrap_status` reads from. Non-fatal on
+/// error (state lands on `Error`, user can still BYOK cloud).
+async fn spawn_local_llm_bootstrap() {
+    const SKIP_ENV: &str = "ZEROCLAW_SKIP_LOCAL_LLM_BOOTSTRAP";
+    if std::env::var_os(SKIP_ENV).is_some_and(|v| !v.is_empty()) {
+        bootstrap_state::set(bootstrap_state::BootstrapStage::Skipped);
+        tracing::debug!(env = SKIP_ENV, "local-LLM bootstrap skipped (env opt-out)");
+        return;
+    }
+
+    use crate::local_llm::setup::{ensure_ready, EnsureOutcome, SetupCallbacks, SetupStage};
+    use crate::local_llm::DEFAULT_OLLAMA_URL;
+
+    // Mutable pull-attempt tracker shared between the stage and pull-progress
+    // closures so `PullingModel { attempt }` retains the correct attempt
+    // number as NDJSON progress events stream in.
+    let pull_attempt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
+
+    let pull_attempt_stage = pull_attempt.clone();
+    let mut on_stage = move |stage: SetupStage| {
+        let mapped = match stage {
+            SetupStage::Probing => bootstrap_state::BootstrapStage::Probing,
+            SetupStage::CheckingDisk => bootstrap_state::BootstrapStage::CheckingDisk,
+            SetupStage::InstallingOllama => bootstrap_state::BootstrapStage::InstallingOllama,
+            SetupStage::WaitingForDaemon => bootstrap_state::BootstrapStage::WaitingForDaemon,
+            SetupStage::PullingModel { attempt } => {
+                pull_attempt_stage.store(attempt, std::sync::atomic::Ordering::Relaxed);
+                bootstrap_state::BootstrapStage::PullingModel {
+                    attempt,
+                    fraction: None,
+                    pull_status: None,
+                }
+            }
+            SetupStage::Persisting => bootstrap_state::BootstrapStage::Persisting,
+            SetupStage::Done => return, // terminal tag handled after ensure_ready returns
+        };
+        bootstrap_state::set(mapped);
+    };
+    let mut on_install = |_: crate::local_llm::installer::InstallProgress| {};
+    let pull_attempt_pull = pull_attempt.clone();
+    let mut on_pull = move |p: crate::local_llm::PullProgress| {
+        let attempt = pull_attempt_pull.load(std::sync::atomic::Ordering::Relaxed);
+        bootstrap_state::set(bootstrap_state::BootstrapStage::PullingModel {
+            attempt,
+            fraction: p.fraction(),
+            pull_status: Some(p.status.clone()),
+        });
+    };
+
+    let mut callbacks = SetupCallbacks {
+        on_stage: &mut on_stage,
+        on_install_progress: &mut on_install,
+        on_pull_progress: &mut on_pull,
+    };
+
+    match ensure_ready(DEFAULT_OLLAMA_URL, &mut callbacks).await {
+        Ok(EnsureOutcome::AlreadyReady { model })
+        | Ok(EnsureOutcome::ModelPulled { model }) => {
+            bootstrap_state::set(bootstrap_state::BootstrapStage::Done { model });
+        }
+        Ok(EnsureOutcome::Installed { report }) => {
+            bootstrap_state::set(bootstrap_state::BootstrapStage::Done {
+                model: report.model_tag,
+            });
+        }
+        Err(e) => {
+            let message = format!("{e:#}");
+            tracing::warn!(
+                error = %message,
+                "local-LLM bootstrap failed; continuing without on-device fallback"
+            );
+            bootstrap_state::set(bootstrap_state::BootstrapStage::Error { message });
+        }
+    }
 }
 
 #[cfg(test)]

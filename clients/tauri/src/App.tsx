@@ -7,6 +7,7 @@ import { SignUp } from "./components/SignUp";
 import { DeviceSelect } from "./components/DeviceSelect";
 import { Interpreter } from "./components/Interpreter";
 import { SetupWizard } from "./components/SetupWizard";
+import { LocalLlmBootstrap } from "./components/LocalLlmBootstrap";
 import { GatewayStatus } from "./components/GatewayStatus";
 import { LockScreen } from "./components/LockScreen";
 import { DocumentEditor } from "./components/DocumentEditor";
@@ -31,7 +32,7 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "chat" | "settings" | "interpreter" | "document" | "archive";
+type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "llm_bootstrap" | "chat" | "settings" | "interpreter" | "document" | "archive";
 
 /** Inactivity auto-lock timeout in milliseconds (default: 5 minutes). */
 const AUTO_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
@@ -453,15 +454,45 @@ function App() {
   );
 
   const handleLoginSuccess = useCallback((devices: DeviceInfo[]) => {
+    // Decide between the first-launch Gemma 4 progress screen and the chat
+    // view. On Tauri desktop, if the local-LLM bootstrap is still running we
+    // route to `llm_bootstrap`, which polls the gateway and forwards the user
+    // to chat once the base gun is loaded. On mobile / browser runtimes (no
+    // local Ollama), or when the gateway reports `done`/`skipped`, we skip
+    // straight to chat so returning users don't see an extra hop.
     const proceedToChat = () => {
       setIsConnected(true);
       setPage("chat");
       apiClient.startHeartbeat();
 
-      // Determine if first login (no previous chats)
       const existingChats = loadChats();
       const isFirstLogin = existingChats.length === 0;
       sendAutoGreeting(isFirstLogin);
+    };
+
+    const routeAfterAuth = async () => {
+      if (!isTauri()) {
+        proceedToChat();
+        return;
+      }
+      try {
+        const res = await fetch(
+          `${apiClient.getServerUrl()}/api/local-llm/bootstrap-status`,
+          { method: "GET" },
+        );
+        if (!res.ok) {
+          proceedToChat();
+          return;
+        }
+        const data = (await res.json()) as { stage?: string };
+        if (data.stage === "done" || data.stage === "skipped") {
+          proceedToChat();
+        } else {
+          setPage("llm_bootstrap");
+        }
+      } catch {
+        proceedToChat();
+      }
     };
 
     if (devices.length <= 1) {
@@ -469,7 +500,7 @@ function App() {
       if (devices.length === 0) {
         apiClient.registerCurrentDevice().catch(() => {});
       }
-      proceedToChat();
+      void routeAfterAuth();
     } else {
       // Multiple devices → show device selection
       const currentDeviceId = apiClient.getDeviceId();
@@ -477,9 +508,9 @@ function App() {
       const onlineDevices = devices.filter((d) => d.is_online);
 
       if (currentInList) {
-        proceedToChat();
+        void routeAfterAuth();
       } else if (onlineDevices.length === 1 && !onlineDevices[0].has_pairing_code) {
-        proceedToChat();
+        void routeAfterAuth();
       } else {
         // Show device selection
         setPendingDevices(devices);
@@ -489,13 +520,40 @@ function App() {
   }, [sendAutoGreeting]);
 
   const handleDeviceSelected = useCallback(() => {
-    setIsConnected(true);
-    setPage("chat");
     apiClient.startHeartbeat();
-
-    const existingChats = loadChats();
-    const isFirstLogin = existingChats.length === 0;
-    sendAutoGreeting(isFirstLogin);
+    // Mirror handleLoginSuccess: gate the chat view on the local-LLM
+    // bootstrap completing so the user does not land in chat with an
+    // unarmed base gun.
+    const route = async () => {
+      if (!isTauri()) {
+        setIsConnected(true);
+        setPage("chat");
+        const existingChats = loadChats();
+        sendAutoGreeting(existingChats.length === 0);
+        return;
+      }
+      try {
+        const res = await fetch(
+          `${apiClient.getServerUrl()}/api/local-llm/bootstrap-status`,
+          { method: "GET" },
+        );
+        const data = res.ok ? ((await res.json()) as { stage?: string }) : { stage: "done" };
+        if (data.stage === "done" || data.stage === "skipped") {
+          setIsConnected(true);
+          setPage("chat");
+          const existingChats = loadChats();
+          sendAutoGreeting(existingChats.length === 0);
+        } else {
+          setPage("llm_bootstrap");
+        }
+      } catch {
+        setIsConnected(true);
+        setPage("chat");
+        const existingChats = loadChats();
+        sendAutoGreeting(existingChats.length === 0);
+      }
+    };
+    void route();
   }, [sendAutoGreeting]);
 
   const handleLogout = useCallback(async () => {
@@ -655,6 +713,31 @@ function App() {
           devices={pendingDevices}
           onDeviceSelected={handleDeviceSelected}
           onLogout={handleLogout}
+        />
+      </div>
+    );
+  }
+
+  // First-launch local-LLM install progress (base gun = Gemma 4). We arrive
+  // here only when the gateway has reported the bootstrap is not yet Done —
+  // see `handleLoginSuccess` below. Leaving this screen is either "Done"
+  // (auto) or the explicit "Continue without local AI" button.
+  if (page === "llm_bootstrap") {
+    return (
+      <div className="app">
+        <LocalLlmBootstrap
+          locale={locale}
+          onReady={(ready) => {
+            setIsConnected(true);
+            apiClient.startHeartbeat();
+            setPage("chat");
+            const existingChats = loadChats();
+            const isFirstLogin = existingChats.length === 0;
+            sendAutoGreeting(isFirstLogin);
+            // `ready=false` indicates the user skipped — we still proceed to
+            // chat; downstream code handles the cloud-fallback case.
+            void ready;
+          }}
         />
       </div>
     );

@@ -47,6 +47,7 @@ use crate::local_llm::{self, InstalledModel, LocalLlmConfig};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/status", get(handle_status))
+        .route("/bootstrap-status", get(handle_bootstrap_status))
         .route("/reprobe", post(handle_reprobe))
         .route("/uninstall", post(handle_uninstall))
         .route("/offline-only", post(handle_offline_only))
@@ -488,4 +489,16 @@ mod tests {
         );
         drop(tx);
     }
+}
+
+
+// ── /bootstrap-status ────────────────────────────────────────────────
+//
+// Poll-friendly snapshot of the first-launch Gemma 4 bootstrap progress
+// (see `gateway::bootstrap_state`). The desktop client hits this every
+// ~500 ms after login until the stage reaches `done`, `error`, or
+// `skipped`, then switches to the chat UI. Returns immediately (no long
+// polling) so the client can implement its own retry/backoff policy.
+async fn handle_bootstrap_status() -> impl IntoResponse {
+    Json(super::bootstrap_state::snapshot())
 }

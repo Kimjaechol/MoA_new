@@ -1086,7 +1086,16 @@ async fn main() -> Result<()> {
             host,
             new_pairing,
         } => {
-            maybe_auto_bootstrap_local_llm("gateway").await;
+            // NOTE: The synchronous pre-bind bootstrap was replaced by a
+            // background task inside `gateway::run_gateway` (see
+            // `spawn_local_llm_bootstrap` + `bootstrap_state`). Keeping the
+            // HTTP surface responsive during a multi-GB model download lets
+            // the desktop client render a progress screen via
+            // `GET /api/local-llm/bootstrap-status`, which would be
+            // impossible if the gateway blocked its bind() call on the
+            // installer. The agent/daemon commands still call the
+            // synchronous path because they run without an HTTP client on
+            // the other end to observe progress.
             if new_pairing {
                 // Persist token reset from raw config so env-derived overrides are not written to disk.
                 let mut persisted_config = Config::load_or_init().await?;

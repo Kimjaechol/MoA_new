@@ -174,6 +174,22 @@ type TranslationKey =
   | "greeting_prompt"
   | "greeting_prompt_returning"
   | "greeting_first_chat_local"
+  // Local-LLM first-launch bootstrap screen
+  | "local_llm_bootstrap_title"
+  | "local_llm_bootstrap_subtitle"
+  | "local_llm_bootstrap_stage_not_started"
+  | "local_llm_bootstrap_stage_skipped"
+  | "local_llm_bootstrap_stage_probing"
+  | "local_llm_bootstrap_stage_checking_disk"
+  | "local_llm_bootstrap_stage_installing_ollama"
+  | "local_llm_bootstrap_stage_waiting_for_daemon"
+  | "local_llm_bootstrap_stage_pulling_model"
+  | "local_llm_bootstrap_stage_persisting"
+  | "local_llm_bootstrap_stage_done"
+  | "local_llm_bootstrap_stage_error"
+  | "local_llm_bootstrap_retry"
+  | "local_llm_bootstrap_poll_retry"
+  | "local_llm_bootstrap_skip"
   // Lock screen
   | "lock_title"
   | "lock_subtitle"
@@ -393,6 +409,21 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     greeting_prompt: "[SYSTEM] The user just logged in for the first time. Their username is \"{username}\". You are MoA, the user's personal AI assistant. Greet them with a polite, gentle, multi-step approach in a SINGLE response. Structure your response as follows:\n1. First, introduce yourself warmly: \"Hello. My name is MoA. To briefly introduce myself, I am your personal AI assistant. I look forward to working with you.\"\n2. Then, carefully and politely ask for their name and occupation: \"May I ask your name and what you do?\"\n3. Finally, ask how they would like to be addressed: \"If you don't mind, how would you prefer I address you?\"\nBe respectful, courteous, and gentle throughout — as if meeting someone important for the first time. Do NOT be overly casual. Use a warm but professional secretary-like tone. Respond in the user's language.",
     greeting_prompt_returning: "[SYSTEM] The user \"{username}\" just logged in. You are their personal AI assistant MoA. Greet them like a secretary who knows them. Use any memories you have about them (name, job, preferences). If you remember their real name, use it. Be warm, concise, and proactive — mention anything relevant or ask how you can help today.",
     greeting_first_chat_local: "Hello. I am MoA, your friendly AI assistant.\n\nI'm a local AI that works on your device even without an internet connection. For complex problems that need advanced reasoning, I'll call on heavyweight LLMs such as Claude, Gemini, or GPT as optional high-performance upgrades.\n\nUsing those advanced models consumes credits. If you already have an API key for one of them, you can paste it into Settings and I'll use your key instead — no credits will be spent in that case.",
+    local_llm_bootstrap_title: "Preparing your base gun — Gemma 4",
+    local_llm_bootstrap_subtitle: "One-time setup. We are installing the local brain so MoA can think offline.",
+    local_llm_bootstrap_stage_not_started: "Waiting for the backend to start…",
+    local_llm_bootstrap_stage_skipped: "Local install skipped — using cloud fallback.",
+    local_llm_bootstrap_stage_probing: "Probing hardware…",
+    local_llm_bootstrap_stage_checking_disk: "Checking free disk space…",
+    local_llm_bootstrap_stage_installing_ollama: "Installing Ollama runtime…",
+    local_llm_bootstrap_stage_waiting_for_daemon: "Waiting for Ollama daemon…",
+    local_llm_bootstrap_stage_pulling_model: "Downloading Gemma 4 model…",
+    local_llm_bootstrap_stage_persisting: "Saving local-LLM configuration…",
+    local_llm_bootstrap_stage_done: "Ready — Gemma 4 is loaded.",
+    local_llm_bootstrap_stage_error: "Setup failed — you can still use a cloud LLM from Settings.",
+    local_llm_bootstrap_retry: "(retry #{n})",
+    local_llm_bootstrap_poll_retry: "Backend not responding — retrying…",
+    local_llm_bootstrap_skip: "Continue without local AI",
     // Lock screen
     lock_title: "MoA Locked",
     lock_subtitle: "Enter your password to unlock",
@@ -609,6 +640,21 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     greeting_prompt: "[SYSTEM] 사용자가 처음 로그인했습니다. 아이디는 \"{username}\"입니다. 당신은 MoA, 사용자의 개인 AI 비서입니다. 정중하고 조심스러운 태도로 여러 단계에 걸쳐 대화를 시작하세요. 하나의 응답 안에서 다음 순서로 구성하세요:\n1. 먼저 따뜻하게 자기소개: \"안녕하세요. 저는 MoA라고 합니다. 간단하게 저를 소개하면 사용자님의 개인 AI 비서입니다. 앞으로 잘 부탁드립니다.\"\n2. 그 다음, 조심스럽게 이름과 직업을 여쭤보기: \"혹시 사용자님의 이름과 직업을 여쭈어봐도 될까요?\"\n3. 마지막으로, 호칭을 어떻게 하면 좋을지 정중하게 묻기: \"실례가 되지 않는다면 제가 사용자님을 어떤 호칭으로 부르는 것이 좋을까요?\"\n위 내용을 참고하되 자연스럽게 변형하여 말하세요. 처음 만나는 중요한 분을 대하듯 공손하고 예의바르게 대화하세요. 지나치게 캐주얼하지 않게, 따뜻하지만 전문적인 비서의 톤을 유지하세요. 반드시 한국어로 대화하세요.",
     greeting_prompt_returning: "[SYSTEM] \uC0AC\uC6A9\uC790 \"{username}\"\uB2D8\uC774 \uB85C\uADF8\uC778\uD588\uC2B5\uB2C8\uB2E4. \uB2F9\uC2E0\uC740 \uAC1C\uC778 AI \uBE44\uC11C MoA\uC785\uB2C8\uB2E4. \uC0AC\uC6A9\uC790\uB97C \uC798 \uC544\uB294 \uBE44\uC11C\uCC98\uB7FC \uC778\uC0AC\uD558\uC138\uC694. \uAE30\uC5B5\uD558\uACE0 \uC788\uB294 \uC815\uBCF4(\uC774\uB984, \uC9C1\uC5C5, \uC120\uD638\uB3C4)\uB97C \uD65C\uC6A9\uD558\uC138\uC694. \uB530\uB73B\uD558\uACE0 \uAC04\uACB0\uD558\uAC8C, \uC624\uB298 \uBB34\uC5C7\uC744 \uB3C4\uC640\uB4DC\uB9B4\uC9C0 \uBB3C\uC5B4\uBD10\uC8FC\uC138\uC694. \uD55C\uAD6D\uC5B4\uB85C \uB300\uD654\uD558\uC138\uC694.",
     greeting_first_chat_local: "안녕하세요. 저는 당신의 친절한 AI 비서 MoA입니다.\n\n저는 로컬에서 인터넷 연결 없이도 작동하는 AI입니다만, 고급 추론이 필요한 복잡한 문제 해결을 위해서 특별히 클로드나 제미나이, 또는 GPT와 같은 LLM 모델을 옵션 총(Gun)처럼 연결하여 사용할 예정입니다.\n\n고급 LLM 모델을 문제 해결에 사용할 때에는 크레딧이 소진됩니다. 다만 사용자님께서 위 LLM 모델의 API key를 가지고 계신다면 설정 화면에 입력해 주시면, 그 키가 쓰이는 동안에는 별도의 크레딧이 소진되지 않습니다.",
+    local_llm_bootstrap_title: "기본 총(Gun)을 장착하고 있어요 — Gemma 4",
+    local_llm_bootstrap_subtitle: "최초 1회 설치입니다. 오프라인에서도 작동하는 로컬 두뇌를 준비하고 있어요.",
+    local_llm_bootstrap_stage_not_started: "백엔드 기동을 기다리는 중…",
+    local_llm_bootstrap_stage_skipped: "로컬 설치를 건너뛰었습니다 — 클라우드로만 동작합니다.",
+    local_llm_bootstrap_stage_probing: "하드웨어를 확인하는 중…",
+    local_llm_bootstrap_stage_checking_disk: "저장 공간을 확인하는 중…",
+    local_llm_bootstrap_stage_installing_ollama: "Ollama 런타임을 설치하는 중…",
+    local_llm_bootstrap_stage_waiting_for_daemon: "Ollama 데몬을 기다리는 중…",
+    local_llm_bootstrap_stage_pulling_model: "Gemma 4 모델을 내려받는 중…",
+    local_llm_bootstrap_stage_persisting: "로컬 LLM 설정을 저장하는 중…",
+    local_llm_bootstrap_stage_done: "준비 완료 — Gemma 4가 장착되었습니다.",
+    local_llm_bootstrap_stage_error: "설치에 실패했어요 — 설정에서 클라우드 LLM을 사용할 수 있어요.",
+    local_llm_bootstrap_retry: "(재시도 {n}회차)",
+    local_llm_bootstrap_poll_retry: "서버 응답 대기 중 — 재시도합니다…",
+    local_llm_bootstrap_skip: "로컬 AI 없이 계속하기",
     // Lock screen
     lock_title: "MoA \uc7a0\uae08",
     lock_subtitle: "\ube44\ubc00\ubc88\ud638\ub97c \uc785\ub825\ud558\uc5ec \uc7a0\uae08\uc744 \ud574\uc81c\ud558\uc138\uc694",
