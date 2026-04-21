@@ -890,20 +890,29 @@ export class MoAClient {
       throw new Error("Not authenticated. Please login first.");
     }
 
-    // Include user's selected provider/model preference
-    // Priority: user's explicit choice > Anthropic (if key exists) > OpenAI > Gemini
+    // Include user's selected provider/model preference.
+    // Gun metaphor: Gemma 4 (local Ollama) is the mandatory base gun — always
+    // loaded, no credit cost, no network. Cloud providers (Claude / GPT /
+    // Gemini) are optional high-performance guns the user can swap in once
+    // they register a BYOK key. Priority:
+    //   1. User's explicit choice (from Settings)
+    //   2. Local Ollama when a Tauri desktop runtime is detected
+    //   3. Any cloud provider whose BYOK key is already stored
+    //   4. Gemini as the final cloud fallback
     let provider = localStorage.getItem("zeroclaw_llm_provider") || "";
     if (!provider) {
-      if (localStorage.getItem("zeroclaw_api_key_anthropic")) provider = "claude";
+      if (isTauri()) provider = "ollama";
+      else if (localStorage.getItem("zeroclaw_api_key_anthropic")) provider = "claude";
       else if (localStorage.getItem("zeroclaw_api_key_openai")) provider = "openai";
       else provider = "gemini";
     }
     const providerDefaults: Record<string, string> = {
+      ollama: "gemma4:e4b",
       claude: "claude-opus-4-6",
       openai: "gpt-5.4",
       gemini: "gemini-3.1-pro-preview",
     };
-    const model = localStorage.getItem("zeroclaw_llm_model") || providerDefaults[provider] || "gemini-3.1-pro-preview";
+    const model = localStorage.getItem("zeroclaw_llm_model") || providerDefaults[provider] || "gemma4:e4b";
 
     const keyStorageName = MoAClient.PROVIDER_KEY_MAP[provider] || provider;
     const apiKey = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`) || "";

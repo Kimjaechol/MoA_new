@@ -2067,7 +2067,7 @@ pub enum TaskCategory {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PlatformRoutingConfig {
     /// Credit cost multiplier applied to API token costs (before tax).
-    /// Default: `2.0` (user pays 2× the raw API cost in credits).
+    /// Default: `2.2` (user pays 2.2× the raw API cost in credits).
     #[serde(default = "default_credit_multiplier")]
     pub credit_multiplier: f64,
 
@@ -2118,7 +2118,10 @@ pub struct PlatformRoutingConfig {
 }
 
 fn default_credit_multiplier() -> f64 {
-    2.0
+    // 2.2x markup on raw API cost (before VAT) when the user is relying on the
+    // platform operator's API key instead of their own BYOK key. Combined with
+    // the 10% VAT default this surfaces as roughly 2.42x effective charge.
+    2.2
 }
 fn default_vat_rate() -> f64 {
     0.1

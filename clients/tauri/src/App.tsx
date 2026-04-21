@@ -107,8 +107,27 @@ function App() {
 
   // Check auth on startup — show setup wizard for first-time users.
   // In Tauri mode, wait for the gateway to be ready before proceeding.
+  //
+  // Gun metaphor onboarding (spec, 2026-04-22): Desktop/mobile installs are
+  // shipped with Gemma 4 as the base gun, so the legacy SetupWizard is never
+  // shown on Tauri runtimes — we auto-stamp the "setup complete" flag and the
+  // default provider/model pair on first launch so the user lands directly on
+  // Login → Chat with a working local brain. The wizard remains reachable from
+  // Settings for users who want to register BYOK cloud keys as optional guns.
   useEffect(() => {
     if (!gatewayReady) return;
+
+    if (isTauri()) {
+      if (!localStorage.getItem("zeroclaw_llm_provider")) {
+        localStorage.setItem("zeroclaw_llm_provider", "ollama");
+      }
+      if (!localStorage.getItem("zeroclaw_llm_model")) {
+        localStorage.setItem("zeroclaw_llm_model", "gemma4:e4b");
+      }
+      if (!localStorage.getItem("zeroclaw_setup_complete")) {
+        localStorage.setItem("zeroclaw_setup_complete", "true");
+      }
+    }
 
     const setupComplete = localStorage.getItem("zeroclaw_setup_complete");
     if (!setupComplete) {
@@ -352,7 +371,17 @@ function App() {
     [activeChatId, handleSendMessage],
   );
 
-  // Send an automatic greeting from MoA when chat opens after login
+  // Send an automatic greeting from MoA when chat opens after login.
+  //
+  // First login: we render a *deterministic* introduction message written from
+  // the Gemma 4 base-gun perspective so every new user sees the same welcome
+  // and the business rules (credit burn on cloud, BYOK opt-out) are stated
+  // verbatim. The active model is labelled `gemma4:e4b` so the bubble attributes
+  // correctly in the UI even though the text itself is pre-baked rather than
+  // sampled from the SLM — this is intentional (deterministic onboarding).
+  //
+  // Returning users still get an AI-generated personalised greeting through
+  // the existing chat pipeline below.
   const sendAutoGreeting = useCallback(
     async (isFirstLogin: boolean) => {
       const chat = createNewChat();
@@ -360,12 +389,26 @@ function App() {
       setChats((prev) => [chat, ...prev]);
       setActiveChatIdState(chatId);
 
+      if (isFirstLogin) {
+        const introText = t("greeting_first_chat_local", locale);
+        const introMsg = createMessage("assistant", introText, "gemma4:e4b");
+        setChats((prev) =>
+          prev.map((c) => {
+            if (c.id !== chatId) return c;
+            return {
+              ...c,
+              title: t("app_title", locale),
+              messages: [introMsg],
+              updatedAt: Date.now(),
+            };
+          }),
+        );
+        return;
+      }
+
       const user = apiClient.getUser();
       const username = user?.username ?? "User";
-
-      // Choose prompt based on whether this is a first-time or returning user
-      const promptKey = isFirstLogin ? "greeting_prompt" : "greeting_prompt_returning";
-      const prompt = t(promptKey, locale).replace("{username}", username);
+      const prompt = t("greeting_prompt_returning", locale).replace("{username}", username);
 
       try {
         const response = await apiClient.chat(prompt, []);
