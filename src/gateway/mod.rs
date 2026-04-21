@@ -3882,8 +3882,24 @@ async fn handle_kakao_webhook(State(state): State<AppState>, body: Bytes) -> imp
         "KakaoTalk webhook received"
     );
 
+    // If a sticky case is active for this user, scope the inbound message
+    // to a per-case `session_id` so memory recall can answer
+    // "어제 의뢰인이 뭐라 했지?" without bleeding across cases.
+    let active_case = state.case_sessions.current("kakao", user_id);
+    let session_id = active_case
+        .as_ref()
+        .map(|c| crate::channels::case_session::case_session_id("kakao", c));
+
     // Route through the common channel routing framework
-    match process_channel_message_rich(&state, "kakao", user_id, utterance, None).await {
+    match process_channel_message_rich(
+        &state,
+        "kakao",
+        user_id,
+        utterance,
+        session_id.as_deref(),
+    )
+    .await
+    {
         Ok(reply) => kakao_skill_json(&reply.text, &reply.buttons),
         Err(e) => {
             tracing::error!("KakaoTalk processing failed: {e:#}");
