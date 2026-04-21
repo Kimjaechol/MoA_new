@@ -11,6 +11,7 @@ pub mod admin_api;
 pub mod api;
 pub mod auth_api;
 pub mod channel_router;
+pub mod kakao_share;
 pub mod llm_proxy;
 pub mod local_llm_api;
 mod openai_compat;
@@ -393,6 +394,11 @@ pub struct AppState {
     /// memory recall can answer "어제 의뢰인이 뭐라 했지?" questions
     /// without bleeding across cases.
     pub case_sessions: Arc<crate::channels::case_session::CaseSessionStore>,
+    /// Single-use, short-lived tokens that back the
+    /// `📤 단톡방으로 보내기` quick-reply button on KakaoTalk replies.
+    /// `None` when the deployment has no SQLite workspace (degrades
+    /// the share button to a no-op).
+    pub kakao_share_store: Option<Arc<crate::channels::kakao_share_store::KakaoShareStore>>,
     /// Whether new user registration is allowed.
     pub auth_allow_registration: bool,
     /// Device router for cross-device remote access via web chat.
@@ -1228,6 +1234,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             (None, None, false, None, None)
         };
 
+    // Kakao share-back token store. File-backed when a workspace dir is
+    // present; falls back to None on open error so the deployment keeps
+    // working without share-back support.
+    let kakao_share_store = {
+        let path = std::path::Path::new(&config.workspace_dir).join("kakao_share.db");
+        match crate::channels::kakao_share_store::KakaoShareStore::open(&path) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to open kakao_share.db ({e}); 단톡방 공유 버튼이 비활성화됩니다."
+                );
+                None
+            }
+        }
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -1267,6 +1289,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         channel_pairing,
         chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
         case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+        kakao_share_store,
         auth_allow_registration,
         device_router,
         email_verify_service,
@@ -1534,6 +1557,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/pair/auto/{token}", post(pair::handle_auto_pair_login))
         .route("/pair/signup", get(pair::handle_pair_signup_page))
         .route("/pair/signup", post(pair::handle_pair_signup_submit))
+        // ── KakaoTalk one-tap share-back ──
+        .route("/kakao/share/{token}", get(kakao_share::handle_share_page))
+        .route(
+            "/kakao/share/{token}/consume",
+            post(kakao_share::handle_share_consume),
+        )
         // ── Sync endpoints (cross-device memory sync) ──
         .route("/api/sync/push", post(api::handle_sync_push))
         .route("/api/sync/pull", post(api::handle_sync_pull))
@@ -4091,6 +4120,7 @@ mod tests {
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4170,6 +4200,7 @@ mod tests {
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4232,6 +4263,7 @@ mod tests {
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4295,6 +4327,7 @@ mod tests {
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4802,6 +4835,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4893,6 +4927,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4965,6 +5000,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5038,6 +5074,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5120,6 +5157,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5194,6 +5232,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5273,6 +5312,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5378,6 +5418,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5453,6 +5494,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5533,6 +5575,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5627,6 +5670,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5700,6 +5744,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5784,6 +5829,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5873,6 +5919,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5952,6 +5999,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -6024,6 +6072,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -6095,6 +6144,7 @@ Reminder set successfully."#;
             channel_pairing: None,
             chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
