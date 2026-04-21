@@ -1432,6 +1432,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/billing/sweep-expired",
             post(api::handle_api_billing_sweep_expired),
         )
+        // Subscription plans (spec, 2026-04-22): $30/mo + $324/yr (10% off).
+        .route(
+            "/api/subscriptions/plans",
+            get(api::handle_api_subscription_plans),
+        )
+        .route(
+            "/api/subscriptions/current",
+            get(api::handle_api_subscription_current)
+                .delete(api::handle_api_subscription_cancel),
+        )
+        .route(
+            "/api/subscriptions/subscribe",
+            post(api::handle_api_subscription_subscribe),
+        )
         // ── Payment callbacks (Kakao Pay redirects) ──
         .route("/api/payment/approve", get(api::handle_api_payment_approve))
         .route("/api/payment/cancel", get(api::handle_api_payment_cancel))

@@ -90,6 +90,65 @@ pub const USD_PACKAGES: &[UsdCreditPackage] = &[
 /// without hardcoding the subset there.
 pub const AUTO_RECHARGE_PACKAGE_IDS: &[&str] = &["topup_10", "topup_25", "topup_50"];
 
+/// Recurring subscription plan (spec, 2026-04-22).
+///
+/// Credits are granted every billing cycle with the same 30-day TTL as
+/// one-off top-ups: unused balance rolls off at the end of the month
+/// rather than accumulating indefinitely. The annual plan charges
+/// 12 × monthly × 0.9 up front (10% discount) and grants 12× the
+/// monthly credit amount in one shot — each grant still uses the
+/// standard 30-day TTL, so an annual subscriber receives fresh credits
+/// every 30 days via the subscription renewal hook (not by splitting
+/// the up-front grant).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionPlan {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// One up-front charge in USD cents. Monthly: 3_000 ($30). Annual:
+    /// 3_000 × 12 × 0.9 = 32_400 ($324).
+    pub price_cents: u32,
+    /// Baseline KRW hardcode. The React billing page overrides this with
+    /// a live FX conversion before rendering — keep the fallback in the
+    /// same ~1,380 KRW/USD ballpark for offline operation.
+    pub price_krw: u32,
+    /// Credits granted per billing cycle (monthly plan: 20_000 on each
+    /// renewal; annual plan: 20_000 each month, issued by the webhook
+    /// renewal hook rather than as a single 240_000 block).
+    pub credits_per_cycle: u32,
+    /// Number of billing cycles covered by a single charge.
+    pub cycles: u32,
+    /// `"month"` | `"year"` — display label only.
+    pub interval: &'static str,
+}
+
+/// Catalog of subscription plans.
+pub const SUBSCRIPTION_PLANS: &[SubscriptionPlan] = &[
+    SubscriptionPlan {
+        id: "sub_monthly_30",
+        name: "MoA Monthly",
+        price_cents: 3_000,
+        price_krw: 41_000,
+        credits_per_cycle: 20_000,
+        cycles: 1,
+        interval: "month",
+    },
+    SubscriptionPlan {
+        id: "sub_annual_324",
+        name: "MoA Annual (save 10%)",
+        // 3_000 cents × 12 × 0.9 = 32_400 cents ($324).
+        price_cents: 32_400,
+        price_krw: 447_000,
+        credits_per_cycle: 20_000,
+        cycles: 12,
+        interval: "year",
+    },
+];
+
+/// Look up a subscription plan by ID.
+pub fn find_subscription_plan(id: &str) -> Option<&'static SubscriptionPlan> {
+    SUBSCRIPTION_PLANS.iter().find(|p| p.id == id)
+}
+
 /// Fallback auto-recharge balance trigger when the user has not saved
 /// an explicit preference. Overridden per-user by
 /// `billing_preferences.auto_recharge_threshold` (values: 3_000 or 5_000).

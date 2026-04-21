@@ -331,6 +331,25 @@ impl PaymentManager {
                 CREATE INDEX IF NOT EXISTS idx_credit_grants_pending_expiry
                     ON credit_grants(expires_at) WHERE processed_at IS NULL;
 
+                -- Active subscription ledger (spec, 2026-04-22). A user has at
+                -- most one active subscription row at a time: the primary key
+                -- is `user_id` so subscribing again replaces the previous
+                -- record. `renewal_at` tracks when the next 20_000-credit
+                -- grant is due — the renewal sweep (part of
+                -- `sweep_expired_grants` in run_gateway) tops users up after
+                -- it passes. `status` values: 'active' | 'cancelled' | 'past_due'.
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    user_id        TEXT PRIMARY KEY,
+                    plan_id        TEXT NOT NULL,
+                    provider       TEXT,
+                    provider_sub_id TEXT,
+                    status         TEXT NOT NULL DEFAULT 'active',
+                    started_at     INTEGER NOT NULL,
+                    renewal_at     INTEGER NOT NULL,
+                    expires_at     INTEGER NOT NULL,
+                    updated_at     INTEGER NOT NULL
+                );
+
                 -- Per-user billing preferences (spec, 2026-04-22):
                 --   low_balance_threshold     — 3000 | 5000
                 --   auto_recharge_enabled     — 0 | 1
@@ -1068,6 +1087,107 @@ impl PaymentManager {
         )?;
         Ok(())
     }
+
+    // ── Subscription ledger (spec, 2026-04-22) ────────────────────────
+
+    /// Upsert a subscription row. Invoked after the first successful
+    /// payment for a subscription plan (see checkout webhook) and again
+    /// on each renewal event. `cycle_secs` is the duration until the next
+    /// renewal charge — for the monthly plan this is 30 days, for the
+    /// annual plan 365 days.
+    pub fn upsert_subscription(
+        &self,
+        user_id: &str,
+        plan_id: &str,
+        provider: Option<&str>,
+        provider_sub_id: Option<&str>,
+        cycle_secs: i64,
+    ) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let Some(ref conn) = self.conn else {
+            return Ok(());
+        };
+        let now = now_epoch();
+        let renewal_at = now + cycle_secs;
+        conn.execute(
+            "INSERT INTO subscriptions
+                (user_id, plan_id, provider, provider_sub_id, status,
+                 started_at, renewal_at, expires_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?6, ?5)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 plan_id         = excluded.plan_id,
+                 provider        = excluded.provider,
+                 provider_sub_id = excluded.provider_sub_id,
+                 status          = 'active',
+                 renewal_at      = excluded.renewal_at,
+                 expires_at      = excluded.expires_at,
+                 updated_at      = excluded.updated_at",
+            params![user_id, plan_id, provider, provider_sub_id, now, renewal_at],
+        )?;
+        Ok(())
+    }
+
+    /// Return the user's current subscription row, if any.
+    pub fn get_subscription(&self, user_id: &str) -> anyhow::Result<Option<SubscriptionRecord>> {
+        let Some(ref conn) = self.conn else {
+            return Ok(None);
+        };
+        let row = conn
+            .query_row(
+                "SELECT plan_id, provider, provider_sub_id, status,
+                        started_at, renewal_at, expires_at
+                 FROM subscriptions WHERE user_id = ?1",
+                params![user_id],
+                |r| {
+                    Ok(SubscriptionRecord {
+                        user_id: user_id.to_string(),
+                        plan_id: r.get::<_, String>(0)?,
+                        provider: r.get::<_, Option<String>>(1)?,
+                        provider_sub_id: r.get::<_, Option<String>>(2)?,
+                        status: r.get::<_, String>(3)?,
+                        started_at: r.get::<_, i64>(4)?,
+                        renewal_at: r.get::<_, i64>(5)?,
+                        expires_at: r.get::<_, i64>(6)?,
+                    })
+                },
+            )
+            .ok();
+        Ok(row)
+    }
+
+    /// Mark a subscription cancelled (user-initiated or failed renewal).
+    pub fn cancel_subscription(&self, user_id: &str) -> anyhow::Result<()> {
+        let Some(ref conn) = self.conn else {
+            return Ok(());
+        };
+        let now = now_epoch();
+        conn.execute(
+            "UPDATE subscriptions SET status = 'cancelled', updated_at = ?2 WHERE user_id = ?1",
+            params![user_id, now],
+        )?;
+        Ok(())
+    }
+
+}
+
+/// Active subscription row mirrored from the `subscriptions` table.
+///
+/// `status` is a stringly-typed enum ("active" | "cancelled" | "past_due").
+/// Renewal handling is driven by the gateway scheduler — a tick past
+/// `renewal_at` triggers a 20_000-credit grant + bumps `renewal_at`
+/// forward by one cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionRecord {
+    pub user_id: String,
+    pub plan_id: String,
+    pub provider: Option<String>,
+    pub provider_sub_id: Option<String>,
+    pub status: String,
+    pub started_at: i64,
+    pub renewal_at: i64,
+    pub expires_at: i64,
 }
 
 /// Per-user billing preferences persisted in SQLite (see
