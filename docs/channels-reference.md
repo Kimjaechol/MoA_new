@@ -46,12 +46,6 @@ while remaining channels continue running.
 
 When running `zeroclaw channel start` (or daemon mode), runtime commands include:
 
-Channel mode (observer / participant) — see `Chat Modes` section below:
-- `/mode` or `/mode current` — show the channel's active mode
-- `/mode observer` — switch to observer mode (where supported)
-- `/mode participant` — switch to participant mode (where supported)
-- Korean aliases: `/모드`, `/모드 옵저버`, `/모드 참가자`
-
 Sticky case sessions (scopes inbound messages to one memory namespace):
 - `/case start <라벨>` — pin a case session
 - `/case end` — clear the active case
@@ -165,44 +159,25 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 
 ---
 
-## 2A. Chat Modes (Observer / Participant)
+## 2A. How MoA connects to groups
 
-Each channel operates in exactly one mode. The mode determines
-whether the bot sits inside the group chat or runs as a 1:1
-sidecar for the user.
+MoA's connection model is automatic and not user-configurable —
+each channel has exactly one operating mode, hardcoded:
 
 | Channel | Mode | Why |
 |---|---|---|
-| KakaoTalk | **Observer** | Kakao Open Builder has no API path into third-party 단톡방; observer is the only technically available mode. |
-| Telegram, Discord, Slack, Matrix, Mattermost, Lark, Feishu, WhatsApp, LINE, iMessage, Nextcloud Talk, Email, IRC, Nostr, DingTalk, QQ, Napcat, Linq, Webhook, CLI | **Participant** | Native bot model on these platforms lets MoA join the group directly. Participant ⊇ observer in AI capability, so exposing an observer toggle would add UX surface with zero new AI value. |
+| KakaoTalk | **Observer** (only) | Kakao Open Builder has no API path into third-party 단톡방. MoA listens on the 1:1 chat; the user forwards group content in, and AI replies are shared back via a **📤 단톡방으로 보내기** button (Kakao Share SDK). Every AI reply carries a footer reminding the user that KakaoTalk can only run in observer mode. |
+| Telegram, Discord, Slack, Matrix, Mattermost, Lark, Feishu, WhatsApp, LINE, iMessage, Nextcloud Talk, Email, IRC, Nostr, DingTalk, QQ, Napcat, Linq, Webhook, CLI | **Participant** (only) | These platforms' native bot models already let MoA join the group directly — just invite the bot in the normal way. Participant mode covers everything observer mode would add for these channels, so no mode toggle is surfaced. |
 
-**Observer mode** (KakaoTalk only): the bot is *not* in the target
-group chat. The user manually forwards relevant messages into the
-bot's 1:1 chat (or pastes a `대화 내보내기 .txt` export); the bot
-replies in the 1:1 chat with a one-tap **📤 단톡방으로 보내기**
-button that opens Kakao's native share picker so the user can post
-the AI reply back to the chosen group with a `[🤖 AI 답변]` prefix.
-Every share-back requires an explicit tap by design, for legal and
-professional safety.
+Neither mode is user-configurable — there is no `/mode` command.
+See `docs/channel-setup-guide.md` for the KakaoTalk
+`단톡방 Assist Workflow` including multi-select forwarding, case
+sessions, and the share-back button.
 
-**Participant mode** (all other channels): the bot is a full
-member of the chat, reading and posting directly. Unchanged from
-historical MoA behavior — invite the bot to your group in the
-normal way for that platform.
-
-### Inspecting and switching modes
-
-Use `/mode` or `/mode current` (Korean aliases: `/모드`,
-`/모드 현재`) to see the active mode for a channel. Attempting to
-switch a channel to an unsupported mode — e.g. `/mode participant`
-on KakaoTalk or `/mode observer` on Telegram — returns a friendly
-rejection message; the channel's single supported mode is always
-the effective mode.
-
-The `ChatMode` framework keeps both variants internally so that a
-future, explicitly justified privacy use case can re-enable
-observer mode on a single non-Kakao channel without rediscovery.
-No such follow-up is planned at the moment.
+The observer/participant split survives internally in the codebase
+as a conceptual distinction so the KakaoTalk behavior is easy to
+explain, but as of this revision there is no runtime state or
+command surface exposing it.
 
 ---
 

@@ -386,9 +386,6 @@ pub struct AppState {
     pub auth_store: Option<Arc<crate::auth::store::AuthStore>>,
     /// Channel pairing store for one-click messaging channel auth.
     pub channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>>,
-    /// Active chat mode (observer/participant) per (channel, platform_uid).
-    /// In-memory; defaults apply when the user has not issued `/mode`.
-    pub chat_modes: Arc<crate::channels::chat_mode::ChatModeStore>,
     /// Active sticky case session per (channel, platform_uid). When set,
     /// inbound utterances are scoped to a per-case `session_id` so that
     /// memory recall can answer "어제 의뢰인이 뭐라 했지?" questions
@@ -1304,7 +1301,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         payment_manager,
         auth_store,
         channel_pairing,
-        chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
         case_sessions: case_sessions_store,
         kakao_share_store,
         auth_allow_registration,
@@ -1981,7 +1977,6 @@ pub(super) async fn process_channel_message_rich(
     if let Some(reply) = channel_router::handle_channel_command(
         auth_store,
         device_router,
-        &state.chat_modes,
         &state.case_sessions,
         channel_name,
         sender_platform_uid,
@@ -3957,7 +3952,12 @@ async fn handle_kakao_webhook(State(state): State<AppState>, body: Bytes) -> imp
     {
         Ok(mut reply) => {
             if !looks_like_command && !reply.text.trim().is_empty() {
+                // Mint a share token BEFORE appending the observer
+                // notice — the user forwards only the body itself to
+                // their 단톡방 via the share button; the notice is a
+                // 1:1 reminder, not content for the target group.
                 attach_kakao_share_button(&state, user_id, &mut reply);
+                reply.text = crate::channels::kakao::append_observer_notice(&reply.text);
             }
             kakao_skill_json(&reply.text, &reply.buttons)
         }
@@ -4203,7 +4203,6 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -4283,7 +4282,6 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -4346,7 +4344,6 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -4410,7 +4407,6 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -4918,7 +4914,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5010,7 +5005,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5083,7 +5077,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5157,7 +5150,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5240,7 +5232,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5315,7 +5306,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5395,7 +5385,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5501,7 +5490,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5577,7 +5565,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5658,7 +5645,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5753,7 +5739,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5827,7 +5812,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -5912,7 +5896,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -6002,7 +5985,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -6082,7 +6064,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -6155,7 +6136,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,
@@ -6227,7 +6207,6 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
-            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
             kakao_share_store: None,
             auth_allow_registration: false,

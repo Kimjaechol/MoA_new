@@ -121,16 +121,16 @@ Add the channel as a friend in KakaoTalk and send a message!
 | `/case end` | End the active case / 사건 종료 |
 | `/case current` | Show active case / 현재 사건 보기 |
 | `/case list` | List active cases / 내 사건 목록 |
-| `/mode` or `/mode current` | Show channel mode / 현재 모드 — also `/모드` |
 
-> KakaoTalk is always in observer mode (no other option exists).
-> `/mode participant` is rejected because the Kakao Open Builder API
-> cannot put the bot into third-party 단톡방.
+> **KakaoTalk runs in observer mode only.** Every AI reply carries a
+> footer reminding you that the Open Builder API cannot put MoA
+> into third-party 단톡방 directly — you forward 단톡방 content in,
+> and share AI answers back via the **📤 단톡방으로 보내기** button.
+> There is no mode switch and no need to set one.
 >
-> 카카오톡은 항상 옵저버 모드로 동작합니다 (다른 옵션 없음).
-> 다른 채널(Telegram·Discord·Slack 등)은 항상 참가자 모드로 동작하며
-> 모드 전환은 지원하지 않습니다 — 각 플랫폼의 native 봇 기능이 AI가
-> 필요로 하는 모든 동작을 이미 제공하기 때문입니다.
+> 카카오톡은 옵저버 모드로만 동작합니다 (AI 답변 하단에 자동 안내
+> 표시). 나머지 채널(Telegram·Discord·Slack 등)은 참가자 모드로
+> 동작하며 사용자가 설정할 필요 없습니다.
 
 ### 단톡방(Group Chat) Assist Workflow / 단톡방 보조 워크플로
 

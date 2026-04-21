@@ -19,7 +19,6 @@ pub mod acp;
 pub mod bluebubbles;
 pub mod bridge;
 pub mod case_session;
-pub mod chat_mode;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
