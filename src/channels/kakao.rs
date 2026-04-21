@@ -15,6 +15,27 @@ use uuid::Uuid;
 /// Maximum text length per KakaoTalk message (platform limit).
 const KAKAO_MAX_TEXT_LEN: usize = 1000;
 
+/// Footer notice appended to every AI-generated reply on KakaoTalk
+/// so users are reminded that — unlike their other MoA channels —
+/// MoA cannot join 단톡방 directly through the Kakao Open Builder
+/// API. Kept concise: users habituate after a few exposures and the
+/// line is short enough to not dominate short replies.
+///
+/// Applied only to AI (content) replies, not to command
+/// acknowledgements like `/case start` responses.
+pub const KAKAO_OBSERVER_NOTICE: &str =
+    "\n\n━━━━━━━━━━━━━━━━━━\nℹ️ 카카오톡은 \"옵저버 모드\"만 가능합니다.\n(옵저버 모드에서는 AI가 직접 단톡방에 참여할 수 없습니다)";
+
+/// Wrap an AI-generated Kakao reply with the observer-mode notice.
+/// Empty-body replies pass through unchanged so error fallbacks do
+/// not get decorated with an irrelevant footer.
+pub fn append_observer_notice(body: &str) -> String {
+    if body.trim().is_empty() {
+        return body.to_string();
+    }
+    format!("{body}{KAKAO_OBSERVER_NOTICE}")
+}
+
 /// KakaoTalk REST API base URL.
 const KAKAO_API_BASE: &str = "https://kapi.kakao.com";
 
@@ -713,16 +734,6 @@ impl Channel for KakaoTalkChannel {
         "kakao"
     }
 
-    /// KakaoTalk's official Open Builder API only exposes the bot's 1:1
-    /// chat, never a third-party group chat. The channel therefore
-    /// supports only observer mode — the user forwards messages from
-    /// the group into the bot's 1:1 chat and the bot's reply carries a
-    /// share-back button that opens KakaoTalk's native share picker.
-    fn supported_chat_modes(&self) -> &'static [super::chat_mode::ChatMode] {
-        use super::chat_mode::ChatMode;
-        &[ChatMode::Observer]
-    }
-
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let chunks = Self::split_message(&message.content);
 
@@ -1031,5 +1042,34 @@ javascript_app_key = "jsapp_key_xyz"
 "#;
         let config: crate::config::schema::KakaoTalkConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.javascript_app_key.as_deref(), Some("jsapp_key_xyz"));
+    }
+
+    #[test]
+    fn test_append_observer_notice_appends_footer() {
+        let decorated = append_observer_notice("안녕하세요, 이렇게 하면 됩니다.");
+        assert!(decorated.starts_with("안녕하세요, 이렇게 하면 됩니다."));
+        assert!(decorated.contains("카카오톡은 \"옵저버 모드\"만 가능합니다."));
+        assert!(decorated.contains("직접 단톡방에 참여할 수 없습니다"));
+        // Footer adds a visual separator so the notice reads clearly
+        // even on small Kakao bubbles.
+        assert!(decorated.contains("━━"));
+    }
+
+    #[test]
+    fn test_append_observer_notice_preserves_empty_body() {
+        // Error fallbacks and timeout paths can surface empty bodies —
+        // don't decorate those with an out-of-context footer.
+        assert_eq!(append_observer_notice(""), "");
+        assert_eq!(append_observer_notice("   "), "   ");
+    }
+
+    #[test]
+    fn test_observer_notice_constant_shape() {
+        // The notice starts with two newlines so it stands off from
+        // the reply body regardless of whether the body ends in a
+        // newline or not.
+        assert!(KAKAO_OBSERVER_NOTICE.starts_with("\n\n"));
+        assert!(KAKAO_OBSERVER_NOTICE.contains("옵저버 모드"));
+        assert!(KAKAO_OBSERVER_NOTICE.contains("AI가 직접 단톡방에 참여할 수 없습니다"));
     }
 }

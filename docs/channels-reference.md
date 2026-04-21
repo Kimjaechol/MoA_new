@@ -46,12 +46,6 @@ while remaining channels continue running.
 
 When running `zeroclaw channel start` (or daemon mode), runtime commands include:
 
-Channel mode (observer / participant) — see `Chat Modes` section below:
-- `/mode` or `/mode current` — show the channel's active mode
-- `/mode observer` — switch to observer mode (where supported)
-- `/mode participant` — switch to participant mode (where supported)
-- Korean aliases: `/모드`, `/모드 옵저버`, `/모드 참가자`
-
 Sticky case sessions (scopes inbound messages to one memory namespace):
 - `/case start <라벨>` — pin a case session
 - `/case end` — clear the active case
@@ -165,42 +159,25 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 
 ---
 
-## 2A. Chat Modes (Observer / Participant)
+## 2A. How MoA connects to groups
 
-ZeroClaw exposes a unified mode abstraction so the KakaoTalk
-group-chat sidecar UX (where the bot is *not* a member of the
-target chat) can coexist with native group-participation behavior on
-other channels. Each channel declares which modes it supports.
+MoA's connection model is automatic and not user-configurable —
+each channel has exactly one operating mode, hardcoded:
 
-| Channel | Participant | Observer (v1 wired?) | Default |
-|---|---|---|---|
-| KakaoTalk | ❌ Not supported (no group-chat API access) | ✅ Wired | Observer |
-| Telegram, Discord, Slack, Matrix, Mattermost, Lark, Feishu, WhatsApp, LINE, iMessage, Nextcloud Talk, Email, IRC, Nostr, DingTalk, QQ, Napcat, Linq, Webhook, CLI | ✅ Wired (current default behavior) | Declared, not yet wired in v1 | Participant |
+| Channel | Mode | Why |
+|---|---|---|
+| KakaoTalk | **Observer** (only) | Kakao Open Builder has no API path into third-party 단톡방. MoA listens on the 1:1 chat; the user forwards group content in, and AI replies are shared back via a **📤 단톡방으로 보내기** button (Kakao Share SDK). Every AI reply carries a footer reminding the user that KakaoTalk can only run in observer mode. |
+| Telegram, Discord, Slack, Matrix, Mattermost, Lark, Feishu, WhatsApp, LINE, iMessage, Nextcloud Talk, Email, IRC, Nostr, DingTalk, QQ, Napcat, Linq, Webhook, CLI | **Participant** (only) | These platforms' native bot models already let MoA join the group directly — just invite the bot in the normal way. Participant mode covers everything observer mode would add for these channels, so no mode toggle is surfaced. |
 
-**Observer mode** (KakaoTalk default): the bot is not in the
-target group chat. The user manually forwards relevant messages
-into the bot's 1:1 chat (or pastes a `대화 내보내기 .txt` export);
-the bot replies in the 1:1 chat with a one-tap
-**📤 단톡방으로 보내기** button that opens the platform's native
-share picker so the user can post the AI reply back to the chosen
-group with a `[🤖 AI 답변]` prefix. Every share-back requires an
-explicit tap by design, for legal and professional safety.
+Neither mode is user-configurable — there is no `/mode` command.
+See `docs/channel-setup-guide.md` for the KakaoTalk
+`단톡방 Assist Workflow` including multi-select forwarding, case
+sessions, and the share-back button.
 
-**Participant mode**: the bot is a full member of the chat,
-reading and posting directly. This is what every non-KakaoTalk
-channel in the table above does today.
-
-Switching is per-(channel, user) and ephemeral (in-memory). Use
-`/mode observer`, `/mode participant`, or `/mode current` (Korean
-aliases: `/모드 옵저버`, `/모드 참가자`, `/모드 현재`). Attempting
-to switch to an unsupported mode (e.g. `/mode participant` on
-KakaoTalk) returns a friendly error. Attempting to switch to a
-declared-but-not-yet-wired mode (e.g. `/mode observer` on
-Telegram) returns "곧 지원될 예정" — no half-implemented behavior
-ships in v1.
-
-Per-channel observer-mode wiring will land in follow-up PRs as
-each channel's native share/forward UX is verified end-to-end.
+The observer/participant split survives internally in the codebase
+as a conceptual distinction so the KakaoTalk behavior is easy to
+explain, but as of this revision there is no runtime state or
+command surface exposing it.
 
 ---
 

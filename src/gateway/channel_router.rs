@@ -15,9 +15,6 @@ use uuid::Uuid;
 use super::remote::{DeviceRouter, RoutedMessage, REMOTE_RESPONSE_CHANNELS};
 use crate::auth::store::{AuthStore, ChannelLink};
 use crate::channels::case_session::{ActiveCase, CaseSessionStore};
-use crate::channels::chat_mode::{
-    default_chat_mode_for, is_mode_wired_v1, ChatMode, ChatModeStore,
-};
 
 // ── Structured Reply ────────────────────────────────────────────────
 
@@ -109,8 +106,6 @@ pub const CB_UNLINK: &str = "moa:unlink";
 pub const CB_HELP: &str = "moa:help";
 pub const CB_DEVICE_LIST: &str = "moa:devlist";
 pub const CB_SETTINGS: &str = "moa:settings";
-pub const CB_CHATMODE_OBSERVER: &str = "moa:chatmode:observer";
-pub const CB_CHATMODE_PARTICIPANT: &str = "moa:chatmode:participant";
 
 // ── Route Result ────────────────────────────────────────────────────
 
@@ -266,7 +261,6 @@ pub async fn route_channel_message(
 pub fn handle_channel_command(
     auth_store: &AuthStore,
     device_router: &DeviceRouter,
-    chat_modes: &ChatModeStore,
     case_sessions: &CaseSessionStore,
     channel: &str,
     platform_uid: &str,
@@ -277,11 +271,6 @@ pub fn handle_channel_command(
     // ── Settings menu ──
     if trimmed == CB_SETTINGS || trimmed == "/설정" || trimmed.eq_ignore_ascii_case("/settings") {
         return Some(settings_menu(auth_store, channel, platform_uid));
-    }
-
-    // ── Chat mode (observer / participant) ──
-    if let Some(reply) = try_handle_mode_command(chat_modes, channel, platform_uid, trimmed) {
-        return Some(reply);
     }
 
     // ── Sticky case session (/case start | end | current | list) ──
@@ -493,155 +482,6 @@ fn select_device(
         ),
         vec![postback("⚙️ 설정", CB_SETTINGS)],
     )
-}
-
-// ── Chat-mode command (/mode observer | participant | current) ─────
-
-/// Recognised forms (any whitespace allowed):
-/// - `/mode`, `/mode current` — show the active mode + supported set
-/// - `/mode observer` / `/mode participant` (also Korean: `/모드 옵저버`, `/모드 참가자`)
-/// - Postback callbacks `moa:chatmode:observer` / `moa:chatmode:participant`
-fn try_handle_mode_command(
-    chat_modes: &ChatModeStore,
-    channel: &str,
-    platform_uid: &str,
-    trimmed: &str,
-) -> Option<ChannelReply> {
-    if trimmed == CB_CHATMODE_OBSERVER {
-        return Some(apply_mode_change(
-            chat_modes,
-            channel,
-            platform_uid,
-            ChatMode::Observer,
-        ));
-    }
-    if trimmed == CB_CHATMODE_PARTICIPANT {
-        return Some(apply_mode_change(
-            chat_modes,
-            channel,
-            platform_uid,
-            ChatMode::Participant,
-        ));
-    }
-
-    let lower = trimmed.to_lowercase();
-    let stripped = lower
-        .strip_prefix("/mode")
-        .or_else(|| lower.strip_prefix("/모드"))?;
-
-    let arg = stripped.trim();
-    if arg.is_empty() || arg == "current" || arg == "현재" {
-        return Some(mode_status_reply(chat_modes, channel, platform_uid));
-    }
-
-    match ChatMode::parse_user_input(arg) {
-        Some(mode) => Some(apply_mode_change(chat_modes, channel, platform_uid, mode)),
-        None => Some(ChannelReply::text(
-            "사용법:\n  /mode current — 현재 모드 보기\n  /mode observer — 옵저버 모드\n  /mode participant — 참가자 모드",
-        )),
-    }
-}
-
-fn apply_mode_change(
-    chat_modes: &ChatModeStore,
-    channel: &str,
-    platform_uid: &str,
-    requested: ChatMode,
-) -> ChannelReply {
-    let supported = supported_modes_for(channel);
-    if !supported.contains(&requested) {
-        return ChannelReply::text(format!(
-            "{ch_label}에서는 {req_label}로 전환할 수 없습니다.\n\n지원 모드: {supported_label}",
-            ch_label = channel_display_label(channel),
-            req_label = requested.display_label_ko(),
-            supported_label = supported_modes_display(&supported),
-        ));
-    }
-
-    if !is_mode_wired_v1(channel, requested) {
-        return ChannelReply::text(format!(
-            "{req_label}는 {ch_label}에서 곧 지원될 예정입니다.\n현재는 {default_label}로 동작합니다.",
-            req_label = requested.display_label_ko(),
-            ch_label = channel_display_label(channel),
-            default_label = default_chat_mode_for(channel).display_label_ko(),
-        ));
-    }
-
-    chat_modes.set(channel, platform_uid, requested);
-    ChannelReply::with_buttons(
-        format!(
-            "{}로 전환되었습니다.\n\n{}",
-            requested.display_label_ko(),
-            mode_description_ko(requested),
-        ),
-        vec![postback("⚙️ 설정", CB_SETTINGS)],
-    )
-}
-
-fn mode_status_reply(
-    chat_modes: &ChatModeStore,
-    channel: &str,
-    platform_uid: &str,
-) -> ChannelReply {
-    let active = chat_modes.effective(channel, platform_uid);
-    let supported = supported_modes_for(channel);
-    let mut buttons = Vec::new();
-    if supported.contains(&ChatMode::Observer) && active != ChatMode::Observer {
-        buttons.push(postback("👁 옵저버 모드로 전환", CB_CHATMODE_OBSERVER));
-    }
-    if supported.contains(&ChatMode::Participant) && active != ChatMode::Participant {
-        buttons.push(postback("👥 참가자 모드로 전환", CB_CHATMODE_PARTICIPANT));
-    }
-    buttons.push(postback("⚙️ 설정", CB_SETTINGS));
-
-    let text = format!(
-        "현재 모드: {active}\n지원 모드: {supported}\n\n{desc}",
-        active = active.display_label_ko(),
-        supported = supported_modes_display(&supported),
-        desc = mode_description_ko(active),
-    );
-    ChannelReply::with_buttons(text, buttons)
-}
-
-fn mode_description_ko(mode: ChatMode) -> &'static str {
-    match mode {
-        ChatMode::Observer => "단톡방에는 직접 참여하지 않습니다.\n• 사용자가 단톡방 메시지를 모아 1:1로 공유하면 모아가 읽고 답합니다.\n• 답변에는 단톡방으로 1탭에 보낼 수 있는 버튼이 첨부됩니다.",
-        ChatMode::Participant => "MoA가 그룹 채팅의 정식 멤버로 참여합니다.\n• 그룹 메시지를 직접 읽고 직접 답글을 보냅니다.",
-    }
-}
-
-fn supported_modes_for(channel: &str) -> Vec<ChatMode> {
-    // KakaoTalk: observer-only by platform constraint.
-    // Other channels: declare both for the unified UX, even when only
-    // participant mode is wired in v1 (see is_mode_wired_v1).
-    if channel == "kakao" {
-        vec![ChatMode::Observer]
-    } else {
-        vec![ChatMode::Participant, ChatMode::Observer]
-    }
-}
-
-fn supported_modes_display(modes: &[ChatMode]) -> String {
-    modes
-        .iter()
-        .map(|m| m.display_label_ko())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn channel_display_label(channel: &str) -> String {
-    match channel {
-        "kakao" => "카카오톡".to_string(),
-        "telegram" => "Telegram".to_string(),
-        "discord" => "Discord".to_string(),
-        "slack" => "Slack".to_string(),
-        "whatsapp" => "WhatsApp".to_string(),
-        "matrix" => "Matrix".to_string(),
-        "mattermost" => "Mattermost".to_string(),
-        "line" => "LINE".to_string(),
-        "imessage" => "iMessage".to_string(),
-        other => other.to_string(),
-    }
 }
 
 // ── Case session command (/case start | end | current | list) ──────
@@ -861,103 +701,6 @@ pub fn device_offline_reply(device_name: Option<&str>) -> ChannelReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mode_command_without_args_shows_status() {
-        let store = ChatModeStore::new();
-        let reply = try_handle_mode_command(&store, "kakao", "u_1", "/mode").unwrap();
-        assert!(reply.text.contains("옵저버 모드"), "text: {}", reply.text);
-        assert!(reply.text.contains("현재 모드"));
-    }
-
-    #[test]
-    fn mode_command_status_alias_korean() {
-        let store = ChatModeStore::new();
-        let reply = try_handle_mode_command(&store, "telegram", "u_1", "/모드 현재").unwrap();
-        assert!(reply.text.contains("참가자 모드"));
-    }
-
-    #[test]
-    fn mode_command_kakao_observer_succeeds() {
-        let store = ChatModeStore::new();
-        let reply = try_handle_mode_command(&store, "kakao", "u_1", "/mode observer").unwrap();
-        assert!(reply.text.contains("옵저버 모드로 전환"));
-        assert_eq!(store.current("kakao", "u_1"), Some(ChatMode::Observer));
-    }
-
-    #[test]
-    fn mode_command_kakao_participant_rejected_unsupported() {
-        let store = ChatModeStore::new();
-        let reply = try_handle_mode_command(&store, "kakao", "u_1", "/mode participant").unwrap();
-        assert!(
-            reply.text.contains("전환할 수 없습니다"),
-            "text: {}",
-            reply.text
-        );
-        assert_eq!(store.current("kakao", "u_1"), None);
-    }
-
-    #[test]
-    fn mode_command_telegram_observer_declared_but_not_wired() {
-        let store = ChatModeStore::new();
-        let reply = try_handle_mode_command(&store, "telegram", "u_1", "/mode observer").unwrap();
-        assert!(
-            reply.text.contains("곧 지원될 예정"),
-            "text: {}",
-            reply.text
-        );
-        assert_eq!(store.current("telegram", "u_1"), None);
-    }
-
-    #[test]
-    fn mode_command_telegram_participant_succeeds() {
-        let store = ChatModeStore::new();
-        let reply =
-            try_handle_mode_command(&store, "telegram", "u_1", "/mode participant").unwrap();
-        assert!(reply.text.contains("참가자 모드로 전환"));
-        assert_eq!(
-            store.current("telegram", "u_1"),
-            Some(ChatMode::Participant)
-        );
-    }
-
-    #[test]
-    fn mode_command_unknown_arg_shows_usage() {
-        let store = ChatModeStore::new();
-        let reply = try_handle_mode_command(&store, "kakao", "u_1", "/mode bogus").unwrap();
-        assert!(reply.text.contains("사용법"), "text: {}", reply.text);
-    }
-
-    #[test]
-    fn mode_command_callback_observer() {
-        let store = ChatModeStore::new();
-        let reply = try_handle_mode_command(&store, "kakao", "u_1", CB_CHATMODE_OBSERVER).unwrap();
-        assert_eq!(store.current("kakao", "u_1"), Some(ChatMode::Observer));
-        assert!(reply.text.contains("옵저버 모드로 전환"));
-    }
-
-    #[test]
-    fn mode_command_does_not_match_other_text() {
-        let store = ChatModeStore::new();
-        assert!(try_handle_mode_command(&store, "kakao", "u_1", "/help").is_none());
-        assert!(try_handle_mode_command(&store, "kakao", "u_1", "안녕하세요").is_none());
-    }
-
-    #[test]
-    fn supported_modes_for_returns_kakao_observer_only() {
-        assert_eq!(supported_modes_for("kakao"), vec![ChatMode::Observer]);
-        assert_eq!(
-            supported_modes_for("telegram"),
-            vec![ChatMode::Participant, ChatMode::Observer]
-        );
-    }
-
-    #[test]
-    fn channel_display_label_known_and_unknown() {
-        assert_eq!(channel_display_label("kakao"), "카카오톡");
-        assert_eq!(channel_display_label("imessage"), "iMessage");
-        assert_eq!(channel_display_label("custom"), "custom");
-    }
 
     // ── /case command tests ──
 
