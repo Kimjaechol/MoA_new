@@ -901,7 +901,11 @@ export class MoAClient {
     //   4. Gemini as the final cloud fallback
     let provider = localStorage.getItem("zeroclaw_llm_provider") || "";
     if (!provider) {
-      if (isTauri()) provider = "ollama";
+      // Mobile Tauri (Android / iOS) cannot host Ollama — skip the base-gun
+      // default on those runtimes and walk the cloud-first chain instead.
+      const ua = typeof navigator !== "undefined" ? navigator.userAgent.toLowerCase() : "";
+      const isMobileRuntime = /(android|iphone|ipad|ipod|mobile)/i.test(ua);
+      if (isTauri() && !isMobileRuntime) provider = "ollama";
       else if (localStorage.getItem("zeroclaw_api_key_anthropic")) provider = "claude";
       else if (localStorage.getItem("zeroclaw_api_key_openai")) provider = "openai";
       else provider = "gemini";

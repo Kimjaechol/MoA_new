@@ -190,6 +190,12 @@ type TranslationKey =
   | "local_llm_bootstrap_retry"
   | "local_llm_bootstrap_poll_retry"
   | "local_llm_bootstrap_skip"
+  // Sidebar gun-metaphor labels
+  | "sidebar_base_gun_heading"
+  | "sidebar_option_gun_heading"
+  | "sidebar_badge_base_gun"
+  | "sidebar_badge_byok"
+  | "sidebar_badge_credit"
   // Lock screen
   | "lock_title"
   | "lock_subtitle"
@@ -424,6 +430,11 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     local_llm_bootstrap_retry: "(retry #{n})",
     local_llm_bootstrap_poll_retry: "Backend not responding — retrying…",
     local_llm_bootstrap_skip: "Continue without local AI",
+    sidebar_base_gun_heading: "Base gun (always loaded)",
+    sidebar_option_gun_heading: "Optional guns (swap in)",
+    sidebar_badge_base_gun: "local",
+    sidebar_badge_byok: "BYOK",
+    sidebar_badge_credit: "credits",
     // Lock screen
     lock_title: "MoA Locked",
     lock_subtitle: "Enter your password to unlock",
@@ -655,6 +666,11 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     local_llm_bootstrap_retry: "(재시도 {n}회차)",
     local_llm_bootstrap_poll_retry: "서버 응답 대기 중 — 재시도합니다…",
     local_llm_bootstrap_skip: "로컬 AI 없이 계속하기",
+    sidebar_base_gun_heading: "기본 총 (항상 장착)",
+    sidebar_option_gun_heading: "옵션 총 (갈아끼우기)",
+    sidebar_badge_base_gun: "로컬",
+    sidebar_badge_byok: "BYOK",
+    sidebar_badge_credit: "크레딧",
     // Lock screen
     lock_title: "MoA \uc7a0\uae08",
     lock_subtitle: "\ube44\ubc00\ubc88\ud638\ub97c \uc785\ub825\ud558\uc5ec \uc7a0\uae08\uc744 \ud574\uc81c\ud558\uc138\uc694",

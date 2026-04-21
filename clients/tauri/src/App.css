@@ -1057,6 +1057,43 @@ html, body {
   padding: 8px 8px 4px;
 }
 
+/* Gun-metaphor headings (spec, 2026-04-22): split the model picker into
+   "기본 총" (base gun = Gemma 4 local) and "옵션 총" (cloud upgrades). The
+   base-gun heading uses a warm accent so it reads as the always-loaded
+   default rather than a premium upsell. */
+.sidebar-gun-heading {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 10px 8px 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.sidebar-gun-heading.base {
+  color: #34d399;
+}
+.sidebar-gun-heading.option {
+  color: #a78bfa;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  margin-top: 6px;
+}
+
+/* Badge attached to every model row indicating how it is powered:
+     .base   = local Gemma 4 (always free)
+     .byok   = user has pasted an API key for this provider
+     .credit = operator's key will be used, credit burn applies */
+.sidebar-model-gunbadge {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  margin-left: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.sidebar-model-gunbadge.base { background: #10b98130; color: #6ee7b7; }
+.sidebar-model-gunbadge.byok { background: #2563eb30; color: #93c5fd; }
+.sidebar-model-gunbadge.credit { background: #f59e0b22; color: #fbbf24; }
+
 /* Workspace connect buttons */
 .sidebar-workspace-btn {
   display: flex;

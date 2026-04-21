@@ -119,11 +119,24 @@ function App() {
     if (!gatewayReady) return;
 
     if (isTauri()) {
+      // Mobile Tauri runtimes (Android / iOS) cannot host Ollama — the
+      // daemon is desktop-only — so skip the base-gun default there and let
+      // the gateway's platform-routing proxy serve Gemini Flash Lite with
+      // credit burn until the user pastes a BYOK key. Desktop Tauri keeps
+      // the Gemma 4 base gun as per the gun metaphor.
+      const ua = typeof navigator !== "undefined" ? navigator.userAgent.toLowerCase() : "";
+      const isMobileRuntime = /(android|iphone|ipad|ipod|mobile)/i.test(ua);
       if (!localStorage.getItem("zeroclaw_llm_provider")) {
-        localStorage.setItem("zeroclaw_llm_provider", "ollama");
+        localStorage.setItem(
+          "zeroclaw_llm_provider",
+          isMobileRuntime ? "gemini" : "ollama",
+        );
       }
       if (!localStorage.getItem("zeroclaw_llm_model")) {
-        localStorage.setItem("zeroclaw_llm_model", "gemma4:e4b");
+        localStorage.setItem(
+          "zeroclaw_llm_model",
+          isMobileRuntime ? "gemini-3.1-flash-lite-preview" : "gemma4:e4b",
+        );
       }
       if (!localStorage.getItem("zeroclaw_setup_complete")) {
         localStorage.setItem("zeroclaw_setup_complete", "true");
@@ -472,6 +485,14 @@ function App() {
 
     const routeAfterAuth = async () => {
       if (!isTauri()) {
+        proceedToChat();
+        return;
+      }
+      // Mobile (Android / iOS) Tauri cannot run Ollama, so there is no base
+      // gun install to wait on — skip the bootstrap screen entirely.
+      const ua = typeof navigator !== "undefined" ? navigator.userAgent.toLowerCase() : "";
+      const isMobileRuntime = /(android|iphone|ipad|ipod|mobile)/i.test(ua);
+      if (isMobileRuntime) {
         proceedToChat();
         return;
       }
