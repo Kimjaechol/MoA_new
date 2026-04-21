@@ -90,6 +90,16 @@ pub fn process_post_call(
         .context("failed to insert phone_calls row")?;
     result.call_recorded = true;
 
+    // Compute a single canonical location string — Some only when BOTH lat and
+    // lon are present, using 5-decimal precision (~1 m) consistently for both
+    // the timeline row and the ontology action (fixes BUG 2/3: the old code
+    // fell back to lon=0.0 when only lat was present, which is a meaningless
+    // coordinate, and mixed precision between the two call sites).
+    let location_str = match (data.gps_lat, data.gps_lon) {
+        (Some(lat), Some(lon)) => Some(format!("{lat:.5},{lon:.5}")),
+        _ => None,
+    };
+
     // 2. Append to memory_timeline (if we have a transcript and memory_id)
     if let (Some(ref transcript), Some(ref memory_id)) = (&data.transcript, &data.memory_id) {
         if !transcript.trim().is_empty() {
@@ -102,10 +112,6 @@ pub fn process_post_call(
                 "risk_level": data.risk_level,
             });
 
-            let location = match (data.gps_lat, data.gps_lon) {
-                (Some(lat), Some(lon)) => Some(format!("{lat:.5},{lon:.5}")),
-                _ => None,
-            };
             let uuid = memory.append_timeline(
                 memory_id,
                 "call",
@@ -114,7 +120,7 @@ pub fn process_post_call(
                 transcript,
                 Some(&metadata.to_string()),
                 &data.device_id,
-                location.as_deref(),
+                location_str.as_deref(),
             )?;
             result.timeline_uuid = Some(uuid);
         }
@@ -144,7 +150,7 @@ pub fn process_post_call(
             Some("phone"),
             None,
             occurred_at.as_deref(),
-            data.gps_lat.map(|lat| format!("{lat},{}", data.gps_lon.unwrap_or(0.0))).as_deref(),
+            location_str.as_deref(),
             &data.home_timezone,
         ) {
             Ok(id) => result.action_id = Some(id),
@@ -319,5 +325,101 @@ mod tests {
         let json = serde_json::to_string(&data).unwrap();
         let parsed: PostCallData = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.call_uuid, "call-001");
+    }
+
+    // --- GPS location formatting regression tests (BUG 2 + BUG 3) ---
+
+    #[tokio::test]
+    async fn location_is_none_when_lon_missing() {
+        let (_tmp, mem) = setup();
+        use crate::memory::traits::{Memory, MemoryCategory};
+        mem.store("c1", "Client 1", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("c1").await.unwrap().unwrap();
+
+        let mut data = sample_data();
+        data.memory_id = Some(entry.id.clone());
+        data.memory_key = Some("c1".to_string());
+        // Only lat present — previous bug recorded "37.5665,0" as location.
+        data.gps_lat = Some(37.5665);
+        data.gps_lon = None;
+
+        process_post_call(&mem, None, &data).unwrap();
+
+        // Verify the timeline row has NULL location rather than a bogus "lat,0".
+        let conn = mem.conn_for_test();
+        let location: Option<String> = conn
+            .query_row(
+                "SELECT location FROM memory_timeline WHERE memory_id = ?1",
+                rusqlite::params![entry.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            location.is_none(),
+            "location must be None when only lat is present; got {location:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn location_uses_5_decimal_precision_when_both_present() {
+        let (_tmp, mem) = setup();
+        use crate::memory::traits::{Memory, MemoryCategory};
+        mem.store("c2", "Client 2", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("c2").await.unwrap().unwrap();
+
+        let mut data = sample_data();
+        data.memory_id = Some(entry.id.clone());
+        data.memory_key = Some("c2".to_string());
+        // More precision than 5 decimals — expect truncation.
+        data.gps_lat = Some(37.566_543_21);
+        data.gps_lon = Some(126.978_012_34);
+
+        process_post_call(&mem, None, &data).unwrap();
+
+        let conn = mem.conn_for_test();
+        let location: Option<String> = conn
+            .query_row(
+                "SELECT location FROM memory_timeline WHERE memory_id = ?1",
+                rusqlite::params![entry.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            location.as_deref(),
+            Some("37.56654,126.97801"),
+            "location must use 5-decimal precision consistently"
+        );
+    }
+
+    #[tokio::test]
+    async fn location_is_none_when_both_missing() {
+        let (_tmp, mem) = setup();
+        use crate::memory::traits::{Memory, MemoryCategory};
+        mem.store("c3", "Client 3", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("c3").await.unwrap().unwrap();
+
+        let mut data = sample_data();
+        data.memory_id = Some(entry.id.clone());
+        data.memory_key = Some("c3".to_string());
+        data.gps_lat = None;
+        data.gps_lon = None;
+
+        process_post_call(&mem, None, &data).unwrap();
+
+        let conn = mem.conn_for_test();
+        let location: Option<String> = conn
+            .query_row(
+                "SELECT location FROM memory_timeline WHERE memory_id = ?1",
+                rusqlite::params![entry.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(location.is_none());
     }
 }
