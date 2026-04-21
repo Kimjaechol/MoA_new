@@ -15,9 +15,7 @@ use uuid::Uuid;
 use super::remote::{DeviceRouter, RoutedMessage, REMOTE_RESPONSE_CHANNELS};
 use crate::auth::store::{AuthStore, ChannelLink};
 use crate::channels::case_session::{ActiveCase, CaseSessionStore};
-use crate::channels::chat_mode::{
-    default_chat_mode_for, is_mode_wired_v1, ChatMode, ChatModeStore,
-};
+use crate::channels::chat_mode::{ChatMode, ChatModeStore};
 
 // ── Structured Reply ────────────────────────────────────────────────
 
@@ -558,15 +556,6 @@ fn apply_mode_change(
         ));
     }
 
-    if !is_mode_wired_v1(channel, requested) {
-        return ChannelReply::text(format!(
-            "{req_label}는 {ch_label}에서 곧 지원될 예정입니다.\n현재는 {default_label}로 동작합니다.",
-            req_label = requested.display_label_ko(),
-            ch_label = channel_display_label(channel),
-            default_label = default_chat_mode_for(channel).display_label_ko(),
-        ));
-    }
-
     chat_modes.set(channel, platform_uid, requested);
     ChannelReply::with_buttons(
         format!(
@@ -611,13 +600,24 @@ fn mode_description_ko(mode: ChatMode) -> &'static str {
 }
 
 fn supported_modes_for(channel: &str) -> Vec<ChatMode> {
-    // KakaoTalk: observer-only by platform constraint.
-    // Other channels: declare both for the unified UX, even when only
-    // participant mode is wired in v1 (see is_mode_wired_v1).
+    // KakaoTalk: observer-only by platform constraint — Kakao Open
+    // Builder cannot put the bot into third-party 단톡방, so no
+    // participant-mode option is offered.
+    //
+    // All other channels: participant-only. Their native bot model
+    // (Telegram/Discord/Slack/Matrix/etc.) already supports everything
+    // the AI needs to do in a group — participant ⊇ observer in AI
+    // capability. We intentionally do NOT surface observer mode on
+    // these channels to avoid a false promise: there is no
+    // per-channel observer-UX wiring and building one per channel
+    // would duplicate eight separate native-share flows for zero new
+    // AI capability. The ChatMode framework stays in place so a
+    // specific privacy-driven case could re-open observer mode for a
+    // single channel later without rediscovery.
     if channel == "kakao" {
         vec![ChatMode::Observer]
     } else {
-        vec![ChatMode::Participant, ChatMode::Observer]
+        vec![ChatMode::Participant]
     }
 }
 
@@ -898,11 +898,20 @@ mod tests {
     }
 
     #[test]
-    fn mode_command_telegram_observer_declared_but_not_wired() {
+    fn mode_command_telegram_observer_rejected_hidden() {
+        // Observer mode is intentionally hidden on non-kakao channels.
+        // Requesting it via `/mode observer` on Telegram returns the
+        // "전환할 수 없습니다" rejection (same path as requesting
+        // participant on Kakao).
         let store = ChatModeStore::new();
         let reply = try_handle_mode_command(&store, "telegram", "u_1", "/mode observer").unwrap();
         assert!(
-            reply.text.contains("곧 지원될 예정"),
+            reply.text.contains("전환할 수 없습니다"),
+            "text: {}",
+            reply.text
+        );
+        assert!(
+            !reply.text.contains("곧 지원될 예정"),
             "text: {}",
             reply.text
         );
@@ -944,12 +953,26 @@ mod tests {
     }
 
     #[test]
-    fn supported_modes_for_returns_kakao_observer_only() {
+    fn supported_modes_for_one_mode_per_channel() {
+        // kakao: observer-only by platform constraint
         assert_eq!(supported_modes_for("kakao"), vec![ChatMode::Observer]);
-        assert_eq!(
-            supported_modes_for("telegram"),
-            vec![ChatMode::Participant, ChatMode::Observer]
-        );
+        // every other channel: participant-only (observer hidden)
+        for channel in [
+            "telegram",
+            "discord",
+            "slack",
+            "matrix",
+            "whatsapp",
+            "line",
+            "imessage",
+            "unknown_channel",
+        ] {
+            assert_eq!(
+                supported_modes_for(channel),
+                vec![ChatMode::Participant],
+                "channel {channel} should be participant-only",
+            );
+        }
     }
 
     #[test]

@@ -16,14 +16,22 @@
 //! between supported modes per channel via the `/mode` command. The active
 //! mode is held in [`ChatModeStore`] keyed by `(channel, platform_uid)`.
 //!
-//! ## v1 wiring scope
+//! ## Per-channel contract
 //!
-//! KakaoTalk: observer-only, fully wired (the only mode it supports).
-//! Other channels: declare both modes supported but only participant mode
-//! is fully wired in v1. `/mode observer` on those channels returns an
-//! "지원 예정" message until the per-channel observer UX lands in a
-//! follow-up PR. This keeps the mode abstraction in place without shipping
-//! half-implemented observer paths across eight channels at once.
+//! - **KakaoTalk**: observer-only. Kakao Open Builder has no API path
+//!   into third-party 단톡방, so participant mode is not offered.
+//! - **All other channels** (Telegram, Discord, Slack, Matrix, WhatsApp,
+//!   LINE, iMessage, Nextcloud Talk, Email, IRC, Nostr, DingTalk, QQ,
+//!   Napcat, Linq, Webhook, CLI): participant-only. Their native bot
+//!   model already covers everything observer mode would add —
+//!   participant ⊇ observer in AI capability. Exposing an observer
+//!   toggle that duplicates eight separate native-share flows would
+//!   add UX surface with zero new AI value, so observer is
+//!   intentionally hidden on these channels.
+//!
+//! The [`ChatMode`] enum keeps both variants because the framework is
+//! designed to re-open observer mode on a single channel later if a
+//! concrete privacy-driven case requires it — without rediscovery work.
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -134,29 +142,6 @@ pub fn default_chat_mode_for(channel: &str) -> ChatMode {
     }
 }
 
-/// Whether `mode` is fully wired for `channel` in v1. Channels can declare
-/// support for a mode via [`Channel::supported_chat_modes`](crate::channels::traits::Channel::supported_chat_modes)
-/// while the actual UX wiring lands in a later PR; this flag lets the
-/// `/mode` command tell the user "지원 예정" instead of silently switching
-/// to a half-implemented mode.
-///
-/// v1 contract: kakao/observer is wired. participant on every other channel
-/// is wired (current default behavior). Observer on non-kakao channels is
-/// declared-but-not-wired.
-//
-// The four match arms are intentionally kept explicit even though two pairs
-// share bodies — each arm documents one cell of the v1 capability matrix.
-// Collapsing would hide the matrix for a trivial deduplication win.
-#[allow(clippy::match_same_arms)]
-pub fn is_mode_wired_v1(channel: &str, mode: ChatMode) -> bool {
-    match (channel, mode) {
-        ("kakao", ChatMode::Observer) => true,
-        ("kakao", ChatMode::Participant) => false,
-        (_, ChatMode::Participant) => true,
-        (_, ChatMode::Observer) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,20 +227,6 @@ mod tests {
         assert_eq!(default_chat_mode_for("telegram"), ChatMode::Participant);
         assert_eq!(default_chat_mode_for("discord"), ChatMode::Participant);
         assert_eq!(default_chat_mode_for("slack"), ChatMode::Participant);
-    }
-
-    #[test]
-    fn v1_wiring_kakao_observer_only() {
-        assert!(is_mode_wired_v1("kakao", ChatMode::Observer));
-        assert!(!is_mode_wired_v1("kakao", ChatMode::Participant));
-    }
-
-    #[test]
-    fn v1_wiring_other_channels_participant_only() {
-        assert!(is_mode_wired_v1("telegram", ChatMode::Participant));
-        assert!(!is_mode_wired_v1("telegram", ChatMode::Observer));
-        assert!(is_mode_wired_v1("discord", ChatMode::Participant));
-        assert!(!is_mode_wired_v1("discord", ChatMode::Observer));
     }
 
     #[test]
