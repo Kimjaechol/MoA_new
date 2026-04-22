@@ -182,7 +182,9 @@ impl SupabaseClient {
         let new_user = SupabaseUser {
             id: None,
             kakao_user_id: kakao_user_id.to_string(),
-            credits: 1000, // Default starter credits
+            // Default starter credits: matches billing::SIGNUP_BONUS_CREDITS
+            // (2_000 under the 1:1000 USD-to-credit ratio = $2 of headroom).
+            credits: 2_000,
             total_spent: 0,
             custom_api_key: None,
             custom_provider: None,

@@ -3423,3 +3423,292 @@ mod tests {
         );
     }
 }
+
+// ── Billing preferences + expiration sweep (spec, 2026-04-22) ────
+
+/// GET /api/billing/preferences — read the caller's billing preferences
+/// (low-balance threshold, auto-recharge config, saved payment method).
+pub async fn handle_api_billing_preferences_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment subsystem disabled"})),
+        )
+            .into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let pm_guard = pm.lock();
+    match pm_guard.get_billing_preferences(&user_id) {
+        Ok(prefs) => Json(prefs).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to read preferences: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/billing/preferences — upsert the caller's preferences.
+/// Body matches `BillingPreferences` minus `user_id` which is derived
+/// from the session (ignored if the body supplies it).
+pub async fn handle_api_billing_preferences_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<crate::billing::BillingPreferences>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment subsystem disabled"})),
+        )
+            .into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    body.user_id = user_id;
+    let pm_guard = pm.lock();
+    match pm_guard.set_billing_preferences(&body) {
+        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/billing/sweep-expired — operator-triggered expiration sweep.
+/// The periodic task in `run_gateway` runs this every 6h; this endpoint is
+/// kept for manual triggering from the admin dashboard and for tests.
+pub async fn handle_api_billing_sweep_expired(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment subsystem disabled"})),
+        )
+            .into_response();
+    };
+    let pm_guard = pm.lock();
+    match pm_guard.sweep_expired_grants() {
+        Ok((grants, credits)) => Json(serde_json::json!({
+            "grants_expired": grants,
+            "credits_clawed_back": credits,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Sweep failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+// ── Subscription plans (spec, 2026-04-22) ────────────────────────
+
+/// GET /api/subscriptions/plans — list available subscription plans
+/// ($30/mo and $324/yr-save-10%). The billing page combines this with
+/// a KRW FX query to render the localized card.
+pub async fn handle_api_subscription_plans(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let plans: Vec<serde_json::Value> = crate::billing::SUBSCRIPTION_PLANS
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "price_cents": p.price_cents,
+                "price_usd": p.price_cents as f64 / 100.0,
+                "price_krw": p.price_krw,
+                "credits_per_cycle": p.credits_per_cycle,
+                "cycles": p.cycles,
+                "interval": p.interval,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "plans": plans })).into_response()
+}
+
+/// GET /api/subscriptions/current — return the caller's active
+/// subscription row or `{subscription: null}` when absent.
+pub async fn handle_api_subscription_current(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return Json(serde_json::json!({ "subscription": null })).into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let pm_guard = pm.lock();
+    match pm_guard.get_subscription(&user_id) {
+        Ok(Some(record)) => Json(serde_json::json!({ "subscription": record })).into_response(),
+        Ok(None) => Json(serde_json::json!({ "subscription": null })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Subscription lookup failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubscriptionSubscribeBody {
+    pub plan_id: String,
+    /// Payment provider to route the first-cycle checkout through.
+    /// `"stripe"` (default) or `"toss"` — must match Railway's configured
+    /// keys. Subsequent renewals go through the same provider.
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+/// POST /api/subscriptions/subscribe — record a subscription for the
+/// current user and grant the first cycle's credits with the standard
+/// 30-day TTL. Full Stripe Billing recurring integration is a follow-up;
+/// for now the caller is expected to have completed payment out-of-band
+/// (via the existing checkout flow) before POSTing here, so this
+/// endpoint is the idempotent "credit me and persist the plan row" call
+/// the webhook handler can reuse.
+pub async fn handle_api_subscription_subscribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SubscriptionSubscribeBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(plan) = crate::billing::find_subscription_plan(&body.plan_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown plan_id {}", body.plan_id) })),
+        )
+            .into_response();
+    };
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Payment subsystem disabled" })),
+        )
+            .into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+
+    // Monthly plan renews every 30 days; annual plan renews every 365.
+    // We grant one cycle's worth of credits at each renewal hop — so an
+    // annual subscriber still gets 20_000 credits per month, freshly
+    // expiring on the 30-day rolling window.
+    let renewal_secs: i64 = if plan.interval == "year" {
+        365 * 24 * 60 * 60
+    } else {
+        30 * 24 * 60 * 60
+    };
+
+    let pm_guard = pm.lock();
+    if let Err(e) = pm_guard.upsert_subscription(
+        &user_id,
+        plan.id,
+        body.provider.as_deref(),
+        None,
+        renewal_secs,
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Upsert failed: {e}") })),
+        )
+            .into_response();
+    }
+    if let Err(e) = pm_guard.add_bonus_credits(&user_id, plan.credits_per_cycle) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Credit grant failed: {e}") })),
+        )
+            .into_response();
+    }
+    if let Err(e) = pm_guard.record_grant(
+        "",
+        &user_id,
+        plan.credits_per_cycle,
+        "subscription",
+        crate::billing::GRANT_TTL_SECS_30D,
+    ) {
+        tracing::warn!(
+            user_id = %user_id,
+            error = %e,
+            "subscription credits granted but ledger insert failed"
+        );
+    }
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "plan_id": plan.id,
+        "credits_granted": plan.credits_per_cycle,
+    }))
+    .into_response()
+}
+
+/// DELETE /api/subscriptions/current — cancel the caller's subscription.
+pub async fn handle_api_subscription_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Payment subsystem disabled" })),
+        )
+            .into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let pm_guard = pm.lock();
+    match pm_guard.cancel_subscription(&user_id) {
+        Ok(()) => Json(serde_json::json!({ "status": "cancelled" })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Cancel failed: {e}") })),
+        )
+            .into_response(),
+    }
+}

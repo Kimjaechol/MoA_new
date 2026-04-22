@@ -10,6 +10,7 @@
 pub mod admin_api;
 pub mod api;
 pub mod auth_api;
+pub mod bootstrap_state;
 pub mod channel_router;
 pub mod kakao_share;
 pub mod llm_proxy;
@@ -1146,6 +1147,44 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     crate::health::mark_component_ok("gateway");
 
+    // Kick off the first-launch local-LLM bootstrap (Gemma 4 base gun) in the
+    // background so the HTTP surface becomes responsive *while* Ollama and
+    // the model are downloading. The desktop client polls
+    // `GET /api/local-llm/bootstrap-status` to render progress. When
+    // `ZEROCLAW_SKIP_LOCAL_LLM_BOOTSTRAP=1` is set (Railway, CI, tests) the
+    // task exits immediately and marks the stage as `skipped`.
+    tokio::spawn(spawn_local_llm_bootstrap());
+
+    // Credit-grant expiration sweep (spec, 2026-04-22): walk the ledger
+    // every 6 hours, expire grants older than 30 days, and claw back any
+    // unused credits from the user's balance (clamped at zero). Running
+    // on a loose schedule is fine because grants store their own
+    // `expires_at` — a missed sweep window just delays the claw-back to
+    // the next tick. Bootstrapping with an immediate sweep handles the
+    // common case of a service that was offline for longer than 30 days.
+    if let Some(pm_arc) = payment_manager.clone() {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let outcome = {
+                    let pm = pm_arc.lock();
+                    pm.sweep_expired_grants()
+                };
+                match outcome {
+                    Ok((grants, credits)) if grants > 0 => tracing::info!(
+                        grants,
+                        credits,
+                        "credit-grant expiration sweep clawed back expired credits"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "credit-grant sweep failed"),
+                }
+            }
+        });
+    }
+
     // Fire gateway start hook
     if let Some(ref hooks) = hooks {
         hooks.fire_gateway_start(host, actual_port).await;
@@ -1425,6 +1464,30 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route("/api/credits/history", get(api::handle_api_credits_history))
         .route("/api/credits/usage", get(api::handle_api_credits_usage))
+        // Billing preferences + manual expiration sweep (spec, 2026-04-22)
+        .route(
+            "/api/billing/preferences",
+            get(api::handle_api_billing_preferences_get)
+                .put(api::handle_api_billing_preferences_put),
+        )
+        .route(
+            "/api/billing/sweep-expired",
+            post(api::handle_api_billing_sweep_expired),
+        )
+        // Subscription plans (spec, 2026-04-22): $30/mo + $324/yr (10% off).
+        .route(
+            "/api/subscriptions/plans",
+            get(api::handle_api_subscription_plans),
+        )
+        .route(
+            "/api/subscriptions/current",
+            get(api::handle_api_subscription_current)
+                .delete(api::handle_api_subscription_cancel),
+        )
+        .route(
+            "/api/subscriptions/subscribe",
+            post(api::handle_api_subscription_subscribe),
+        )
         // ── Payment callbacks (Kakao Pay redirects) ──
         .route("/api/payment/approve", get(api::handle_api_payment_approve))
         .route("/api/payment/cancel", get(api::handle_api_payment_cancel))
@@ -4074,6 +4137,88 @@ fn kakao_skill_json(
             "template": template
         })),
     )
+}
+
+/// Background task that runs the first-launch Gemma 4 bootstrap and keeps
+/// [`bootstrap_state`] up to date.
+///
+/// Structure intentionally mirrors `main::maybe_auto_bootstrap_local_llm` so
+/// the stderr narration stays consistent between the CLI and HTTP surfaces,
+/// but the progress callbacks push into the shared state the HTTP handler
+/// in `local_llm_api::handle_bootstrap_status` reads from. Non-fatal on
+/// error (state lands on `Error`, user can still BYOK cloud).
+async fn spawn_local_llm_bootstrap() {
+    const SKIP_ENV: &str = "ZEROCLAW_SKIP_LOCAL_LLM_BOOTSTRAP";
+    if std::env::var_os(SKIP_ENV).is_some_and(|v| !v.is_empty()) {
+        bootstrap_state::set(bootstrap_state::BootstrapStage::Skipped);
+        tracing::debug!(env = SKIP_ENV, "local-LLM bootstrap skipped (env opt-out)");
+        return;
+    }
+
+    use crate::local_llm::setup::{ensure_ready, EnsureOutcome, SetupCallbacks, SetupStage};
+    use crate::local_llm::DEFAULT_OLLAMA_URL;
+
+    // Mutable pull-attempt tracker shared between the stage and pull-progress
+    // closures so `PullingModel { attempt }` retains the correct attempt
+    // number as NDJSON progress events stream in.
+    let pull_attempt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
+
+    let pull_attempt_stage = pull_attempt.clone();
+    let mut on_stage = move |stage: SetupStage| {
+        let mapped = match stage {
+            SetupStage::Probing => bootstrap_state::BootstrapStage::Probing,
+            SetupStage::CheckingDisk => bootstrap_state::BootstrapStage::CheckingDisk,
+            SetupStage::InstallingOllama => bootstrap_state::BootstrapStage::InstallingOllama,
+            SetupStage::WaitingForDaemon => bootstrap_state::BootstrapStage::WaitingForDaemon,
+            SetupStage::PullingModel { attempt } => {
+                pull_attempt_stage.store(attempt, std::sync::atomic::Ordering::Relaxed);
+                bootstrap_state::BootstrapStage::PullingModel {
+                    attempt,
+                    fraction: None,
+                    pull_status: None,
+                }
+            }
+            SetupStage::Persisting => bootstrap_state::BootstrapStage::Persisting,
+            SetupStage::Done => return, // terminal tag handled after ensure_ready returns
+        };
+        bootstrap_state::set(mapped);
+    };
+    let mut on_install = |_: crate::local_llm::installer::InstallProgress| {};
+    let pull_attempt_pull = pull_attempt.clone();
+    let mut on_pull = move |p: crate::local_llm::PullProgress| {
+        let attempt = pull_attempt_pull.load(std::sync::atomic::Ordering::Relaxed);
+        bootstrap_state::set(bootstrap_state::BootstrapStage::PullingModel {
+            attempt,
+            fraction: p.fraction(),
+            pull_status: Some(p.status.clone()),
+        });
+    };
+
+    let mut callbacks = SetupCallbacks {
+        on_stage: &mut on_stage,
+        on_install_progress: &mut on_install,
+        on_pull_progress: &mut on_pull,
+    };
+
+    match ensure_ready(DEFAULT_OLLAMA_URL, &mut callbacks).await {
+        Ok(EnsureOutcome::AlreadyReady { model })
+        | Ok(EnsureOutcome::ModelPulled { model }) => {
+            bootstrap_state::set(bootstrap_state::BootstrapStage::Done { model });
+        }
+        Ok(EnsureOutcome::Installed { report }) => {
+            bootstrap_state::set(bootstrap_state::BootstrapStage::Done {
+                model: report.model_tag,
+            });
+        }
+        Err(e) => {
+            let message = format!("{e:#}");
+            tracing::warn!(
+                error = %message,
+                "local-LLM bootstrap failed; continuing without on-device fallback"
+            );
+            bootstrap_state::set(bootstrap_state::BootstrapStage::Error { message });
+        }
+    }
 }
 
 #[cfg(test)]

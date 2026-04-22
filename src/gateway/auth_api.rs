@@ -82,14 +82,38 @@ pub async fn handle_auth_register(
     }
 
     match auth_store.register(&body.username, &body.password) {
-        Ok(user_id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "status": "ok",
-                "user_id": user_id,
-            })),
-        )
-            .into_response(),
+        Ok(user_id) => {
+            // Spec (2026-04-22): grant the one-time SIGNUP_BONUS_CREDITS
+            // (2,000 credits = $2 of headroom at the 1:1000 ratio) the
+            // moment registration succeeds. Non-fatal on failure — the
+            // user is still registered; the operator can reconcile the
+            // missed bonus out-of-band from the billing audit log.
+            let bonus_granted = if let Some(pm) = state.payment_manager.as_ref() {
+                let guard = pm.lock();
+                match crate::billing::grant_signup_bonus(&guard, &user_id) {
+                    Ok(amount) => Some(amount),
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = %e,
+                            "Failed to grant signup bonus credits"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "user_id": user_id,
+                    "signup_bonus_credits": bonus_granted,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),

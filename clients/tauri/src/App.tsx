@@ -7,6 +7,9 @@ import { SignUp } from "./components/SignUp";
 import { DeviceSelect } from "./components/DeviceSelect";
 import { Interpreter } from "./components/Interpreter";
 import { SetupWizard } from "./components/SetupWizard";
+import { LocalLlmBootstrap } from "./components/LocalLlmBootstrap";
+import { BillingPage } from "./components/BillingPage";
+import { LowBalanceBanner } from "./components/LowBalanceBanner";
 import { GatewayStatus } from "./components/GatewayStatus";
 import { LockScreen } from "./components/LockScreen";
 import { DocumentEditor } from "./components/DocumentEditor";
@@ -31,7 +34,7 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "chat" | "settings" | "interpreter" | "document" | "archive";
+type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "llm_bootstrap" | "chat" | "settings" | "billing" | "interpreter" | "document" | "archive";
 
 /** Inactivity auto-lock timeout in milliseconds (default: 5 minutes). */
 const AUTO_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
@@ -107,8 +110,40 @@ function App() {
 
   // Check auth on startup — show setup wizard for first-time users.
   // In Tauri mode, wait for the gateway to be ready before proceeding.
+  //
+  // Gun metaphor onboarding (spec, 2026-04-22): Desktop/mobile installs are
+  // shipped with Gemma 4 as the base gun, so the legacy SetupWizard is never
+  // shown on Tauri runtimes — we auto-stamp the "setup complete" flag and the
+  // default provider/model pair on first launch so the user lands directly on
+  // Login → Chat with a working local brain. The wizard remains reachable from
+  // Settings for users who want to register BYOK cloud keys as optional guns.
   useEffect(() => {
     if (!gatewayReady) return;
+
+    if (isTauri()) {
+      // Mobile Tauri runtimes (Android / iOS) cannot host Ollama — the
+      // daemon is desktop-only — so skip the base-gun default there and let
+      // the gateway's platform-routing proxy serve Gemini Flash Lite with
+      // credit burn until the user pastes a BYOK key. Desktop Tauri keeps
+      // the Gemma 4 base gun as per the gun metaphor.
+      const ua = typeof navigator !== "undefined" ? navigator.userAgent.toLowerCase() : "";
+      const isMobileRuntime = /(android|iphone|ipad|ipod|mobile)/i.test(ua);
+      if (!localStorage.getItem("zeroclaw_llm_provider")) {
+        localStorage.setItem(
+          "zeroclaw_llm_provider",
+          isMobileRuntime ? "gemini" : "ollama",
+        );
+      }
+      if (!localStorage.getItem("zeroclaw_llm_model")) {
+        localStorage.setItem(
+          "zeroclaw_llm_model",
+          isMobileRuntime ? "gemini-3.1-flash-lite-preview" : "gemma4:e4b",
+        );
+      }
+      if (!localStorage.getItem("zeroclaw_setup_complete")) {
+        localStorage.setItem("zeroclaw_setup_complete", "true");
+      }
+    }
 
     const setupComplete = localStorage.getItem("zeroclaw_setup_complete");
     if (!setupComplete) {
@@ -352,7 +387,17 @@ function App() {
     [activeChatId, handleSendMessage],
   );
 
-  // Send an automatic greeting from MoA when chat opens after login
+  // Send an automatic greeting from MoA when chat opens after login.
+  //
+  // First login: we render a *deterministic* introduction message written from
+  // the Gemma 4 base-gun perspective so every new user sees the same welcome
+  // and the business rules (credit burn on cloud, BYOK opt-out) are stated
+  // verbatim. The active model is labelled `gemma4:e4b` so the bubble attributes
+  // correctly in the UI even though the text itself is pre-baked rather than
+  // sampled from the SLM — this is intentional (deterministic onboarding).
+  //
+  // Returning users still get an AI-generated personalised greeting through
+  // the existing chat pipeline below.
   const sendAutoGreeting = useCallback(
     async (isFirstLogin: boolean) => {
       const chat = createNewChat();
@@ -360,12 +405,26 @@ function App() {
       setChats((prev) => [chat, ...prev]);
       setActiveChatIdState(chatId);
 
+      if (isFirstLogin) {
+        const introText = t("greeting_first_chat_local", locale);
+        const introMsg = createMessage("assistant", introText, "gemma4:e4b");
+        setChats((prev) =>
+          prev.map((c) => {
+            if (c.id !== chatId) return c;
+            return {
+              ...c,
+              title: t("app_title", locale),
+              messages: [introMsg],
+              updatedAt: Date.now(),
+            };
+          }),
+        );
+        return;
+      }
+
       const user = apiClient.getUser();
       const username = user?.username ?? "User";
-
-      // Choose prompt based on whether this is a first-time or returning user
-      const promptKey = isFirstLogin ? "greeting_prompt" : "greeting_prompt_returning";
-      const prompt = t(promptKey, locale).replace("{username}", username);
+      const prompt = t("greeting_prompt_returning", locale).replace("{username}", username);
 
       try {
         const response = await apiClient.chat(prompt, []);
@@ -410,15 +469,53 @@ function App() {
   );
 
   const handleLoginSuccess = useCallback((devices: DeviceInfo[]) => {
+    // Decide between the first-launch Gemma 4 progress screen and the chat
+    // view. On Tauri desktop, if the local-LLM bootstrap is still running we
+    // route to `llm_bootstrap`, which polls the gateway and forwards the user
+    // to chat once the base gun is loaded. On mobile / browser runtimes (no
+    // local Ollama), or when the gateway reports `done`/`skipped`, we skip
+    // straight to chat so returning users don't see an extra hop.
     const proceedToChat = () => {
       setIsConnected(true);
       setPage("chat");
       apiClient.startHeartbeat();
 
-      // Determine if first login (no previous chats)
       const existingChats = loadChats();
       const isFirstLogin = existingChats.length === 0;
       sendAutoGreeting(isFirstLogin);
+    };
+
+    const routeAfterAuth = async () => {
+      if (!isTauri()) {
+        proceedToChat();
+        return;
+      }
+      // Mobile (Android / iOS) Tauri cannot run Ollama, so there is no base
+      // gun install to wait on — skip the bootstrap screen entirely.
+      const ua = typeof navigator !== "undefined" ? navigator.userAgent.toLowerCase() : "";
+      const isMobileRuntime = /(android|iphone|ipad|ipod|mobile)/i.test(ua);
+      if (isMobileRuntime) {
+        proceedToChat();
+        return;
+      }
+      try {
+        const res = await fetch(
+          `${apiClient.getServerUrl()}/api/local-llm/bootstrap-status`,
+          { method: "GET" },
+        );
+        if (!res.ok) {
+          proceedToChat();
+          return;
+        }
+        const data = (await res.json()) as { stage?: string };
+        if (data.stage === "done" || data.stage === "skipped") {
+          proceedToChat();
+        } else {
+          setPage("llm_bootstrap");
+        }
+      } catch {
+        proceedToChat();
+      }
     };
 
     if (devices.length <= 1) {
@@ -426,7 +523,7 @@ function App() {
       if (devices.length === 0) {
         apiClient.registerCurrentDevice().catch(() => {});
       }
-      proceedToChat();
+      void routeAfterAuth();
     } else {
       // Multiple devices → show device selection
       const currentDeviceId = apiClient.getDeviceId();
@@ -434,9 +531,9 @@ function App() {
       const onlineDevices = devices.filter((d) => d.is_online);
 
       if (currentInList) {
-        proceedToChat();
+        void routeAfterAuth();
       } else if (onlineDevices.length === 1 && !onlineDevices[0].has_pairing_code) {
-        proceedToChat();
+        void routeAfterAuth();
       } else {
         // Show device selection
         setPendingDevices(devices);
@@ -446,13 +543,40 @@ function App() {
   }, [sendAutoGreeting]);
 
   const handleDeviceSelected = useCallback(() => {
-    setIsConnected(true);
-    setPage("chat");
     apiClient.startHeartbeat();
-
-    const existingChats = loadChats();
-    const isFirstLogin = existingChats.length === 0;
-    sendAutoGreeting(isFirstLogin);
+    // Mirror handleLoginSuccess: gate the chat view on the local-LLM
+    // bootstrap completing so the user does not land in chat with an
+    // unarmed base gun.
+    const route = async () => {
+      if (!isTauri()) {
+        setIsConnected(true);
+        setPage("chat");
+        const existingChats = loadChats();
+        sendAutoGreeting(existingChats.length === 0);
+        return;
+      }
+      try {
+        const res = await fetch(
+          `${apiClient.getServerUrl()}/api/local-llm/bootstrap-status`,
+          { method: "GET" },
+        );
+        const data = res.ok ? ((await res.json()) as { stage?: string }) : { stage: "done" };
+        if (data.stage === "done" || data.stage === "skipped") {
+          setIsConnected(true);
+          setPage("chat");
+          const existingChats = loadChats();
+          sendAutoGreeting(existingChats.length === 0);
+        } else {
+          setPage("llm_bootstrap");
+        }
+      } catch {
+        setIsConnected(true);
+        setPage("chat");
+        const existingChats = loadChats();
+        sendAutoGreeting(existingChats.length === 0);
+      }
+    };
+    void route();
   }, [sendAutoGreeting]);
 
   const handleLogout = useCallback(async () => {
@@ -617,6 +741,39 @@ function App() {
     );
   }
 
+  // First-launch local-LLM install progress (base gun = Gemma 4). We arrive
+  // here only when the gateway has reported the bootstrap is not yet Done —
+  // see `handleLoginSuccess` below. Leaving this screen is either "Done"
+  // (auto) or the explicit "Continue without local AI" button.
+  if (page === "llm_bootstrap") {
+    return (
+      <div className="app">
+        <LocalLlmBootstrap
+          locale={locale}
+          onReady={(ready) => {
+            setIsConnected(true);
+            apiClient.startHeartbeat();
+            setPage("chat");
+            const existingChats = loadChats();
+            const isFirstLogin = existingChats.length === 0;
+            sendAutoGreeting(isFirstLogin);
+            // `ready=false` indicates the user skipped — we still proceed to
+            // chat; downstream code handles the cloud-fallback case.
+            void ready;
+          }}
+        />
+      </div>
+    );
+  }
+
+  if (page === "billing") {
+    return (
+      <div className="app">
+        <BillingPage locale={locale} onBack={() => setPage("chat")} />
+      </div>
+    );
+  }
+
   // Main app (with sidebar)
   return (
     <div className="app">
@@ -634,6 +791,7 @@ function App() {
         onSelectChat={handleSelectChat}
         onDeleteChat={handleDeleteChat}
         onOpenSettings={() => setPage("settings")}
+        onOpenBilling={() => setPage("billing")}
         onOpenInterpreter={() => {
           setPage("interpreter");
           if (window.innerWidth <= 768) setSidebarOpen(false);
@@ -651,6 +809,9 @@ function App() {
         currentPage={page}
       />
       <main className={`main-content ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
+        {page === "chat" && isTauri() && (
+          <LowBalanceBanner locale={locale} onOpenBilling={() => setPage("billing")} />
+        )}
         {page === "chat" ? (
           <Chat
             chat={activeChat}

@@ -119,17 +119,23 @@ pub fn default_model_for_task(task: TaskCategory) -> (&'static str, &'static str
 
 /// Low-balance warning threshold in credits.
 ///
-/// When a user's balance drops to or below this threshold, a warning is shown
-/// prompting them to recharge credits or enter their own API keys.
-/// ~$1 worth of credits (1 credit ≈ $0.007 → ~143 credits).
-pub const LOW_BALANCE_WARNING_THRESHOLD: u32 = 143;
-
-/// Signup bonus credits granted to new users upon registration.
+/// Fallback low-balance warning threshold when the user has not chosen
+/// an explicit preference (see `billing_preferences.low_balance_threshold`).
 ///
-/// Equivalent to approximately $3–5 of usage at 2.2× billing,
-/// enough for the user to explore MoA before purchasing credits
-/// or entering their own API keys.
-pub const SIGNUP_BONUS_CREDITS: u32 = 500;
+/// Under the 1:1000 USD-to-credit ratio this is equivalent to $5 of
+/// remaining headroom at 1× billing. Spec allows the user to narrow it
+/// to 3,000 credits in Settings; the default of 5,000 is chosen to give
+/// the auto-recharge path time to succeed before the balance hits zero.
+pub const LOW_BALANCE_WARNING_THRESHOLD: u32 = 5_000;
+
+/// Signup bonus credits granted once to each new user at registration.
+///
+/// Under the 1:1000 USD-to-credit ratio this is equivalent to $2 worth
+/// of headroom at 1× billing, or roughly $0.91 at the 2.2× operator
+/// markup. Enough for the user to try a handful of premium-cloud chats
+/// before deciding whether to subscribe, paste a BYOK key, or stay on
+/// the free Gemma 4 base gun.
+pub const SIGNUP_BONUS_CREDITS: u32 = 2_000;
 
 /// Grant signup bonus credits to a new user.
 ///
@@ -138,6 +144,15 @@ pub const SIGNUP_BONUS_CREDITS: u32 = 500;
 /// cost-effective) and a few coding/document tasks.
 pub fn grant_signup_bonus(payment_manager: &PaymentManager, user_id: &str) -> anyhow::Result<u32> {
     payment_manager.add_bonus_credits(user_id, SIGNUP_BONUS_CREDITS)?;
+    // Log the grant in the per-grant ledger with the standard 30-day TTL
+    // so the monthly sweep can expire any unused portion on schedule.
+    payment_manager.record_grant(
+        "",
+        user_id,
+        SIGNUP_BONUS_CREDITS,
+        "signup",
+        crate::billing::GRANT_TTL_SECS_30D,
+    )?;
     tracing::info!(
         user_id,
         credits = SIGNUP_BONUS_CREDITS,
@@ -247,6 +262,14 @@ pub struct ResolvedKey {
 ///
 /// 2.0× base operator margin + 10% VAT = 2.2× total.
 /// Expressed as a float to preserve the fractional VAT component.
+/// Scalar mapping USD billing charges to user-visible credit units.
+///
+/// Spec (2026-04-22): "달러에 1000배한 것이 MoA에서의 크레딧 가치".
+/// Keep this constant in lockstep with the React-side display logic
+/// (`clients/tauri/src/lib/billing.ts::CREDITS_PER_USD`) and with the
+/// KRW FX conversion that renders prices in the billing page.
+pub const CREDITS_PER_USD: f64 = 1_000.0;
+
 const OPERATOR_KEY_CREDIT_MULTIPLIER: f64 = 2.2;
 
 /// Resolve which API key to use for a given provider.
@@ -312,10 +335,14 @@ pub fn record_usage(
 
     // Deduct credits only when using operator key
     if key_source == KeySource::OperatorKey {
-        // Convert USD cost to credits: 1 credit ≈ ₩10 ≈ $0.007
-        // Then multiply by 2.2× (2.0× operator margin + 10% VAT)
-        let base_credits = (cost_usd / 0.007).ceil();
-        let credits_to_deduct = (base_credits * OPERATOR_KEY_CREDIT_MULTIPLIER).ceil() as u32;
+        // Spec (2026-04-22): 1 USD billed = 1,000 credits, and the
+        // operator's raw API cost is charged at 2.2× (plus VAT applied
+        // elsewhere in the pipeline via PlatformRoutingConfig.vat_rate).
+        // Example: raw cost $0.91 → 0.91 × 2.2 × 1_000 ≈ 2,002 credits
+        // → the user sees ~"$2 of API burn = 2,000 credits" in their
+        // history, which matches the onboarding greeting copy.
+        let credits_to_deduct =
+            (cost_usd * OPERATOR_KEY_CREDIT_MULTIPLIER * CREDITS_PER_USD).ceil() as u32;
         let credits_to_deduct = credits_to_deduct.max(1); // Minimum 1 credit
 
         // Check balance and warn before deduction

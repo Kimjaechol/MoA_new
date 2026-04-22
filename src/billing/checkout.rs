@@ -35,34 +35,124 @@ pub struct UsdCreditPackage {
     pub price_krw: u32,
 }
 
-/// Available credit packages.
+/// Available one-off top-up packages (spec, 2026-04-22):
+///
+/// * Manual-recharge offering: $10 / $25 / $50 / $100 / $200.
+/// * Auto-recharge offering (subset): $10 / $25 / $50 — the top three
+///   tiers are deliberately absent from auto-recharge so an unattended
+///   loop can never silently charge a user >$50 at a time.
+///
+/// Credit grants follow the 1:1000 USD-to-credit ratio strictly — NO
+/// loyalty bonus on one-off purchases. Loyalty bonuses belong on the
+/// monthly subscription plan (see `SUBSCRIPTION_PLANS`). The `price_krw`
+/// values are baseline hardcodes; the billing page recomputes them
+/// from a live FX feed before rendering.
 pub const USD_PACKAGES: &[UsdCreditPackage] = &[
     UsdCreditPackage {
-        id: "starter_10",
-        name: "Starter",
-        price_cents: 1000, // $10
-        credits: 1_500,
+        id: "topup_10",
+        name: "$10",
+        price_cents: 1_000,
+        credits: 10_000,
         price_krw: 14_000,
     },
     UsdCreditPackage {
-        id: "standard_20",
-        name: "Standard",
-        price_cents: 2000, // $20
-        credits: 3_200,
-        price_krw: 28_000,
+        id: "topup_25",
+        name: "$25",
+        price_cents: 2_500,
+        credits: 25_000,
+        price_krw: 35_000,
     },
     UsdCreditPackage {
-        id: "power_50",
-        name: "Power",
-        price_cents: 5000, // $50
-        credits: 8_500,
+        id: "topup_50",
+        name: "$50",
+        price_cents: 5_000,
+        credits: 50_000,
         price_krw: 69_000,
+    },
+    UsdCreditPackage {
+        id: "topup_100",
+        name: "$100",
+        price_cents: 10_000,
+        credits: 100_000,
+        price_krw: 138_000,
+    },
+    UsdCreditPackage {
+        id: "topup_200",
+        name: "$200",
+        price_cents: 20_000,
+        credits: 200_000,
+        price_krw: 276_000,
     },
 ];
 
-/// Auto-recharge threshold: recharge when balance drops below this.
-/// ~$1 worth of credits (1 credit ≈ $0.007).
-pub const AUTO_RECHARGE_THRESHOLD: u32 = 143;
+/// Package IDs eligible for auto-recharge (subset of `USD_PACKAGES`).
+/// Kept separate so the billing page can render a narrower dropdown
+/// without hardcoding the subset there.
+pub const AUTO_RECHARGE_PACKAGE_IDS: &[&str] = &["topup_10", "topup_25", "topup_50"];
+
+/// Recurring subscription plan (spec, 2026-04-22).
+///
+/// Credits are granted every billing cycle with the same 30-day TTL as
+/// one-off top-ups: unused balance rolls off at the end of the month
+/// rather than accumulating indefinitely. The annual plan charges
+/// 12 × monthly × 0.9 up front (10% discount) and grants 12× the
+/// monthly credit amount in one shot — each grant still uses the
+/// standard 30-day TTL, so an annual subscriber receives fresh credits
+/// every 30 days via the subscription renewal hook (not by splitting
+/// the up-front grant).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionPlan {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// One up-front charge in USD cents. Monthly: 3_000 ($30). Annual:
+    /// 3_000 × 12 × 0.9 = 32_400 ($324).
+    pub price_cents: u32,
+    /// Baseline KRW hardcode. The React billing page overrides this with
+    /// a live FX conversion before rendering — keep the fallback in the
+    /// same ~1,380 KRW/USD ballpark for offline operation.
+    pub price_krw: u32,
+    /// Credits granted per billing cycle (monthly plan: 20_000 on each
+    /// renewal; annual plan: 20_000 each month, issued by the webhook
+    /// renewal hook rather than as a single 240_000 block).
+    pub credits_per_cycle: u32,
+    /// Number of billing cycles covered by a single charge.
+    pub cycles: u32,
+    /// `"month"` | `"year"` — display label only.
+    pub interval: &'static str,
+}
+
+/// Catalog of subscription plans.
+pub const SUBSCRIPTION_PLANS: &[SubscriptionPlan] = &[
+    SubscriptionPlan {
+        id: "sub_monthly_30",
+        name: "MoA Monthly",
+        price_cents: 3_000,
+        price_krw: 41_000,
+        credits_per_cycle: 20_000,
+        cycles: 1,
+        interval: "month",
+    },
+    SubscriptionPlan {
+        id: "sub_annual_324",
+        name: "MoA Annual (save 10%)",
+        // 3_000 cents × 12 × 0.9 = 32_400 cents ($324).
+        price_cents: 32_400,
+        price_krw: 447_000,
+        credits_per_cycle: 20_000,
+        cycles: 12,
+        interval: "year",
+    },
+];
+
+/// Look up a subscription plan by ID.
+pub fn find_subscription_plan(id: &str) -> Option<&'static SubscriptionPlan> {
+    SUBSCRIPTION_PLANS.iter().find(|p| p.id == id)
+}
+
+/// Fallback auto-recharge balance trigger when the user has not saved
+/// an explicit preference. Overridden per-user by
+/// `billing_preferences.auto_recharge_threshold` (values: 3_000 or 5_000).
+pub const AUTO_RECHARGE_THRESHOLD: u32 = 5_000;
 
 pub fn find_usd_package(id: &str) -> Option<&'static UsdCreditPackage> {
     USD_PACKAGES.iter().find(|p| p.id == id)

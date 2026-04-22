@@ -21,7 +21,26 @@ interface ModelGroup {
   models: ModelEntry[];
 }
 
+/**
+ * Gun metaphor (spec, 2026-04-22):
+ *   - "ollama" group = the *base gun* (항상 장착, 로컬, 무료) — Gemma 4 tiers.
+ *   - All remaining groups = *optional guns* (옵션) — swapped in at runtime
+ *     either by pasting a BYOK key or by spending operator credits.
+ *
+ * The base gun group is rendered ABOVE the 기본 총 / 옵션 총 divider in
+ * the sidebar; downstream code relies on it being first in this array.
+ */
 const MODEL_GROUPS: ModelGroup[] = [
+  {
+    provider: "ollama",
+    keyName: "ollama",
+    models: [
+      { id: "gemma4:e4b", label: "Gemma 4 E4B", tier: "Standard" },
+      { id: "gemma4:e2b", label: "Gemma 4 E2B", tier: "Fast" },
+      { id: "gemma4:26b", label: "Gemma 4 26B MoE", tier: "Premium" },
+      { id: "gemma4:31b", label: "Gemma 4 31B Dense", tier: "Premium" },
+    ],
+  },
   {
     provider: "anthropic",
     keyName: "anthropic",
@@ -74,6 +93,7 @@ interface SidebarProps {
   onSelectChat: (id: string) => void;
   onDeleteChat: (id: string) => void;
   onOpenSettings: () => void;
+  onOpenBilling?: () => void;
   onOpenInterpreter: () => void;
   onOpenDocument: () => void;
   onOpenArchive: () => void;
@@ -265,6 +285,7 @@ export function Sidebar({
   onSelectChat,
   onDeleteChat,
   onOpenSettings,
+  onOpenBilling,
   onOpenInterpreter,
   onOpenDocument,
   onOpenArchive,
@@ -317,18 +338,13 @@ export function Sidebar({
     setSelectedModel(modelId);
   }, []);
 
-  // Determine which model groups to show
-  const visibleModelGroups = useMemo(() => {
-    if (availableProviders.size === 0) {
-      // No keys set: show only Gemini 3.1 Flash Lite as default free tier
-      return [{
-        provider: "gemini",
-        keyName: "gemini",
-        models: [{ id: "gemini-3.1-flash-lite-preview", label: "Gemini 3.1 Flash Lite", tier: "Fast" as const }],
-      }];
-    }
-    return MODEL_GROUPS.filter((g) => availableProviders.has(g.keyName));
-  }, [availableProviders]);
+  // Gun metaphor routing: the base-gun (ollama / Gemma 4) group is ALWAYS
+  // shown, regardless of BYOK state. The cloud groups are also always shown
+  // now — when the user lacks a BYOK key for that provider the gateway will
+  // route through the operator's platform key and burn credits (see
+  // PlatformRoutingConfig), but we want the picker to expose the model list
+  // so the user can choose which optional gun to swap in.
+  const visibleModelGroups = useMemo(() => MODEL_GROUPS, []);
 
   // Tool API key dropdown state
   const [, setShowToolKeyDropdown] = useState(false);
@@ -536,30 +552,80 @@ export function Sidebar({
             {expandedSections.models && (
               <div className="sidebar-section-content">
                 <div className="sidebar-model-list">
-                  {visibleModelGroups.map((group) => (
-                    <div key={group.provider}>
-                      <div className="sidebar-model-provider">
-                        {group.provider}
-                      </div>
-                      {group.models.map((model) => (
-                        <button
-                          key={model.id}
-                          className={`sidebar-model-item ${selectedModel === model.id ? "active" : ""}`}
-                          onClick={() => handleSelectModel(group.provider, model.id)}
-                        >
-                          {selectedModel === model.id && (
-                            <svg className="sidebar-model-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                              <polyline points="20 6 9 17 4 12" />
-                            </svg>
-                          )}
-                          <span>{model.label}</span>
-                          <span className={`sidebar-model-tier ${model.tier.toLowerCase()}`}>
-                            {model.tier}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  ))}
+                  {(() => {
+                    const baseGunGroups = visibleModelGroups.filter(
+                      (g) => g.keyName === "ollama",
+                    );
+                    const optionGunGroups = visibleModelGroups.filter(
+                      (g) => g.keyName !== "ollama",
+                    );
+                    const renderGroup = (group: ModelGroup) => {
+                      const hasByokKey = availableProviders.has(group.keyName);
+                      return (
+                        <div key={group.provider}>
+                          <div className="sidebar-model-provider">
+                            {group.provider}
+                          </div>
+                          {group.models.map((model) => {
+                            const isBaseGun = group.keyName === "ollama";
+                            const badge = isBaseGun
+                              ? t("sidebar_badge_base_gun", locale)
+                              : hasByokKey
+                              ? t("sidebar_badge_byok", locale)
+                              : t("sidebar_badge_credit", locale);
+                            return (
+                              <button
+                                key={model.id}
+                                className={`sidebar-model-item ${selectedModel === model.id ? "active" : ""}`}
+                                onClick={() => handleSelectModel(group.provider, model.id)}
+                              >
+                                {selectedModel === model.id && (
+                                  <svg className="sidebar-model-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                                    <polyline points="20 6 9 17 4 12" />
+                                  </svg>
+                                )}
+                                <span>{model.label}</span>
+                                <span className={`sidebar-model-tier ${model.tier.toLowerCase()}`}>
+                                  {model.tier}
+                                </span>
+                                <span
+                                  className={`sidebar-model-gunbadge ${
+                                    isBaseGun
+                                      ? "base"
+                                      : hasByokKey
+                                      ? "byok"
+                                      : "credit"
+                                  }`}
+                                >
+                                  {badge}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      );
+                    };
+                    return (
+                      <>
+                        {baseGunGroups.length > 0 && (
+                          <>
+                            <div className="sidebar-gun-heading base">
+                              {t("sidebar_base_gun_heading", locale)}
+                            </div>
+                            {baseGunGroups.map(renderGroup)}
+                          </>
+                        )}
+                        {optionGunGroups.length > 0 && (
+                          <>
+                            <div className="sidebar-gun-heading option">
+                              {t("sidebar_option_gun_heading", locale)}
+                            </div>
+                            {optionGunGroups.map(renderGroup)}
+                          </>
+                        )}
+                      </>
+                    );
+                  })()}
                 </div>
               </div>
             )}
@@ -744,6 +810,21 @@ export function Sidebar({
 
         {/* Footer */}
         <div className="sidebar-footer">
+          {onOpenBilling && (
+            <button
+              className={`sidebar-footer-btn ${currentPage === "billing" ? "active" : ""}`}
+              onClick={onOpenBilling}
+              title={t("sidebar_billing_link", locale)}
+            >
+              <span className="icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="2" y="5" width="20" height="14" rx="2" />
+                  <line x1="2" y1="10" x2="22" y2="10" />
+                </svg>
+              </span>
+              <span>{t("sidebar_billing_link", locale)}</span>
+            </button>
+          )}
           <button
             className={`sidebar-footer-btn ${currentPage === "settings" ? "active" : ""}`}
             onClick={onOpenSettings}
