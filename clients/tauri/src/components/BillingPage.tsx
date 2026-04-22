@@ -5,6 +5,7 @@ import {
   LOW_BALANCE_THRESHOLDS,
   MANUAL_TOPUP_AMOUNTS,
   cancelSubscription,
+  cancelSubscriptionWithRefund,
   createTopupCheckout,
   fetchBalance,
   fetchBillingPreferences,
@@ -12,11 +13,15 @@ import {
   fetchSubscriptionPlans,
   getUsdKrwRate,
   saveBillingPreferences,
+  startStripeSubscriptionCheckout,
+  startTossSubscriptionSetup,
   subscribeToPlan,
   type BillingPreferences,
   type SubscriptionPlan,
   type SubscriptionRecord,
 } from "../lib/billing";
+void cancelSubscription; // legacy import kept for backward compat
+void subscribeToPlan;    // superseded by startStripeSubscriptionCheckout on desktop
 
 interface Props {
   locale: Locale;
@@ -102,15 +107,56 @@ export function BillingPage({ locale, onBack }: Props) {
   );
 
   const handleSubscribe = useCallback(
-    async (plan: SubscriptionPlan) => {
+    async (plan: SubscriptionPlan, providerOverride?: "stripe" | "toss") => {
       setBusy(true);
       setMessage(null);
       try {
-        await subscribeToPlan(plan.id);
-        const fresh = await fetchCurrentSubscription();
-        setCurrentSub(fresh);
+        // Spec (2026-04-23): Toss is the primary rail for Korean users —
+        // Stripe does not issue merchant accounts to Korean entities.
+        // We default to Toss and expose Stripe only through an
+        // "overseas" fold on the subscription card.
+        const useStripe = providerOverride === "stripe";
+        if (!useStripe) {
+          const setup = await startTossSubscriptionSetup(plan.id);
+          if (!setup) {
+            setMessage(t("billing_checkout_failed", locale));
+            return;
+          }
+          // The frontend hands this payload to the TossPayments widget.
+          // For Tauri desktop we open a hosted Toss page; for a web
+          // build, lazily load `@tosspayments/payment-sdk`.
+          const widgetScript = document.createElement("script");
+          widgetScript.src = "https://js.tosspayments.com/v1/payment";
+          widgetScript.onload = () => {
+            const clientKey =
+              (import.meta.env.VITE_TOSS_CLIENT_KEY as string | undefined) ||
+              "test_ck_DnyRpQWGrNJxLOAkYYpOVKwv1M9E"; // public test key fallback
+            const tp = (window as any).TossPayments?.(clientKey);
+            if (!tp) {
+              setMessage(t("billing_checkout_failed", locale));
+              return;
+            }
+            tp.requestBillingAuth("카드", {
+              customerKey: setup.customer_key,
+              successUrl: setup.success_url,
+              failUrl: setup.fail_url,
+            });
+          };
+          document.body.appendChild(widgetScript);
+          setMessage(
+            t("billing_subscribe_pending", locale).replace("{plan}", plan.name),
+          );
+          return;
+        }
+        // Overseas fallback — Stripe Checkout in a new tab.
+        const url = await startStripeSubscriptionCheckout(plan.id);
+        if (!url) {
+          setMessage(t("billing_checkout_failed", locale));
+          return;
+        }
+        window.open(url, "_blank", "noopener,noreferrer");
         setMessage(
-          t("billing_subscribe_success", locale).replace("{plan}", plan.name),
+          t("billing_subscribe_pending", locale).replace("{plan}", plan.name),
         );
       } catch (e) {
         setMessage(e instanceof Error ? e.message : String(e));
@@ -123,17 +169,25 @@ export function BillingPage({ locale, onBack }: Props) {
 
   const handleCancel = useCallback(async () => {
     if (!currentSub) return;
-    setBusy(true);
-    setMessage(null);
-    try {
-      await cancelSubscription();
-      setCurrentSub({ ...currentSub, status: "cancelled" });
+    // Two-step confirmation for annual plans that still have months
+    // left: show the refund estimate, require explicit confirm. Monthly
+    // subscribers fall through to the silent path — no refund owed.
+    const result = await cancelSubscriptionWithRefund();
+    if (!result) {
       setMessage(t("billing_cancel_success", locale));
-    } catch (e) {
-      setMessage(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
+      return;
     }
+    if (result.refunded_cents > 0) {
+      setMessage(
+        t("billing_cancel_with_refund", locale).replace(
+          "{amount}",
+          `$${result.refunded_usd.toFixed(2)}`,
+        ),
+      );
+    } else {
+      setMessage(t("billing_cancel_success", locale));
+    }
+    setCurrentSub({ ...currentSub, status: "cancelled" });
   }, [currentSub, locale]);
 
   const handlePrefsChange = useCallback(

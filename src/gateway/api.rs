@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use chrono::Datelike;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const MASKED_SECRET: &str = "***MASKED***";
 
@@ -1694,12 +1694,67 @@ pub async fn handle_api_checkout_webhook_stripe(
 
     match event_type {
         "checkout.session.completed" | "payment_intent.succeeded" => {
+            // Split: subscription-mode checkout sessions carry a
+            // `mode=subscription` and a subscription id that we must
+            // backfill into our ledger so future invoice.paid events can
+            // map to this user. Payment-mode sessions (one-off topups)
+            // continue to flow through `complete_payment` unchanged.
+            let mode = event
+                .pointer("/data/object/mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let tx_id = event
                 .pointer("/data/object/metadata/transaction_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let user_id = event
+                .pointer("/data/object/metadata/user_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let plan_id = event
+                .pointer("/data/object/metadata/plan_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let stripe_sub_id = event
+                .pointer("/data/object/subscription")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
-            if !tx_id.is_empty() {
+            if mode == "subscription" && !user_id.is_empty() && !plan_id.is_empty() {
+                if let (Some(plan), Some(ref pm)) = (
+                    crate::billing::find_subscription_plan(plan_id),
+                    state.payment_manager.as_ref(),
+                ) {
+                    let renewal_secs: i64 = if plan.interval == "year" {
+                        365 * 24 * 60 * 60
+                    } else {
+                        30 * 24 * 60 * 60
+                    };
+                    let pm_guard = pm.lock();
+                    if let Err(e) = pm_guard.upsert_subscription(
+                        user_id,
+                        plan.id,
+                        Some("stripe"),
+                        if stripe_sub_id.is_empty() { None } else { Some(stripe_sub_id) },
+                        renewal_secs,
+                    ) {
+                        tracing::warn!(%user_id, plan_id = plan.id, "Stripe subscription upsert failed: {e}");
+                    }
+                    if let Err(e) = pm_guard.add_bonus_credits(user_id, plan.credits_per_cycle) {
+                        tracing::warn!(%user_id, "Stripe subscription credit grant failed: {e}");
+                    }
+                    if let Err(e) = pm_guard.record_grant(
+                        "",
+                        user_id,
+                        plan.credits_per_cycle,
+                        "subscription",
+                        crate::billing::GRANT_TTL_SECS_30D,
+                    ) {
+                        tracing::warn!(%user_id, "subscription grant ledger insert failed: {e}");
+                    }
+                    tracing::info!(%user_id, plan_id = plan.id, %stripe_sub_id, "Stripe subscription activated");
+                }
+            } else if !tx_id.is_empty() {
                 if let Some(ref pm) = state.payment_manager {
                     let pm_guard = pm.lock();
                     if let Err(e) = pm_guard.complete_payment(tx_id) {
@@ -1707,6 +1762,71 @@ pub async fn handle_api_checkout_webhook_stripe(
                     } else {
                         tracing::info!(transaction_id = %tx_id, "Stripe webhook: credits granted");
                     }
+                }
+            }
+        }
+        "invoice.paid" => {
+            // Recurring renewal — Stripe drives the clock for subscriptions
+            // that were set up in subscription mode. Look up the user by
+            // the subscription id and top them up with one more cycle's
+            // worth of credits at the standard 30-day TTL.
+            let stripe_sub_id = event
+                .pointer("/data/object/subscription")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if stripe_sub_id.is_empty() {
+                tracing::debug!("invoice.paid without subscription id (probably one-off invoice)");
+            } else if let Some(ref pm) = state.payment_manager {
+                let (user_id, plan_id) = {
+                    let pm_guard = pm.lock();
+                    let uid = pm_guard.find_user_by_provider_sub_id(stripe_sub_id).ok().flatten();
+                    let pid = uid
+                        .as_ref()
+                        .and_then(|u| pm_guard.get_subscription(u).ok().flatten())
+                        .map(|r| r.plan_id);
+                    (uid, pid)
+                };
+                match (user_id, plan_id.as_deref().and_then(crate::billing::find_subscription_plan)) {
+                    (Some(uid), Some(plan)) => {
+                        let renewal_secs: i64 = if plan.interval == "year" {
+                            365 * 24 * 60 * 60
+                        } else {
+                            30 * 24 * 60 * 60
+                        };
+                        let pm_guard = pm.lock();
+                        let _ = pm_guard.upsert_subscription(
+                            &uid,
+                            plan.id,
+                            Some("stripe"),
+                            Some(stripe_sub_id),
+                            renewal_secs,
+                        );
+                        let _ = pm_guard.add_bonus_credits(&uid, plan.credits_per_cycle);
+                        let _ = pm_guard.record_grant(
+                            "",
+                            &uid,
+                            plan.credits_per_cycle,
+                            "subscription",
+                            crate::billing::GRANT_TTL_SECS_30D,
+                        );
+                        tracing::info!(user_id = %uid, plan_id = plan.id, %stripe_sub_id, "Stripe renewal credited");
+                    }
+                    _ => tracing::warn!(%stripe_sub_id, "invoice.paid: no matching local subscription"),
+                }
+            }
+        }
+        "customer.subscription.deleted" => {
+            let stripe_sub_id = event
+                .pointer("/data/object/id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if stripe_sub_id.is_empty() {
+                tracing::debug!("subscription.deleted without id");
+            } else if let Some(ref pm) = state.payment_manager {
+                let pm_guard = pm.lock();
+                if let Ok(Some(user_id)) = pm_guard.find_user_by_provider_sub_id(stripe_sub_id) {
+                    let _ = pm_guard.cancel_subscription(&user_id);
+                    tracing::info!(%user_id, %stripe_sub_id, "Stripe subscription deletion synced to local ledger");
                 }
             }
         }
@@ -3682,7 +3802,10 @@ pub async fn handle_api_subscription_subscribe(
     .into_response()
 }
 
-/// DELETE /api/subscriptions/current — cancel the caller's subscription.
+/// DELETE /api/subscriptions/current — cancel the caller's subscription
+/// and, for annual plans with whole months remaining, issue a prorated
+/// refund via Stripe. Returns the refund amount (in USD cents) so the
+/// billing page can surface "Refunded $X" immediately.
 pub async fn handle_api_subscription_cancel(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3702,12 +3825,518 @@ pub async fn handle_api_subscription_cancel(
         .as_ref()
         .map(|sc| sc.device_id().to_string())
         .unwrap_or_else(|| "local_user".to_string());
+
+    // Load the active subscription + plan once up front so we can decide
+    // whether a refund is owed before we touch Stripe.
+    let subscription = {
+        let pm_guard = pm.lock();
+        match pm_guard.get_subscription(&user_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "No active subscription" })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("Lookup failed: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let stripe_key = {
+        let cfg = state.config.lock();
+        cfg.stripe_secret_key.clone()
+    };
+
+    // Issue the Stripe cancel + refund round-trip if we have enough info.
+    // If the subscription was never activated through Stripe (provider_sub_id
+    // missing), we just mark it cancelled locally — there is nothing to
+    // refund and nothing to detach on the provider side.
+    let mut refunded_cents: u32 = 0;
+    if let (Some(ref stripe_sub_id), Some(plan)) = (
+        subscription.provider_sub_id.clone(),
+        crate::billing::find_subscription_plan(&subscription.plan_id),
+    ) {
+        if let Some(ref key) = stripe_key {
+            match crate::billing::checkout::cancel_stripe_subscription(
+                key,
+                stripe_sub_id,
+                plan,
+                subscription.renewal_at,
+            )
+            .await
+            {
+                Ok((_cancelled_at, refund)) => {
+                    refunded_cents = refund;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        %stripe_sub_id,
+                        "Stripe cancel/refund failed: {e} — proceeding with local-only cancel"
+                    );
+                }
+            }
+        }
+    }
+
     let pm_guard = pm.lock();
-    match pm_guard.cancel_subscription(&user_id) {
-        Ok(()) => Json(serde_json::json!({ "status": "cancelled" })).into_response(),
-        Err(e) => (
+    if let Err(e) = pm_guard.cancel_subscription(&user_id) {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Cancel failed: {e}") })),
+        )
+            .into_response();
+    }
+    if refunded_cents > 0 {
+        if let Err(e) = pm_guard.mark_subscription_refunded(&user_id, refunded_cents) {
+            tracing::warn!(user_id = %user_id, "refund persisted on Stripe but local marker failed: {e}");
+        }
+    }
+
+    Json(serde_json::json!({
+        "status": "cancelled",
+        "refunded_usd": (refunded_cents as f64) / 100.0,
+        "refunded_cents": refunded_cents,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StripeSubscriptionCheckoutBody {
+    pub plan_id: String,
+}
+
+/// POST /api/subscriptions/stripe-checkout — create a Stripe Checkout
+/// Session in subscription mode for the selected plan. The returned URL
+/// opens Stripe's card-collection + first-charge flow; Stripe then calls
+/// our webhook with `checkout.session.completed` (first activation) and
+/// `invoice.paid` on every renewal cycle.
+pub async fn handle_api_subscription_stripe_checkout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StripeSubscriptionCheckoutBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(plan) = crate::billing::find_subscription_plan(&body.plan_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown plan_id {}", body.plan_id) })),
+        )
+            .into_response();
+    };
+    let (stripe_key, callback_base) = {
+        let cfg = state.config.lock();
+        (
+            cfg.stripe_secret_key.clone(),
+            format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port),
+        )
+    };
+    let Some(key) = stripe_key else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Stripe not configured" })),
+        )
+            .into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    match crate::billing::checkout::create_stripe_subscription_session(
+        &key,
+        plan,
+        &transaction_id,
+        &user_id,
+        &callback_base,
+    )
+    .await
+    {
+        Ok(resp) => Json(serde_json::json!({
+            "checkout_url": resp.checkout_url,
+            "transaction_id": resp.transaction_id,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("Stripe checkout error: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+// ── Toss 빌링키 (recurring) endpoints — spec, 2026-04-23 ─────────
+
+#[derive(Debug, Deserialize)]
+pub struct TossSubscriptionSetupBody {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TossBillingSetupResponse {
+    /// Opaque key the client must pass to Toss's widget. Re-used on the
+    /// callback to prove the redirect belongs to the same session.
+    pub customer_key: String,
+    /// Our internal transaction id echoed back through the redirect so
+    /// we can pair the authKey with the plan the user selected.
+    pub transaction_id: String,
+    /// URL Toss should redirect the user to on successful card auth.
+    /// Points at `handle_api_checkout_toss_billing_callback`.
+    pub success_url: String,
+    /// URL Toss should redirect the user to on card auth failure.
+    pub fail_url: String,
+    /// KRW amount of the first cycle (Toss widget renders this).
+    pub price_krw: u32,
+    /// Plan name for the widget-side order description.
+    pub plan_name: String,
+}
+
+/// POST /api/subscriptions/toss-setup — start a Toss 빌링키 flow for
+/// the selected subscription plan. Returns a `customer_key` + widget
+/// URLs the React frontend hands to the TossPayments JS widget. Toss
+/// then takes the user through card authorisation and redirects back
+/// to `success_url` with `authKey` + `customerKey` query params.
+pub async fn handle_api_subscription_toss_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TossSubscriptionSetupBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(plan) = crate::billing::find_subscription_plan(&body.plan_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown plan_id {}", body.plan_id) })),
+        )
+            .into_response();
+    };
+    let callback_base = {
+        let cfg = state.config.lock();
+        format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port)
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let customer_key = format!("moa_{user_id}");
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let first_cycle_krw = plan.price_krw / plan.cycles.max(1);
+
+    Json(TossBillingSetupResponse {
+        customer_key,
+        transaction_id: transaction_id.clone(),
+        success_url: format!(
+            "{callback_base}/api/checkout/toss-billing-callback?tx={transaction_id}&plan={plan_id}",
+            plan_id = plan.id,
+        ),
+        fail_url: format!("{callback_base}/api/checkout/cancel?tx={transaction_id}"),
+        price_krw: first_cycle_krw,
+        plan_name: plan.name.to_string(),
+    })
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TossBillingCallbackQuery {
+    #[serde(rename = "authKey")]
+    pub auth_key: String,
+    #[serde(rename = "customerKey")]
+    pub customer_key: String,
+    pub tx: String,
+    pub plan: String,
+}
+
+/// GET /api/checkout/toss-billing-callback — redirect target Toss
+/// sends the user to after card authorisation. Exchanges the
+/// `authKey` for a persistent `billingKey`, charges the first cycle,
+/// and persists the subscription + the billing key for future
+/// recurring charges + auto-recharges.
+pub async fn handle_api_checkout_toss_billing_callback(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<TossBillingCallbackQuery>,
+) -> impl IntoResponse {
+    let Some(plan) = crate::billing::find_subscription_plan(&q.plan) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown plan_id {}", q.plan) })),
+        )
+            .into_response();
+    };
+    let toss_key = {
+        let cfg = state.config.lock();
+        cfg.toss_secret_key.clone()
+    };
+    let Some(key) = toss_key else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Toss not configured" })),
+        )
+            .into_response();
+    };
+
+    // 1) authKey → billingKey
+    let billing_key = match crate::billing::checkout::exchange_toss_auth_key(
+        &key,
+        &q.auth_key,
+        &q.customer_key,
+    )
+    .await
+    {
+        Ok(bk) => bk,
+        Err(e) => {
+            tracing::warn!(error = %e, "Toss auth exchange failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    // 2) First-cycle charge
+    let first_cycle_krw = plan.price_krw / plan.cycles.max(1);
+    if let Err(e) = crate::billing::checkout::charge_toss_billing_key(
+        &key,
+        &billing_key,
+        &q.customer_key,
+        first_cycle_krw,
+        &q.tx,
+        &format!("MoA 구독 — {}", plan.name),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "Toss first-cycle charge failed");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        )
+            .into_response();
+    }
+
+    // 3) Persist subscription row + billing key + grant first credits.
+    let user_id = q
+        .customer_key
+        .strip_prefix("moa_")
+        .unwrap_or(&q.customer_key)
+        .to_string();
+
+    if let Some(ref pm) = state.payment_manager {
+        let renewal_secs: i64 = if plan.interval == "year" {
+            365 * 24 * 60 * 60
+        } else {
+            30 * 24 * 60 * 60
+        };
+        let pm_guard = pm.lock();
+        let _ = pm_guard.upsert_subscription(
+            &user_id,
+            plan.id,
+            Some("toss"),
+            Some(&billing_key),
+            renewal_secs,
+        );
+        let _ = pm_guard.add_bonus_credits(&user_id, plan.credits_per_cycle);
+        let _ = pm_guard.record_grant(
+            "",
+            &user_id,
+            plan.credits_per_cycle,
+            "subscription",
+            crate::billing::GRANT_TTL_SECS_30D,
+        );
+        // Save the billing key into the user's preferences so the
+        // auto-recharge scheduler can reuse it without a second widget
+        // round-trip.
+        if let Ok(mut prefs) = pm_guard.get_billing_preferences(&user_id) {
+            prefs.saved_method_id = Some(billing_key);
+            prefs.saved_method_provider = Some("toss".into());
+            let _ = pm_guard.set_billing_preferences(&prefs);
+        }
+    }
+
+    // Friendly post-checkout redirect back to the billing page so the
+    // user lands on a visible "Subscribed ✓" state rather than the
+    // JSON blob of this handler.
+    let redirect_url = {
+        let cfg = state.config.lock();
+        format!("http://{}:{}/billing?toss=ok", cfg.gateway.host, cfg.gateway.port)
+    };
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [("Location", redirect_url.as_str())],
+        Json(serde_json::json!({ "status": "ok" })),
+    )
+        .into_response()
+}
+
+// ── Pending auto-recharge queue (spec, 2026-04-23) ─────────────
+
+/// GET /api/billing/pending-auto-recharge — return the caller's
+/// oldest unresolved pending auto-recharge row, or `{ pending: null }`
+/// when the queue is empty. Used by the React modal's poll loop.
+pub async fn handle_api_pending_auto_recharge_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return Json(serde_json::json!({ "pending": null })).into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let pm_guard = pm.lock();
+    match pm_guard.list_oldest_pending_auto_recharge(&user_id) {
+        Ok(Some(row)) => Json(serde_json::json!({ "pending": row })).into_response(),
+        Ok(None) => Json(serde_json::json!({ "pending": null })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResolvePendingBody {
+    /// One of "approve" | "defer" | "cancel".
+    pub resolution: String,
+}
+
+/// POST /api/billing/pending-auto-recharge/:id/resolve — record the
+/// user's modal decision. On `approve` we immediately trigger the
+/// actual charge via `maybe_auto_recharge` using the stored billing
+/// method. `defer` and `cancel` just close the row; the next
+/// threshold-crossing creates a fresh pending row if needed.
+pub async fn handle_api_pending_auto_recharge_resolve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(pending_id): Path<String>,
+    Json(body): Json<ResolvePendingBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Payment subsystem disabled" })),
+        )
+            .into_response();
+    };
+    if !["approve", "defer", "cancel"].contains(&body.resolution.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "resolution must be approve|defer|cancel" })),
+        )
+            .into_response();
+    }
+
+    // Persist the decision first — we want the audit trail even if the
+    // downstream charge fails.
+    {
+        let pm_guard = pm.lock();
+        if let Err(e) = pm_guard.resolve_pending_auto_recharge(&pending_id, &body.resolution) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+                .into_response();
+        }
+    }
+
+    // On approve, actually run the charge through `maybe_auto_recharge`.
+    // On defer / cancel we return success without touching provider APIs.
+    if body.resolution != "approve" {
+        return Json(serde_json::json!({ "status": body.resolution })).into_response();
+    }
+
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+
+    let (balance, prefs, stripe_key, toss_key, callback_base) = {
+        let pm_guard = pm.lock();
+        let balance = pm_guard.get_balance(&user_id).unwrap_or(0);
+        let prefs = pm_guard.get_billing_preferences(&user_id).ok();
+        let cfg = state.config.lock();
+        (
+            balance,
+            prefs,
+            cfg.stripe_secret_key.clone(),
+            cfg.toss_secret_key.clone(),
+            format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port),
+        )
+    };
+    let Some(prefs) = prefs else {
+        return Json(serde_json::json!({ "status": "approve", "charge": "skipped_no_prefs" }))
+            .into_response();
+    };
+    let Some(pkg_id) = prefs.auto_recharge_package_id.clone() else {
+        return Json(serde_json::json!({ "status": "approve", "charge": "skipped_no_package" }))
+            .into_response();
+    };
+    let Some(provider_str) = prefs.saved_method_provider.clone() else {
+        return Json(serde_json::json!({ "status": "approve", "charge": "skipped_no_provider" }))
+            .into_response();
+    };
+    let provider = match provider_str.as_str() {
+        "stripe" => crate::billing::CheckoutProvider::Stripe,
+        "toss" => crate::billing::CheckoutProvider::Toss,
+        _ => {
+            return Json(serde_json::json!({
+                "status": "approve",
+                "charge": "skipped_unknown_provider",
+            }))
+            .into_response();
+        }
+    };
+    let settings = crate::billing::AutoRechargeSettings {
+        enabled: true,
+        package_id: pkg_id,
+        provider,
+        saved_method_id: prefs.saved_method_id.clone(),
+    };
+    let outcome = crate::billing::checkout::maybe_auto_recharge(
+        &user_id,
+        balance,
+        &settings,
+        stripe_key.as_deref(),
+        toss_key.as_deref(),
+        &callback_base,
+    )
+    .await;
+    match outcome {
+        Ok(Some(tx)) => Json(serde_json::json!({
+            "status": "approve",
+            "charge": "ok",
+            "transaction_id": tx,
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({ "status": "approve", "charge": "skipped" })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "status": "approve",
+                "charge": "failed",
+                "error": format!("{e}"),
+            })),
         )
             .into_response(),
     }

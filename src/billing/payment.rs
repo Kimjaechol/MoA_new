@@ -339,15 +339,17 @@ impl PaymentManager {
                 -- `sweep_expired_grants` in run_gateway) tops users up after
                 -- it passes. `status` values: 'active' | 'cancelled' | 'past_due'.
                 CREATE TABLE IF NOT EXISTS subscriptions (
-                    user_id        TEXT PRIMARY KEY,
-                    plan_id        TEXT NOT NULL,
-                    provider       TEXT,
-                    provider_sub_id TEXT,
-                    status         TEXT NOT NULL DEFAULT 'active',
-                    started_at     INTEGER NOT NULL,
-                    renewal_at     INTEGER NOT NULL,
-                    expires_at     INTEGER NOT NULL,
-                    updated_at     INTEGER NOT NULL
+                    user_id                TEXT PRIMARY KEY,
+                    plan_id                TEXT NOT NULL,
+                    provider               TEXT,
+                    provider_sub_id        TEXT,
+                    status                 TEXT NOT NULL DEFAULT 'active',
+                    started_at             INTEGER NOT NULL,
+                    renewal_at             INTEGER NOT NULL,
+                    expires_at             INTEGER NOT NULL,
+                    refunded_at            INTEGER,
+                    refunded_amount_cents  INTEGER,
+                    updated_at             INTEGER NOT NULL
                 );
 
                 -- Per-user billing preferences (spec, 2026-04-22):
@@ -357,7 +359,33 @@ impl PaymentManager {
                 --   auto_recharge_threshold   — 3000 | 5000
                 --   saved_method_id           — Stripe customer / Toss billing key
                 --   saved_method_provider     — 'stripe' | 'toss'
-                CREATE TABLE IF NOT EXISTS billing_preferences (
+                -- Auto-recharge confirmation queue (spec, 2026-04-23).
+                -- Safeguard against runaway charges: when the scheduler
+                -- detects a balance drop below the user's threshold, we
+                -- write a row here instead of charging immediately and
+                -- wait for the user to approve from the modal popup. A
+                -- 10-minute timer transitions stale rows to
+                -- `resolution='timeout'` (treated as cancel) so an
+                -- abandoned browser tab doesn't leave the queue open
+                -- forever.
+                CREATE TABLE IF NOT EXISTS pending_auto_recharges (
+                    pending_id   TEXT PRIMARY KEY,
+                    user_id      TEXT NOT NULL,
+                    package_id   TEXT NOT NULL,
+                    balance_at   INTEGER NOT NULL,
+                    threshold_at INTEGER NOT NULL,
+                    created_at   INTEGER NOT NULL,
+                    resolved_at  INTEGER,
+                    resolution   TEXT
+                                  CHECK(resolution IN ('approve','defer','cancel','timeout'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_recharges_user
+                    ON pending_auto_recharges(user_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_pending_recharges_unresolved
+                    ON pending_auto_recharges(created_at)
+                    WHERE resolved_at IS NULL;
+
+                                CREATE TABLE IF NOT EXISTS billing_preferences (
                     user_id                  TEXT PRIMARY KEY,
                     low_balance_threshold    INTEGER NOT NULL DEFAULT 5000,
                     auto_recharge_enabled    INTEGER NOT NULL DEFAULT 0,
@@ -365,9 +393,37 @@ impl PaymentManager {
                     auto_recharge_threshold  INTEGER NOT NULL DEFAULT 5000,
                     saved_method_id          TEXT,
                     saved_method_provider    TEXT,
+                    alert_email_enabled      INTEGER NOT NULL DEFAULT 0,
+                    alert_email_address      TEXT,
+                    alert_sms_enabled        INTEGER NOT NULL DEFAULT 0,
+                    alert_sms_phone          TEXT,
                     updated_at               INTEGER NOT NULL
                 );",
             )?;
+
+            // Additive migrations for upgraded DBs that predate the
+            // 2026-04-22 refund/Stripe-subscription columns. Each call
+            // is idempotent: SQLite complains if the column exists, so
+            // we swallow the duplicate-column error and move on.
+            // The `provider_sub_id` column already exists in the
+            // CREATE TABLE above and is what we fill from the Stripe
+            // subscription object on webhook — no separate migration
+            // needed. These two are pure additives for schemas created
+            // before the 2026-04-22 refund-tracking work landed.
+            for migration in [
+                "ALTER TABLE subscriptions ADD COLUMN refunded_at INTEGER",
+                "ALTER TABLE subscriptions ADD COLUMN refunded_amount_cents INTEGER",
+                "ALTER TABLE billing_preferences ADD COLUMN alert_email_enabled INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE billing_preferences ADD COLUMN alert_email_address TEXT",
+                "ALTER TABLE billing_preferences ADD COLUMN alert_sms_enabled INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE billing_preferences ADD COLUMN alert_sms_phone TEXT",
+            ] {
+                if let Err(e) = conn.execute(migration, []) {
+                    if !e.to_string().contains("duplicate column name") {
+                        anyhow::bail!("subscription additive migration failed: {e}");
+                    }
+                }
+            }
             Some(conn)
         } else {
             None
@@ -1020,7 +1076,9 @@ impl PaymentManager {
         )?;
         let row = conn.query_row(
             "SELECT low_balance_threshold, auto_recharge_enabled, auto_recharge_package_id,
-                    auto_recharge_threshold, saved_method_id, saved_method_provider
+                    auto_recharge_threshold, saved_method_id, saved_method_provider,
+                    alert_email_enabled, alert_email_address,
+                    alert_sms_enabled, alert_sms_phone
              FROM billing_preferences WHERE user_id = ?1",
             params![user_id],
             |r| {
@@ -1032,6 +1090,10 @@ impl PaymentManager {
                     auto_recharge_threshold: r.get::<_, u32>(3)?,
                     saved_method_id: r.get::<_, Option<String>>(4)?,
                     saved_method_provider: r.get::<_, Option<String>>(5)?,
+                    alert_email_enabled: r.get::<_, i64>(6)? != 0,
+                    alert_email_address: r.get::<_, Option<String>>(7)?,
+                    alert_sms_enabled: r.get::<_, i64>(8)? != 0,
+                    alert_sms_phone: r.get::<_, Option<String>>(9)?,
                 })
             },
         )?;
@@ -1064,8 +1126,10 @@ impl PaymentManager {
             "INSERT INTO billing_preferences
                 (user_id, low_balance_threshold, auto_recharge_enabled,
                  auto_recharge_package_id, auto_recharge_threshold,
-                 saved_method_id, saved_method_provider, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 saved_method_id, saved_method_provider,
+                 alert_email_enabled, alert_email_address,
+                 alert_sms_enabled, alert_sms_phone, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(user_id) DO UPDATE SET
                  low_balance_threshold    = excluded.low_balance_threshold,
                  auto_recharge_enabled    = excluded.auto_recharge_enabled,
@@ -1073,6 +1137,10 @@ impl PaymentManager {
                  auto_recharge_threshold  = excluded.auto_recharge_threshold,
                  saved_method_id          = excluded.saved_method_id,
                  saved_method_provider    = excluded.saved_method_provider,
+                 alert_email_enabled      = excluded.alert_email_enabled,
+                 alert_email_address      = excluded.alert_email_address,
+                 alert_sms_enabled        = excluded.alert_sms_enabled,
+                 alert_sms_phone          = excluded.alert_sms_phone,
                  updated_at               = excluded.updated_at",
             params![
                 prefs.user_id,
@@ -1082,6 +1150,10 @@ impl PaymentManager {
                 prefs.auto_recharge_threshold,
                 prefs.saved_method_id,
                 prefs.saved_method_provider,
+                if prefs.alert_email_enabled { 1 } else { 0 },
+                prefs.alert_email_address,
+                if prefs.alert_sms_enabled { 1 } else { 0 },
+                prefs.alert_sms_phone,
                 now,
             ],
         )?;
@@ -1137,7 +1209,8 @@ impl PaymentManager {
         let row = conn
             .query_row(
                 "SELECT plan_id, provider, provider_sub_id, status,
-                        started_at, renewal_at, expires_at
+                        started_at, renewal_at, expires_at,
+                        refunded_at, refunded_amount_cents
                  FROM subscriptions WHERE user_id = ?1",
                 params![user_id],
                 |r| {
@@ -1150,6 +1223,8 @@ impl PaymentManager {
                         started_at: r.get::<_, i64>(4)?,
                         renewal_at: r.get::<_, i64>(5)?,
                         expires_at: r.get::<_, i64>(6)?,
+                        refunded_at: r.get::<_, Option<i64>>(7)?,
+                        refunded_amount_cents: r.get::<_, Option<u32>>(8)?,
                     })
                 },
             )
@@ -1170,6 +1245,222 @@ impl PaymentManager {
         Ok(())
     }
 
+    /// Record that a prorated refund has been issued for this user's
+    /// subscription. Called from the cancel flow after the Stripe
+    /// refund API round-trip succeeds so the UI can surface
+    /// `refunded_amount_cents` on the next balance refresh.
+    pub fn mark_subscription_refunded(
+        &self,
+        user_id: &str,
+        refunded_cents: u32,
+    ) -> anyhow::Result<()> {
+        let Some(ref conn) = self.conn else {
+            return Ok(());
+        };
+        let now = now_epoch();
+        conn.execute(
+            "UPDATE subscriptions
+             SET refunded_at = ?2,
+                 refunded_amount_cents = ?3,
+                 updated_at = ?2
+             WHERE user_id = ?1",
+            params![user_id, now, refunded_cents],
+        )?;
+        Ok(())
+    }
+
+    /// List every active subscription whose `renewal_at` has passed and
+    /// whose provider is `"toss"`. Used by the scheduler to drive the
+    /// Toss billing-key charge for the next cycle. Stripe subscriptions
+    /// are deliberately excluded — Stripe drives its own renewal clock
+    /// via `invoice.paid` webhooks and we don't want to double-charge.
+    pub fn list_due_toss_subscriptions(
+        &self,
+        now: i64,
+    ) -> anyhow::Result<Vec<SubscriptionRecord>> {
+        let Some(ref conn) = self.conn else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT user_id, plan_id, provider, provider_sub_id, status,
+                    started_at, renewal_at, expires_at,
+                    refunded_at, refunded_amount_cents
+             FROM subscriptions
+             WHERE status = 'active'
+               AND provider = 'toss'
+               AND renewal_at <= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |r| {
+                Ok(SubscriptionRecord {
+                    user_id: r.get::<_, String>(0)?,
+                    plan_id: r.get::<_, String>(1)?,
+                    provider: r.get::<_, Option<String>>(2)?,
+                    provider_sub_id: r.get::<_, Option<String>>(3)?,
+                    status: r.get::<_, String>(4)?,
+                    started_at: r.get::<_, i64>(5)?,
+                    renewal_at: r.get::<_, i64>(6)?,
+                    expires_at: r.get::<_, i64>(7)?,
+                    refunded_at: r.get::<_, Option<i64>>(8)?,
+                    refunded_amount_cents: r.get::<_, Option<u32>>(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Backfill a subscription row with the Stripe subscription ID that
+    /// webhook events carry in `data.object.subscription`. Idempotent —
+    /// repeated calls with the same ID no-op.
+    pub fn set_subscription_provider_id(
+        &self,
+        user_id: &str,
+        provider_sub_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(ref conn) = self.conn else {
+            return Ok(());
+        };
+        let now = now_epoch();
+        conn.execute(
+            "UPDATE subscriptions
+             SET provider_sub_id = ?2, updated_at = ?3
+             WHERE user_id = ?1",
+            params![user_id, provider_sub_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Find the user who owns a given Stripe subscription ID. Used by
+    /// the webhook handler when Stripe emits `invoice.paid` /
+    /// `customer.subscription.deleted` and we need to map the event
+    /// back to our local user row.
+    pub fn find_user_by_provider_sub_id(
+        &self,
+        provider_sub_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(ref conn) = self.conn else {
+            return Ok(None);
+        };
+        let user_id: Option<String> = conn
+            .query_row(
+                "SELECT user_id FROM subscriptions WHERE provider_sub_id = ?1",
+                params![provider_sub_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(user_id)
+    }
+
+
+    // ── Pending auto-recharge queue (spec, 2026-04-23) ───────────────
+    //
+    // The React client reads the oldest unresolved row via
+    // `list_oldest_pending_auto_recharge`, presents a modal, and POSTs
+    // the user's choice to `resolve_pending_auto_recharge`. A 10-minute
+    // timer in the scheduler flips stale rows to `resolution='timeout'`
+    // so an abandoned tab never leaves the queue open forever.
+
+    /// Insert a pending row. Returns the generated `pending_id` so the
+    /// caller can surface the modal key back to the client. Idempotent
+    /// at the spec level — the scheduler only inserts once per balance
+    /// descent because `LowBalanceAlertState::should_fire` keeps state.
+    pub fn create_pending_auto_recharge(
+        &self,
+        user_id: &str,
+        package_id: &str,
+        balance: u32,
+        threshold: u32,
+    ) -> anyhow::Result<String> {
+        let Some(ref conn) = self.conn else {
+            anyhow::bail!("Payment database not initialized");
+        };
+        let now = now_epoch();
+        let pending_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO pending_auto_recharges
+                (pending_id, user_id, package_id, balance_at, threshold_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![pending_id, user_id, package_id, balance, threshold, now],
+        )?;
+        Ok(pending_id)
+    }
+
+    /// Fetch the user's oldest unresolved pending row (the modal is
+    /// FIFO — one popup at a time). Returns `None` when the queue is
+    /// empty for this user.
+    pub fn list_oldest_pending_auto_recharge(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Option<PendingAutoRecharge>> {
+        let Some(ref conn) = self.conn else {
+            return Ok(None);
+        };
+        let row = conn
+            .query_row(
+                "SELECT pending_id, user_id, package_id, balance_at, threshold_at,
+                        created_at, resolved_at, resolution
+                 FROM pending_auto_recharges
+                 WHERE user_id = ?1 AND resolved_at IS NULL
+                 ORDER BY created_at ASC LIMIT 1",
+                params![user_id],
+                |r| {
+                    Ok(PendingAutoRecharge {
+                        pending_id: r.get::<_, String>(0)?,
+                        user_id: r.get::<_, String>(1)?,
+                        package_id: r.get::<_, String>(2)?,
+                        balance_at: r.get::<_, u32>(3)?,
+                        threshold_at: r.get::<_, u32>(4)?,
+                        created_at: r.get::<_, i64>(5)?,
+                        resolved_at: r.get::<_, Option<i64>>(6)?,
+                        resolution: r.get::<_, Option<String>>(7)?,
+                    })
+                },
+            )
+            .ok();
+        Ok(row)
+    }
+
+    /// Mark a pending row as resolved with the given outcome. `resolution`
+    /// must be one of the enum values accepted by the CHECK constraint.
+    pub fn resolve_pending_auto_recharge(
+        &self,
+        pending_id: &str,
+        resolution: &str,
+    ) -> anyhow::Result<()> {
+        const ALLOWED: [&str; 4] = ["approve", "defer", "cancel", "timeout"];
+        if !ALLOWED.contains(&resolution) {
+            anyhow::bail!("invalid resolution value");
+        }
+        let Some(ref conn) = self.conn else {
+            anyhow::bail!("Payment database not initialized");
+        };
+        let now = now_epoch();
+        conn.execute(
+            "UPDATE pending_auto_recharges
+             SET resolved_at = ?2, resolution = ?3
+             WHERE pending_id = ?1 AND resolved_at IS NULL",
+            params![pending_id, now, resolution],
+        )?;
+        Ok(())
+    }
+
+    /// Force-resolve every unresolved row older than
+    /// `PENDING_AUTO_RECHARGE_TIMEOUT_SECS` with `resolution='timeout'`.
+    /// Returns the number of rows touched so the scheduler can log it.
+    pub fn timeout_stale_pending_auto_recharges(&self) -> anyhow::Result<u32> {
+        let Some(ref conn) = self.conn else {
+            return Ok(0);
+        };
+        let cutoff = now_epoch() - PENDING_AUTO_RECHARGE_TIMEOUT_SECS;
+        let n = conn.execute(
+            "UPDATE pending_auto_recharges
+             SET resolved_at = ?2, resolution = 'timeout'
+             WHERE resolved_at IS NULL AND created_at < ?1",
+            params![cutoff, now_epoch()],
+        )?;
+        Ok(n as u32)
+    }
+
 }
 
 /// Active subscription row mirrored from the `subscriptions` table.
@@ -1188,6 +1479,13 @@ pub struct SubscriptionRecord {
     pub started_at: i64,
     pub renewal_at: i64,
     pub expires_at: i64,
+    /// Unix epoch of prorated refund issuance, if the user cancelled
+    /// an annual plan with whole months remaining. None for active
+    /// subscriptions and for monthly-plan cancels (no refund ever).
+    pub refunded_at: Option<i64>,
+    /// Amount refunded in USD cents. Sums over multiple refunds if
+    /// cancellation is replayed; typically set once and immutable.
+    pub refunded_amount_cents: Option<u32>,
 }
 
 /// Per-user billing preferences persisted in SQLite (see
@@ -1202,7 +1500,44 @@ pub struct BillingPreferences {
     pub auto_recharge_threshold: u32,
     pub saved_method_id: Option<String>,
     pub saved_method_provider: Option<String>,
+    /// When `true` and `alert_email_address` is set, low-balance
+    /// alerts are sent via SMTP through the billing alerts module.
+    #[serde(default)]
+    pub alert_email_enabled: bool,
+    #[serde(default)]
+    pub alert_email_address: Option<String>,
+    /// When `true` and `alert_sms_phone` is set, low-balance alerts
+    /// are sent via Twilio (or whatever SMS backend is wired into
+    /// `billing::alerts::send_low_balance_sms`). Requires
+    /// `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM_NUMBER`
+    /// env vars to be present on the gateway.
+    #[serde(default)]
+    pub alert_sms_enabled: bool,
+    #[serde(default)]
+    pub alert_sms_phone: Option<String>,
 }
+
+/// A single entry in the auto-recharge confirmation queue (see
+/// `pending_auto_recharges` schema). The scheduler writes these rows
+/// when a balance drop would normally trigger an auto-recharge; the
+/// React client surfaces the oldest unresolved row as a modal popup
+/// and POSTs back the user's choice within the 10-minute window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingAutoRecharge {
+    pub pending_id: String,
+    pub user_id: String,
+    pub package_id: String,
+    pub balance_at: u32,
+    pub threshold_at: u32,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+    pub resolution: Option<String>,
+}
+
+/// Default grace window before `pending_auto_recharges` rows are
+/// force-resolved as `timeout`. Keep in sync with the client-side
+/// modal auto-close timer in `PendingAutoRechargeModal.tsx`.
+pub const PENDING_AUTO_RECHARGE_TIMEOUT_SECS: i64 = 10 * 60;
 
 /// Default TTL applied to every non-subscription grant: 30 days.
 /// Subscriptions grant with a 30-day TTL as well but schedule a renewal
