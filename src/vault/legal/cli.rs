@@ -84,8 +84,28 @@ async fn ingest_one(
     path: &Path,
     report: &mut IngestReport,
 ) -> Result<()> {
-    let body = std::fs::read_to_string(path)
+    // Accept UTF-8 / UTF-8 w/ BOM / UTF-16 / CP949 / EUC-KR — Korean legal
+    // corpora arrive in a mix of encodings depending on vintage. We log
+    // anything that wasn't vanilla UTF-8 so operators can spot malformed
+    // dumps in the `skip` stream.
+    let decoded = super::encoding::read_markdown_auto(path)
         .with_context(|| format!("reading {}", path.display()))?;
+    if decoded.encoding != "utf-8" {
+        tracing::debug!(
+            path = %path.display(),
+            encoding = decoded.encoding,
+            had_errors = decoded.had_errors,
+            "legal ingest: non-UTF-8 input decoded"
+        );
+    }
+    if decoded.had_errors {
+        tracing::warn!(
+            path = %path.display(),
+            encoding = decoded.encoding,
+            "legal ingest: decoder produced replacement characters — file may be a different encoding"
+        );
+    }
+    let body = decoded.content;
     let source_path = path.to_string_lossy().to_string();
 
     // Route: case first (cheaper signal — explicit `## 사건번호`), fallback statute.

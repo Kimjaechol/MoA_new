@@ -21,6 +21,7 @@
 pub mod case_extractor;
 pub mod citation_patterns;
 pub mod cli;
+pub mod encoding;
 pub mod graph_query;
 pub mod ingest;
 pub mod law_aliases;
