@@ -206,8 +206,28 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 }
 
-// Bootstrap: if the URL has ?node=..., auto-load.
+// Bootstrap. Priority:
+//   1. If a <script id="__prebundled_subgraph__" type="application/json">
+//      tag is present (static HTML export from `vault legal export`),
+//      render it immediately — no network needed.
+//   2. Else if the URL has ?node=..., auto-load via the live API.
+//   3. Else show gateway stats.
 (() => {
+  const prebundled = document.getElementById('__prebundled_subgraph__');
+  if (prebundled) {
+    try {
+      const sg = JSON.parse(prebundled.textContent);
+      const meta = sg.__meta || {};
+      lastSubgraph = sg;
+      render(sg);
+      if (meta.root) $('#node').value = meta.root;
+      if (meta.depth) $('#depth').value = meta.depth;
+      $('#stats').textContent = `snapshot · nodes ${sg.nodes.length} · edges ${sg.edges.length}${meta.exported_at ? ' · ' + meta.exported_at : ''}`;
+      return;
+    } catch (e) {
+      showErr('malformed prebundled subgraph: ' + e.message);
+    }
+  }
   const p = new URLSearchParams(location.search);
   const node = p.get('node');
   if (node) {

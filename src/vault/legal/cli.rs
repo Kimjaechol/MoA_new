@@ -7,6 +7,7 @@
 
 use super::{
     case_extractor::{extract_case, looks_like_case},
+    graph_query::{self, NodeKind, Subgraph},
     ingest::{ingest_case, ingest_statute, resolve_pending_links, IngestCounts, IngestReport},
     statute_extractor::{extract_statute, looks_like_statute},
 };
@@ -186,6 +187,171 @@ fn print_report(report: &IngestReport) {
         if c.errors.len() > 10 {
             println!("    (+{} more)", c.errors.len() - 10);
         }
+    }
+}
+
+/// Export format for `zeroclaw vault legal export`.
+pub enum ExportFormat {
+    /// Single self-contained HTML file — Cytoscape viewer with the subgraph
+    /// embedded inline. Works offline, no network needed.
+    Html,
+    /// graphify-compatible JSON (`{nodes, edges, __meta}`) for external tools.
+    Json,
+}
+
+/// Compute a subgraph rooted at `root_slug` up to `depth` hops, filtered by
+/// `kinds` (comma-separated `statute,case`), and write it to `out` as either
+/// a standalone HTML viewer or raw JSON.
+pub fn export_subgraph(
+    config: &Config,
+    root: &str,
+    depth: usize,
+    kinds: Option<&str>,
+    format: ExportFormat,
+    out: &Path,
+) -> Result<()> {
+    let db_path = config.workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        anyhow::bail!("brain.db not found at {}", db_path.display());
+    }
+    let conn = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", db_path.display()))?;
+
+    let kinds_parsed = parse_kinds_csv(kinds);
+    let sg = graph_query::neighbors(&conn, root, depth, &kinds_parsed)?;
+    let exported_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+
+    // Augment with export metadata so the viewer can show provenance.
+    let mut sg_value = serde_json::to_value(&sg)?;
+    if let Some(obj) = sg_value.as_object_mut() {
+        obj.insert(
+            "__meta".to_string(),
+            serde_json::json!({
+                "root": root,
+                "depth": depth,
+                "kinds": kinds,
+                "exported_at": exported_at,
+                "source": "zeroclaw vault legal export",
+            }),
+        );
+    }
+    let sg_json = serde_json::to_string(&sg_value)?;
+
+    match format {
+        ExportFormat::Json => {
+            std::fs::write(out, sg_json.as_bytes())
+                .with_context(|| format!("writing {}", out.display()))?;
+        }
+        ExportFormat::Html => {
+            let html = build_snapshot_html(&sg_json);
+            std::fs::write(out, html.as_bytes())
+                .with_context(|| format!("writing {}", out.display()))?;
+        }
+    }
+
+    println!(
+        "{} {} (nodes={}, edges={}{}) → {}",
+        style("wrote").green(),
+        match format {
+            ExportFormat::Html => "HTML snapshot",
+            ExportFormat::Json => "JSON subgraph",
+        },
+        sg.nodes.len(),
+        sg.edges.len(),
+        if sg.truncated { ", TRUNCATED" } else { "" },
+        out.display()
+    );
+    Ok(())
+}
+
+fn parse_kinds_csv(raw: Option<&str>) -> Vec<NodeKind> {
+    let Some(raw) = raw else {
+        return vec![];
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s {
+            "statute" => Some(NodeKind::Statute),
+            "case" => Some(NodeKind::Case),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The HTML template is the same Cytoscape viewer served by the gateway.
+/// The exporter injects the subgraph as a `<script type="application/json"
+/// id="__prebundled_subgraph__">...</script>` tag right before `</body>`;
+/// the viewer's bootstrap sees it and renders without any network calls.
+fn build_snapshot_html(subgraph_json: &str) -> String {
+    // Escape `</script>` within the JSON payload so it can't terminate the
+    // embedding script tag.
+    let safe_json = subgraph_json.replace("</", "<\\/");
+    let mut html = VIEWER_TEMPLATE.to_string();
+    let injection = format!(
+        "<script type=\"application/json\" id=\"__prebundled_subgraph__\">{safe_json}</script>\n</body>"
+    );
+    // Replace the final `</body>` (case-sensitive, matches what we ship).
+    if let Some(idx) = html.rfind("</body>") {
+        html.replace_range(idx..idx + "</body>".len(), &injection);
+    } else {
+        // Fallback — append; unlikely, template is stable.
+        html.push_str(&injection);
+    }
+    html
+}
+
+const VIEWER_TEMPLATE: &str = include_str!("../../gateway/legal_graph_viewer.html");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_injects_prebundle_script_before_body_close() {
+        let json = r#"{"nodes":[],"edges":[],"__meta":{"root":"x"}}"#;
+        let html = build_snapshot_html(json);
+        assert!(
+            html.contains(r#"<script type="application/json" id="__prebundled_subgraph__">"#),
+            "prebundle script tag missing"
+        );
+        // The injected block must sit before `</body>`.
+        let close = html.rfind("</body>").expect("viewer must have </body>");
+        let inject = html
+            .find("__prebundled_subgraph__")
+            .expect("injection marker");
+        assert!(inject < close, "prebundle must come before </body>");
+        // JSON payload round-trips.
+        assert!(html.contains(r#""root":"x""#));
+    }
+
+    #[test]
+    fn snapshot_escapes_script_close_tag_in_payload() {
+        // A malicious payload containing `</script>` must not break out of the
+        // embedding tag. We escape `</` → `<\/` which keeps JSON.parse happy
+        // but prevents HTML parser from terminating the script.
+        let json = r#"{"evil":"</script><img src=x onerror=alert(1)>"}"#;
+        let html = build_snapshot_html(json);
+        assert!(
+            !html.contains("</script><img"),
+            "script tag termination not escaped: {html}"
+        );
+        assert!(
+            html.contains(r#"<\/script><img"#) || html.contains(r#"<\/"#),
+            "expected `<\\/` escape in the payload"
+        );
+    }
+
+    #[test]
+    fn parse_kinds_csv_filters_unknown() {
+        use NodeKind::*;
+        assert_eq!(parse_kinds_csv(None), Vec::<NodeKind>::new());
+        assert_eq!(parse_kinds_csv(Some("")), Vec::<NodeKind>::new());
+        assert_eq!(parse_kinds_csv(Some("statute")), vec![Statute]);
+        assert_eq!(parse_kinds_csv(Some("case, statute, bogus")), vec![Case, Statute]);
     }
 }
 

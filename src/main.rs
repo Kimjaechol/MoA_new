@@ -927,6 +927,26 @@ enum VaultLegalCommands {
     },
     /// Show legal-graph node/edge counts in brain.db.
     Stats,
+    /// Export a subgraph rooted at a slug to a standalone HTML snapshot
+    /// (Cytoscape viewer with data embedded) or graphify-compatible JSON.
+    Export {
+        /// Root slug (e.g. `statute::근로기준법::36` or `case::2024노3424`).
+        #[arg(long)]
+        root: String,
+        /// Hop limit (1–3).
+        #[arg(long, default_value = "2")]
+        depth: u32,
+        /// Comma-separated kinds filter (`statute,case`). Omit for both.
+        #[arg(long)]
+        kinds: Option<String>,
+        /// Output file path.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Output format. `html` = self-contained viewer (default); `json` =
+        /// raw `{nodes, edges, __meta}`, also graphify-compatible.
+        #[arg(long, default_value = "html")]
+        format: String,
+    },
 }
 
 #[tokio::main]
@@ -1411,6 +1431,29 @@ async fn main() -> Result<()> {
                     vault::legal::cli::ingest_path(&config, path, dry_run).await
                 }
                 VaultLegalCommands::Stats => vault::legal::cli::stats(&config).await,
+                VaultLegalCommands::Export {
+                    root,
+                    depth,
+                    kinds,
+                    out,
+                    format,
+                } => {
+                    let fmt = match format.to_ascii_lowercase().as_str() {
+                        "html" => vault::legal::cli::ExportFormat::Html,
+                        "json" => vault::legal::cli::ExportFormat::Json,
+                        other => anyhow::bail!(
+                            "unknown --format `{other}` (expected `html` or `json`)"
+                        ),
+                    };
+                    vault::legal::cli::export_subgraph(
+                        &config,
+                        &root,
+                        (depth as usize).clamp(1, 3),
+                        kinds.as_deref(),
+                        fmt,
+                        &out,
+                    )
+                }
             },
         },
 

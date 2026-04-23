@@ -431,6 +431,26 @@ pub enum VaultLegalCommands {
     },
     /// Show legal-graph node/edge counts in brain.db.
     Stats,
+    /// Export a subgraph rooted at a slug to a standalone HTML snapshot
+    /// (Cytoscape viewer with data embedded) or graphify-compatible JSON.
+    Export {
+        /// Root slug (e.g. `statute::근로기준법::36` or `case::2024노3424`).
+        #[arg(long)]
+        root: String,
+        /// Hop limit (1–3).
+        #[arg(long, default_value = "2")]
+        depth: u32,
+        /// Comma-separated kinds filter (`statute,case`). Omit for both.
+        #[arg(long)]
+        kinds: Option<String>,
+        /// Output file path.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Output format. `html` = self-contained viewer (default); `json` =
+        /// raw `{nodes, edges, __meta}`, also graphify-compatible.
+        #[arg(long, default_value = "html")]
+        format: String,
+    },
 }
 
 /// Integration subcommands
