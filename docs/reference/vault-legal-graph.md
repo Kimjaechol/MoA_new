@@ -558,6 +558,90 @@ Each is a separate follow-up PR.
 
 ---
 
+## Version history (현행법령 vs 연혁법령)
+
+The user's corpus is organised as:
+
+```
+<root>/현행법령/YYYYMMDD/<법령명>.md      ← currently in-force version
+<root>/연혁법령/YYYYMMDD/<법령명>.md      ← pre-amendment versions (going back to 1940s)
+```
+
+The ingester auto-detects the category from the path and applies a
+dual-slug write policy so history is preserved without polluting the
+citation graph:
+
+| Path contains | Canonical slug write | Versioned slug write |
+|---|---|---|
+| `현행법령` | yes — `statute::{법}::{N}` gets the latest body | yes — `statute::{법}::{N}@YYYYMMDD` also written |
+| `연혁법령` | **no** — canonical is never overwritten by history | yes — versioned slug only |
+| neither | yes (backward-compat) | no |
+
+**Why this split?** Citations in cases and cross-references always
+resolve to the canonical slug. A 연혁법령 ingest must not change
+what `case → cites → statute::근로기준법::36` points at — otherwise
+graph walks would suddenly jump to 1949's version whenever a
+historical corpus is added. The versioned slug
+(`statute::근로기준법::36@20101004`) is a separate storage location
+that `legal_read_article` can retrieve on demand.
+
+### Versioned-node write details
+
+- `doc_type = 'statute_article_version'` (distinct from
+  `'statute_article'` used by canonical nodes)
+- Content: article body prefixed with `# 근로기준법 제36조 (공포
+  YYYYMMDD)` for clear provenance when read back
+- Frontmatter: `law_name`, `article_num`, `article_sub`,
+  `publish_date`, `version_of` (= canonical slug pointer),
+  `version_source` (`"current"` / `"historical"`)
+- Alias: `근로기준법 제36조 (YYYY-MM-DD 공포)` so
+  `legal_graph_find` can resolve by human-friendly form
+- Tags: `domain:legal`, `kind:statute_version`, `law:…`, `year:YYYY`
+- **No outbound edges** — versioned nodes are read-only archives;
+  graph traversal stays on canonical slugs to keep it uncluttered
+
+### Picker integration
+
+When `legal_applicable_version(case_slug, statute_slug)` fires and
+lands on a historical version:
+
+```jsonc
+{
+  "branch": "revision_cutoff",
+  "anchor_date": "20211221",
+  "supplement_slug":        "statute::근로기준법::supplement::17326",
+  "effective_date":         "20200526",
+  "promulgation_date":      "20200526",
+  "versioned_article_slug": "statute::근로기준법::36@20200526",  // ← new
+  "explanation":            "구법 citation: applied version whose effective_date ≤ 20211221"
+}
+```
+
+The agent (or any caller) then feeds `versioned_article_slug` into
+`legal_read_article` to retrieve the historical body text verbatim.
+
+`versioned_article_slug` is surfaced **only when the corresponding
+node exists in brain.db** — we never fabricate a slug we can't read.
+So `None` means "this version exists conceptually but the snapshot
+wasn't in the ingested corpus".
+
+### Recommended workflow
+
+```powershell
+# Ingest current versions first (or not — order doesn't matter).
+zeroclaw vault legal ingest "D:\국가법령정보api(법령과 판례)\현행법령"
+
+# Then ingest the full historical archive.
+zeroclaw vault legal ingest "D:\국가법령정보api(법령과 판례)\연혁법령"
+
+# Verify.
+zeroclaw vault legal stats
+```
+
+On each run, the console reports the detected `corpus:` label
+(`현행법령` / `연혁법령`) before walking files so you can abort if
+it's wrong.
+
 ## Source files
 
 - `src/vault/legal/` — extractors, ingest, graph_query, law_aliases, cli, slug, citation_patterns
