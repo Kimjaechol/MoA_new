@@ -488,6 +488,41 @@ Adding a new row is a single line in `LAW_ALIAS_TABLE`. Unknown law
 names pass through unchanged — we never invent a slug from a name we
 don't recognise.
 
+### Inference rules for unlisted abbreviations
+
+The curated table covers the most-cited ~60 laws, but Korean
+practitioners coin short forms for thousands of other statutes too.
+When an agent encounters an abbreviation **not** in the table, it
+applies three universal rules that every Korean legal abbreviation
+obeys by construction:
+
+1. **Length rule.** An abbreviation is never longer than its full
+   name. Any candidate whose official name is shorter (in non-space
+   characters) than the abbreviation is impossible.
+2. **Character-origin rule.** Abbreviations are formed by picking
+   characters *from the full name, in the order they appear*. E.g.
+   `교특법` = 교(통사고처리)+특(례)+법, taken left-to-right from
+   `교통사고처리특례법`.
+3. **Ordered-subsequence test.** To resolve an unknown abbreviation,
+   enumerate every canonical whose name contains ALL of the
+   abbreviation's characters as an **ordered subsequence**. The
+   surviving list is the candidate set; pick among them using the
+   surrounding judgment's subject matter.
+
+Implementation:
+- `law_aliases::infer_candidates_by_subsequence(abbrev)` returns
+  every canonical in the table passing all three rules (whitespace
+  in canonicals is transparent — `특경법` still subsequences through
+  `특정경제범죄 가중처벌 등에 관한 법률` despite the spaces).
+- Agent tool **`legal_infer_law_abbreviation`** exposes the same
+  logic so the LLM / SLM can call it when a direct
+  `legal_graph_find` lookup comes up empty.
+
+Siblings deliberately share character sequences (`특가법` subsequences
+through both 특정범죄 and 특정경제범죄 가중처벌 canonicals) so
+multi-candidate results are expected and correct — disambiguation
+from context is part of the rule set, not a failure of it.
+
 ---
 
 ## What's NOT automatic yet (deferred)

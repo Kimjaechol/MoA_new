@@ -23,6 +23,11 @@
 //! - [`short_forms`] — every known short form for a given official name;
 //!   used by `slug::statute_aliases` to generate
 //!   `vault_aliases` rows so `legal_graph_find` can match "근기법 43조의2".
+//! - [`infer_candidates_by_subsequence`] — fallback reasoning helper
+//!   used when the agent / user encounters an abbreviation NOT listed
+//!   in the table. Returns canonical-name candidates whose characters
+//!   contain the abbreviation as an ordered subsequence. See the
+//!   "Inference rules for unlisted abbreviations" section below.
 //!
 //! **Design constraint**: this table is deliberately small and
 //! high-confidence. Only laws whose short forms are unambiguous among
@@ -30,6 +35,40 @@
 //! unchanged (we never invent a slug from a name we don't recognize).
 //! Adding a new entry requires only a single line; see the test block
 //! for the invariants the table must maintain.
+//!
+//! Inference rules for unlisted abbreviations (AI-reasoning guide)
+//! ───────────────────────────────────────────────────────────────
+//! The curated table above covers the most frequently-cited ~60 laws.
+//! Korean practitioners regularly coin short forms for less common
+//! statutes — when the AI encounters such an abbreviation and finds
+//! **no direct match** in [`canonical_name`], it should fall back to
+//! these three inference rules that every Korean legal abbreviation
+//! obeys by construction:
+//!
+//!   1. **An abbreviation is never LONGER than the full name.** An
+//!      abbreviation exists solely to call the law more briefly, so
+//!      any candidate whose official name is shorter than the
+//!      abbreviation is impossible and must be rejected.
+//!
+//!   2. **The abbreviation's characters are taken FROM the full
+//!      name**, in the order they appear.
+//!      Example: `교특법` = `교`(통사고처리) + `특`(례) + `법`
+//!      → all three characters appear, in order, inside
+//!      `교통사고처리특례법`.
+//!
+//!   3. **To resolve an unknown abbreviation, enumerate every law
+//!      whose official name contains ALL of the abbreviation's
+//!      characters as an ordered subsequence, then pick among the
+//!      surviving candidates based on the surrounding context**
+//!      (judgment's subject matter, cited articles, etc.).
+//!
+//! [`infer_candidates_by_subsequence`] implements rules 1–3 against
+//! the curated canonical-name list; a future, richer catalogue can
+//! drop in without changing callers. When the function returns
+//! `[]` or an ambiguous multi-candidate list, the agent must ask
+//! the user or widen the search against the FTS-indexed statute
+//! corpus (the SLM can feed each candidate into `legal_graph_find`
+//! to check whether a matching node exists in brain.db).
 
 use std::sync::OnceLock;
 
@@ -234,6 +273,82 @@ pub fn is_known(name: &str) -> bool {
         || idx
             .get_canonical(&key.split_whitespace().collect::<Vec<_>>().join(" "))
             .is_some()
+}
+
+/// Inference fallback for abbreviations NOT in the curated table.
+/// Returns every canonical in `LAW_ALIAS_TABLE` whose characters contain
+/// `abbrev` as an **ordered subsequence** — implementing the three
+/// Korean-legal abbreviation rules documented in the module header:
+///
+///   1. **Length rule** — a candidate whose full name is shorter than
+///      the abbreviation is rejected (abbreviations cannot grow).
+///   2. **Character-origin rule** — abbreviations take characters from
+///      the full name, in the order they appear.
+///   3. **Ordered-subsequence test** — every character of the
+///      abbreviation must appear, in sequence, inside the candidate.
+///
+/// Whitespace in the abbreviation is stripped before comparison;
+/// whitespace in the canonical name counts as a character a subsequence
+/// match can skip (so e.g. `특경법` matches `특정경제범죄 가중처벌 등에
+/// 관한 법률` despite the spaces). A direct hit in the curated table
+/// (via [`canonical_name`]) ALWAYS wins over this fallback; the function
+/// is meant as an AI-reasoning aid when direct lookup has failed.
+///
+/// # Example
+/// ```
+/// // `교특법` is in the table explicitly — canonical_name resolves it
+/// // directly. For an unlisted abbreviation:
+/// let cands = zeroclaw::vault::legal::law_aliases
+///     ::infer_candidates_by_subsequence("특가법");
+/// assert!(cands.contains(&"특정범죄 가중처벌 등에 관한 법률"));
+/// ```
+///
+/// # Ambiguity
+/// Korean short forms deliberately share character sequences across
+/// topically-related statutes (`특가법` & `특경법` both subsequence
+/// through both 특정…가중처벌 siblings). When the result has >1
+/// entry the caller must disambiguate from surrounding context — this
+/// function surfaces the candidates but does not choose between them.
+pub fn infer_candidates_by_subsequence(abbrev: &str) -> Vec<&'static str> {
+    let needle: Vec<char> = abbrev.chars().filter(|c| !c.is_whitespace()).collect();
+    if needle.is_empty() {
+        return vec![];
+    }
+
+    let mut out: Vec<&'static str> = Vec::new();
+    for (canonical, _) in LAW_ALIAS_TABLE {
+        // Rule 1: the abbreviation can't be longer than the full name
+        // (measured in chars, ignoring whitespace on both sides for fairness).
+        let canonical_len = canonical.chars().filter(|c| !c.is_whitespace()).count();
+        if needle.len() > canonical_len {
+            continue;
+        }
+        // Rules 2 + 3: every needle char appears, in order, inside the candidate.
+        if is_ordered_subsequence(&needle, canonical) {
+            out.push(*canonical);
+        }
+    }
+    out
+}
+
+/// Returns `true` when every char of `needle` occurs, in order, inside
+/// `haystack`. Whitespace in `haystack` is transparent (skipped) so
+/// `특경법` matches `특정경제범죄 가중처벌 등에 관한 법률` despite the
+/// spaces between the tokens.
+fn is_ordered_subsequence(needle: &[char], haystack: &str) -> bool {
+    let mut i = 0;
+    for c in haystack.chars() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if i < needle.len() && c == needle[i] {
+            i += 1;
+            if i == needle.len() {
+                return true;
+            }
+        }
+    }
+    i == needle.len()
 }
 
 // ───────── Internals ─────────
@@ -495,5 +610,83 @@ mod tests {
         assert_eq!(canonical_name("구 근기법"), "근로기준법");
         // And hanja: `구 民法` → 민법.
         assert_eq!(canonical_name("구 民法"), "민법");
+    }
+
+    // ── Inference-rule tests for UNLISTED abbreviations ───────────
+
+    #[test]
+    fn subsequence_infers_listed_abbreviation_against_its_canonical() {
+        // Sanity check: if an abbreviation IS listed, the inference
+        // function should at minimum produce its canonical as a
+        // candidate (possibly among others). Direct `canonical_name`
+        // is still preferred in practice.
+        let c = infer_candidates_by_subsequence("교특법");
+        assert!(c.contains(&"교통사고처리 특례법"));
+    }
+
+    #[test]
+    fn subsequence_respects_rule_1_length_constraint() {
+        // An abbreviation LONGER than every canonical (in chars) must
+        // return no candidates. `민법` is 2 chars, so a 100-char input
+        // beats every canonical and returns nothing.
+        let long = "가".repeat(100);
+        assert!(infer_candidates_by_subsequence(&long).is_empty());
+    }
+
+    #[test]
+    fn subsequence_respects_rule_2_character_origin() {
+        // `교특법` = 교 + 특 + 법 → must match `교통사고처리 특례법`
+        // because all three chars appear in that order. Must NOT match
+        // e.g. `민법` (missing 교 and 특) or `형사소송법` (missing 교/특).
+        let c = infer_candidates_by_subsequence("교특법");
+        assert!(c.contains(&"교통사고처리 특례법"));
+        assert!(!c.contains(&"민법"));
+        assert!(!c.contains(&"형사소송법"));
+    }
+
+    #[test]
+    fn subsequence_respects_rule_3_order_matters() {
+        // `법특교` (reversed from `교특법`) must NOT match
+        // `교통사고처리 특례법` — the characters appear but not in order.
+        let c = infer_candidates_by_subsequence("법특교");
+        assert!(!c.contains(&"교통사고처리 특례법"));
+    }
+
+    #[test]
+    fn subsequence_surfaces_siblings_that_share_a_root() {
+        // 특가법 / 특경법 are siblings in the 특정…가중처벌 family —
+        // the ordered-subsequence test correctly returns BOTH because
+        // either short form's characters subsequence through each
+        // sibling's full name. The agent / user then disambiguates
+        // from surrounding context (what the judgment actually cites).
+        let c = infer_candidates_by_subsequence("특가법");
+        assert!(c.contains(&"특정범죄 가중처벌 등에 관한 법률"));
+        assert!(c.contains(&"특정경제범죄 가중처벌 등에 관한 법률"));
+    }
+
+    #[test]
+    fn subsequence_skips_whitespace_in_canonical_names() {
+        // `근퇴법` must match `근로자퇴직급여 보장법` despite the space.
+        let c = infer_candidates_by_subsequence("근퇴법");
+        assert!(c.contains(&"근로자퇴직급여 보장법"));
+    }
+
+    #[test]
+    fn subsequence_empty_input_returns_empty() {
+        assert!(infer_candidates_by_subsequence("").is_empty());
+        assert!(infer_candidates_by_subsequence("   ").is_empty());
+    }
+
+    #[test]
+    fn subsequence_for_unlisted_abbreviation_still_finds_the_right_family() {
+        // Imagine the user coins a fresh abbreviation we haven't
+        // curated. As long as its characters appear in order in a
+        // known canonical, the inference rule surfaces it.
+        // `성매법` is NOT in our table — but all 3 chars appear in
+        // either 성매매 law canonical, so both surface as candidates.
+        let c = infer_candidates_by_subsequence("성매법");
+        assert!(c
+            .iter()
+            .any(|n| n.contains("성매매방지") || n.contains("성매매알선")));
     }
 }
