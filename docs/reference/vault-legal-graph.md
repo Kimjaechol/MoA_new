@@ -295,6 +295,93 @@ Case numbers: `YYYY{유형}NNNNN` where 유형 is 1-3 Korean chars
 
 ---
 
+## 행위시법 원칙 (time-of-action law) — temporal metadata
+
+Korean law follows **행위시법 원칙**: the version of a statute in force
+**at the time the incident occurred** is the one that applies to a case
+— not the version at the time of judgment. The ingester therefore
+extracts and stores three kinds of dates so a practitioner (or agent)
+can match them:
+
+| Dimension | Source | Frontmatter key | Format |
+|---|---|---|---|
+| **법령 시행일** | 부칙 body (`제1조(시행일) 이 법은 …부터 시행한다`) | `effective_date` on `statute_supplement` node | YYYYMMDD |
+| **조문 최신 개정일** | `<개정 YYYY. M. D., …>` tags inside each article body | `amendment_dates` (CSV) + `latest_amendment_date` on `statute_article` node | YYYYMMDD |
+| **판례 사건발생일** | Date literals in `## 판례내용` (판결이유) | `incident_dates` (CSV, up to 50) + `incident_date_earliest` + `incident_date_latest` on `case` node | YYYYMMDD |
+
+### 시행일 parsing
+
+`parse_supplement_effective_date(body, promulgation_date)` handles the
+three phrasings seen in published 부칙 bodies:
+
+1. **Explicit literal** — `이 법은 2025년 10월 1일부터 시행한다` →
+   extracts the date literal near `시행`.
+2. **Promulgation-day** — `이 법은 공포한 날부터 시행한다` →
+   returns `promulgation_date` (supplied by the caller from the
+   parsed supplement title's `법률 제N호, YYYY. M. D.`).
+3. **Relative offset** — `이 법은 공포 후 6개월이 경과한 날부터 시행한다`
+   → `promulgation_date + 6 months` (also handles `N일`).
+
+The parser **scopes to the primary `제1조(시행일)` clause** when one is
+present, so later `다만, 제XX조의 개정규정은 2026년 1월 1일부터 시행한다`
+exceptions don't override the main date. Per-article exception handling
+is a known follow-up (see "Not automatic yet").
+
+### 사건발생일 parsing
+
+`find_all_dates(body)` collects every date literal matching any of:
+
+- `2024. 3. 28.` / `2024.3.28` / `2024. 3. 01.`
+- `2024년 3월 28일`
+- `2024-03-28`
+
+Invalid month/day combinations (e.g. `2024. 13. 45.`) are dropped; the
+result is sorted + deduplicated. The ingester stores up to 50 dates
+per case in the CSV; `incident_date_earliest` / `incident_date_latest`
+carry the first and last for common range queries.
+
+The case-extractor deliberately scans `## 판례내용` first and falls
+back to the full markdown so it picks up dates in 판시사항 / 판결요지
+when the verdict body is short.
+
+### Applying the principle
+
+Given a resolved chain `case → cites → statute_article`:
+
+```
+case.incident_date_earliest   ≥   statute.effective_version.effective_date
+                                  AND
+case.incident_date_earliest   <    statute.effective_version.next_effective_date
+```
+
+is the normal determination. The current implementation **stores** all
+three dates on nodes but does **not yet compute** the
+applicable-version pick — that requires version-aware statute nodes
+(a deliberate deferral; same article, one slug today). A follow-up
+will add a `legal_applicable_version` tool that does this lookup for
+the agent.
+
+### The 형사사건 exception (유일한 예외)
+
+In **criminal cases only** (형사사건), if the law has been amended
+between the 행위시 and the 판결시 to be **more lenient**
+(경하게) — lower penalty, narrower element, etc. — then the current
+version applies instead of the 행위시 version. Civil and
+administrative cases have no such exception.
+
+Detection requires:
+
+1. Knowing the case is criminal — carried by `case_type_name`
+   frontmatter (`"형사"`) plus `court_type_code` patterns.
+2. Comparing penalty clauses across the two versions — textual
+   comparison at best, requires LLM judgment for non-trivial changes.
+
+This is intentionally NOT automated in the current build. The
+`legal_read_article` tool exposes both versions' content; the agent
+(or the human lawyer) makes the "more lenient?" call.
+
+---
+
 ## Law-name aliases
 
 `src/vault/legal/law_aliases.rs` carries a hand-curated table of ~40
@@ -345,13 +432,37 @@ Adding this would need a Cargo dep for Korean tokenisation and a
 nightly job that fills a `vault_tags` row for each extracted noun.
 Design note + issue to track this is TODO.
 
-### Historical-version references
+### Historical-version slugs (per-date node splitting)
 
 `구 민법 (2007. 12. 21. 법률 제8720호로 개정되기 전의 것) 제839조의2`
-currently extracts as the **current** 민법 제839조의2 — the "구" /
-revision-date qualifier is dropped. A version-aware slug
-(`statute::민법::839-2@20071221`) is the planned fix. Not yet
-implemented.
+currently canonicalises to the **current** 민법 제839조의2 slug. The
+revision-date parenthetical is preserved in `vault_links.context` as
+evidence, and the corresponding supplement's `effective_date` +
+article's `amendment_dates` let a caller *infer* which version was in
+force — but we don't yet split statute articles into per-version
+nodes. A future `statute::민법::839-2@20071221` layer would let the
+graph carry the full temporal history as distinct nodes; today it's
+one node with its history flattened into metadata.
+
+### Computed applicable-version picker
+
+The ingester now captures everything needed to answer "which version
+of 근로기준법 제36조 applies to incident of 2024. 3. 28.?":
+
+- `case.incident_date_earliest`
+- `statute_article.amendment_dates`
+- `statute_supplement.effective_date` joined via `promulgation_date`
+
+but there is no Tool / CLI yet that runs the lookup end-to-end. A
+planned `legal_applicable_version(case_slug, statute_slug)` tool will
+close the loop for agents.
+
+### 형사사건 경한-개정 예외 자동 판정
+
+Per the exception rule documented above, the "is the new law more
+lenient than the old?" judgement is deliberately left to the
+agent / human; it requires semantic comparison that deterministic
+regex can't cover.
 
 ### Ontology / cross-recall integration
 

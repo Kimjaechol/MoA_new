@@ -76,6 +76,22 @@ pub struct Node {
     pub verdict_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub case_name: Option<String>,
+    /// 행위시법 원칙 alignment fields — populated when the corresponding
+    /// extractor produced a value. Shape depends on node subtype:
+    ///
+    /// - statute article → `latest_amendment_date`
+    /// - statute supplement → `effective_date` (+ `promulgation_date`)
+    /// - case → `incident_date_earliest` / `incident_date_latest`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promulgation_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_amendment_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incident_date_earliest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incident_date_latest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,6 +648,11 @@ fn hydrate_node(conn: &Connection, id: i64, slug: &str, kind: NodeKind) -> Resul
         court_name: fm.get("court_name").cloned(),
         verdict_date: fm.get("verdict_date").cloned(),
         case_name: fm.get("case_name").cloned(),
+        effective_date: fm.get("effective_date").cloned(),
+        promulgation_date: fm.get("promulgation_date").cloned(),
+        latest_amendment_date: fm.get("latest_amendment_date").cloned(),
+        incident_date_earliest: fm.get("incident_date_earliest").cloned(),
+        incident_date_latest: fm.get("incident_date_latest").cloned(),
     })
 }
 

@@ -208,6 +208,19 @@ fn upsert_statute_article(
         }
     };
 
+    // Amendment-date history parsed from inline `<개정 …>` / `<신설 …>` /
+    // `[시행일 …]` tags inside the article body. The dates here signal
+    // *when the article was last touched*; the corresponding 시행일 for
+    // each amendment lives in the matching supplement (joined at query
+    // time via promulgation_date).
+    let amendment_dates = super::date_parse::extract_article_amendment_dates(&article.body);
+    let amendment_dates_csv: Option<String> = if amendment_dates.is_empty() {
+        None
+    } else {
+        Some(amendment_dates.join(","))
+    };
+    let latest_amendment = amendment_dates.last().cloned();
+
     // Frontmatter (structured metadata).
     let frontmatter = [
         ("law_name", Some(doc.law_name.clone())),
@@ -224,6 +237,8 @@ fn upsert_statute_article(
         ("ls_id", doc.ls_id.clone()),
         ("ls_seq", doc.ls_seq.clone()),
         ("ancestry_no", doc.ancestry.clone()),
+        ("amendment_dates", amendment_dates_csv),
+        ("latest_amendment_date", latest_amendment),
     ];
     for (k, v) in frontmatter {
         if let Some(val) = v {
@@ -363,12 +378,23 @@ fn upsert_supplement(
         }
     };
 
-    // Frontmatter: link back to parent law, preserve promulgation metadata.
+    // Parse 시행일 (effective date) from the body. This is the date the
+    // supplement's rules take effect, which per 행위시법 원칙 is the
+    // date a practitioner matches against a 사건발생일 to decide which
+    // version of a law applies.
+    let effective_date = super::date_parse::parse_supplement_effective_date(
+        &sup.body,
+        sup.promulgation_date.as_deref(),
+    );
+
+    // Frontmatter: link back to parent law, preserve promulgation metadata,
+    // and record effective_date (the operationally-important key).
     let fm: &[(&str, Option<String>)] = &[
         ("parent_law", Some(doc.law_name.clone())),
         ("kind", Some("supplement".to_string())),
         ("promulgation_no", Some(anc_no.to_string())),
         ("promulgation_date", sup.promulgation_date.clone()),
+        ("effective_date", effective_date.clone()),
         ("supplement_note", sup.note.clone()),
         ("supplement_title", Some(sup.title.clone())),
     ];
@@ -536,6 +562,27 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
         }
     };
 
+    // 행위시법 원칙: extract every date literal from the case body so we
+    // can later match 사건발생일 against statute 시행일. We scan both
+    // the explicitly-marked 판례내용 section (if present, usually the
+    // 판결이유 text) and the full markdown to catch dates in the
+    // 판시사항 / 판결요지 summary blocks as well. Up to 50 dates are
+    // retained to bound the stored CSV; earliest and latest are surfaced
+    // separately for common range queries.
+    let body_for_dates = doc
+        .body
+        .clone()
+        .unwrap_or_else(|| doc.original_markdown.clone());
+    let incident_dates = super::date_parse::find_all_dates(&body_for_dates);
+    let incident_dates_capped: Vec<String> = incident_dates.iter().take(50).cloned().collect();
+    let incident_dates_csv = if incident_dates_capped.is_empty() {
+        None
+    } else {
+        Some(incident_dates_capped.join(","))
+    };
+    let incident_earliest = incident_dates_capped.first().cloned();
+    let incident_latest = incident_dates_capped.last().cloned();
+
     // Frontmatter.
     let frontmatter = [
         ("case_number", Some(doc.case_number.clone())),
@@ -548,6 +595,9 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
         ("verdict_date", doc.verdict_date.clone()),
         ("verdict_kind", doc.verdict_kind.clone()),
         ("verdict_type", doc.verdict_type.clone()),
+        ("incident_dates", incident_dates_csv),
+        ("incident_date_earliest", incident_earliest),
+        ("incident_date_latest", incident_latest),
     ];
     for (k, v) in frontmatter {
         if let Some(val) = v {
@@ -898,5 +948,144 @@ mod tests {
         // Post-batch resolve pass picks them up.
         let newly = resolve_pending_links(&conn).unwrap();
         assert!(newly >= 2, "expected ≥2 links resolved, got {newly}");
+    }
+
+    const STATUTE_WITH_SUPPLEMENT_MD: &str = r#"# 근로기준법
+
+```json
+{
+  "meta": {"lsNm": "근로기준법", "ancYd": "20251001", "efYd": "20251001"},
+  "title": "근로기준법",
+  "articles": [
+    {"anchor": "J2:0", "number": "제2조(정의)",
+     "text": "제2조(정의) ① 정의 <개정 2018. 3. 20., 2019. 1. 15., 2020. 5. 26.>"},
+    {"anchor": "J36:0", "number": "제36조(금품 청산)",
+     "text": "제36조(금품 청산) 지급한다. <개정 2020. 5. 26.>"}
+  ],
+  "supplements": [
+    {"title": "부칙 <법률 제21065호, 2025. 10. 1.>",
+     "body": "제1조(시행일) 이 법은 공포한 날부터 시행한다."}
+  ]
+}
+```
+"#;
+
+    #[test]
+    fn supplement_stores_effective_date_and_falls_back_to_promulgation() {
+        let conn = fresh_conn();
+        let doc = extract_statute(
+            STATUTE_WITH_SUPPLEMENT_MD,
+            "/x/20251001/근로기준법.md",
+        )
+        .unwrap();
+        ingest_statute(&conn, &doc).unwrap();
+        let g = conn.lock();
+        let eff: String = g
+            .query_row(
+                "SELECT value FROM vault_frontmatter
+                   WHERE key = 'effective_date'
+                     AND doc_id = (SELECT id FROM vault_documents
+                                    WHERE title = 'statute::근로기준법::supplement::21065')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // `공포한 날부터 시행` → effective = promulgation = 20251001.
+        assert_eq!(eff, "20251001");
+    }
+
+    #[test]
+    fn article_stores_amendment_dates_csv_and_latest() {
+        let conn = fresh_conn();
+        let doc = extract_statute(
+            STATUTE_WITH_SUPPLEMENT_MD,
+            "/x/20251001/근로기준법.md",
+        )
+        .unwrap();
+        ingest_statute(&conn, &doc).unwrap();
+        let g = conn.lock();
+        // 제2조 has three amendment dates — all three in CSV, latest = 20200526.
+        let csv: String = g
+            .query_row(
+                "SELECT value FROM vault_frontmatter
+                   WHERE key = 'amendment_dates'
+                     AND doc_id = (SELECT id FROM vault_documents
+                                    WHERE title = 'statute::근로기준법::2')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(csv, "20180320,20190115,20200526");
+        let latest: String = g
+            .query_row(
+                "SELECT value FROM vault_frontmatter
+                   WHERE key = 'latest_amendment_date'
+                     AND doc_id = (SELECT id FROM vault_documents
+                                    WHERE title = 'statute::근로기준법::2')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(latest, "20200526");
+    }
+
+    #[test]
+    fn case_stores_incident_dates_from_body() {
+        let conn = fresh_conn();
+        let case_md = r#"## 사건번호
+2024노3424
+## 선고일자
+20250530
+## 법원명
+수원지법
+## 사건명
+근로기준법위반
+## 참조조문
+근로기준법 제36조
+## 판시사항
+test
+## 판결요지
+test
+## 판례내용
+피고인과 甲은 2024. 3. 28. 임의조정을 성립하였고, 2024. 4. 5. 800만 원을 지급하였다. 이후 2025. 4. 10. 탄원서를 제출하였다.
+"#;
+        let cdoc =
+            extract_case(case_md, "/x/20250530/2024노3424_400102_형사_606941.md").unwrap();
+        ingest_case(&conn, &cdoc).unwrap();
+        let g = conn.lock();
+        let earliest: String = g
+            .query_row(
+                "SELECT value FROM vault_frontmatter
+                   WHERE key = 'incident_date_earliest'
+                     AND doc_id = (SELECT id FROM vault_documents
+                                    WHERE title = 'case::2024노3424')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(earliest, "20240328");
+        let latest: String = g
+            .query_row(
+                "SELECT value FROM vault_frontmatter
+                   WHERE key = 'incident_date_latest'
+                     AND doc_id = (SELECT id FROM vault_documents
+                                    WHERE title = 'case::2024노3424')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(latest, "20250410");
+        // CSV must contain all three in sorted order.
+        let csv: String = g
+            .query_row(
+                "SELECT value FROM vault_frontmatter
+                   WHERE key = 'incident_dates'
+                     AND doc_id = (SELECT id FROM vault_documents
+                                    WHERE title = 'case::2024노3424')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(csv, "20240328,20240405,20250410");
     }
 }
