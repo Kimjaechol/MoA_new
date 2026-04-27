@@ -1,24 +1,26 @@
 //! Source-path introspection for legal ingestion.
 //!
-//! The user's corpus layout is:
+//! The user's corpus layout (Korean legal corpus, 6 top-level categories):
 //!
 //! ```text
-//! <root>/현행법령/<YYYYMMDD>/<법령명>.md    ← currently in-force version
-//! <root>/연혁법령/<YYYYMMDD>/<법령명>.md    ← historical (pre-amendment) version
+//! <root>/현행법령/<YYYYMMDD>/<법령명>.md      ← currently in-force statute
+//! <root>/연혁법령/<YYYYMMDD>/<법령명>.md      ← historical (pre-amendment) statute
+//! <root>/자치법규/<...>/<자치법규명>.md       ← local-government ordinance
+//! <root>/행정규칙/<...>/<규칙명>.md            ← administrative rule
+//! <root>/판례/<YYYYMMDD>/<사건번호>_*.md       ← court case
+//! <root>/헌재결정례/<YYYYMMDD>/<사건번호>_*.md ← constitutional court decision
 //! ```
 //!
 //! This module extracts:
-//!   - [`SourceCategory`] — `Current` (현행법령) / `Historical` (연혁법령) /
-//!     `Unknown` (neither marker in the path)
-//!   - **publish date** as `YYYYMMDD`, pulled from the parent folder
-//!     name. Accepts common separator variants (`20250131`,
-//!     `2025-01-31`, `2025.01.31`) by stripping non-digits.
+//!   - [`SourceCategory`] — `Current` / `Historical` / `LocalOrdinance` /
+//!     `AdminRule` / `Case` / `ConstitutionalCase` / `Unknown`
+//!   - **publish date** as `YYYYMMDD`, pulled from a parent folder
+//!     name. Strict 8-digit form per user-confirmed layout.
 //!
-//! The JSON `meta.ancYd` inside each statute file is authoritative
-//! for the 공포일, but the path signal is cheap, independent, and
-//! used as a fallback when the JSON is malformed. When both are
-//! present and disagree, the caller decides which wins — the default
-//! policy (see `ingest.rs`) is to prefer JSON.
+//! For statutes the path category drives the canonical-vs-versioned write
+//! policy in [`super::ingest::ingest_statute_to`]; for cases it's used
+//! purely as a metadata tag (cases live under one slug per 사건번호 with
+//! no versioning).
 
 use regex::Regex;
 use std::path::Path;
@@ -26,12 +28,25 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCategory {
-    /// Path contained `현행법령` — this is the currently in-force version.
+    /// Path contained `현행법령` — currently in-force statute.
     Current,
-    /// Path contained `연혁법령` — this is a pre-amendment historical version.
+    /// Path contained `연혁법령` — pre-amendment historical statute.
     Historical,
-    /// Neither marker present. Caller falls back to treating the doc as Current
-    /// so backward compat with the pre-versioning ingest API is preserved.
+    /// Path contained `자치법규` — local-government ordinance / 조례 / 규칙.
+    /// Treated as a statute (writes a single canonical slug, no versioning).
+    LocalOrdinance,
+    /// Path contained `행정규칙` — administrative rule (훈령 / 예규 / 고시).
+    /// Treated as a statute (writes a single canonical slug, no versioning).
+    AdminRule,
+    /// Path contained `판례` — court case markdown.
+    Case,
+    /// Path contained `헌재결정례` — constitutional court decision.
+    /// Detected before `판례` since the marker is more specific (substring
+    /// `결정례` cannot collide with `판례` itself, but explicit ordering
+    /// keeps the precedence obvious).
+    ConstitutionalCase,
+    /// Neither marker present. Statute-shaped files fall back to canonical-only;
+    /// case-shaped files still ingest correctly via the case extractor.
     Unknown,
 }
 
@@ -40,8 +55,28 @@ impl SourceCategory {
         match self {
             Self::Current => "current",
             Self::Historical => "historical",
+            Self::LocalOrdinance => "local_ordinance",
+            Self::AdminRule => "admin_rule",
+            Self::Case => "case",
+            Self::ConstitutionalCase => "constitutional_case",
             Self::Unknown => "unknown",
         }
+    }
+
+    /// `true` when the category is statute-shaped (writes through
+    /// `extract_statute` + `ingest_statute_to`). False for case-shaped
+    /// categories which use `extract_case` + `ingest_case_to`.
+    pub fn is_statute_kind(self) -> bool {
+        matches!(
+            self,
+            Self::Current | Self::Historical | Self::LocalOrdinance | Self::AdminRule
+        )
+    }
+
+    /// `true` when the category is case-shaped (court judgment or
+    /// constitutional court decision).
+    pub fn is_case_kind(self) -> bool {
+        matches!(self, Self::Case | Self::ConstitutionalCase)
     }
 }
 
@@ -68,10 +103,21 @@ pub fn parse_path(path: &Path) -> SourcePathMeta {
 }
 
 fn detect_category(path: &str) -> SourceCategory {
-    if path.contains("현행법령") {
+    // Order matters: `헌재결정례` is more specific than `결정례`/`판례`
+    // and must be checked before `판례` to avoid mis-classification when
+    // a path happens to contain both substrings as sibling markers.
+    if path.contains("헌재결정례") {
+        SourceCategory::ConstitutionalCase
+    } else if path.contains("현행법령") {
         SourceCategory::Current
     } else if path.contains("연혁법령") {
         SourceCategory::Historical
+    } else if path.contains("자치법규") {
+        SourceCategory::LocalOrdinance
+    } else if path.contains("행정규칙") {
+        SourceCategory::AdminRule
+    } else if path.contains("판례") {
+        SourceCategory::Case
     } else {
         SourceCategory::Unknown
     }
@@ -152,5 +198,64 @@ mod tests {
         let meta = parse("/현행법령/민법.md");
         assert_eq!(meta.category, SourceCategory::Current);
         assert!(meta.publish_date.is_none());
+    }
+
+    // ── 6-category recognition (corpus-categories work) ──
+
+    #[test]
+    fn detects_local_ordinance_category() {
+        let meta = parse(r"C:\세컨드브레인_로컬DB\자치법규\서울특별시\서울특별시_도시공원_조례.md");
+        assert_eq!(meta.category, SourceCategory::LocalOrdinance);
+        assert!(meta.category.is_statute_kind());
+        assert!(!meta.category.is_case_kind());
+    }
+
+    #[test]
+    fn detects_admin_rule_category() {
+        let meta = parse("/corpus/행정규칙/국세청훈령_제1234호.md");
+        assert_eq!(meta.category, SourceCategory::AdminRule);
+        assert!(meta.category.is_statute_kind());
+    }
+
+    #[test]
+    fn detects_case_category() {
+        let meta = parse(r"C:\세컨드브레인_로컬DB\판례\20250530\2024노3424_400102_형사_606941.md");
+        assert_eq!(meta.category, SourceCategory::Case);
+        assert!(meta.category.is_case_kind());
+        assert!(!meta.category.is_statute_kind());
+        assert_eq!(meta.publish_date.as_deref(), Some("20250530"));
+    }
+
+    #[test]
+    fn detects_constitutional_case_category() {
+        let meta = parse("/corpus/헌재결정례/20240328/2023헌마123.md");
+        assert_eq!(meta.category, SourceCategory::ConstitutionalCase);
+        assert!(meta.category.is_case_kind());
+    }
+
+    #[test]
+    fn constitutional_case_takes_precedence_over_substring_matches() {
+        // A path like `/corpus/헌재결정례/.../...` contains the substring
+        // `결정례` but NOT `판례`, so this is the primary precedence test.
+        // We construct a path that DOES contain both markers to verify
+        // that 헌재결정례 still wins.
+        let meta = parse("/corpus/판례/headers/헌재결정례/2023/2023헌마1.md");
+        assert_eq!(meta.category, SourceCategory::ConstitutionalCase);
+    }
+
+    #[test]
+    fn category_kind_helpers() {
+        assert!(SourceCategory::Current.is_statute_kind());
+        assert!(SourceCategory::Historical.is_statute_kind());
+        assert!(SourceCategory::LocalOrdinance.is_statute_kind());
+        assert!(SourceCategory::AdminRule.is_statute_kind());
+        assert!(!SourceCategory::Current.is_case_kind());
+
+        assert!(SourceCategory::Case.is_case_kind());
+        assert!(SourceCategory::ConstitutionalCase.is_case_kind());
+        assert!(!SourceCategory::Case.is_statute_kind());
+
+        assert!(!SourceCategory::Unknown.is_statute_kind());
+        assert!(!SourceCategory::Unknown.is_case_kind());
     }
 }

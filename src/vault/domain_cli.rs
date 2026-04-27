@@ -247,7 +247,7 @@ pub async fn build(corpus_dir: &Path, out_path: &Path) -> Result<()> {
 
     let mut stats = BuildStats::default();
     for entry in walk_markdown(corpus_dir)? {
-        match ingest_one(&conn, &entry).await {
+        match ingest_one(&conn, &entry, &mut stats).await {
             Ok(IngestKind::Statute(n)) => {
                 stats.statute_files += 1;
                 stats.statute_articles += n;
@@ -308,6 +308,14 @@ pub async fn build(corpus_dir: &Path, out_path: &Path) -> Result<()> {
         style("✓").green(),
         stats.edges_resolved_after_pass
     );
+    if !stats.by_category.is_empty() {
+        println!();
+        println!("  {} corpus mix by source-path category:", style("·").dim());
+        for (cat, n) in &stats.by_category {
+            println!("    - {cat:>20} : {n}");
+        }
+    }
+    println!();
     println!(
         "  {} bundle: {} ({})",
         style("→").bold().green(),
@@ -330,6 +338,10 @@ struct BuildStats {
     skipped_files: usize,
     errors: usize,
     edges_resolved_after_pass: usize,
+    /// Per-category file counts so the build report shows what was
+    /// found in each top-level corpus directory (현행법령 / 연혁법령 /
+    /// 자치법규 / 행정규칙 / 판례 / 헌재결정례 / unknown).
+    by_category: std::collections::BTreeMap<&'static str, usize>,
 }
 
 enum IngestKind {
@@ -338,7 +350,12 @@ enum IngestKind {
     Skipped,
 }
 
-async fn ingest_one(conn: &Arc<Mutex<Connection>>, path: &Path) -> Result<IngestKind> {
+async fn ingest_one(
+    conn: &Arc<Mutex<Connection>>,
+    path: &Path,
+    stats: &mut BuildStats,
+) -> Result<IngestKind> {
+    use crate::vault::legal::source_path::parse_path;
     use crate::vault::legal::{
         encoding, extract_case, extract_statute, ingest_case_to, ingest_statute_to,
         looks_like_case, looks_like_statute, IngestTarget,
@@ -349,15 +366,40 @@ async fn ingest_one(conn: &Arc<Mutex<Connection>>, path: &Path) -> Result<Ingest
     let body = decoded.content;
     let source_path = path.to_string_lossy().to_string();
 
-    if looks_like_case(&body) {
+    let category = parse_path(path).category;
+    let cat_label = category.as_str();
+    *stats.by_category.entry(cat_label).or_insert(0) += 1;
+
+    // Routing rule:
+    //   * Path category provides a STRONG hint about expected shape
+    //     (case-shaped categories → case extractor; statute-shaped
+    //     categories → statute extractor).
+    //   * Content heuristics (`looks_like_case` / `looks_like_statute`)
+    //     remain the AUTHORITATIVE check, since folder layout drift
+    //     (mis-filed docs, transcripts dropped under wrong tree) does
+    //     happen. We use the category only to BREAK TIES when both
+    //     heuristics return true (e.g. a case markdown that mentions
+    //     `## 참조조문` could match both — pick case for case-shaped
+    //     categories, statute for statute-shaped).
+    let path_says_case = category.is_case_kind();
+    let content_says_case = looks_like_case(&body);
+    let content_says_statute = looks_like_statute(&body);
+
+    if content_says_case && (path_says_case || !content_says_statute) {
         let doc = extract_case(&body, &source_path)?;
         ingest_case_to(conn, &doc, IngestTarget::Domain)?;
         Ok(IngestKind::Case)
-    } else if looks_like_statute(&body) {
+    } else if content_says_statute {
         let doc = extract_statute(&body, &source_path)?;
         let n = doc.articles.len();
         ingest_statute_to(conn, &doc, IngestTarget::Domain)?;
         Ok(IngestKind::Statute(n))
+    } else if content_says_case {
+        // Fallback: looks_like_case true but path was statute-shaped;
+        // trust the content heuristic.
+        let doc = extract_case(&body, &source_path)?;
+        ingest_case_to(conn, &doc, IngestTarget::Domain)?;
+        Ok(IngestKind::Case)
     } else {
         Ok(IngestKind::Skipped)
     }

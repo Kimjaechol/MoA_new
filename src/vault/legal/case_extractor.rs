@@ -1,4 +1,5 @@
-//! Parse a Korean precedent (판례) markdown file into a [`CaseDoc`].
+//! Parse a Korean precedent (판례) or constitutional court decision (헌재결정례)
+//! markdown file into a [`CaseDoc`].
 //!
 //! Signal sources (in order of reliability):
 //!   1. **Filename**  — `{선고일YYYYMMDD}/{사건번호}_{사건종류코드}_{사건종류}_{판례정보일련번호}_{판결유형}_{관할법원}_{사건명}.md`
@@ -6,12 +7,23 @@
 //!   2. **`## field` headers** — structured sections the user's pipeline
 //!      writes (사건번호, 법원명, 선고일자, 사건종류코드, 판례정보일련번호,
 //!      선고, 판결유형, 법원종류코드, 사건종류명, 사건명, 판시사항, 판결요지,
-//!      참조조문, 참조판례, 판례내용).
+//!      적용법조 / 적용법령 / 적용법률, 참조조문, 참조판례, 판례내용).
 //!
-//! The **참조조문** section is the most valuable edge source — it's the user's
-//! "most direct link between statute and case." We parse it with the
-//! same-law-inheritance rules in `citation_patterns::extract_statute_citations`.
-//! **참조판례** is the case↔case edge source.
+//! Citation extraction
+//! ───────────────────
+//! Statute citations are pulled from THREE places (in priority order so
+//! the strongest signal wins):
+//!
+//!   1. **`적용법조` / `적용법령` / `적용법률`** — the AUTHORITATIVE list of
+//!      statutes the court actually applied to this case. Per the
+//!      user's spec, these are THE primary keyword for the second
+//!      brain — every entry here becomes a `cites` edge AND a tag.
+//!   2. **`참조조문`** — secondary edge source listing statutes referenced
+//!      in the judgment body.
+//!   3. **`판례내용`** — body mentions (often inline citations like
+//!      `대법원 2012. 9. 13. 선고 2012도3166 판결`).
+//!
+//! Case-to-case citations (`참조판례` + body) feed the case↔case edges.
 
 use super::citation_patterns::{
     extract_case_numbers, extract_statute_citations, CaseRef, StatuteRef,
@@ -49,8 +61,28 @@ pub struct CaseDoc {
     pub original_markdown: String,
 }
 
+/// Section names where statute citations live, in priority order. The
+/// AUTHORITATIVE list is `적용법조` / `적용법령` / `적용법률` — this is
+/// what the court explicitly applied. Anything mentioned only in
+/// `참조조문` is supplementary background; anything mentioned only in
+/// `판례내용` is body-text inference.
+const APPLIED_STATUTE_SECTIONS: &[&str] = &["적용법조", "적용법령", "적용법률"];
+
 pub fn looks_like_case(md: &str) -> bool {
-    md.contains("## 사건번호") || md.contains("## 판결요지") || md.contains("## 참조조문")
+    // Every Korean court markdown the user produces carries `## 사건번호`
+    // (or starts with one), so that's the primary detector. We accept
+    // 판결요지 / 참조조문 as fallbacks for cases stripped of headers
+    // during transcription. Constitutional-court decisions (헌재결정례)
+    // also use `## 사건번호` so no separate detector is needed; we add
+    // 결정요지 / 결정문 as additional fallback signals because
+    // constitutional decisions sometimes use those instead of 판결요지.
+    md.contains("## 사건번호")
+        || md.contains("## 판결요지")
+        || md.contains("## 결정요지")
+        || md.contains("## 참조조문")
+        || md.contains("## 적용법조")
+        || md.contains("## 적용법령")
+        || md.contains("## 적용법률")
 }
 
 pub fn extract_case(md: &str, source_path: &str) -> Result<CaseDoc> {
@@ -79,15 +111,28 @@ pub fn extract_case(md: &str, source_path: &str) -> Result<CaseDoc> {
         .map(|s| s.trim().to_string())
         .or(path_meta.verdict_date.clone());
 
-    // Primary edge extraction: 참조조문 → statute citations.
-    let mut statute_cits = sections
-        .get("참조조문")
-        .map(|s| extract_statute_citations(s, None))
-        .unwrap_or_default();
-    // Secondary: body mentions (e.g. 대법원 2012. 9. 13. 선고 2012도3166 판결).
-    if let Some(body) = sections.get("판례내용") {
-        let mut body_cits = extract_statute_citations(body, None);
-        statute_cits.append(&mut body_cits);
+    // PRIMARY edge extraction: 적용법조 / 적용법령 / 적용법률 — these are
+    // the statutes the court explicitly applied. Per the user's spec
+    // (corpus-categories patch), these are THE most important keyword
+    // for second-brain wiring. We collect from any of the three header
+    // variants that may appear; the citation regex deduplicates later.
+    let mut statute_cits: Vec<StatuteRef> = APPLIED_STATUTE_SECTIONS
+        .iter()
+        .filter_map(|name| sections.get(*name))
+        .flat_map(|s| extract_statute_citations(s, None))
+        .collect();
+    // SECONDARY: 참조조문 — supplementary background citations.
+    if let Some(refs) = sections.get("참조조문") {
+        let mut more = extract_statute_citations(refs, None);
+        statute_cits.append(&mut more);
+    }
+    // TERTIARY: body mentions (e.g. 대법원 2012. 9. 13. 선고 2012도3166 판결).
+    // Some constitutional decisions use 결정문 instead of 판례내용.
+    for body_section in ["판례내용", "결정문"] {
+        if let Some(body) = sections.get(body_section) {
+            let mut body_cits = extract_statute_citations(body, None);
+            statute_cits.append(&mut body_cits);
+        }
     }
     // Deduplicate by (law, article, sub, paragraph, item).
     statute_cits.sort_by(|a, b| {
@@ -118,9 +163,12 @@ pub fn extract_case(md: &str, source_path: &str) -> Result<CaseDoc> {
         .get("참조판례")
         .map(|s| extract_case_numbers(s))
         .unwrap_or_default();
-    if let Some(body) = sections.get("판례내용") {
-        let mut body_cases = extract_case_numbers(body);
-        case_cits.append(&mut body_cases);
+    // Body section name varies: 판례내용 (court cases) vs. 결정문 (헌재결정례).
+    for body_section in ["판례내용", "결정문"] {
+        if let Some(body) = sections.get(body_section) {
+            let mut body_cases = extract_case_numbers(body);
+            case_cits.append(&mut body_cases);
+        }
     }
     // Don't self-link.
     case_cits.retain(|c| c.case_number != case_number);
@@ -142,9 +190,18 @@ pub fn extract_case(md: &str, source_path: &str) -> Result<CaseDoc> {
         verdict_date,
         verdict_kind: sections.get("선고").map(|s| s.trim().to_string()),
         verdict_type: sections.get("판결유형").map(|s| s.trim().to_string()),
+        // 판시사항 = 결정의 요지 (헌재 also uses 판시사항 commonly);
+        // 판결요지 = 판결의 요지 / 결정요지 = 헌재 결정의 요지.
         holding: sections.get("판시사항").map(|s| s.to_string()),
-        summary: sections.get("판결요지").map(|s| s.to_string()),
-        body: sections.get("판례내용").map(|s| s.to_string()),
+        summary: sections
+            .get("판결요지")
+            .or_else(|| sections.get("결정요지"))
+            .map(|s| s.to_string()),
+        // 판례내용 (court cases) / 결정문 (헌재결정례) — same role: full text body.
+        body: sections
+            .get("판례내용")
+            .or_else(|| sections.get("결정문"))
+            .map(|s| s.to_string()),
         source_path: source_path.to_string(),
         statute_citations: statute_cits,
         case_citations: case_cits,
@@ -329,5 +386,108 @@ mod tests {
         assert!(nums.contains(&"2012도3166"));
         // Self-case is excluded.
         assert!(!nums.contains(&"2024노3424"));
+    }
+
+    // ── 적용법조 / 적용법령 / 적용법률 extraction (corpus-categories patch) ──
+
+    const SAMPLE_WITH_APPLIED: &str = r#"## 사건번호
+2024노9999
+## 선고일자
+20250101
+## 법원명
+서울고등법원
+## 사건명
+배임
+## 적용법조
+형법 제355조 제2항, 제356조
+## 참조조문
+형법 제355조
+## 판시사항
+holding
+## 판결요지
+요지
+## 판례내용
+본문
+"#;
+
+    #[test]
+    fn extracts_statutes_from_applied_law_section() {
+        let doc = extract_case(
+            SAMPLE_WITH_APPLIED,
+            "/판례/20250101/2024노9999_형사.md",
+        )
+        .unwrap();
+        let pairs: Vec<_> = doc
+            .statute_citations
+            .iter()
+            .map(|c| (c.law_name.as_str(), c.article))
+            .collect();
+        // 적용법조 contributes 제355조 (with paragraph) AND 제356조.
+        assert!(pairs.contains(&("형법", 355)));
+        assert!(pairs.contains(&("형법", 356)));
+        // 참조조문 also contributes 제355조 → dedup keeps a single entry.
+        let count_355 = pairs.iter().filter(|(_, n)| *n == 355).count();
+        assert_eq!(count_355, 1, "duplicate 제355조 must be deduped");
+    }
+
+    // ── 헌재결정례 — uses 결정요지 / 결정문 instead of 판결요지 / 판례내용 ──
+
+    const SAMPLE_HEONJAE: &str = r#"## 사건번호
+2023헌마123
+## 선고일자
+20240328
+## 법원명
+헌법재판소
+## 사건명
+공직선거법 제200조 위헌확인
+## 적용법조
+공직선거법 제200조, 헌법 제34조
+## 결정요지
+이 사건 결정의 요지는 ...
+## 결정문
+헌법재판소는 ... 대법원 2012. 9. 13. 선고 2012도3166 판결을 참조한다 ...
+"#;
+
+    #[test]
+    fn looks_like_case_recognises_헌재_결정례() {
+        assert!(looks_like_case(SAMPLE_HEONJAE));
+    }
+
+    #[test]
+    fn extracts_헌재_결정례_with_결정문_body() {
+        let doc = extract_case(
+            SAMPLE_HEONJAE,
+            "/헌재결정례/20240328/2023헌마123_공직선거법.md",
+        )
+        .unwrap();
+        assert_eq!(doc.case_number, "2023헌마123");
+        assert_eq!(doc.case_name.as_deref(), Some("공직선거법 제200조 위헌확인"));
+        // Body falls back to 결정문 when 판례내용 is absent.
+        assert!(doc
+            .body
+            .as_deref()
+            .unwrap_or("")
+            .contains("헌법재판소는"));
+        // Summary falls back to 결정요지.
+        assert!(doc
+            .summary
+            .as_deref()
+            .unwrap_or("")
+            .contains("결정의 요지"));
+        // 적용법조 picked up.
+        let pairs: Vec<_> = doc
+            .statute_citations
+            .iter()
+            .map(|c| (c.law_name.as_str(), c.article))
+            .collect();
+        assert!(pairs.contains(&("공직선거법", 200)));
+        assert!(pairs.contains(&("헌법", 34)));
+        // Body case citation picked up.
+        let case_nums: Vec<_> = doc
+            .case_citations
+            .iter()
+            .map(|c| c.case_number.as_str())
+            .collect();
+        assert!(case_nums.contains(&"2012도3166"));
     }
 }

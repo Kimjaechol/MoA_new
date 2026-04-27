@@ -389,7 +389,17 @@ fn upsert_statute_article(
     }
 
     // Aliases — human-friendly lookup forms. UNIQUE globally; skip on conflict.
-    let aliases = statute_aliases(&doc.law_name, article.article_num, article.article_sub);
+    let mut aliases =
+        statute_aliases(&doc.law_name, article.article_num, article.article_sub);
+    // Article subtitle (소제목, e.g. "금품 청산") — per user spec
+    // (corpus-categories patch), the noun in each article's parenthetical
+    // title is a key search keyword. Expose it as both a bare alias
+    // ("금품 청산") AND a law-qualified alias ("근로기준법 금품 청산") so
+    // users typing either form resolve to this article.
+    if let Some(kw) = article.title_kw.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        aliases.push(kw.to_string());
+        aliases.push(format!("{} {}", doc.law_name, kw));
+    }
     for alias in aliases {
         let _ = conn.execute(
             &format!(
@@ -1047,7 +1057,9 @@ pub fn ingest_case_to(
         }
     }
 
-    // Aliases — full case number + court-qualified form.
+    // Aliases — full case number + court-qualified form. Per user spec
+    // (corpus-categories patch), the case title (사건명) is also a top-tier
+    // search keyword, so register it both bare and case-number-qualified.
     let _ = tx.execute(
         &format!(
             "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
@@ -1060,6 +1072,26 @@ pub fn ingest_case_to(
                 "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
             ),
             params![doc_id, format!("{court} {}", doc.case_number)],
+        );
+    }
+    if let Some(name) = doc.case_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        // Bare case-name alias — collisions are real (e.g. multiple
+        // "근로기준법위반" cases) but globally-unique alias schema means
+        // only the first inserted wins; subsequent INSERT OR IGNOREs
+        // are no-ops, which is acceptable since the case is still
+        // findable by case_number / "{court} {case_number}".
+        let _ = tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
+            ),
+            params![doc_id, name],
+        );
+        // Case-number-qualified form — never collides.
+        let _ = tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
+            ),
+            params![doc_id, format!("{} {}", doc.case_number, name)],
         );
     }
 
@@ -1077,6 +1109,10 @@ pub fn ingest_case_to(
             &format!("type:{c}"),
             Some("case_type"),
         )?;
+    }
+    // Case title (사건명) as a tag for facet search (`title:근로기준법위반`).
+    if let Some(name) = doc.case_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        insert_tag(&tx, schema, doc_id, &format!("title:{name}"), Some("case_title"))?;
     }
     if let Some(d) = doc.verdict_date.as_deref() {
         if d.len() >= 4 {
@@ -1737,5 +1773,143 @@ test
             .unwrap();
         assert!(v2025.contains("현행 — 2024 개정 반영"));
         assert!(v2010.contains("옛 버전 — 2010"));
+    }
+
+    // ── corpus-categories patch: subtitle-aliases + case-name aliases ──
+
+    #[test]
+    fn statute_article_subtitle_is_searchable_as_alias() {
+        let conn = fresh_conn();
+        let doc = extract_statute(STATUTE_MD, "/x/20251001/근로기준법.md").unwrap();
+        ingest_statute(&conn, &doc).unwrap();
+        let g = conn.lock();
+        // Article 36 has title "(금품 청산)" → exposed as bare alias AND as
+        // "근로기준법 금품 청산" so the second-brain search resolves either form.
+        let bare: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_aliases va
+                   JOIN vault_documents d ON d.id = va.doc_id
+                  WHERE va.alias = '금품 청산'
+                    AND d.title = 'statute::근로기준법::36'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bare, 1, "subtitle must be exposed as bare alias");
+        let qualified: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_aliases va
+                   JOIN vault_documents d ON d.id = va.doc_id
+                  WHERE va.alias = '근로기준법 금품 청산'
+                    AND d.title = 'statute::근로기준법::36'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(qualified, 1, "law-qualified subtitle alias must exist");
+    }
+
+    #[test]
+    fn case_name_is_searchable_as_alias_and_tag() {
+        let conn = fresh_conn();
+        // Statute first so case→statute edges resolve.
+        let sdoc = extract_statute(STATUTE_MD, "/x/20251001/근로기준법.md").unwrap();
+        ingest_statute(&conn, &sdoc).unwrap();
+        let cdoc = extract_case(CASE_MD, "/x/20250530/2024노3424_400102_형사_606941.md").unwrap();
+        ingest_case(&conn, &cdoc).unwrap();
+        let g = conn.lock();
+        // Bare alias resolves the case by its 사건명.
+        let bare: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_aliases va
+                   JOIN vault_documents d ON d.id = va.doc_id
+                  WHERE va.alias = '근로기준법위반'
+                    AND d.title = 'case::2024노3424'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bare, 1);
+        // case-number-qualified alias also present.
+        let qualified: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_aliases va
+                   JOIN vault_documents d ON d.id = va.doc_id
+                  WHERE va.alias = '2024노3424 근로기준법위반'
+                    AND d.title = 'case::2024노3424'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(qualified, 1);
+        // Faceting tag.
+        let tag: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_tags vt
+                   JOIN vault_documents d ON d.id = vt.doc_id
+                  WHERE vt.tag_name = 'title:근로기준법위반'
+                    AND vt.tag_type = 'case_title'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag, 1);
+    }
+
+    #[test]
+    fn applied_law_section_drives_cites_edges() {
+        // SAMPLE_WITH_APPLIED's `## 적용법조` declares 형법 제355조 + 제356조.
+        // Build a minimal statute doc for 형법 to make the edges resolvable.
+        const STATUTE_HYUNG: &str = r#"# 형법
+
+```json
+{
+  "meta": {"lsNm": "형법", "ancYd": "20251001", "efYd": "20251001"},
+  "title": "형법",
+  "articles": [
+    {"anchor": "J355:0", "number": "제355조(횡령, 배임)",
+     "text": "제355조(횡령, 배임) ① 타인의 재물을 보관하는 자가 ..."},
+    {"anchor": "J356:0", "number": "제356조(업무상의 횡령과 배임)",
+     "text": "제356조(업무상의 횡령과 배임) 업무상 ..."}
+  ],
+  "supplements": []
+}
+```
+"#;
+        const CASE_WITH_APPLIED: &str = r#"## 사건번호
+2024노9999
+## 선고일자
+20250101
+## 법원명
+서울고등법원
+## 사건명
+배임
+## 적용법조
+형법 제355조 제2항, 제356조
+## 판시사항
+holding
+## 판결요지
+요지
+## 판례내용
+본문
+"#;
+        let conn = fresh_conn();
+        let sdoc = extract_statute(STATUTE_HYUNG, "/x/20251001/형법.md").unwrap();
+        ingest_statute(&conn, &sdoc).unwrap();
+        let cdoc =
+            extract_case(CASE_WITH_APPLIED, "/판례/20250101/2024노9999_형사.md").unwrap();
+        ingest_case(&conn, &cdoc).unwrap();
+        let g = conn.lock();
+        // Both 적용법조 entries become resolved `cites` edges.
+        let resolved: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_links
+                  WHERE display_text='cites' AND is_resolved=1
+                    AND target_raw IN ('statute::형법::355', 'statute::형법::356')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved, 2, "both 적용법조 entries must wire");
     }
 }
